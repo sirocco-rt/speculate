@@ -1,12 +1,12 @@
 ---
-title: marimo app template
+title: Speculate
 emoji: 🍃
 colorFrom: indigo
 colorTo: purple
 sdk: docker
 pinned: true
-license: mit
-short_description: Template for deploying a marimo application to HF
+license: gpl-3.0
+short_description: A sirocco emulator for astrophysical spectra
 ---
 
 Check out marimo at <https://github.com/marimo-team/marimo>
