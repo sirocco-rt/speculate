@@ -2,7 +2,7 @@
 title: Speculate
 emoji: 💨
 colorFrom: blue
-colorTo: orange
+colorTo: yellow
 sdk: docker
 pinned: true
 license: gpl-3.0
