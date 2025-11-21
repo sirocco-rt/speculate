@@ -1,4 +1,11 @@
+# Core dependencies
 marimo>=0.17.0
 uvicorn[standard]
 
-# Add other dependencies as needed
+# Add other dependencies below
+# HuggingFace integration
+huggingface_hub
+
+# Data processing
+pandas
+
