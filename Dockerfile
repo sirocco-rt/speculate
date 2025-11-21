@@ -16,4 +16,5 @@ RUN mkdir -p /app/__marimo__ && \
     chmod -R 755 /app
 USER user
 
-CMD ["marimo", "run", "app.py", "--include-code", "--host", "0.0.0.0", "--port", "7860"]
+# Run the ASGI app with uvicorn (multi-page marimo app with routes)
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]

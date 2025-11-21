@@ -230,7 +230,7 @@ Starfish/.vscode/
 Speculate_addones/__pycache__
 slurm-*.out
 speculate_dev/
-observation_files/
 .DS_Store
+raw_scripts_of_notebooks/
 
 

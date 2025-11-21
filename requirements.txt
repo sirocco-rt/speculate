@@ -1,5 +1,4 @@
-marimo
-# Or a specific version
-# marimo>=0.9.0
+marimo>=0.17.0
+uvicorn[standard]
 
 # Add other dependencies as needed

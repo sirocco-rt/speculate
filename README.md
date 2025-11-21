@@ -1,8 +1,8 @@
 ---
 title: Speculate
-emoji: 🍃
-colorFrom: indigo
-colorTo: purple
+emoji: 💨
+colorFrom: blue
+colorTo: orange
 sdk: docker
 pinned: true
 license: gpl-3.0
