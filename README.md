@@ -13,5 +13,7 @@ short_description: A sirocco emulator for astrophysical spectra
 
 An emulator for Sirocco for faster inference of an observational spectrum's outflow parameters
 
+To get started, run: python run.py
+
 Check out marimo at <https://github.com/marimo-team/marimo>
 Check out the configuration reference at <https://huggingface.co/docs/hub/spaces-config-reference>

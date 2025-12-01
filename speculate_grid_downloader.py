@@ -443,17 +443,36 @@ def _(
         mo.md(f"### ✅ Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
     return
 
-
 @app.cell
 def _(mo):
-    # Navigation - back to home only
-    back_home = mo.nav_menu(
-        {
-            "/": "## <ins>⬅︎ Back to Home</ins>",
-        },
-        orientation="horizontal"
+    # Static sidebar - always shows all options
+    mo.sidebar(
+        mo.vstack([
+            mo.md("# 🔭 Speculate"),
+            mo.md(" "),
+            mo.md(" "),
+            mo.md("---"),
+            mo.md("---"),
+            mo.md(" "),
+            mo.md(" "),
+            mo.nav_menu({
+                "/": f"###{mo.icon('lucide:home')} Home",
+            }, orientation="vertical"),
+            mo.md(" "),
+            mo.md("---"),
+            mo.md("---"),
+            mo.nav_menu({
+            "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
+            "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
+            }, orientation="vertical"),
+            mo.md(" "),
+            mo.md("---"),
+            mo.nav_menu({
+            "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
+            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs"
+            }, orientation="vertical")
+        ])
     )
-    back_home
     return
 
 

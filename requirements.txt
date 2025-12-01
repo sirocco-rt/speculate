@@ -1,5 +1,5 @@
 # Core dependencies
-marimo>=0.17.0
+marimo>=0.18.1
 uvicorn[standard]
 
 # Add other dependencies below
