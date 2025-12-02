@@ -2,6 +2,7 @@
 # [tool.marimo.display]
 # theme = "dark"
 # ///
+
 import marimo
 
 __generated_with = "0.18.1"
@@ -31,9 +32,9 @@ def _(mo):
     # Add logo using marimo's image display
     import pathlib
 
-    logo_path = pathlib.Path("assets/logos/Speculate_logo3.png")
+    logo_path = pathlib.Path("assets/logos/Speculate_logo4.mp4")
 
-    logo = mo.image(src=str(logo_path), width=800)
+    logo = mo.video(src=str(logo_path), muted=True, autoplay=True, controls=False, rounded=True, width=800)
     link = mo.md('<p style="text-align: center;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
     mo.vstack([mo.md("---"), logo, link], align="center")
     return
@@ -84,11 +85,11 @@ def _(mo):
 @app.cell
 def _(mo):
     import os
-    
+
     # Auto-detect if running on HuggingFace Space
     is_hf_space = os.environ.get("SPACE_ID") is not None
     default_mode = "🤗 HuggingFace Space" if is_hf_space else "💻 Local Computer"
-    
+
     # Environment mode selector
     environment_mode = mo.ui.dropdown(
         options={
@@ -117,11 +118,11 @@ def _(environment_mode, mo):
     if current_mode == "HuggingFace Space":
         mode_warning = mo.callout(
             mo.md("""**🤗 HuggingFace Space Mode Active** 
-        
+
             Only the following tools will operate as expected due to resource limitations: 
             - **Grid Inspector**
             - **Inference Tool**
-        
+
             ⚠️ **Note:** For full features, install Speculate locally and select "Local Machine".
             """),
             kind="warn"
@@ -129,13 +130,14 @@ def _(environment_mode, mo):
     else:
         mode_warning = mo.callout(
             mo.md("""**💻 Local Mode Active** 
-        
+
             All tools available! Please ensure you have adequate local CPU and GPU provisions."""),
             kind="success"
         )
 
     mode_warning
     return (current_mode,)
+
 
 @app.cell
 def _(current_mode, mo):
@@ -211,6 +213,7 @@ def _(current_mode, mo):
 
     mo.sidebar(menu)
     return
+
 
 if __name__ == "__main__":
     app.run()
