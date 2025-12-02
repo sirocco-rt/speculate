@@ -29,12 +29,12 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    # Add logo using marimo's image display
+    # Add logo using marimo's video display
     import pathlib
 
     logo_path = pathlib.Path("assets/logos/Speculate_logo4.mp4")
 
-    logo = mo.Html(f'<video autoplay muted playsinline style="border-radius: 8px; width: 800px; max-width: 100%;"><source src="{logo_path}" type="video/mp4"></video>')
+    logo = mo.video(src=str(logo_path), muted=True, autoplay=True, loop=False, controls=False, rounded=False, width=800)
     link = mo.md('<p style="text-align: center;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
     mo.vstack([mo.md("---"), logo, link], align="center")
     return
