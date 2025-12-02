@@ -8,4 +8,8 @@ huggingface_hub
 
 # Data processing
 pandas
+numpy
+
+# Visualization
+altair
 
