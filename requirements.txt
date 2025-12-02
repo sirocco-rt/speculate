@@ -9,6 +9,7 @@ huggingface_hub
 # Data processing
 pandas
 numpy
+pyarrow
 
 # Visualization
 altair
