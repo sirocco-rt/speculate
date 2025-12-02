@@ -2,9 +2,10 @@
 # [tool.marimo.display]
 # theme = "dark"
 # ///
+
 import marimo
 
-__generated_with = "0.17.8"
+__generated_with = "0.18.1"
 app = marimo.App(
     width="full",
     app_title="Speculate Grid Downloader",
@@ -446,6 +447,7 @@ def _(
 
         mo.md(f"### ✅ Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
     return
+
 
 @app.cell
 def _(mo):
