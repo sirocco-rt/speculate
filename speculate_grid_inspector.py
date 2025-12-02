@@ -1,6 +1,8 @@
 # /// script
 # [tool.marimo.display]
 # theme = "dark"
+# [tool.marimo.runtime]
+# output_max_bytes = 50_000_000
 # ///
 
 import marimo
@@ -91,9 +93,12 @@ def _():
     from pathlib import Path
     import altair as alt
 
+    # Enable VegaFusion for large datasets
+    alt.data_transformers.enable("vegafusion")
+
     # Detect environment
     IS_HUGGINGFACE_SPACE = os.environ.get("SPACE_ID") is not None
-    return IS_HUGGINGFACE_SPACE, Path, alt, np, pd
+    return IS_HUGGINGFACE_SPACE, Path, alt, np, os, pd
 
 
 @app.cell
@@ -156,7 +161,38 @@ def _(IS_HUGGINGFACE_SPACE, Path, mo):
 
 
 @app.cell
-def _(grid_selector, mo):
+def _(IS_HUGGINGFACE_SPACE, cache_tracker_state, grid_selector, mo):
+    # Clear cache when grid changes (HuggingFace mode only)
+    if IS_HUGGINGFACE_SPACE:
+        get_cache_check, set_cache_check = cache_tracker_state
+
+        # Track previous grid to detect changes
+        import os as os_cache
+
+        prev_grid_key = "_prev_selected_grid"
+        prev_grid = os_cache.environ.get(prev_grid_key, "")
+        current_grid = grid_selector.value if grid_selector else ""
+
+        if prev_grid and current_grid and prev_grid != current_grid:
+            # Grid changed - clear cache
+            cached_files = get_cache_check()
+            cleared = 0
+            for file_path in cached_files:
+                if os_cache.path.exists(file_path):
+                    try:
+                        os_cache.remove(file_path)
+                        cleared += 1
+                    except Exception:
+                        pass
+            set_cache_check(set())
+
+            if cleared > 0:
+                mo.md(f"🧹 Cleared {cleared} cached spectra from previous grid")
+
+        # Update tracked grid
+        if current_grid:
+            os_cache.environ[prev_grid_key] = current_grid
+
     # Only proceed if grid is selected
     if grid_selector is None or grid_selector.value is None:
         mo.md("Please download a grid first using the Grid Downloader tool.")
@@ -409,61 +445,71 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    # Buttons for managing fixed spectra
-    add_spectrum_btn = mo.ui.button(label="➕ Add Spectrum", kind="success")
-    clear_spectra_btn = mo.ui.button(label="🗑️ Clear All", kind="danger")
+    # Initialize state for pinned spectra storage
+    get_pinned_spectra, set_pinned_spectra = mo.state([])
 
-    mo.hstack([add_spectrum_btn, clear_spectra_btn], justify="start", gap=1)
-    return add_spectrum_btn, clear_spectra_btn
-
-
-@app.cell
-def _(mo):
-    # Initialize state for fixed spectra storage
-    fixed_spectra_state = mo.state([])
-    return (fixed_spectra_state,)
+    # Initialize cache tracker for HuggingFace downloads
+    cache_tracker_state = mo.state(set())
+    return cache_tracker_state, get_pinned_spectra, set_pinned_spectra
 
 
 @app.cell
 def _(
-    add_spectrum_btn,
-    clear_spectra_btn,
     current_run_index,
-    fixed_spectra_state,
+    get_pinned_spectra,
     inclination_selector,
     mo,
+    set_pinned_spectra,
 ):
-    # Manage fixed spectra using marimo state
-    get_fixed, set_fixed = fixed_spectra_state
+    # Define button callbacks
+    def add_current_spectrum():
+        current_combo = (current_run_index, inclination_selector.value)
+        current_list = list(get_pinned_spectra())
+        if current_combo not in current_list:
+            current_list.append(current_combo)
+            set_pinned_spectra(current_list)
 
-    # Store both run index and inclination angle
-    current_combo = (current_run_index, inclination_selector.value)
+    def clear_all_spectra():
+        set_pinned_spectra([])
 
-    # Add current spectrum when button clicked
-    if add_spectrum_btn.value:
-        current_list = get_fixed()
-        if current_combo not in current_list:  # Avoid duplicates
-            set_fixed(current_list + [current_combo])
+    # Create buttons with on_click callbacks
+    add_spectrum_btn = mo.ui.button(
+        label="➕ Add Spectrum", 
+        kind="success",
+        on_click=lambda _: add_current_spectrum()
+    )
+    clear_spectra_btn = mo.ui.button(
+        label="🗑️ Clear All", 
+        kind="danger",
+        on_click=lambda _: clear_all_spectra()
+    )
 
-    # Clear all fixed spectra when button clicked
-    if clear_spectra_btn.value:
-        set_fixed([])
+    mo.hstack([add_spectrum_btn, clear_spectra_btn], justify="start", gap=1)
+    return
 
-    # Get current list of fixed (run, inclination) tuples
-    fixed_spectra_list = get_fixed()
-    num_fixed = len(fixed_spectra_list)
 
-    if num_fixed > 0:
-        fixed_labels = [f"run{run}@{inc}°" for run, inc in fixed_spectra_list]
-        mo.md(f"📌 **Fixed Spectra**: {num_fixed} pinned ({', '.join(fixed_labels)})")
-    return (fixed_spectra_list,)
+@app.cell
+def _(get_pinned_spectra, mo):
+    # Display pinned spectra status
+    pinned_spectra_indices = list(get_pinned_spectra())
+    num_pinned = len(pinned_spectra_indices)
+
+    # Display status message
+    if num_pinned > 0:
+        pinned_labels = [f"run{run}@{inc}°" for run, inc in pinned_spectra_indices]
+        status_msg = mo.md(f"📌 **Pinned Spectra**: {num_pinned} ({', '.join(pinned_labels)})")
+    else:
+        status_msg = mo.md("_No pinned spectra_")
+
+    status_msg
+    return (pinned_spectra_indices,)
 
 
 @app.cell
 def _(
     Path,
+    cache_tracker_state,
     current_run_index,
-    fixed_spectra_list,
     grid_mode,
     grid_path,
     hf_hub_download,
@@ -472,10 +518,36 @@ def _(
     lookup_df,
     lzma,
     np,
+    os,
     param_cols,
     repo_id,
-    use_dimensionless,
 ):
+    # Cache management functions
+    get_cache, set_cache = cache_tracker_state
+
+    def clear_spectrum_cache():
+        """Clear all cached spectrum files from HuggingFace downloads"""
+        cached_files = get_cache()
+        cleared_count = 0
+
+        for file_path in cached_files:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    cleared_count += 1
+                except Exception:
+                    pass  # Ignore errors, file might be in use
+
+        # Reset cache tracker
+        set_cache(set())
+        return cleared_count
+
+    def track_cached_file(file_path):
+        """Add file to cache tracker"""
+        cached_files = get_cache()
+        cached_files.add(file_path)
+        set_cache(cached_files)
+
     # Function to load a spectrum by run index and inclination
     def load_spectrum_with_skiprows(file_handle):
         """Helper to find correct skiprows and load data"""
@@ -510,6 +582,9 @@ def _(
                 repo_type="dataset"
             )
 
+            # Track this file in cache
+            track_cached_file(spec_path_temp)
+
             with lzma.open(spec_path_temp, 'rt') as f:
                 data = load_spectrum_with_skiprows(f)
                 flux = np.flip(data[col_idx])
@@ -529,54 +604,19 @@ def _(
         return flux, params
 
     # Load current spectrum
-    # with mo.status.spinner(title="Loading spectrum..."):
     current_flux, current_params = load_spectrum(current_run_index, inclination_selector.value)
-
-    # Load fixed spectra
-    fixed_spectra_data = []
-    for run_idx, inclination in fixed_spectra_list:
-        try:
-            fixed_flux, fixed_params = load_spectrum(run_idx, inclination)
-            fixed_spectra_data.append({
-                'run_idx': run_idx,
-                'inclination': inclination,
-                'flux': fixed_flux,
-                'params': fixed_params
-            })
-        except Exception as e:
-            pass  # Skip failed loads
-
-    # Dimensionless transformation if requested
-    if use_dimensionless.value:
-        # Normalize current spectrum
-        current_flux_plot = current_flux.copy()
-        norm_factor = current_flux_plot.mean()
-        current_flux_plot /= norm_factor
-        current_flux_plot -= current_flux_plot.mean()
-
-        # Normalize fixed spectra
-        for fixed_data in fixed_spectra_data:
-            fixed_flux_copy = fixed_data['flux'].copy()
-            norm_factor = fixed_flux_copy.mean()
-            fixed_flux_copy /= norm_factor
-            fixed_flux_copy -= fixed_flux_copy.mean()
-            fixed_data['flux_plot'] = fixed_flux_copy
-    else:
-        current_flux_plot = current_flux
-        for fixed_data in fixed_spectra_data:
-            fixed_data['flux_plot'] = fixed_data['flux']
-    return current_flux_plot, current_params, fixed_spectra_data
+    return current_flux, current_params, load_spectrum
 
 
 @app.cell
 def _(
     alt,
-    current_flux_plot,
-    current_params,
+    current_flux,
     current_run_index,
-    fixed_spectra_data,
     inclination_selector,
+    load_spectrum,
     pd,
+    pinned_spectra_indices,
     selected_grid,
     show_current,
     show_fixed,
@@ -592,9 +632,16 @@ def _(
     # Prepare data for Altair
     plot_data_list = []
 
-    # Add current spectrum data
+    # Process and add current spectrum data
     if show_current.value:
-        current_param_label = ', '.join([f'{col}={val:.3e}' for col, val in current_params.items()])
+        current_flux_plot = current_flux.copy()
+
+        # Apply dimensionless transformation if requested
+        if use_dimensionless.value:
+            norm_factor = current_flux_plot.mean()
+            current_flux_plot /= norm_factor
+            current_flux_plot -= current_flux_plot.mean()
+
         current_df = pd.DataFrame({
             'Wavelength': filtered_wavelengths,
             'Flux': current_flux_plot[wl_mask],
@@ -603,16 +650,33 @@ def _(
         })
         plot_data_list.append(current_df)
 
-    # Add fixed spectra data
-    if show_fixed.value and len(fixed_spectra_data) > 0:
-        for idx, plot_fixed_data in enumerate(fixed_spectra_data):
-            fixed_df = pd.DataFrame({
-                'Wavelength': filtered_wavelengths,
-                'Flux': plot_fixed_data['flux_plot'][wl_mask],
-                'Spectrum': f'run{plot_fixed_data["run_idx"]}@{plot_fixed_data["inclination"]}°',
-                'Type': 'Fixed'
-            })
-            plot_data_list.append(fixed_df)
+    # Load and add pinned spectra data
+    # Force reactivity by explicitly checking the list
+    num_pinned_to_plot = len(pinned_spectra_indices)
+
+    if show_fixed.value and num_pinned_to_plot > 0:
+        for run_idx, inclination in pinned_spectra_indices:
+            try:
+                pinned_flux, pinned_params = load_spectrum(run_idx, inclination)
+
+                # Apply dimensionless transformation if requested
+                if use_dimensionless.value:
+                    pinned_flux_plot = pinned_flux.copy()
+                    norm_factor = pinned_flux_plot.mean()
+                    pinned_flux_plot /= norm_factor
+                    pinned_flux_plot -= pinned_flux_plot.mean()
+                else:
+                    pinned_flux_plot = pinned_flux
+
+                pinned_df = pd.DataFrame({
+                    'Wavelength': filtered_wavelengths,
+                    'Flux': pinned_flux_plot[wl_mask],
+                    'Spectrum': f'run{run_idx}@{inclination}°',
+                    'Type': 'Pinned'
+                })
+                plot_data_list.append(pinned_df)
+            except Exception as e:
+                pass  # Skip failed loads
 
     # Combine all data
     if plot_data_list:
@@ -691,10 +755,10 @@ def _(mo):
     - **Dimensionless Data**: Normalize spectra (mean-centered) for comparison
 
     ### Performance Notes
-    - Spectra are loaded on-demand (no caching)
-    - Each spectrum is ~2.5MB, loads in <0.1s locally
-    - HuggingFace Space mode streams from cloud (slower)
-    - Pinned spectra are reloaded on each view
+    - Spectra are cached within a grid session for fast browsing
+    - Each spectrum is ~2.5MB, first load from cloud, then cached
+    - Cache automatically cleared when switching grids
+    - HuggingFace Space: ~1-2s first load, <0.5s cached loads
 
     ### Tips
     - Pin interesting spectra before changing parameters
