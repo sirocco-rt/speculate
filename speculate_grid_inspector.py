@@ -136,11 +136,11 @@ def _(IS_HUGGINGFACE_SPACE, Path, mo):
             label="Select Grid Dataset:"
         )
     else:
-        # Local: scan raw_grids directory
-        raw_grids_path = Path("raw_grids")
-        if raw_grids_path.exists():
+        # Local: scan sirocco_grids directory
+        sirocco_grids_path = Path("sirocco_grids")
+        if sirocco_grids_path.exists():
             available_grids = [
-                d.name for d in raw_grids_path.iterdir() 
+                d.name for d in sirocco_grids_path.iterdir() 
                 if d.is_dir() and not d.name.startswith('.')
             ]
         else:
@@ -154,7 +154,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, mo):
             )
         else:
             grid_selector = None
-            mo.md("⚠️ **No grids found in `raw_grids/` directory**\n\nPlease download grids using the Grid Downloader tool first.")
+            mo.md("⚠️ **No grids found in `sirocco_grids/` directory**\n\nPlease download grids using the Grid Downloader tool first.")
 
     grid_selector
     return (grid_selector,)
@@ -270,7 +270,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
 
         else:
             # Local mode: scan directory for spec files
-            grid_path = Path("raw_grids") / selected_grid
+            grid_path = Path("sirocco_grids") / selected_grid
 
             if not grid_path.exists():
                 mo.md(f"❌ Grid directory not found: {grid_path}")

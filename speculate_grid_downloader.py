@@ -323,7 +323,7 @@ def _(
     # Show save location if files are ready to download
     _summary_display = download_summary
     if files_to_download and dataset_dropdown is not None and dataset_dropdown.value:
-        save_location = os.path.abspath(f"raw_grids/{dataset_dropdown.value}/")
+        save_location = os.path.abspath(f"sirocco_grids/{dataset_dropdown.value}/")
         location_info = mo.md(f"📁 Files will be saved to: `{save_location}`")
         _summary_display = mo.vstack([download_summary, location_info])
 
@@ -378,7 +378,7 @@ def _(
     download_results = []
 
     if (download_only_button.value or download_and_decompress_button.value) and files_to_download:
-        extraction_dir = f"raw_grids/{dataset_dropdown.value}/"
+        extraction_dir = f"sirocco_grids/{dataset_dropdown.value}/"
 
         mo.md("### Downloading...")
 
@@ -420,7 +420,7 @@ def _(
 
     elif decompress_only_button.value and files_to_download:
         # Decompress previously downloaded files
-        extraction_dir = f"raw_grids/{dataset_dropdown.value}/"
+        extraction_dir = f"sirocco_grids/{dataset_dropdown.value}/"
         os.makedirs(extraction_dir, exist_ok=True)
 
         mo.md("### Decompressing cached files...")
