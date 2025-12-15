@@ -324,7 +324,7 @@ def batch_kernel_pytorch(X, Z, variances, lengthscales, device='cuda'):
     return result.cpu().numpy()
 
 
-def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda'):
+def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', return_stacked=False):
     """
     PyTorch GPU-accelerated batched RBF kernel that returns GPU tensor (NO CPU TRANSFER!)
     
@@ -345,11 +345,15 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda'):
         The lengthscale for each RBF kernel (n_components, n_features)
     device : str
         'cuda' for GPU or 'cpu' for CPU
+    return_stacked : bool
+        If True, returns a 3D tensor (n_components, n_X, n_Z) instead of a 2D block-diagonal matrix.
+        This saves massive amounts of memory by avoiding storing zeros.
     
     Returns
     -------
     torch.Tensor
         Block diagonal kernel matrix on GPU (n_X*n_components, n_Z*n_components)
+        OR (n_components, n_X, n_Z) if return_stacked=True
     """
     if not PYTORCH_AVAILABLE:
         raise RuntimeError("PyTorch not available. Install with: pip install torch")
@@ -381,9 +385,12 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda'):
     n_X, n_Z = X_torch.shape[0], Z_torch.shape[0]
     
     # Pre-allocate result on GPU
-    total_size_X = n_X * n_components
-    total_size_Z = n_Z * n_components
-    result = torch.zeros((total_size_X, total_size_Z), dtype=DTYPE, device=device_obj)
+    if return_stacked:
+        result = torch.zeros((n_components, n_X, n_Z), dtype=DTYPE, device=device_obj)
+    else:
+        total_size_X = n_X * n_components
+        total_size_Z = n_Z * n_components
+        result = torch.zeros((total_size_X, total_size_Z), dtype=DTYPE, device=device_obj)
     
     # Compute each block on GPU using torch.cdist
     for i in range(n_components):
@@ -400,12 +407,15 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda'):
         # Apply RBF kernel
         kernel_block = var * torch.exp(-0.5 * sq_dist)
         
-        # Place in block diagonal matrix
-        start_X = i * n_X
-        end_X = (i + 1) * n_X
-        start_Z = i * n_Z
-        end_Z = (i + 1) * n_Z
-        result[start_X:end_X, start_Z:end_Z] = kernel_block
+        if return_stacked:
+            result[i] = kernel_block
+        else:
+            # Place in block diagonal matrix
+            start_X = i * n_X
+            end_X = (i + 1) * n_X
+            start_Z = i * n_Z
+            end_Z = (i + 1) * n_Z
+            result[start_X:end_X, start_Z:end_Z] = kernel_block
     
     # Return GPU tensor - NO CPU TRANSFER!
     return result

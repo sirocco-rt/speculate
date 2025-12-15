@@ -33,8 +33,9 @@ try:
     #
     TORCH_FLOAT64 = torch.float64  # <-- EDIT THIS (and kernels.py, _utils.py!)
     # ============================================================================
-    
-    if torch.cuda.is_available():
+
+    # Import PCA regardless of GPU availability
+    if PYTORCH_AVAILABLE and torch.cuda.is_available():
         try: 
             from cuml.decomposition import PCA
             GPU_PCA = True
@@ -43,6 +44,12 @@ try:
             from sklearn.decomposition import PCA, NMF, FastICA
             print('Warning: Using CPU for PCA')
             GPU_PCA = False
+    else:
+        # CPU fallback - always import sklearn PCA
+        from sklearn.decomposition import PCA, NMF, FastICA
+        GPU_PCA = False
+        if PYTORCH_AVAILABLE:
+            print('CUDA not available - using CPU for PCA')
             
     def _pytorch_log_likelihood_computation(v11, w_hat, device='cuda', dtype=None):
         """PyTorch log likelihood computation with GPU acceleration (float64)
@@ -67,6 +74,34 @@ try:
         v11_torch = torch.from_numpy(v11).to(device_obj, dtype)
         w_hat_torch = torch.from_numpy(w_hat).to(device_obj, dtype)
         
+        if v11_torch.dim() == 3:
+            # Block diagonal case (Batched)
+            # v11_torch: (n_comp, M, M)
+            # w_hat_torch: (n_comp * M,) -> reshape to (n_comp, M, 1)
+            n_comp = v11_torch.shape[0]
+            M = v11_torch.shape[1]
+            w_hat_reshaped = w_hat_torch.view(n_comp, M, 1)
+            
+            L = torch.linalg.cholesky(v11_torch) # (n_comp, M, M)
+            
+            # logdet = 2 * sum(log(diag(L)))
+            # L.diagonal(dim1=-2, dim2=-1) -> (n_comp, M)
+            logdet = 2.0 * torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)))
+            
+            # Solve
+            z = torch.linalg.solve_triangular(L, w_hat_reshaped, upper=False) # (n_comp, M, 1)
+            solved = torch.linalg.solve_triangular(L.transpose(-2, -1), z, upper=True) # (n_comp, M, 1)
+            
+            # sqmah = w_hat^T @ solved
+            # w_hat_reshaped is (n_comp, M, 1)
+            # solved is (n_comp, M, 1)
+            # We want sum over all components of w_hat_i^T @ solved_i
+            # w_hat_reshaped.transpose(-2, -1) @ solved -> (n_comp, 1, 1)
+            sqmah = torch.sum(torch.matmul(w_hat_reshaped.transpose(-2, -1), solved))
+            
+            log_likelihood = -(logdet + sqmah) / 2.0
+            return float(log_likelihood.cpu())
+
         # Cholesky decomposition: v11 = L @ L.T
         L = torch.linalg.cholesky(v11_torch)
         
@@ -98,23 +133,59 @@ try:
         
         Args:
             v11_gpu: Covariance matrix (torch.Tensor on GPU, float64)
+                     Can be 2D (dense) or 3D (stacked block-diagonal)
             w_hat_gpu: Weight vector (torch.Tensor on GPU, float64)
             
         Returns:
             log_likelihood: Scalar float (only transfers single number to CPU)
         """
         # Everything stays on GPU until final result
-        L = torch.linalg.cholesky(v11_gpu)
-        logdet = 2.0 * torch.sum(torch.log(L.diagonal()))
         
-        z = torch.linalg.solve_triangular(L, w_hat_gpu.unsqueeze(1), upper=False).squeeze()
-        solved = torch.linalg.solve_triangular(L.T, z.unsqueeze(1), upper=True).squeeze()
-        
-        sqmah = torch.dot(w_hat_gpu, solved)
-        log_likelihood = -(logdet + sqmah) / 2.0
-        
-        # Only transfer single scalar to CPU (< 1ms vs 339s for full matrix!)
-        return float(log_likelihood.cpu())
+        # Check if we are using the block-diagonal optimization (3D tensor)
+        if v11_gpu.dim() == 3:
+            # v11_gpu shape: (n_components, M, M)
+            # w_hat_gpu shape: (n_components * M) -> needs reshaping
+            
+            n_comp, M, _ = v11_gpu.shape
+            w_hat_reshaped = w_hat_gpu.view(n_comp, M)
+            
+            # Batch Cholesky decomposition (parallel over components)
+            L = torch.linalg.cholesky(v11_gpu) # (n_comp, M, M)
+            
+            # Log determinant: sum of log diag of all blocks
+            # L.diagonal(dim1=-2, dim2=-1) gets diagonals of each block
+            logdet = 2.0 * torch.sum(torch.log(L.diagonal(dim1=-2, dim2=-1)))
+            
+            # Solve v11 @ x = w_hat via batched triangular solves
+            # L @ z = w_hat
+            # unsqueeze(-1) makes w_hat (n_comp, M, 1) for matrix solve
+            z = torch.linalg.solve_triangular(L, w_hat_reshaped.unsqueeze(-1), upper=False).squeeze(-1)
+            
+            # L.T @ x = z
+            # transpose(-2, -1) transposes the last two dimensions (the matrices)
+            solved = torch.linalg.solve_triangular(L.transpose(-2, -1), z.unsqueeze(-1), upper=True).squeeze(-1)
+            
+            # Mahalanobis distance: sum(w_hat * solved)
+            # This is equivalent to w^T @ v11^{-1} @ w for the block diagonal case
+            sqmah = torch.sum(w_hat_reshaped * solved)
+            
+            log_likelihood = -(logdet + sqmah) / 2.0
+            
+            return float(log_likelihood.cpu())
+            
+        else:
+            # Original dense implementation (2D matrix)
+            L = torch.linalg.cholesky(v11_gpu)
+            logdet = 2.0 * torch.sum(torch.log(L.diagonal()))
+            
+            z = torch.linalg.solve_triangular(L, w_hat_gpu.unsqueeze(1), upper=False).squeeze()
+            solved = torch.linalg.solve_triangular(L.T, z.unsqueeze(1), upper=True).squeeze()
+            
+            sqmah = torch.dot(w_hat_gpu, solved)
+            log_likelihood = -(logdet + sqmah) / 2.0
+            
+            # Only transfer single scalar to CPU
+            return float(log_likelihood.cpu())
     
 except ImportError:
     PYTORCH_AVAILABLE = False
@@ -123,7 +194,7 @@ except ImportError:
 from Starfish.grid_tools import NPZInterface
 from Starfish.grid_tools.utils import determine_chunk_log
 from Starfish.utils import calculate_dv
-from .kernels import batch_kernel, batch_kernel_cached, batch_kernel_auto, batch_kernel_pytorch_gpu_only, clear_kernel_cache, get_cache_size
+from .kernels import batch_kernel, batch_kernel_cached, batch_kernel_auto, batch_kernel_pytorch_gpu_only, clear_kernel_cache, get_cache_size, rbf_kernel
 from ._utils import get_phi_squared_optimized, get_phi_squared_pytorch, get_w_hat, PYTORCH_AVAILABLE as UTILS_PYTORCH_AVAILABLE
 log = logging.getLogger(__name__)
 
@@ -262,6 +333,7 @@ class Emulator:
         variances: Optional[np.ndarray] = None,
         lengthscales: Optional[np.ndarray] = None,
         name: Optional[str] = None,
+        block_diagonal: bool = False,
         ):
         self.log = logging.getLogger(self.__class__.__name__)
         
@@ -273,6 +345,7 @@ class Emulator:
         self.flux_mean = flux_mean
         self.flux_std = flux_std
         self.factors = factors
+        self.block_diagonal = block_diagonal
         
         # Create optimal interpolator (RegularGrid if possible, LinearND fallback)
         self.factor_interpolator = _create_optimal_interpolator(
@@ -314,13 +387,36 @@ class Emulator:
             # Block diagonal optimization: (A ⊗ B)⁻¹ = A⁻¹ ⊗ B⁻¹
             dots = torch.matmul(eig_torch, eig_torch.T)
             dots_inv = torch.linalg.inv(dots)
-            eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
-            iPhiPhi_gpu = torch.kron(dots_inv.contiguous(), eye_M.contiguous())
             
-            kernel_gpu = batch_kernel_pytorch_gpu_only(
-                self.grid_points, self.grid_points, self.variances, self.lengthscales, device='cuda'
-            )
-            v11_gpu = iPhiPhi_gpu / self.lambda_xi + kernel_gpu
+            if self.block_diagonal:
+                self.log.info("Using Block-Diagonal Optimization (Memory Efficient)")
+                # Extract diagonal elements of dots_inv for block scaling
+                # Assuming PCA orthogonality, off-diagonals should be negligible
+                dots_inv_diag = torch.diagonal(dots_inv) # (n_comp,)
+                
+                # Create stacked iPhiPhi: (n_comp, M, M)
+                # Each block is dots_inv_diag[i] * I_M
+                eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
+                # Use broadcasting to create the stack efficiently
+                iPhiPhi_gpu = dots_inv_diag.view(-1, 1, 1) * eye_M.unsqueeze(0)
+                
+                kernel_gpu = batch_kernel_pytorch_gpu_only(
+                    self.grid_points, self.grid_points, self.variances, self.lengthscales, 
+                    device='cuda', return_stacked=True
+                )
+                
+                v11_gpu = iPhiPhi_gpu / self.lambda_xi + kernel_gpu
+            else:
+                self.log.info("Using Full Dense Matrix (Standard)")
+                eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
+                iPhiPhi_gpu = torch.kron(dots_inv.contiguous(), eye_M.contiguous())
+                
+                kernel_gpu = batch_kernel_pytorch_gpu_only(
+                    self.grid_points, self.grid_points, self.variances, self.lengthscales, device='cuda'
+                )
+                v11_gpu = iPhiPhi_gpu / self.lambda_xi + kernel_gpu
+                
+
             
             self._iPhiPhi_gpu = iPhiPhi_gpu
             self._v11_gpu = v11_gpu
@@ -328,11 +424,51 @@ class Emulator:
             self._v11 = None
         else:
             self.log.info("GPU not available, using CPU")
-            phi_squared = get_phi_squared_optimized(eigenspectra_matrix, M)
-            self._iPhiPhi = np.linalg.inv(phi_squared)
-            self._v11 = self._iPhiPhi / self.lambda_xi + batch_kernel_auto(
-                self.grid_points, self.grid_points, self.variances, self.lengthscales
-            )
+            
+            if self.block_diagonal:
+                self.log.info("Using Block-Diagonal Optimization (CPU Mode)")
+                # CPU Block Diagonal Implementation
+                # 1. Compute diagonal of (Phi Phi^T)^-1
+                dots = eigenspectra_matrix @ eigenspectra_matrix.T
+                dots_inv = np.linalg.inv(dots)
+                dots_inv_diag = np.diag(dots_inv) # (n_comp,)
+                
+                # 2. Create stacked iPhiPhi: (n_comp, M, M)
+                # We use a list of matrices or 3D array. 3D array is better for batch operations.
+                iPhiPhi_cpu = np.zeros((self.ncomps, M, M))
+                eye_M = np.eye(M)
+                for i in range(self.ncomps):
+                    iPhiPhi_cpu[i] = dots_inv_diag[i] * eye_M
+                
+                # 3. Compute stacked kernels
+                # We need a CPU version of batch_kernel that returns stacked
+                # For now, we can just loop over components using the existing single-kernel function
+                # or modify batch_kernel_auto. 
+                # Let's construct it manually to be safe and explicit.
+                kernel_cpu = np.zeros((self.ncomps, M, M))
+                from .kernels import rbf_kernel
+                for i in range(self.ncomps):
+                    kernel_cpu[i] = rbf_kernel(
+                        self.grid_points, 
+                        self.grid_points, 
+                        self.variances[i], 
+                        self.lengthscales[i]
+                    )
+                
+                v11_cpu = iPhiPhi_cpu / self.lambda_xi + kernel_cpu
+                
+                # Store as _v11 but note it is 3D
+                self._iPhiPhi = iPhiPhi_cpu
+                self._v11 = v11_cpu
+                
+            else:
+                self.log.info("Using Full Dense Matrix (Standard CPU)")
+                phi_squared = get_phi_squared_optimized(eigenspectra_matrix, M)
+                self._iPhiPhi = np.linalg.inv(phi_squared)
+                self._v11 = self._iPhiPhi / self.lambda_xi + batch_kernel_auto(
+                    self.grid_points, self.grid_points, self.variances, self.lengthscales
+                )
+            
             self._iPhiPhi_gpu = None
             self._v11_gpu = None
         
@@ -447,13 +583,15 @@ class Emulator:
         return self.hyperparams[key]
 
     @classmethod
-    def load(cls, filename: Union[str, os.PathLike]):
+    def load(cls, filename: Union[str, os.PathLike], block_diagonal: Optional[bool] = None):
         """
         Load an emulator from an NPZ file
 
         Parameters
         ----------
         filename : str or path-like
+        block_diagonal : bool, optional
+            Override the block_diagonal setting from the file.
         """
         filename = os.path.expandvars(filename)
         data = np.load(filename, allow_pickle=True)
@@ -471,6 +609,13 @@ class Emulator:
         variances = data["variances"]
         lengthscales = data["lengthscales"]
         trained = bool(data["trained"])
+        
+        # Load block_diagonal flag if present (backward compatibility)
+        if block_diagonal is None:
+            if "block_diagonal" in data:
+                block_diagonal = bool(data["block_diagonal"])
+            else:
+                block_diagonal = False
         
         if "name" in data:
             name = str(data["name"])
@@ -491,6 +636,7 @@ class Emulator:
             lengthscales=lengthscales,
             name=name,
             factors=factors,
+            block_diagonal=block_diagonal
         )
         emulator._trained = trained
         return emulator
@@ -521,7 +667,8 @@ class Emulator:
             "factors": self.factors,
             "lambda_xi": self.lambda_xi,
             "variances": self.variances,
-            "lengthscales": self.lengthscales
+            "lengthscales": self.lengthscales,
+            "block_diagonal": self.block_diagonal
         }
         
         if self.name is not None:
@@ -531,7 +678,7 @@ class Emulator:
         self.log.info("Saved file at {}".format(filename))
 
     @classmethod
-    def from_grid(cls, grid, **pca_kwargs):
+    def from_grid(cls, grid, block_diagonal=False, **pca_kwargs):
         """
         Create an Emulator using PCA decomposition from a GridInterface.
 
@@ -539,6 +686,8 @@ class Emulator:
         ----------
         grid : :class:`GridInterface` or str
             The grid interface to decompose
+        block_diagonal : bool, optional
+            Whether to use block-diagonal approximation for covariance matrix. Default is False.
         pca_kwargs : dict, optional
             The keyword arguments to pass to PCA. By default, `n_components=0.99` and
             `svd_solver='full'`.
@@ -596,6 +745,7 @@ class Emulator:
             flux_mean=flux_mean,
             flux_std=flux_std,
             factors=norm_factors,
+            block_diagonal=block_diagonal,
         )
         # profiler.stop()
         # profiler.print()
@@ -678,17 +828,64 @@ class Emulator:
         
         This is the original implementation that uses NumPy on CPU.
         """
-        # Recalculate V12, V21, and V22.
-        v12 = batch_kernel_auto(self.grid_points, params, self.variances, self.lengthscales)
-        v22 = batch_kernel_auto(params, params, self.variances, self.lengthscales)
-        v21 = v12.T
+        if self.block_diagonal:
+            # Block-Diagonal CPU Implementation
+            # v11 is (n_comp, M, M)
+            
+            # 1. Compute stacked kernels
+            # We loop because we don't have a stacked CPU kernel function yet
+            v12_list = []
+            v22_list = []
+            for i in range(self.ncomps):
+                v12_list.append(rbf_kernel(self.grid_points, params, self.variances[i], self.lengthscales[i]))
+                v22_list.append(rbf_kernel(params, params, self.variances[i], self.lengthscales[i]))
+            
+            v12_stacked = np.stack(v12_list) # (n_comp, M, n_query)
+            v22_stacked = np.stack(v22_list) # (n_comp, n_query, n_query)
+            v21_stacked = v12_stacked.transpose(0, 2, 1) # (n_comp, n_query, M)
+            
+            # w_hat is (n_comp * M,) -> reshape to (n_comp, M, 1)
+            w_hat_stacked = self.w_hat.reshape(self.ncomps, -1)[..., np.newaxis]
+            
+            # Solve v11 @ alpha = w_hat
+            # np.linalg.solve broadcasts over the first dimension (n_comp)
+            alpha = np.linalg.solve(self._v11, w_hat_stacked) # (n_comp, M, 1)
+            
+            # mu = v21 @ alpha
+            mu_stacked = v21_stacked @ alpha # (n_comp, n_query, 1)
+            
+            # Solve v11 @ X = v12
+            v11_inv_v12 = np.linalg.solve(self._v11, v12_stacked) # (n_comp, M, n_query)
+            
+            # cov = v22 - v21 @ v11^{-1} @ v12
+            cov_term = v21_stacked @ v11_inv_v12 # (n_comp, n_query, n_query)
+            cov_stacked = v22_stacked - cov_term
+            
+            # Flatten mu
+            mu = mu_stacked.flatten()
+            
+            if not full_cov:
+                # Just return variances
+                cov_diag = np.diagonal(cov_stacked, axis1=-2, axis2=-1) # (n_comp, n_query)
+                cov = cov_diag.flatten()
+            else:
+                # Construct full block diagonal matrix
+                from scipy.linalg import block_diag
+                cov = block_diag(*cov_stacked)
+                
+        else:
+            # Recalculate V12, V21, and V22.
+            v12 = batch_kernel_auto(self.grid_points, params, self.variances, self.lengthscales)
+            v22 = batch_kernel_auto(params, params, self.variances, self.lengthscales)
+            v21 = v12.T
 
-        # Recalculate the covariance
-        mu = v21 @ np.linalg.solve(self.v11, self.w_hat)
-        cov = v22 - v21 @ np.linalg.solve(self.v11, v12)
-        
-        if not full_cov:
-            cov = np.diag(cov)
+            # Recalculate the covariance
+            mu = v21 @ np.linalg.solve(self.v11, self.w_hat)
+            cov = v22 - v21 @ np.linalg.solve(self.v11, v12)
+            
+            if not full_cov:
+                cov = np.diag(cov)
+                
         if reinterpret_batch:
             mu = mu.reshape(-1, self.ncomps, order="F").squeeze()
             cov = cov.reshape(-1, self.ncomps, order="F").squeeze()
@@ -723,37 +920,102 @@ class Emulator:
         # Transfer query parameters to GPU (tiny transfer: ~56 bytes for 7 params)
         params_gpu = torch.from_numpy(params).to(device, TORCH_FLOAT64)
         
-        # Compute kernels on GPU (massively parallel - this is where the speedup comes from)
-        v12_gpu = batch_kernel_pytorch_gpu_only(
-            self._grid_points_gpu, 
-            params_gpu, 
-            self._variances_gpu, 
-            self._lengthscales_gpu,
-            device='cuda'
-        )
-        v22_gpu = batch_kernel_pytorch_gpu_only(
-            params_gpu, 
-            params_gpu, 
-            self._variances_gpu, 
-            self._lengthscales_gpu,
-            device='cuda'
-        )
-        v21_gpu = v12_gpu.T
+        # Check if we are in block-diagonal mode
+        is_block_diagonal = (self._v11_gpu.dim() == 3)
         
-        # GP prediction equations on GPU (R&W 2.18, 2.19)
-        # mu = v21 @ v11^{-1} @ w_hat
-        mu_gpu = v21_gpu @ torch.linalg.solve(self._v11_gpu, self._w_hat_gpu)
-        
-        # cov = v22 - v21 @ v11^{-1} @ v12
-        cov_gpu = v22_gpu - v21_gpu @ torch.linalg.solve(self._v11_gpu, v12_gpu)
-        
-        # Transfer results back to CPU (small transfer: ~3 KB for 18 components)
-        if not full_cov:
-            mu = mu_gpu.cpu().numpy()
-            cov = cov_gpu.diagonal().cpu().numpy()
+        if is_block_diagonal:
+            # Block-diagonal / Stacked mode
+            n_comp = self.ncomps
+            M = self.grid_points.shape[0]
+            n_query = params.shape[0]
+            
+            # Compute kernels in stacked mode
+            v12_gpu = batch_kernel_pytorch_gpu_only(
+                self._grid_points_gpu, 
+                params_gpu, 
+                self._variances_gpu, 
+                self._lengthscales_gpu,
+                device='cuda',
+                return_stacked=True
+            ) # (n_comp, M, n_query)
+            
+            v22_gpu = batch_kernel_pytorch_gpu_only(
+                params_gpu, 
+                params_gpu, 
+                self._variances_gpu, 
+                self._lengthscales_gpu,
+                device='cuda',
+                return_stacked=True
+            ) # (n_comp, n_query, n_query)
+            
+            v21_gpu = v12_gpu.transpose(-2, -1) # (n_comp, n_query, M)
+            
+            # Reshape w_hat for batch solve
+            w_hat_reshaped = self._w_hat_gpu.view(n_comp, M).unsqueeze(-1) # (n_comp, M, 1)
+            
+            # Solve v11 @ x = w_hat
+            # v11_gpu is (n_comp, M, M)
+            alpha = torch.linalg.solve(self._v11_gpu, w_hat_reshaped) # (n_comp, M, 1)
+            
+            # mu = v21 @ alpha
+            mu_stacked = torch.matmul(v21_gpu, alpha) # (n_comp, n_query, 1)
+            
+            # Solve v11 @ X = v12
+            v11_inv_v12 = torch.linalg.solve(self._v11_gpu, v12_gpu) # (n_comp, M, n_query)
+            
+            # cov = v22 - v21 @ v11^{-1} @ v12
+            cov_term = torch.matmul(v21_gpu, v11_inv_v12) # (n_comp, n_query, n_query)
+            cov_stacked = v22_gpu - cov_term # (n_comp, n_query, n_query)
+            
+            # Reshape results to match expected output format
+            mu_gpu = mu_stacked.squeeze(-1).flatten() # (n_comp * n_query)
+            
+            if not full_cov:
+                # Just return variances (diagonal of cov)
+                cov_diag = cov_stacked.diagonal(dim1=-2, dim2=-1) # (n_comp, n_query)
+                cov = cov_diag.flatten().cpu().numpy()
+                mu = mu_gpu.cpu().numpy()
+            else:
+                # Construct full block diagonal matrix
+                blocks = [cov_stacked[i] for i in range(n_comp)]
+                cov_gpu = torch.block_diag(*blocks)
+                
+                mu = mu_gpu.cpu().numpy()
+                cov = cov_gpu.cpu().numpy()
+                
         else:
-            mu = mu_gpu.cpu().numpy()
-            cov = cov_gpu.cpu().numpy()
+            # Original dense mode
+            # Compute kernels on GPU (massively parallel - this is where the speedup comes from)
+            v12_gpu = batch_kernel_pytorch_gpu_only(
+                self._grid_points_gpu, 
+                params_gpu, 
+                self._variances_gpu, 
+                self._lengthscales_gpu,
+                device='cuda'
+            )
+            v22_gpu = batch_kernel_pytorch_gpu_only(
+                params_gpu, 
+                params_gpu, 
+                self._variances_gpu, 
+                self._lengthscales_gpu,
+                device='cuda'
+            )
+            v21_gpu = v12_gpu.T
+            
+            # GP prediction equations on GPU (R&W 2.18, 2.19)
+            # mu = v21 @ v11^{-1} @ w_hat
+            mu_gpu = v21_gpu @ torch.linalg.solve(self._v11_gpu, self._w_hat_gpu)
+            
+            # cov = v22 - v21 @ v11^{-1} @ v12
+            cov_gpu = v22_gpu - v21_gpu @ torch.linalg.solve(self._v11_gpu, v12_gpu)
+            
+            # Transfer results back to CPU (small transfer: ~3 KB for 18 components)
+            if not full_cov:
+                mu = mu_gpu.cpu().numpy()
+                cov = cov_gpu.diagonal().cpu().numpy()
+            else:
+                mu = mu_gpu.cpu().numpy()
+                cov = cov_gpu.cpu().numpy()
         
         if reinterpret_batch:
             mu = mu.reshape(-1, self.ncomps, order="F").squeeze()
@@ -1199,13 +1461,28 @@ class Emulator:
                 self._grid_points_gpu, 
                 self._variances_gpu, 
                 self._lengthscales_gpu,
-                device='cuda'
+                device='cuda',
+                return_stacked=self.block_diagonal
             )
             self._v11_gpu = self._iPhiPhi_gpu / self.lambda_xi + kernel_gpu
         else:
-            self.v11 = self.iPhiPhi / self.lambda_xi + batch_kernel_auto(
-                self.grid_points, self.grid_points, self.variances, self.lengthscales
-            )
+            if self.block_diagonal:
+                # Block-Diagonal CPU Update
+                M = self.grid_points.shape[0]
+                kernel_cpu = np.zeros((self.ncomps, M, M))
+                
+                for i in range(self.ncomps):
+                    kernel_cpu[i] = rbf_kernel(
+                        self.grid_points, 
+                        self.grid_points, 
+                        self.variances[i], 
+                        self.lengthscales[i]
+                    )
+                self.v11 = self.iPhiPhi / self.lambda_xi + kernel_cpu
+            else:
+                self.v11 = self.iPhiPhi / self.lambda_xi + batch_kernel_auto(
+                    self.grid_points, self.grid_points, self.variances, self.lengthscales
+                )
 
 
     def get_param_vector(self) -> np.ndarray:
@@ -1273,6 +1550,28 @@ class Emulator:
             except Exception as e:
                 self.log.warning(f"PyTorch computation failed: {e}. Falling back to SciPy.")
         
+        # CPU Fallback (SciPy/NumPy)
+        if self.block_diagonal and self._v11 is not None and self._v11.ndim == 3:
+             # Block-Diagonal CPU Implementation
+            # v11 is (n_comp, M, M)
+            # w_hat is (n_comp * M,) -> reshape to (n_comp, M)
+            
+            w_hat_reshaped = self.w_hat.reshape(self.ncomps, -1)
+            
+            logdet = 0.0
+            sqmah = 0.0
+            
+            for i in range(self.ncomps):
+                L, flag = cho_factor(self._v11[i])
+                logdet += 2 * np.sum(np.log(L.diagonal()))
+                
+                # Solve for this component
+                # w_hat_i is (M,)
+                solved_i = cho_solve((L, flag), w_hat_reshaped[i])
+                sqmah += np.dot(w_hat_reshaped[i], solved_i)
+                
+            return -(logdet + sqmah) / 2
+
         L, flag = cho_factor(self.v11)
         logdet = 2 * np.sum(np.log(L.diagonal()))
         solved = cho_solve((L, flag), self.w_hat)

@@ -232,5 +232,6 @@ slurm-*.out
 speculate_dev/
 .DS_Store
 raw_scripts_of_notebooks/
+old_scripts/
 
 

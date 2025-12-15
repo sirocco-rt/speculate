@@ -13,4 +13,4 @@ pyarrow
 
 # Visualization
 altair
-
+vegafusion
