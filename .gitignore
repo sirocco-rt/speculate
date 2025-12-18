@@ -212,10 +212,8 @@ broad_short_spec_cv_grid
 broad_short_spec_cv_grid_test_data
 placement_grid_time_tests
 Ha_grid_spec_files
-Grid-Emulator_Files/Grid_full.hdf5
 Speculate_addones/__pycache__
 Starfish/__pycache__
-Grid-Emulator_Files/
 Claude_tests/
 Profiler_results/
 CV_release_grid_spec_light/
