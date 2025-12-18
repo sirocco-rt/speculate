@@ -10,7 +10,24 @@ huggingface_hub
 pandas
 numpy
 pyarrow
+scipy
+flatdict
+toml
 
 # Visualization
 altair
 vegafusion
+vl-convert-python>=1.8.0
+
+# Speculate Core
+emcee
+corner
+astropy
+extinction
+sigfig
+cuml-cu12
+torch
+torchvision
+
+# Debugging and Profiling
+pyinstrument

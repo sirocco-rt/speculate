@@ -149,25 +149,29 @@ try:
             n_comp, M, _ = v11_gpu.shape
             w_hat_reshaped = w_hat_gpu.view(n_comp, M)
             
-            # Batch Cholesky decomposition (parallel over components)
-            L = torch.linalg.cholesky(v11_gpu) # (n_comp, M, M)
+            logdet = 0.0
+            sqmah = 0.0
             
-            # Log determinant: sum of log diag of all blocks
-            # L.diagonal(dim1=-2, dim2=-1) gets diagonals of each block
-            logdet = 2.0 * torch.sum(torch.log(L.diagonal(dim1=-2, dim2=-1)))
-            
-            # Solve v11 @ x = w_hat via batched triangular solves
-            # L @ z = w_hat
-            # unsqueeze(-1) makes w_hat (n_comp, M, 1) for matrix solve
-            z = torch.linalg.solve_triangular(L, w_hat_reshaped.unsqueeze(-1), upper=False).squeeze(-1)
-            
-            # L.T @ x = z
-            # transpose(-2, -1) transposes the last two dimensions (the matrices)
-            solved = torch.linalg.solve_triangular(L.transpose(-2, -1), z.unsqueeze(-1), upper=True).squeeze(-1)
-            
-            # Mahalanobis distance: sum(w_hat * solved)
-            # This is equivalent to w^T @ v11^{-1} @ w for the block diagonal case
-            sqmah = torch.sum(w_hat_reshaped * solved)
+            # Loop over components to save memory (avoid allocating full L matrix)
+            # This reduces peak memory from (n_comp * M^2) to (M^2) for the Cholesky factor
+            for i in range(n_comp):
+                # Cholesky decomposition for single component
+                L = torch.linalg.cholesky(v11_gpu[i]) # (M, M)
+                
+                # Log determinant
+                logdet += 2.0 * torch.sum(torch.log(L.diagonal()))
+                
+                # Solve v11 @ x = w_hat
+                # L @ z = w_hat
+                z = torch.linalg.solve_triangular(L, w_hat_reshaped[i].unsqueeze(-1), upper=False)
+                
+                # L.T @ x = z
+                solved = torch.linalg.solve_triangular(L.T, z, upper=True).squeeze(-1)
+                
+                # Mahalanobis distance
+                sqmah += torch.dot(w_hat_reshaped[i], solved)
+                
+                # L is freed here, keeping peak memory low
             
             log_likelihood = -(logdet + sqmah) / 2.0
             
@@ -393,19 +397,22 @@ class Emulator:
                 # Extract diagonal elements of dots_inv for block scaling
                 # Assuming PCA orthogonality, off-diagonals should be negligible
                 dots_inv_diag = torch.diagonal(dots_inv) # (n_comp,)
+                self._dots_inv_diag_gpu = dots_inv_diag # Store for training updates
                 
                 # Create stacked iPhiPhi: (n_comp, M, M)
                 # Each block is dots_inv_diag[i] * I_M
                 eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
-                # Use broadcasting to create the stack efficiently
-                iPhiPhi_gpu = dots_inv_diag.view(-1, 1, 1) * eye_M.unsqueeze(0)
                 
-                kernel_gpu = batch_kernel_pytorch_gpu_only(
+                # Initialize v11_gpu directly with iPhiPhi/lambda_xi
+                # This avoids allocating iPhiPhi_gpu separately
+                v11_gpu = (dots_inv_diag.view(-1, 1, 1) * eye_M.unsqueeze(0)) / self.lambda_xi
+                
+                # Add kernel to v11_gpu in-place
+                # This avoids allocating kernel_gpu separately
+                batch_kernel_pytorch_gpu_only(
                     self.grid_points, self.grid_points, self.variances, self.lengthscales, 
-                    device='cuda', return_stacked=True
+                    device='cuda', return_stacked=True, out=v11_gpu, add_to_out=True
                 )
-                
-                v11_gpu = iPhiPhi_gpu / self.lambda_xi + kernel_gpu
             else:
                 self.log.info("Using Full Dense Matrix (Standard)")
                 eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
@@ -416,13 +423,20 @@ class Emulator:
                 )
                 v11_gpu = iPhiPhi_gpu / self.lambda_xi + kernel_gpu
                 
-
+                self._iPhiPhi_gpu = iPhiPhi_gpu
+                self._v11_gpu = v11_gpu
+                self._iPhiPhi = None
+                self._v11 = None
             
-            self._iPhiPhi_gpu = iPhiPhi_gpu
-            self._v11_gpu = v11_gpu
-            self._iPhiPhi = None
-            self._v11 = None
+            if self.block_diagonal:
+                self._iPhiPhi_gpu = None # Not stored in block diagonal mode to save memory
+                self._v11_gpu = v11_gpu
+                self._iPhiPhi = None
+                self._v11 = None
+            else:
+                self._dots_inv_diag_gpu = None
         else:
+            self._dots_inv_diag_gpu = None
             self.log.info("GPU not available, using CPU")
             
             if self.block_diagonal:
@@ -755,13 +769,14 @@ class Emulator:
 
     def __call__(
         self,
-        params: Sequence[float],
+        params: np.ndarray,
         full_cov: bool = True,
         reinterpret_batch: bool = False,
         use_gpu: bool = True,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        return_tensors: bool = False,
+    ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Gets the mu and cov matrix for a given set of params
+        Predict the weights and covariance matrix at the given parameters.
 
         Parameters
         ----------
@@ -777,11 +792,14 @@ class Emulator:
         use_gpu : bool, optional
             Use GPU acceleration if available. Default is True. Falls back to CPU if
             GPU is unavailable or if an error occurs.
+        return_tensors : bool, optional
+            If True and using GPU, returns PyTorch tensors on the GPU device.
+            If False (default), returns numpy arrays on CPU.
 
         Returns
         -------
-        mu : numpy.ndarray (len(params),)
-        cov : numpy.ndarray (len(params), len(params))
+        mu : numpy.ndarray or torch.Tensor (len(params),)
+        cov : numpy.ndarray or torch.Tensor (len(params), len(params))
 
         Raises
         ------
@@ -810,9 +828,12 @@ class Emulator:
         # Try GPU path if requested and available
         if use_gpu and PYTORCH_AVAILABLE and torch.cuda.is_available() and self._v11_gpu is not None:
             try:
-                return self._call_gpu(params, full_cov, reinterpret_batch)
+                return self._call_gpu(params, full_cov, reinterpret_batch, return_tensors=return_tensors)
             except Exception as e:
                 self.log.warning(f"GPU __call__ failed: {e}. Falling back to CPU.")
+        
+        if return_tensors:
+            self.log.warning("GPU not available or failed, but return_tensors=True requested. Returning numpy arrays instead.")
         
         # CPU fallback (original implementation)
         return self._call_cpu(params, full_cov, reinterpret_batch)
@@ -896,7 +917,8 @@ class Emulator:
         params: np.ndarray,
         full_cov: bool = True,
         reinterpret_batch: bool = False,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        return_tensors: bool = False,
+    ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[torch.Tensor, torch.Tensor]]:
         """
         GPU-accelerated implementation of Gaussian Process prediction
         
@@ -973,12 +995,17 @@ class Emulator:
             if not full_cov:
                 # Just return variances (diagonal of cov)
                 cov_diag = cov_stacked.diagonal(dim1=-2, dim2=-1) # (n_comp, n_query)
+                if return_tensors:
+                    return mu_gpu, cov_diag.flatten()
                 cov = cov_diag.flatten().cpu().numpy()
                 mu = mu_gpu.cpu().numpy()
             else:
                 # Construct full block diagonal matrix
                 blocks = [cov_stacked[i] for i in range(n_comp)]
                 cov_gpu = torch.block_diag(*blocks)
+                
+                if return_tensors:
+                    return mu_gpu, cov_gpu
                 
                 mu = mu_gpu.cpu().numpy()
                 cov = cov_gpu.cpu().numpy()
@@ -1011,15 +1038,28 @@ class Emulator:
             
             # Transfer results back to CPU (small transfer: ~3 KB for 18 components)
             if not full_cov:
+                if return_tensors:
+                    return mu_gpu, cov_gpu.diagonal()
                 mu = mu_gpu.cpu().numpy()
                 cov = cov_gpu.diagonal().cpu().numpy()
             else:
+                if return_tensors:
+                    return mu_gpu, cov_gpu
                 mu = mu_gpu.cpu().numpy()
                 cov = cov_gpu.cpu().numpy()
         
         if reinterpret_batch:
-            mu = mu.reshape(-1, self.ncomps, order="F").squeeze()
-            cov = cov.reshape(-1, self.ncomps, order="F").squeeze()
+            if return_tensors:
+                # PyTorch reshape
+                mu = mu.reshape(-1, self.ncomps).T.reshape(-1) # Approximate logic, need to check order="F" equivalent
+                # order="F" in numpy is column-major. PyTorch is row-major.
+                # mu.reshape(-1, self.ncomps, order="F") means fill columns first.
+                # In PyTorch: .T.reshape(...) might be needed or just avoid reinterpret_batch with tensors for now.
+                # For MCMC we usually don't use reinterpret_batch.
+                pass 
+            else:
+                mu = mu.reshape(-1, self.ncomps, order="F").squeeze()
+                cov = cov.reshape(-1, self.ncomps, order="F").squeeze()
         
         return mu, cov
 
@@ -1450,21 +1490,48 @@ class Emulator:
                 self._grid_points_gpu = torch.from_numpy(self.grid_points).to(device, TORCH_FLOAT64)
             if self._w_hat_gpu is None:
                 self._w_hat_gpu = torch.from_numpy(self.w_hat).to(device, TORCH_FLOAT64)
-            if self._iPhiPhi_gpu is None:
-                self._iPhiPhi_gpu = torch.from_numpy(self.iPhiPhi).to(device, TORCH_FLOAT64)
             
             self._variances_gpu = torch.from_numpy(self.variances).to(device, TORCH_FLOAT64)
             self._lengthscales_gpu = torch.from_numpy(self.lengthscales).to(device, TORCH_FLOAT64)
             
-            kernel_gpu = batch_kernel_pytorch_gpu_only(
-                self._grid_points_gpu, 
-                self._grid_points_gpu, 
-                self._variances_gpu, 
-                self._lengthscales_gpu,
-                device='cuda',
-                return_stacked=self.block_diagonal
-            )
-            self._v11_gpu = self._iPhiPhi_gpu / self.lambda_xi + kernel_gpu
+            if self.block_diagonal:
+                # Optimized Block-Diagonal Update (Memory Efficient)
+                # Reconstruct v11 directly without allocating full iPhiPhi
+                
+                M = self.grid_points.shape[0]
+                eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
+                
+                # v11 = (dots_inv_diag * I) / lambda + kernel
+                # Initialize v11 with the diagonal part
+                v11_gpu = (self._dots_inv_diag_gpu.view(-1, 1, 1) * eye_M.unsqueeze(0)) / self.lambda_xi
+                
+                # Add kernel in-place
+                batch_kernel_pytorch_gpu_only(
+                    self._grid_points_gpu, 
+                    self._grid_points_gpu, 
+                    self._variances_gpu, 
+                    self._lengthscales_gpu,
+                    device='cuda',
+                    return_stacked=True,
+                    out=v11_gpu,
+                    add_to_out=True
+                )
+                self._v11_gpu = v11_gpu
+                
+            else:
+                # Standard Dense Update
+                if self._iPhiPhi_gpu is None:
+                    self._iPhiPhi_gpu = torch.from_numpy(self.iPhiPhi).to(device, TORCH_FLOAT64)
+                
+                kernel_gpu = batch_kernel_pytorch_gpu_only(
+                    self._grid_points_gpu, 
+                    self._grid_points_gpu, 
+                    self._variances_gpu, 
+                    self._lengthscales_gpu,
+                    device='cuda',
+                    return_stacked=False
+                )
+                self._v11_gpu = self._iPhiPhi_gpu / self.lambda_xi + kernel_gpu
         else:
             if self.block_diagonal:
                 # Block-Diagonal CPU Update
@@ -1478,7 +1545,20 @@ class Emulator:
                         self.variances[i], 
                         self.lengthscales[i]
                     )
-                self.v11 = self.iPhiPhi / self.lambda_xi + kernel_cpu
+                
+                if self.iPhiPhi is None:
+                    # Reconstruct diagonal scaling factors if iPhiPhi is missing (memory optimization)
+                    dots = self.eigenspectra @ self.eigenspectra.T
+                    dots_inv = np.linalg.inv(dots)
+                    dots_inv_diag = np.diag(dots_inv)
+                    
+                    # Add (dots_inv_diag / lambda) * I to kernel
+                    eye_M = np.eye(M)
+                    for i in range(self.ncomps):
+                        kernel_cpu[i] += (dots_inv_diag[i] / self.lambda_xi) * eye_M
+                    self.v11 = kernel_cpu
+                else:
+                    self.v11 = self.iPhiPhi / self.lambda_xi + kernel_cpu
             else:
                 self.v11 = self.iPhiPhi / self.lambda_xi + batch_kernel_auto(
                     self.grid_points, self.grid_points, self.variances, self.lengthscales

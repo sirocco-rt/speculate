@@ -43,19 +43,27 @@ def get_w_hat(eigenspectra, fluxes):
     # Convert eigenspectra to matrix form
     eigenspectra_matrix = np.array(eigenspectra)  # Shape: (m, npix)
     
-    # Compute all dot products at once using matrix multiplication
-    dot_products = eigenspectra_matrix @ fluxes.T  # Shape: (m, M)
+    # OPTIMIZATION: Avoid creating the massive Kronecker product (A ⊗ I)
+    # The system is (A ⊗ I) x = b
+    # This is equivalent to A X = B where x = vec(X') and b = vec(B')
+    # So X = A^{-1} B
     
-    # Reshape to match original format: out[i * M + j] = eigenspectra[i].T @ fluxes[j]
-    # This means for each component i, we have M values, so we need to interleave
-    out = np.empty((M * m,))
-    for i in range(m):
-        out[i * M:(i + 1) * M] = dot_products[i, :]
-
-    phi_squared = get_phi_squared_optimized(eigenspectra_matrix, M)
+    # Compute B: dot products of eigenspectra and fluxes
+    # Shape: (m, M)
+    dot_products = eigenspectra_matrix @ fluxes.T
     
-    fac = sl.cho_factor(phi_squared, check_finite=False, overwrite_a=True)
-    return sl.cho_solve(fac, out, check_finite=False)
+    # Compute A: dot products of eigenspectra with themselves
+    # Shape: (m, m)
+    dots = eigenspectra_matrix @ eigenspectra_matrix.T
+    
+    # Solve A X = B
+    # Use Cholesky solve for stability since dots is symmetric positive definite
+    fac = sl.cho_factor(dots, check_finite=False, overwrite_a=True)
+    w_hat_reshaped = sl.cho_solve(fac, dot_products, check_finite=False)
+    
+    # Flatten result to match expected output format
+    # The expected format is flattened row-major (component by component)
+    return w_hat_reshaped.ravel()
 
 
 def get_w_hat_gpu(eigenspectra, fluxes):
@@ -103,17 +111,29 @@ def get_w_hat_gpu(eigenspectra, fluxes):
     # 3. Compute phi_squared on GPU (inline to avoid transfer)
     # This is get_phi_squared_pytorch inlined:
     dots = torch.matmul(eig_torch, eig_torch.T)  # (m, m)
-    eye_M = torch.eye(M, dtype=DTYPE, device=device)
-    phi_squared = torch.kron(dots, eye_M)  # (M*m, M*m)
     
-    # 4. Cholesky factorization on GPU
-    L = torch.linalg.cholesky(phi_squared)
+    # OPTIMIZATION: Avoid creating the massive Kronecker product (A ⊗ I)
+    # The system is (A ⊗ I) x = b
+    # This is equivalent to A X = B where x = vec(X') and b = vec(B')
+    # So X = A^{-1} B
     
-    # 5. Solve L @ L.T @ x = out using triangular solves on GPU
-    # First: L @ z = out
-    z = torch.linalg.solve_triangular(L, out.unsqueeze(1), upper=False).squeeze()
-    # Second: L.T @ x = z
-    w_hat = torch.linalg.solve_triangular(L.T, z.unsqueeze(1), upper=True).squeeze()
+    # Reshape out to (m, M)
+    out_reshaped = out.view(m, M)
+    
+    # Solve A X = B
+    # dots @ w_hat_reshaped = out_reshaped
+    # w_hat_reshaped = dots^{-1} @ out_reshaped
+    
+    # Use Cholesky solve for stability since dots is symmetric positive definite
+    L_dots = torch.linalg.cholesky(dots)
+    
+    # Solve dots @ X = out_reshaped
+    # L @ L.T @ X = out_reshaped
+    z = torch.linalg.solve_triangular(L_dots, out_reshaped, upper=False)
+    w_hat_reshaped = torch.linalg.solve_triangular(L_dots.T, z, upper=True)
+    
+    # Flatten result
+    w_hat = w_hat_reshaped.flatten()
     
     # 6. Transfer only final result to CPU (single small vector)
     return w_hat.cpu().numpy()
@@ -139,6 +159,10 @@ def get_phi_squared_optimized(eigenspectra_matrix, M):
     """
     Optimized computation of Phi.T.dot(Phi) using vectorized operations.
     
+    WARNING: This function returns a dense matrix of size (m*M, m*M).
+    For large M, this will consume a massive amount of memory and may cause OOM.
+    Use with caution.
+    
     Parameters
     ----------
     eigenspectra_matrix : numpy.ndarray
@@ -163,6 +187,10 @@ def get_phi_squared_pytorch(eigenspectra_matrix, M, device='cuda'):
     
     Uses GPU for matrix multiplication and Kronecker product, providing
     significant speedup for large matrices (typically 5-10x faster).
+    
+    WARNING: This function returns a dense matrix of size (m*M, m*M).
+    For large M, this will consume a massive amount of memory and may cause OOM.
+    Use with caution.
     
     Parameters
     ----------

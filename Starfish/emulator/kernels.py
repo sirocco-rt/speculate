@@ -324,7 +324,7 @@ def batch_kernel_pytorch(X, Z, variances, lengthscales, device='cuda'):
     return result.cpu().numpy()
 
 
-def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', return_stacked=False):
+def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', return_stacked=False, out=None, add_to_out=False):
     """
     PyTorch GPU-accelerated batched RBF kernel that returns GPU tensor (NO CPU TRANSFER!)
     
@@ -348,6 +348,11 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', 
     return_stacked : bool
         If True, returns a 3D tensor (n_components, n_X, n_Z) instead of a 2D block-diagonal matrix.
         This saves massive amounts of memory by avoiding storing zeros.
+    out : torch.Tensor, optional
+        Output tensor to write results into. If provided, must match expected output shape.
+    add_to_out : bool, optional
+        If True and out is provided, adds the kernel result to out instead of overwriting.
+        Useful for constructing v11 = iPhiPhi + kernel in-place.
     
     Returns
     -------
@@ -384,8 +389,10 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', 
     n_components = len(variances_torch)
     n_X, n_Z = X_torch.shape[0], Z_torch.shape[0]
     
-    # Pre-allocate result on GPU
-    if return_stacked:
+    # Pre-allocate result on GPU or use provided output
+    if out is not None:
+        result = out
+    elif return_stacked:
         result = torch.zeros((n_components, n_X, n_Z), dtype=DTYPE, device=device_obj)
     else:
         total_size_X = n_X * n_components
@@ -401,21 +408,42 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', 
         X_scaled = X_torch / ls
         Z_scaled = Z_torch / ls
         
-        # Compute squared Euclidean distances using torch.cdist
-        sq_dist = torch.cdist(X_scaled, Z_scaled, p=2.0) ** 2
+        # Memory Efficient Implementation:
+        # 1. Compute distances (allocates 1 block)
+        # Note: We use a temporary variable to ensure we don't keep multiple large blocks
+        dist = torch.cdist(X_scaled, Z_scaled, p=2.0)
         
-        # Apply RBF kernel
-        kernel_block = var * torch.exp(-0.5 * sq_dist)
+        # 2. Square in-place
+        dist.pow_(2)
+        
+        # 3. Multiply by -0.5 in-place
+        dist.mul_(-0.5)
+        
+        # 4. Exponentiate in-place
+        torch.exp(dist, out=dist)
+        
+        # 5. Multiply by variance in-place
+        dist.mul_(var)
         
         if return_stacked:
-            result[i] = kernel_block
+            if add_to_out:
+                result[i].add_(dist)
+            else:
+                result[i].copy_(dist)
         else:
             # Place in block diagonal matrix
             start_X = i * n_X
             end_X = (i + 1) * n_X
             start_Z = i * n_Z
             end_Z = (i + 1) * n_Z
-            result[start_X:end_X, start_Z:end_Z] = kernel_block
+            
+            if add_to_out:
+                result[start_X:end_X, start_Z:end_Z].add_(dist)
+            else:
+                result[start_X:end_X, start_Z:end_Z].copy_(dist)
+                
+        # Explicitly free memory
+        del dist
     
     # Return GPU tensor - NO CPU TRANSFER!
     return result
