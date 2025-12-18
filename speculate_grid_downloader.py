@@ -380,39 +380,38 @@ def _(
     if (download_only_button.value or download_and_decompress_button.value) and files_to_download:
         extraction_dir = f"sirocco_grids/{dataset_dropdown.value}/"
 
-        mo.md("### Downloading...")
-
-        for i, filename in enumerate(files_to_download, 1):
-            try:
-                local_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    repo_type=REPO_TYPE
-                )
-                download_results.append((filename, local_path, None))
-                mo.output.append(mo.md(f"✓ Downloaded {i}/{len(files_to_download)}: `{filename}`"))
-            except Exception as e:
-                download_results.append((filename, None, str(e)))
-                mo.output.append(mo.md(f"❌ Failed to download `{filename}`: {e}"))
+        with mo.status.progress_bar(total=len(files_to_download), title="Downloading...") as bar:
+            for i, filename in enumerate(files_to_download, 1):
+                try:
+                    local_path = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=filename,
+                        repo_type=REPO_TYPE
+                    )
+                    download_results.append((filename, local_path, None))
+                except Exception as e:
+                    download_results.append((filename, None, str(e)))
+                    mo.output.append(mo.md(f"❌ Failed to download `{filename}`: {e}"))
+                bar.update()
 
         # Decompress if requested
         if download_and_decompress_button.value:
-            mo.md("### Decompressing...")
             os.makedirs(extraction_dir, exist_ok=True)
 
-            for filename, local_path, error in download_results:
-                if local_path:
-                    try:
-                        output_filename = filename[:-3]  # Remove .xz
-                        output_file_path = os.path.join(extraction_dir, output_filename)
+            with mo.status.progress_bar(total=len(download_results), title="Decompressing...") as bar:
+                for filename, local_path, error in download_results:
+                    if local_path:
+                        try:
+                            output_filename = filename[:-3]  # Remove .xz
+                            output_file_path = os.path.join(extraction_dir, output_filename)
 
-                        with lzma.open(local_path, 'rb') as f_in:
-                            with open(output_file_path, 'wb') as f_out:
-                                shutil.copyfileobj(f_in, f_out)
+                            with lzma.open(local_path, 'rb') as f_in:
+                                with open(output_file_path, 'wb') as f_out:
+                                    shutil.copyfileobj(f_in, f_out)
 
-                        mo.output.append(mo.md(f"✓ Decompressed: `{output_filename}`"))
-                    except Exception as e:
-                        mo.output.append(mo.md(f"❌ Failed to decompress `{filename}`: {e}"))
+                        except Exception as e:
+                            mo.output.append(mo.md(f"❌ Failed to decompress `{filename}`: {e}"))
+                    bar.update()
 
             mo.md(f"### ✅ Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
         else:
@@ -423,27 +422,26 @@ def _(
         extraction_dir = f"sirocco_grids/{dataset_dropdown.value}/"
         os.makedirs(extraction_dir, exist_ok=True)
 
-        mo.md("### Decompressing cached files...")
+        with mo.status.progress_bar(total=len(files_to_download), title="Decompressing cached files...") as bar:
+            for filename in files_to_download:
+                try:
+                    # Files should already be cached
+                    local_path = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=filename,
+                        repo_type=REPO_TYPE
+                    )
 
-        for filename in files_to_download:
-            try:
-                # Files should already be cached
-                local_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    repo_type=REPO_TYPE
-                )
+                    output_filename = filename[:-3]
+                    output_file_path = os.path.join(extraction_dir, output_filename)
 
-                output_filename = filename[:-3]
-                output_file_path = os.path.join(extraction_dir, output_filename)
+                    with lzma.open(local_path, 'rb') as f_in:
+                        with open(output_file_path, 'wb') as f_out:
+                            shutil.copyfileobj(f_in, f_out)
 
-                with lzma.open(local_path, 'rb') as f_in:
-                    with open(output_file_path, 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-
-                mo.output.append(mo.md(f"✓ Decompressed: `{output_filename}`"))
-            except Exception as e:
-                mo.output.append(mo.md(f"❌ Failed to decompress `{filename}`: {e}"))
+                except Exception as e:
+                    mo.output.append(mo.md(f"❌ Failed to decompress `{filename}`: {e}"))
+                bar.update()
 
         mo.md(f"### ✅ Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
     return

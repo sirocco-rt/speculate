@@ -1,0 +1,11 @@
+name: speculate_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - git-lfs           # Installs the LFS tool for HPC users
+  - pip               # Installs standard pip
+  - pip:
+    - --extra-index-url https://pypi.nvidia.com  # <--- vital for cuml-cu12
+    - -r requirements.txt

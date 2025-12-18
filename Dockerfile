@@ -8,7 +8,7 @@ ENV UV_SYSTEM_PYTHON=1
 WORKDIR /app
 
 COPY --chown=user ./requirements.txt requirements.txt
-RUN uv pip install -r requirements.txt
+RUN uv pip install --extra-index-url https://pypi.nvidia.com -r requirements.txt
 
 COPY --chown=user . /app
 RUN mkdir -p /app/__marimo__ && \
