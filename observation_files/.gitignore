@@ -1,4 +1,9 @@
 # Ignore everything in this directory
 *
-# Except this file
+# Except these files
 !.gitignore
+!ixvel_all.csv
+!rwsex_all.csv
+!rwtri_dered.csv
+!uxuma_all.csv
+!v3885sgr_all.csv
