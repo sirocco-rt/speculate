@@ -437,10 +437,20 @@ def _(mo):
     # Visibility and display options
     show_current = mo.ui.checkbox(value=True, label="Show Current Spectrum")
     show_fixed = mo.ui.checkbox(value=True, label="Show Fixed Spectra")
+    show_obs = mo.ui.checkbox(value=False, label="Show Observational Spectra")
     use_dimensionless = mo.ui.checkbox(value=False, label="Dimensionless Data")
+    use_smoothing = mo.ui.checkbox(value=True, label="Smooth Data (Boxcar=5)")
+    show_grid = mo.ui.checkbox(value=True, label="Show Grid")
 
-    mo.hstack([show_current, show_fixed, use_dimensionless], justify="start", gap=2)
-    return show_current, show_fixed, use_dimensionless
+    mo.hstack([show_current, show_fixed, show_obs, use_dimensionless, use_smoothing, show_grid], justify="start", gap=0)
+    return (
+        show_current,
+        show_fixed,
+        show_grid,
+        show_obs,
+        use_dimensionless,
+        use_smoothing,
+    )
 
 
 @app.cell
@@ -474,7 +484,7 @@ def _(
 
     # Create buttons with on_click callbacks
     add_spectrum_btn = mo.ui.button(
-        label="➕ Add Spectrum", 
+        label="➕ Pin Grid Spectrum", 
         kind="success",
         on_click=lambda _: add_current_spectrum()
     )
@@ -615,12 +625,17 @@ def _(
     current_run_index,
     inclination_selector,
     load_spectrum,
+    obs_file_selector,
+    os,
     pd,
     pinned_spectra_indices,
     selected_grid,
     show_current,
     show_fixed,
+    show_grid,
+    show_obs,
     use_dimensionless,
+    use_smoothing,
     wavelength_range,
     wavelengths,
 ):
@@ -629,12 +644,48 @@ def _(
     wl_mask = (wavelengths >= wl_min) & (wavelengths <= wl_max)
     filtered_wavelengths = wavelengths[wl_mask]
 
+    # Helper for smoothing
+    def smooth_flux(flux_array):
+        if use_smoothing.value:
+            # Use min_periods=1 to handle edges without dropping data
+            return pd.Series(flux_array).rolling(window=5, center=True, min_periods=1).mean().values
+        return flux_array
+
     # Prepare data for Altair
     plot_data_list = []
 
-    # Process and add current spectrum data
+    # 1. Add Pinned spectra first (background)
+    num_pinned_to_plot = len(pinned_spectra_indices)
+    if show_fixed.value and num_pinned_to_plot > 0:
+        for run_idx, inclination in pinned_spectra_indices:
+            try:
+                pinned_flux, pinned_params = load_spectrum(run_idx, inclination)
+
+                # Apply smoothing
+                pinned_flux_plot = smooth_flux(pinned_flux)
+
+                # Apply dimensionless transformation if requested
+                if use_dimensionless.value:
+                    norm_factor = pinned_flux_plot.mean()
+                    pinned_flux_plot = pinned_flux_plot / norm_factor
+                    pinned_flux_plot -= pinned_flux_plot.mean()
+
+                pinned_df = pd.DataFrame({
+                    'Wavelength': filtered_wavelengths,
+                    'Flux': pinned_flux_plot[wl_mask],
+                    'Spectrum': f'run{run_idx}@{inclination}°',
+                    'Type': 'Pinned'
+                })
+                plot_data_list.append(pinned_df)
+            except Exception as e:
+                pass  # Skip failed loads
+
+    # 2. Add Current spectrum (middle)
     if show_current.value:
         current_flux_plot = current_flux.copy()
+
+        # Apply smoothing
+        current_flux_plot = smooth_flux(current_flux_plot)
 
         # Apply dimensionless transformation if requested
         if use_dimensionless.value:
@@ -650,33 +701,42 @@ def _(
         })
         plot_data_list.append(current_df)
 
-    # Load and add pinned spectra data
-    # Force reactivity by explicitly checking the list
-    num_pinned_to_plot = len(pinned_spectra_indices)
+    # 3. Add Observational spectrum (foreground)
+    if show_obs.value and obs_file_selector.value:
+        try:
+            obs_path = os.path.join("observation_files", obs_file_selector.value)
+            obs_df = pd.read_csv(obs_path)
 
-    if show_fixed.value and num_pinned_to_plot > 0:
-        for run_idx, inclination in pinned_spectra_indices:
-            try:
-                pinned_flux, pinned_params = load_spectrum(run_idx, inclination)
+            # Normalize column names to uppercase for check
+            obs_df.columns = [c.upper() for c in obs_df.columns]
 
-                # Apply dimensionless transformation if requested
-                if use_dimensionless.value:
-                    pinned_flux_plot = pinned_flux.copy()
-                    norm_factor = pinned_flux_plot.mean()
-                    pinned_flux_plot /= norm_factor
-                    pinned_flux_plot -= pinned_flux_plot.mean()
-                else:
-                    pinned_flux_plot = pinned_flux
+            if 'WAVELENGTH' in obs_df.columns and 'FLUX' in obs_df.columns:
+                # Smooth full dataset before filtering
+                obs_flux_full = obs_df['FLUX'].values
+                obs_flux_full = smooth_flux(obs_flux_full)
+                obs_df['FLUX'] = obs_flux_full # Update DataFrame
 
-                pinned_df = pd.DataFrame({
-                    'Wavelength': filtered_wavelengths,
-                    'Flux': pinned_flux_plot[wl_mask],
-                    'Spectrum': f'run{run_idx}@{inclination}°',
-                    'Type': 'Pinned'
-                })
-                plot_data_list.append(pinned_df)
-            except Exception as e:
-                pass  # Skip failed loads
+                # Filter to current wavelength range
+                obs_mask = (obs_df['WAVELENGTH'] >= wl_min) & (obs_df['WAVELENGTH'] <= wl_max)
+                obs_data = obs_df[obs_mask].copy()
+
+                if not obs_data.empty:
+                    obs_flux = obs_data['FLUX'].values
+
+                    if use_dimensionless.value:
+                        norm_factor = obs_flux.mean()
+                        obs_flux = obs_flux / norm_factor - 1.0
+                        obs_flux -= obs_flux.mean()
+
+                    obs_plot_df = pd.DataFrame({
+                        'Wavelength': obs_data['WAVELENGTH'].values,
+                        'Flux': obs_flux,
+                        'Spectrum': f'Obs: {obs_file_selector.value}',
+                        'Type': 'Observational'
+                    })
+                    plot_data_list.append(obs_plot_df)
+        except Exception as e:
+            pass # Keep silent on error
 
     # Combine all data
     if plot_data_list:
@@ -684,28 +744,47 @@ def _(
 
         # Create Altair chart
         spectrum_chart = alt.Chart(plot_df).mark_line().encode(
-            x=alt.X('Wavelength:Q', title='Wavelength (Å)', scale=alt.Scale(zero=False)),
+            x=alt.X('Wavelength:Q', 
+                   title='Wavelength (Å)', 
+                   scale=alt.Scale(zero=False),
+                   axis=alt.Axis(grid=show_grid.value)),
             y=alt.Y('Flux:Q', 
                     title='Flux' if not use_dimensionless.value else 'Normalized Flux',
                     scale=alt.Scale(zero=False),
-                    axis=alt.Axis(format='~e')),
-            color=alt.Color('Spectrum:N', 
+                    axis=alt.Axis(format='~e', grid=show_grid.value)),
+            color=alt.condition(
+                alt.datum.Type == 'Observational',
+                alt.value('red'),
+                alt.Color('Spectrum:N', 
                            scale=alt.Scale(scheme='viridis'),
-                           legend=alt.Legend(title='Spectra')),
-            strokeWidth=alt.condition(
-                alt.datum.Type == 'Current',
-                alt.value(3),
-                alt.value(1.5)
+                           legend=alt.Legend(title='Spectra'))
             ),
-            opacity=alt.condition(
-                alt.datum.Type == 'Current',
-                alt.value(0.9),
-                alt.value(0.7)
-            )
+            strokeWidth=alt.value(1.0, condition=[
+                {"test": alt.datum.Type == 'Current', "value": 2.0},
+                {"test": alt.datum.Type == 'Observational', "value": 2.0}
+            ]),
+            opacity=alt.value(0.5, condition=[
+                {"test": alt.datum.Type == 'Current', "value": 0.7},
+                {"test": alt.datum.Type == 'Observational', "value": 1.0}
+            ])
         ).properties(
             width=1000,
             height=600,
-            title=f'Spectral Data Exploration - {selected_grid}'
+            title=f'Spectral Data Exploration - {selected_grid}',
+            background='white'
+        ).configure_axis(
+            labelColor='black',
+            titleColor='black',
+            labelFontSize=14,
+            titleFontSize=16
+        ).configure_legend(
+            labelColor='black',
+            titleColor='black',
+            labelFontSize=14,
+            titleFontSize=16
+        ).configure_title(
+            color='black',
+            fontSize=20
         ).interactive()
     else:
         spectrum_chart = alt.Chart(pd.DataFrame({'x': [0], 'y': [0]})).mark_point().encode(
@@ -765,6 +844,119 @@ def _(mo):
     - Use dimensionless mode to compare spectral shapes
     - The interactive plot supports zoom, pan, and save
     """)
+    return
+
+
+@app.cell
+def _(mo):
+    get_obs_refresh, set_obs_refresh = mo.state(0)
+    return get_obs_refresh, set_obs_refresh
+
+
+@app.cell
+def _(mo):
+    # File upload for observational spectra
+    obs_file_uploader = mo.ui.file(
+        kind="area",
+        label="Drag and drop a new observational spectra (CSV)",
+        multiple=False
+    )
+    return (obs_file_uploader,)
+
+
+@app.cell
+def _(mo, obs_file_uploader, os, set_obs_refresh):
+    # Handle file upload
+    if obs_file_uploader.value:
+        save_dir = "observation_files"
+        os.makedirs(save_dir, exist_ok=True)
+
+        files = obs_file_uploader.value
+        # Check if it's a single file (has 'name' attribute) or a list/tuple
+        if hasattr(files, "name"):
+            files = [files]
+
+        for file in files:
+            save_path = os.path.join(save_dir, file.name)
+            with open(save_path, "wb") as file_handle:
+                file_handle.write(file.contents)
+            mo.md(f"✅ Uploaded `{file.name}` to `{save_dir}`")
+
+        # Trigger refresh of the file list
+        set_obs_refresh(lambda v: v + 1)
+    return
+
+
+@app.cell
+def _(get_obs_refresh, obs_file_uploader, os):
+    # Select observational spectrum - File List Calculation
+    import glob
+
+    # Trigger refresh on upload or delete
+    _ = obs_file_uploader.value
+    _ = get_obs_refresh()
+
+    obs_dir = "observation_files"
+    if os.path.exists(obs_dir):
+        obs_files = sorted([os.path.basename(f) for f in glob.glob(os.path.join(obs_dir, "*.csv"))])
+    else:
+        obs_files = []
+    return (obs_files,)
+
+
+@app.cell
+def _(mo, obs_files):
+    # Select observational spectrum - Dropdown Creation
+    obs_file_selector = mo.ui.dropdown(
+        options=obs_files,
+        value=obs_files[0] if obs_files else None,
+        label="Select Observational Spectrum:"
+    )
+    return (obs_file_selector,)
+
+
+@app.cell
+def _(mo, obs_file_selector, os, set_obs_refresh):
+    # Select observational spectrum - Delete Action
+    def delete_selected_file():
+        protected_files = [
+            "ixvel_all.csv", 
+            "rwsex_all.csv", 
+            "rwtri_dered.csv", 
+            "uxuma_all.csv", 
+            "v3885sgr_all.csv"
+        ]
+
+        if obs_file_selector.value:
+            if obs_file_selector.value in protected_files:
+                return
+
+            save_dir = "observation_files"
+            file_path = os.path.join(save_dir, obs_file_selector.value)
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    set_obs_refresh(lambda v: v + 1)
+                except Exception:
+                    pass
+
+    delete_obs_btn = mo.ui.button(
+        label="🗑️ Delete Selected",
+        kind="danger",
+        on_click=lambda _: delete_selected_file()
+    )
+    return (delete_obs_btn,)
+
+
+@app.cell
+def _(delete_obs_btn, mo, obs_file_selector, obs_file_uploader):
+    # Select observational spectrum - Layout
+    mo.vstack([
+        mo.md("### Observational Data"),
+        mo.hstack([obs_file_selector, delete_obs_btn], align="end"),
+        obs_file_uploader,
+        mo.md("Data must be in CSV format with 'Wavelength', then 'Flux' columns.")
+    ])
     return
 
 
