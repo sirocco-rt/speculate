@@ -30,7 +30,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
     
     """
         
-    def __init__(self, path, usecols, skiprows, air=False, wl_range=(800,8000), model_parameters=(1,2,3,4,5,6,7,8,9,10,11), scale='linear'):
+    def __init__(self, path, usecols, air=False, wl_range=(800,8000), model_parameters=(1,2,3,4,5,6,7,8,9,10,11), scale='linear'):
         """
         Initialises an empty grid with parameters and wavelengths.
         
@@ -52,7 +52,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         self.model_parameters = model_parameters
         self.scale = scale # Flux space scale 
         self.usecols = usecols # Wavelength and inclination tuple
-        self.skiprows = skiprows # Starting point of fluxes in the datafile.
+        # self.skiprows = skiprows # Deprecated: calculated dynamically
         points = []
         if 1 in model_parameters:
             param_points_1 = np.log10(np.array([3e-09, 1e-08, 3e-08]))
@@ -110,7 +110,8 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         # The wavelengths for which the fluxes are measured are retrieved.
         try:
             wls_fname = os.path.join(self.path, 'run0.spec')
-            wls = np.loadtxt(wls_fname, usecols=self.usecols[0], skiprows=self.skiprows, unpack=True)
+            skiprows = self._get_skiprows(wls_fname)
+            wls = np.loadtxt(wls_fname, usecols=self.usecols[0], skiprows=skiprows, unpack=True)
             wls = np.flip(wls)
         except:
             raise ValueError("Wavelength file improperly specified")
@@ -317,7 +318,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
     
     """
         
-    def __init__(self, path, usecols, skiprows, air=False, wl_range=(800,8000), model_parameters=(1,2,3,4,5,6,9,10,11), scale='linear'):
+    def __init__(self, path, usecols, air=False, wl_range=(800,8000), model_parameters=(1,2,3,4,5,6,9,10,11), scale='linear'):
         """
         Initialises an empty grid with parameters and wavelengths.
         
@@ -339,7 +340,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         self.model_parameters = model_parameters
         self.scale = scale # Flux space scale 
         self.usecols = usecols # Wavelength and inclination tuple
-        self.skiprows = skiprows # Starting point of fluxes in the datafile.
+        # self.skiprows = skiprows # Deprecated: calculated dynamically
         points = []
         if 1 in model_parameters:
             param_points_1 = np.log10(np.array([3e-09, 1e-08, 3e-08]))
@@ -391,7 +392,8 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         # The wavelengths for which the fluxes are measured are retrieved.
         try:
             wls_fname = os.path.join(self.path, 'run0.spec')
-            wls = np.loadtxt(wls_fname, usecols=self.usecols[0], skiprows=self.skiprows, unpack=True)
+            skiprows = self._get_skiprows(wls_fname)
+            wls = np.loadtxt(wls_fname, usecols=self.usecols[0], skiprows=skiprows, unpack=True)
             wls = np.flip(wls)
         except:
             raise ValueError("Wavelength file improperly specified")
