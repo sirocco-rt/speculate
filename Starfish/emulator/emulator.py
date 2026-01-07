@@ -1171,6 +1171,7 @@ class Emulator:
         if PYTORCH_AVAILABLE and torch.cuda.is_available():
             self._gpu_training_mode = True
         
+        self.loss_history = []
         self._training_start_time = time.time()
         self._iteration_count = 0
         self._best_loss = np.inf
@@ -1179,13 +1180,31 @@ class Emulator:
         print("Started training (Nelder-Mead)")
         print(f"Optimizing {len(self.get_param_vector())} hyperparameters")
         
+        # Calculate maximum allowed variance based on data variance
+        # We allow the kernel variance to be up to 100x the data variance
+        # This prevents "runaway" optimization while allowing flexibility
+        weights_variance = np.var(self.weights, axis=0) # (n_comp,)
+        # Use valid max_variance bounds (at least 1.0 to avoid too tight constraints on small components)
+        max_variances = np.maximum(100.0 * weights_variance, 1.0)
+        
         def nll(P):
             if np.any(~np.isfinite(P)):
                 return np.inf
             self.set_param_vector(P)
+            
+            # Check lengthscales
             if np.any(self.lengthscales < 2 * self._grid_sep):
                 return np.inf
+                
+            # Check variances (prevent runaway)
+            current_variances = self.variances
+            if np.any(current_variances > max_variances):
+                 # Soft penalty instead of hard cutoff for better optimization behavior
+                 penalty = np.sum(np.maximum(0, current_variances - max_variances))
+                 return 1e10 + penalty
+            
             loss = -self.log_likelihood()
+            self.loss_history.append(loss)
             self.log.debug(f"loss: {loss}")
             
             # Progress tracking
@@ -1211,6 +1230,21 @@ class Emulator:
 
         default_kwargs = {"method": "Nelder-Mead", "options": {"maxiter": 10000, "disp": True}}
         default_kwargs.update(opt_kwargs)
+        
+        # Auto-scale fatol if using Nelder-Mead (simulated relative tolerance)
+        if default_kwargs["method"] == "Nelder-Mead":
+            options = default_kwargs.get("options", {})
+            if "fatol" not in options:
+                # Check for a user-provided relative tolerance 'ftol' or default to 1e-4
+                # This makes the convergence criteria independent of the absolute loss value
+                rel_tol = options.pop("ftol", 1e-4) 
+                
+                # fatol = initial_loss * rel_tol
+                # Ensure fatol is at least 1e-4 to prevent issues if loss is near zero
+                calculated_fatol = max(1e-4, abs(initial_loss) * rel_tol)
+                options["fatol"] = calculated_fatol
+                print(f"Auto-scaled fatol: {calculated_fatol:.4f} (relative tolerance: {rel_tol})")
+                default_kwargs["options"] = options
         
         soln = minimize(nll, P0,  **default_kwargs)
         
@@ -1505,6 +1539,9 @@ class Emulator:
                 # Initialize v11 with the diagonal part
                 v11_gpu = (self._dots_inv_diag_gpu.view(-1, 1, 1) * eye_M.unsqueeze(0)) / self.lambda_xi
                 
+                # Add Jitter for numerical stability
+                v11_gpu += 1e-5 * eye_M.unsqueeze(0)
+
                 # Add kernel in-place
                 batch_kernel_pytorch_gpu_only(
                     self._grid_points_gpu, 
@@ -1532,6 +1569,10 @@ class Emulator:
                     return_stacked=False
                 )
                 self._v11_gpu = self._iPhiPhi_gpu / self.lambda_xi + kernel_gpu
+                
+                # Add Jitter for numerical stability
+                M = self._iPhiPhi_gpu.shape[0]
+                self._v11_gpu += 1e-5 * torch.eye(M, device=device, dtype=TORCH_FLOAT64)
         else:
             if self.block_diagonal:
                 # Block-Diagonal CPU Update
@@ -1552,17 +1593,24 @@ class Emulator:
                     dots_inv = np.linalg.inv(dots)
                     dots_inv_diag = np.diag(dots_inv)
                     
-                    # Add (dots_inv_diag / lambda) * I to kernel
+                    # Add (dots_inv_diag / lambda) * I to kernel and Jitter
                     eye_M = np.eye(M)
                     for i in range(self.ncomps):
-                        kernel_cpu[i] += (dots_inv_diag[i] / self.lambda_xi) * eye_M
+                        kernel_cpu[i] += ((dots_inv_diag[i] / self.lambda_xi) + 1e-5) * eye_M
                     self.v11 = kernel_cpu
                 else:
                     self.v11 = self.iPhiPhi / self.lambda_xi + kernel_cpu
+                    # Add Jitter
+                    M = self.v11.shape[-1]
+                    eye_M = np.eye(M)
+                    for i in range(self.ncomps):
+                        self.v11[i] += 1e-5 * eye_M
             else:
                 self.v11 = self.iPhiPhi / self.lambda_xi + batch_kernel_auto(
                     self.grid_points, self.grid_points, self.variances, self.lengthscales
                 )
+                # Add Jitter
+                self.v11 += 1e-5 * np.eye(self.v11.shape[0])
 
 
     def get_param_vector(self) -> np.ndarray:

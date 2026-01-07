@@ -78,7 +78,7 @@ max_wl_range = (6385, 6735)            | 7) Boundary_layer.luminosity(ergs/s)
 """
 
 # ----- Inputs here -----------------------------------------------------------|
-model_parameters = (1,2,3,4,5,6,7,8,9)  # Including parameter 9 for inclination (30°, 55°, 80°)
+model_parameters = (1,2,3,4,5,6,9)  # Including parameter 9 for inclination (30°, 55°, 80°)
 wl_range = (850, 1850)       # Wavelength range of your emulator grid space.
                               # Later becomes truncated +/-10Angstom
                               
@@ -93,8 +93,8 @@ process_grid = True           # Turn off if planning to use existing grid file.
 # opticalspec = 0               # Turn on if planning to use optical_grid_spec_files
 # h_alpha = 0                   # Turn on if planning to use Ha_grid_spec_files
 # cv_release = 1                # Turn on if planning to use CV_release_grid
-speculate_cv_no_bl_grid_v87f = 0 # Turn on if planning to use speculate_cv_no_bl_grid_v87f
-speculate_cv_bl_grid_v87f = 1    # Turn on if planning to use speculate_cv_bl_grid_v87f
+speculate_cv_no_bl_grid_v87f = 1 # Turn on if planning to use speculate_cv_no_bl_grid_v87f
+speculate_cv_bl_grid_v87f = 0    # Turn on if planning to use speculate_cv_bl_grid_v87f
 
 n_components = 10             # Alter the number of PCA components used.
 # Integer for no. of components or decimal (0.0-1.0) for 0%-100% accuracy.
@@ -105,8 +105,6 @@ block_diagonal = True         # Use block-diagonal optimization for covariance m
 model_parameters = sorted(model_parameters)
 # Looping through parameters to create a string of numbers for file name
 model_parameters_str = ''.join(str(i) for i in model_parameters)
-# add model parameters to name
-grid_file_name += model_parameters_str
 
 #TODO Noel's Found bug. There is an offset when comparing spectra to emulated 
 # models. The Wavelength calculation in velocity space grows exponentially and 
@@ -206,41 +204,48 @@ grid_file_name += model_parameters_str
 #     print(emu_file_name)
 
 if speculate_cv_no_bl_grid_v87f == 1:
-    # Change inclination with usecols[1]
-    usecols = (1, 7) # Wavelength, Inclination 2-13 --> 30-85 degrees
+    base_name = 'speculate_cv_no_bl_grid_v87f_'
+    # saved grid file name
+    grid_file_name = base_name + 'grid_' + model_parameters_str
+    # Can change inclination inclination angle
+    inclination_angle = 55  # degrees: 30,35,40,45,50,55,60,65,70,75,80,85
+    inclination_column = int(2 + (inclination_angle - 30) / 5) #(30°->2, 35°->3, ..., 85°->13)
+    usecols = (1, inclination_column) # Wavelength, Inclination 2-13 --> 30-85 degrees
     skiprows = 82  # Starting point of data within file
     grid = Speculate_cv_no_bl_grid_v87f(
         path='sirocco_grids/speculate_cv_no-bl_grid_v87f/',
         usecols=usecols,
-        skiprows=skiprows,
         wl_range=wl_range,
         model_parameters=model_parameters, 
         scale=scale
         )
-    inclination = (usecols[1]+4) * 5
     if 9 in model_parameters or 10 in model_parameters or 11 in model_parameters:
-        emu_file_name = f'CV_no-bl_emu_{scale}_{wl_range[0]}-{wl_range[1]}AA_{n_components}comp_{model_parameters_str}'
+        emu_file_name = f'{base_name}emu_{model_parameters_str}_{scale}_{wl_range[0]}-{wl_range[1]}AA_{n_components}PCA'
     else:
-        emu_file_name = f'CV_no-bl_emu_{scale}_{(usecols[1]+4) * 5}inc_{wl_range[0]}-{wl_range[1]}AA_{n_components}comp_{model_parameters_str}'
+        emu_file_name = f'{base_name}emu_{model_parameters_str}_{scale}_{inclination_angle}inc_{wl_range[0]}-{wl_range[1]}AA_{n_components}PCA'
     print(emu_file_name)
 
 if speculate_cv_bl_grid_v87f == 1:
-    # Change inclination with usecols[1]
-    usecols = (1, 7) # Wavelength, Inclination 2-13 --> 30-85 degrees
+    base_name = 'speculate_cv_bl_grid_v87f_'
+    # saved grid file name
+    grid_file_name = base_name + 'grid_' + model_parameters_str
+    # Can change inclination inclination angle
+    inclination_angle = 55  # degrees: 30,35,40,45,50,55,60,65,70,75,80,85
+    inclination_column = int(2 + (inclination_angle - 30) / 5) #(30°->2, 35°->3, ..., 85°->13)
+    usecols = (1, inclination_column) # Wavelength, Inclination 2-13 --> 30-85 degrees
     skiprows = 82  # Starting point of data within file
     grid = Speculate_cv_bl_grid_v87f(
         path='sirocco_grids/speculate_cv_bl_grid_v87f/',
         usecols=usecols,
-        skiprows=skiprows,
         wl_range=wl_range,
         model_parameters=model_parameters, 
         scale=scale
         )
     inclination = (usecols[1]+4) * 5
     if 9 in model_parameters or 10 in model_parameters or 11 in model_parameters:
-        emu_file_name = f'CV_bl_emu_{scale}_{wl_range[0]}-{wl_range[1]}AA_{n_components}comp_{model_parameters_str}'
+        emu_file_name = f'{base_name}emu_{model_parameters_str}_{scale}_{wl_range[0]}-{wl_range[1]}AA_{n_components}PCA'
     else:
-        emu_file_name = f'CV_bl_emu_{scale}_{(usecols[1]+4) * 5}inc_{wl_range[0]}-{wl_range[1]}AA_{n_components}comp_{model_parameters_str}'
+        emu_file_name = f'{base_name}emu_{model_parameters_str}_{scale}_{inclination_angle}inc_{wl_range[0]}-{wl_range[1]}AA_{n_components}PCA'
     print(emu_file_name)
 
 
@@ -248,8 +253,11 @@ if speculate_cv_bl_grid_v87f == 1:
 # Auto-generated keyname's required to integrate with Starfish
 keyname = ["param{}{{}}".format(i) for i in model_parameters]
 keyname = ''.join(keyname)
-# Processing to NPZ file interface
-if process_grid == True:
+
+#if grid_file exists, skip processing
+if os.path.isfile(f'Grid-Emulator_Files/{grid_file_name}.npz'):
+    print(f'Grid file {grid_file_name} exists, skipping grid processing.')
+else:
     # Set up logging for grid processing verification (file only, no console output)
     import logging
     import os
@@ -285,7 +293,7 @@ for i, param_name in enumerate(data['param_names']):
 # Checking if the emulator file has been created
 if os.path.isfile(f'Grid-Emulator_Files/{emu_file_name}.npz'):
     print(f'Emulator {emu_file_name} already exists.')
-    #emu = Emulator.load(f"Grid-Emulator_Files/{emu_file_name}.npz")
+    emu = Emulator.load(f"Grid-Emulator_Files/{emu_file_name}.npz")
     emu_exists = 1
     print('Existing emulator loaded.')
 else:
@@ -294,15 +302,11 @@ else:
     print('Create new emulator in Stage 3.')
 
 
-
-
-
-
 # %% Stage 2.2) Speculate's spectral data exploration tool (SDET).
 # 2.2) ========================================================================|
 # The Class should open a new window to allow the user to explore the grid.
-# %matplotlib qt
-# grid_viewer = spec.InspectGrid(grid) # Emu (Emulator) optional
+%matplotlib qt
+grid_viewer = spec.InspectGrid(grid, emu) # Emu (Emulator) optional
 
 
 
@@ -321,15 +325,15 @@ else:
 # profiler.start()
 # Asking if user wants to continue training a new emulator
 if emu_exists == 1:
-    emu_exists = 0
+    #emu_exists = 0
     #emu_exists = 0 # developing training /remove when complete
-    # print("Emulator's name:", emu_file_name)
-    # print('Do you want to overwrite the existing emulator (y/n)?')
-    # if input('y/n: ') == 'y':
-    #     emu_exists = 0
-    #     print('Existing emulator will be overwritten')
-    # else:
-    #     print('Existing emulator will be used')
+    print("Emulator's name:", emu_file_name)
+    print('Do you want to overwrite the existing emulator (y/n)?')
+    if input('y/n: ') == 'y':
+        emu_exists = 0
+        print('Existing emulator will be overwritten')
+    else:
+        print('Existing emulator will be used')
 
 # Generating/training/saving and displaying the new emulator
 # TODO Optimse GP for speed GPyTorch
@@ -342,46 +346,59 @@ if emu_exists == 0:
         block_diagonal=block_diagonal) 
     # scipy.optimise.minimise routine
     print('Training the GP')
-    emu.train(method="Nelder-Mead", options=dict(maxiter=100, disp=True)) # method="Nelder-Mead",
+    # Using relative tolerance (ftol) so convergence scales with the loss value automatically
+    emu.train(method="Nelder-Mead", options=dict(maxiter=25000, disp=True, ftol=1e-3))
     emu.save(f'Grid-Emulator_Files/{emu_file_name}.npz')
     print(emu)  # Displays the trained emulator's parameters
+
+    # Plotting the loss function history
+    if hasattr(emu, 'loss_history') and len(emu.loss_history) > 0:
+        plt.figure(figsize=(10, 6))
+        plt.plot(emu.loss_history)
+        plt.xlabel('Iteration')
+        plt.ylabel('Negative Log-Likelihood')
+        plt.title('Gaussian Process Training Loss')
+        plt.grid(True)
+        plt.show()
+
+
 # profiler.stop()
 # profiler.print()
 # tracker.stop()
 # %% Stage 3.5) Plotting the v11 matrix
 # 3.5) ========================================================================|
-print("Plotting v11 matrix...")
-%matplotlib qt
-plt.figure(figsize=(10, 8))
-v11_matrix = emu.v11
-if v11_matrix.ndim == 3:
-    print(f"v11 is Block Diagonal with shape {v11_matrix.shape}")
-    n_blocks = v11_matrix.shape[0]
-    cols = int(np.ceil(np.sqrt(n_blocks)))
-    rows = int(np.ceil(n_blocks / cols))
+# print("Plotting v11 matrix...")
+# %matplotlib qt
+# plt.figure(figsize=(10, 8))
+# v11_matrix = emu.v11
+# if v11_matrix.ndim == 3:
+#     print(f"v11 is Block Diagonal with shape {v11_matrix.shape}")
+#     n_blocks = v11_matrix.shape[0]
+#     cols = int(np.ceil(np.sqrt(n_blocks)))
+#     rows = int(np.ceil(n_blocks / cols))
     
-    fig, axes = plt.subplots(rows, cols, figsize=(15, 12))
-    axes = np.atleast_1d(axes).flatten()
+#     fig, axes = plt.subplots(rows, cols, figsize=(15, 12))
+#     axes = np.atleast_1d(axes).flatten()
     
-    for i in range(n_blocks):
-        im = axes[i].imshow(np.log10(np.abs(v11_matrix[i])), cmap='viridis', interpolation='nearest')
-        axes[i].set_title(f"Block {i}")
-        plt.colorbar(im, ax=axes[i])
+#     for i in range(n_blocks):
+#         im = axes[i].imshow(np.log10(np.abs(v11_matrix[i])), cmap='viridis', interpolation='nearest')
+#         axes[i].set_title(f"Block {i}")
+#         plt.colorbar(im, ax=axes[i])
     
-    # Hide unused subplots
-    for i in range(n_blocks, len(axes)):
-        axes[i].axis('off')
+#     # Hide unused subplots
+#     for i in range(n_blocks, len(axes)):
+#         axes[i].axis('off')
         
-    plt.suptitle(f"v11 Matrix Blocks - Shape {v11_matrix.shape}")
-    plt.tight_layout()
-    plt.show()
-else:
-    print(f"v11 is Dense with shape {v11_matrix.shape}")
-    plt.imshow(np.abs(v11_matrix), cmap='viridis', interpolation='nearest')
-    plt.title(f"v11 Matrix - Shape {v11_matrix.shape}")
-    plt.colorbar(label='|value|')
-    plt.tight_layout()
-    plt.show()
+#     plt.suptitle(f"v11 Matrix Blocks - Shape {v11_matrix.shape}")
+#     plt.tight_layout()
+#     plt.show()
+# else:
+#     print(f"v11 is Dense with shape {v11_matrix.shape}")
+#     plt.imshow(np.abs(v11_matrix), cmap='viridis', interpolation='nearest')
+#     plt.title(f"v11 Matrix - Shape {v11_matrix.shape}")
+#     plt.colorbar(label='|value|')
+#     plt.tight_layout()
+#     plt.show()
 
 
 # print(tracker)
@@ -455,19 +472,19 @@ spec.plot_emulator(emu, grid, 2, 1)
 # # 5) ==========================================================================|
 
 # emu = Emulator.load(f"Grid-Emulator_Files/{emu_file_name}.npz")
-# random_grid_point = random.choice(emu.grid_points)
-# print("Random Grid Point Selection")
-# print(list(emu.param_names))
-# print(emu.grid_points[0]) # put emu.grid_points[0] 
-# print(random_grid_point) # or put: random_grid_point in next line
-# weights, cov = emu(random_grid_point) # here !!!
-# X = emu.eigenspectra * (emu.flux_std)
-# flux = (weights @ X) + emu.flux_mean
-# emu_cov = X.T @ cov @ X
-# plt.matshow(emu_cov, cmap='Reds')
-# plt.title("Emulator Covariance Matrix")
-# plt.colorbar()
-# plt.show()
+random_grid_point = random.choice(emu.grid_points)
+print("Random Grid Point Selection")
+print(list(emu.param_names))
+print(emu.grid_points[0]) # put emu.grid_points[0] 
+print(random_grid_point) # or put: random_grid_point in next line
+weights, cov = emu(random_grid_point) # here !!!
+X = emu.eigenspectra * (emu.flux_std)
+flux = (weights @ X) + emu.flux_mean
+emu_cov = X.T @ cov @ X
+plt.matshow(emu_cov, cmap='Reds')
+plt.title("Emulator Covariance Matrix")
+plt.colorbar()
+plt.show()
 # plt.plot(emu.wl, flux)
 
 
@@ -483,57 +500,57 @@ data_three = 0              # [3] Interpolatation between two grid points
 data_four = 1               # [4] A custom test file from python
 # -----------------------------------------------------------------------------|
 
-# ----------- Inputs here ------------|
-if data_one == 1:
-    # File corresponds to grid points in section 2
-    # Parameter's point given by the XX number in the name (6 params = 12 digits)
-    # 040102000000 = 4.5e-10, 16, 1, 1, 1e10, 3
-    file = 'sscyg_k2_040102000001.spec'
+# # ----------- Inputs here ------------|
+# if data_one == 1:
+#     # File corresponds to grid points in section 2
+#     # Parameter's point given by the XX number in the name (6 params = 12 digits)
+#     # 040102000000 = 4.5e-10, 16, 1, 1, 1e10, 3
+#     file = 'sscyg_k2_040102000001.spec'
     
-    waves, fluxes = np.loadtxt(
-        f'kgrid/sscyg_kgrid090311.210901/{file}', usecols=usecols, unpack=True, skiprows=skiprows)
+#     waves, fluxes = np.loadtxt(
+#         f'kgrid/sscyg_kgrid090311.210901/{file}', usecols=usecols, unpack=True, skiprows=skiprows)
 
 
-if data_two == 1:
-    file = 'sscyg_k2_040102000001.spec'  # File naming same as 1)
-    noise_std = 0.50                    # Percentage noise (0.05 sigma)
+# if data_two == 1:
+#     file = 'sscyg_k2_040102000001.spec'  # File naming same as 1)
+#     noise_std = 0.50                    # Percentage noise (0.05 sigma)
     
-    waves, fluxes = np.loadtxt(
-        f'kgrid/sscyg_kgrid090311.210901/{file}', usecols=usecols, unpack=True, skiprows=skiprows)
-    noise = noise_std * np.std(fluxes)
-    for i in range(len(waves)):
-        fluxes[i] = np.random.normal(fluxes[i], noise)       
+#     waves, fluxes = np.loadtxt(
+#         f'kgrid/sscyg_kgrid090311.210901/{file}', usecols=usecols, unpack=True, skiprows=skiprows)
+#     noise = noise_std * np.std(fluxes)
+#     for i in range(len(waves)):
+#         fluxes[i] = np.random.normal(fluxes[i], noise)       
 
 
-if data_three == 1:
-    print('to do') # TODO
+# if data_three == 1:
+#     print('to do') # TODO
 
 
-# Python v87a formatting. Place python file within kgrid folder/directory
+# Observational files
 if data_four == 1:
-    file = 'BSSpectestrun16_WMdot6p9e-9_d10p0_vinf1p8.spec' # < CHANGEABLE
-    #file = 'runtest_WMdot2e-10_d14_vinf1p5.spec'
+    file = 'rwsex_all.csv' # < CHANGEABLE >
+    waves, fluxes, errors = np.loadtxt(f'observation_files/{file}', unpack=True, usecols=(0,1,2), delimiter=',', skiprows=1)
 
-    waves, fluxes = np.loadtxt(
-        f'observation_files/{file}', unpack=True, usecols=usecols, skiprows=skiprows)
-
-
+# distance corrections 
+distance = 223  # pc < CHANGEABLE >
+fluxes = fluxes * (distance**2 / 100**2)
+errors = errors * (distance**2 / 100**2)
 # Data manipulation/truncation into correct format.
 wl_range_data = (wl_range[0] + 10, wl_range[1] - 10)  # Truncation
-waves = np.flip(waves)
-fluxes = np.flip(fluxes)
+# waves = np.flip(waves)
+# fluxes = np.flip(fluxes)
 # fluxes = gaussian_filter1d(fluxes, 50)
 if scale == 'log':
     fluxes = [np.log10(i) for i in fluxes]  # log
     fluxes = np.array(fluxes)  # log
 if scale == 'scaled':
     fluxes /= np.mean(fluxes)
-indexes = np.where((waves >= wl_range_data[0]) & (
-    waves <= wl_range_data[1]))  # Truncation + next 2 lines
+indexes = np.where((waves >= wl_range_data[0]) & (waves <= wl_range_data[1]))  # Truncation + next 2 lines
 waves = waves[indexes[0]]
 fluxes = fluxes[indexes[0]]
+errors = errors[indexes[0]]
 raw_flux = list(fluxes)
-sigmas = np.zeros(len(waves))
+sigmas = errors
 data = Spectrum(waves, fluxes, sigmas=sigmas, masks=None)
 data.plot(yscale="linear")
 print(file)
@@ -702,7 +719,7 @@ model = SpectrumModel(
     f'Grid-Emulator_Files/{emu_file_name}.npz',
     data,
     # [list, of , grid , points]emu.grid_points[119] [-8.95, 10.26, 1.82]
-    grid_params=list(emu.grid_points[10]),
+    grid_params=list(emu.grid_points[1900]),
     Av=0,
     global_cov=dict(log_amp=log_amp, log_ls=log_ls)
 )
@@ -729,37 +746,84 @@ print(model.labels)
 # Mostly uniform across grid space bar global_cov being normal
 # Change the default distrubtion if you wish something different.
 # WARNING! st.uniform(x, y) is range(x, x+y)
-if kgrid == 1:
+# if kgrid == 1:
+#     default_priors = {
+#         "param1": st.uniform(1.0e-10, 2.9e-9),
+#         "param2": st.uniform(4, 28),
+#         "param3": st.uniform(0.0, 1.0),
+#         "param4": st.uniform(1.0, 2.0),
+#         "param5": st.uniform(1e+10, 6e+10),
+#         "param6": st.uniform(1.0, 5.0),
+#         "global_cov:log_amp": st.norm(log_amp, 10),
+#         "global_cov:log_ls": st.uniform(0.1, 10.9),
+#         "Av": st.uniform(0.0, 1.0)
+#     }
+# if shortspec == 1:
+#     default_priors = {
+#         # log10 values
+#         "param1": st.uniform(np.log10(4e-11), (np.log10(3e-9) - np.log10(4e-11))),
+#         "param2": st.uniform(2, 14),
+#         "param3": st.uniform(1.0, 2.0),
+#         "global_cov:log_amp": st.norm(log_amp, 1),
+#         "global_cov:log_ls": st.uniform(1, 7),
+#         "Av": st.uniform(0.0, 1.0)
+#     }
+
+# if broadshortspec == 1:
+#     default_priors = {
+#         # log10 values
+#         "param1": st.uniform(np.log10(4e-11), (np.log10(2.5e-8) - np.log10(4e-11))),
+#         "param2": st.uniform(2, 14),
+#         "param3": st.uniform(1.0, 2.0),
+#         "global_cov:log_amp": st.norm(log_amp, 1),
+#         "global_cov:log_ls": st.uniform(1, 7),
+#         "Av": st.uniform(0.0, 1.0)
+#     }
+
+# ----------------------------------------|
+# | 1) disk.mdot (msol/yr)
+# | 2) wind.mdot (disk.mdot)
+# | 3) KWD.d(in_units_of_rstar)
+# | 4) KWD.mdot_r_exponent  
+# | 5) KWD.acceleration_length(cm) 
+# | 6) KWD.acceleration_exponent 
+# | 7) Boundary_layer.luminosity(ergs/s)
+# | 8) Boundary_layer.temp(K)
+# | 9) Inclination angle (degrees: 30,55,80)
+# | max_wl_range = (800,8000)
+
+
+# WARNING! st.uniform(x, y) is range(x, x+y)
+if speculate_cv_no_bl_grid_v87f == 1:
     default_priors = {
-        "param1": st.uniform(1.0e-10, 2.9e-9),
-        "param2": st.uniform(4, 28),
-        "param3": st.uniform(0.0, 1.0),
-        "param4": st.uniform(1.0, 2.0),
-        "param5": st.uniform(1e+10, 6e+10),
-        "param6": st.uniform(1.0, 5.0),
+        "param1": st.uniform(np.log10(3e-9), 1),  # disk.mdot (log10)
+        "param2": st.uniform(0.03, 0.27),           # wind.mdot
+        "param3": st.uniform(0.55, 54.45),          # KWD.d(in_units_of_rstar)
+        "param4": st.uniform(0.0, 1.0),             # KWD.mdot_r_exponent  
+        "param5": st.uniform(np.log10(7.25182e+08), 2.0), # KWD.acceleration_length(cm) (log10)
+        "param6": st.uniform(0.5, 4.0),             # KWD.acceleration_exponent 
+        "param9": st.uniform(30, 50),               # Inclination (sparse)
+        #"param10": st.uniform(30, 50),              # Inclination (10deg)
+        #"param11": st.uniform(30, 55),              # Inclination (5deg)
         "global_cov:log_amp": st.norm(log_amp, 10),
         "global_cov:log_ls": st.uniform(0.1, 10.9),
         "Av": st.uniform(0.0, 1.0)
     }
-if shortspec == 1:
+if speculate_cv_bl_grid_v87f == 1:
     default_priors = {
-        # log10 values
-        "param1": st.uniform(np.log10(4e-11), (np.log10(3e-9) - np.log10(4e-11))),
-        "param2": st.uniform(2, 14),
-        "param3": st.uniform(1.0, 2.0),
-        "global_cov:log_amp": st.norm(log_amp, 1),
-        "global_cov:log_ls": st.uniform(1, 7),
-        "Av": st.uniform(0.0, 1.0)
-    }
-
-if broadshortspec == 1:
-    default_priors = {
-        # log10 values
-        "param1": st.uniform(np.log10(4e-11), (np.log10(2.5e-8) - np.log10(4e-11))),
-        "param2": st.uniform(2, 14),
-        "param3": st.uniform(1.0, 2.0),
-        "global_cov:log_amp": st.norm(log_amp, 1),
-        "global_cov:log_ls": st.uniform(1, 7),
+        "param1": st.uniform(np.log10(3e-9), 1.0),  # disk.mdot (log10)
+        "param2": st.uniform(0.03, 0.27),           # wind.mdot
+        "param3": st.uniform(0.55, 54.45),          # KWD.d(in_units_of_rstar)
+        "param4": st.uniform(0.0, 1.0),             # KWD.mdot_r_exponent  
+        "param5": st.uniform(np.log10(7.25182e+08), 2.0), # KWD.acceleration_length(cm) (log10)
+        "param6": st.uniform(0.5, 4.0),             # KWD.acceleration_exponent 
+        "param7": st.uniform(0.0, 1.0),             # Boundary_layer.luminosity(ergs/s)
+        "param8": st.uniform(0.1, 0.9),             # Boundary_layer.temp(K)
+        "param9": st.uniform(30, 50),               # Inclination (sparse)
+        #"param10": st.uniform(30, 50),              # Inclination (10deg)
+        #"param11": st.uniform(30, 55),              # Inclination (5deg)
+        "global_cov:log_amp": st.norm(log_amp, 10),
+        "global_cov:log_ls": st.uniform(0.1, 10.9),
         "Av": st.uniform(0.0, 1.0)
     }
 
@@ -772,13 +836,26 @@ for label in model.labels:
 
 # TODO: SIMPLEX - Need to add global covariance hyperparameters
 initial_simplex = spec.simplex(model, priors) 
-model.train(
-    priors,
-    options=dict(
-        maxiter=1e5,
-        disp=True,
-        initial_simplex=initial_simplex,
-        return_all=True))
+
+# Progress bar for training
+maxiter = 10000
+pbar = tqdm(total=maxiter, desc="Training Progress")
+
+def callback(xk):
+    pbar.update(1)
+
+try:
+    model.train(
+        priors,
+        callback=callback,
+        options=dict(
+            maxiter=maxiter,
+            disp=True,
+            initial_simplex=initial_simplex,
+            return_all=True))
+finally:
+    pbar.close()
+
 print(model)
 
 # %% Stage 11.continued) Continue training the model
@@ -816,15 +893,46 @@ extra_steps = int(max_n / 10)  # Extra MCMC steps
 
 ndim = len(model.labels)
 print("{0} CPUs".format(ncpu))
-if kgrid == 1:
-    default_scales = {"param1": 1e-11, "param2": 1e-2, "param3": 1e-2,
-                      "param4": 1e-2, "param5": 1e+9, "param6": 1e-2}
-if shortspec == 1:
-    default_scales = {"param1": 1e-1, "param2": 1e-1, "param3": 1e-1}
+# if kgrid == 1:
+#     default_scales = {"param1": 1e-11, "param2": 1e-2, "param3": 1e-2,
+#                       "param4": 1e-2, "param5": 1e+9, "param6": 1e-2}
+# if shortspec == 1:
+#     default_scales = {"param1": 1e-1, "param2": 1e-1, "param3": 1e-1}
     
-if broadshortspec == 1:
-    default_scales = {"param1": 1e-1, "param2": 1e-1, "param3": 1e-1}
-
+# if broadshortspec == 1:
+#     default_scales = {"param1": 1e-1, "param2": 1e-1, "param3": 1e-1}
+if speculate_cv_no_bl_grid_v87f == 1:
+    default_scales = {
+        "param1": 1e-1,   # disk.mdot (log10)
+        "param2": 1e-2,   # wind.mdot
+        "param3": 1e-1,   # KWD.d(in_units_of_rstar)
+        "param4": 1e-1,   # KWD.mdot_r_exponent  
+        "param5": 1e+1,   # KWD.acceleration_length(cm) (log10)
+        "param6": 1e-1,   # KWD.acceleration_exponent 
+        "param9": 5.0,    # Inclination (sparse)
+        #"param10": 5.0,   # Inclination (10deg)
+        #"param11": 2.5,   # Inclination (5deg)
+        # "global_cov:log_amp": 1.0,
+        # "global_cov:log_ls": 1.0,
+        # "Av": 0.1
+    }
+if speculate_cv_bl_grid_v87f == 1:
+    default_scales = {
+        "param1": 1e-1,   # disk.mdot (log10)
+        "param2": 1e-2,   # wind.mdot
+        "param3": 1e-1,   # KWD.d(in_units_of_rstar)
+        "param4": 1e-1,   # KWD.mdot_r_exponent  
+        "param5": 1e+1,   # KWD.acceleration_length(cm) (log10)
+        "param6": 1e-1,   # KWD.acceleration_exponent 
+        "param7": 1.0,    # Boundary_layer.luminosity(ergs/s)
+        "param8": 0.1,    # Boundary_layer.temp(K)
+        "param9": 5.0,    # Inclination (sparse)
+        #"param10": 5.0,   # Inclination (10deg)
+        #"param11": 2.5,   # Inclination (5deg)
+        # "global_cov:log_amp": 1.0,
+        # "global_cov:log_ls": 1.0,
+        # "Av": 0.1
+    }
 scales = {}  # Selects the priors required from the model parameters used
 for label in model.labels:
     scales[label] = default_scales[label]
