@@ -82,7 +82,8 @@ try:
             M = v11_torch.shape[1]
             w_hat_reshaped = w_hat_torch.view(n_comp, M, 1)
             
-            L = torch.linalg.cholesky(v11_torch) # (n_comp, M, M)
+            with SuppressStderr():
+                L = torch.linalg.cholesky(v11_torch) # (n_comp, M, M)
             
             # logdet = 2 * sum(log(diag(L)))
             # L.diagonal(dim1=-2, dim2=-1) -> (n_comp, M)
@@ -975,15 +976,45 @@ class Emulator:
             # Reshape w_hat for batch solve
             w_hat_reshaped = self._w_hat_gpu.view(n_comp, M).unsqueeze(-1) # (n_comp, M, 1)
             
-            # Solve v11 @ x = w_hat
-            # v11_gpu is (n_comp, M, M)
-            alpha = torch.linalg.solve(self._v11_gpu, w_hat_reshaped) # (n_comp, M, 1)
+            # --- Optimization: Cached Cholesky Decomposition & Precomputed Alpha ---
+            # Using Cholesky (O(N^3) once) + Substitution (O(N^2)) is much faster than Solve (O(N^3))
+            # avoiding MAGMA batched warnings by looping explicitly during heavy ops.
             
+            # Check if we have a valid cached Cholesky factor L
+            # We track the 'source' v11 tensor object to invalidate cache if v11 changes (e.g. re-training)
+            current_v11_id = id(self._v11_gpu)
+            cached_v11_id = getattr(self, '_L_gpu_source_id', None)
+            
+            if cached_v11_id != current_v11_id:
+                # Cache invalid or missing, recompute L and alpha
+                L_list = []
+                for i in range(n_comp):
+                    # Compute Cholesky decomposition: v11 = L @ L.T
+                    # Loop avoids "batched routines" warning for large matrices
+                    L_list.append(torch.linalg.cholesky(self._v11_gpu[i]))
+                self._L_gpu = torch.stack(L_list)
+                self._L_gpu_source_id = current_v11_id
+                
+                # Compute alpha = v11^-1 @ w_hat using Cholesky
+                # alpha = cholesky_solve(w_hat, L)
+                alpha_list = []
+                for i in range(n_comp):
+                    alpha_list.append(torch.cholesky_solve(w_hat_reshaped[i], self._L_gpu[i]))
+                self._alpha_gpu = torch.stack(alpha_list)
+                
+            # Retrieve cached alpha
+            alpha = self._alpha_gpu
+
             # mu = v21 @ alpha
             mu_stacked = torch.matmul(v21_gpu, alpha) # (n_comp, n_query, 1)
             
             # Solve v11 @ X = v12
-            v11_inv_v12 = torch.linalg.solve(self._v11_gpu, v12_gpu) # (n_comp, M, n_query)
+            # v11_inv_v12 = v11^-1 @ v12 => cholesky_solve(v12, L)
+            # Manual batching with Cholesky solve (O(N^2)) is very fast even in Python loop
+            v11_inv_v12_list = []
+            for i in range(n_comp):
+                v11_inv_v12_list.append(torch.cholesky_solve(v12_gpu[i], self._L_gpu[i]))
+            v11_inv_v12 = torch.stack(v11_inv_v12_list)
             
             # cov = v22 - v21 @ v11^{-1} @ v12
             cov_term = torch.matmul(v21_gpu, v11_inv_v12) # (n_comp, n_query, n_query)

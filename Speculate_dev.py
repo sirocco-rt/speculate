@@ -6,7 +6,7 @@ import os
 import random
 import emcee
 import corner
-#import arviz as az # something broke in the enviroment
+import arviz as az # something broke in the enviroment
 import math as m
 import matplotlib.pyplot as plt
 import multiprocessing as mp
@@ -86,7 +86,7 @@ scale = 'linear'              # Transformation scaling for flux data. 'linear'
                               # 'log' or 'scaled'. scale not implemented yet.
 
 grid_file_name = 'test'  # If Builds fast, file save unnessary.
-process_grid = True           # Turn off if planning to use existing grid file.
+process_grid = False           # Turn off if planning to use existing grid file.
 # kgrid = 0                     # Turn on if planning to use kgrid
 # shortspec = 0                 # Turn on if planning to use shortspec_cv_grid
 # broadshortspec = 0            # Turn on if planning to use broadshortspec_cv_grid
@@ -96,7 +96,7 @@ process_grid = True           # Turn off if planning to use existing grid file.
 speculate_cv_no_bl_grid_v87f = 1 # Turn on if planning to use speculate_cv_no_bl_grid_v87f
 speculate_cv_bl_grid_v87f = 0    # Turn on if planning to use speculate_cv_bl_grid_v87f
 
-n_components = 10             # Alter the number of PCA components used.
+n_components = 20             # Alter the number of PCA components used.
 # Integer for no. of components or decimal (0.0-1.0) for 0%-100% accuracy.
 block_diagonal = True         # Use block-diagonal optimization for covariance matrix
 # -----------------------------------------------------------------------------|
@@ -304,9 +304,9 @@ else:
 
 # %% Stage 2.2) Speculate's spectral data exploration tool (SDET).
 # 2.2) ========================================================================|
-# The Class should open a new window to allow the user to explore the grid.
-%matplotlib qt
-grid_viewer = spec.InspectGrid(grid, emu) # Emu (Emulator) optional
+# # The Class should open a new window to allow the user to explore the grid.
+# %matplotlib qt
+# grid_viewer = spec.InspectGrid(grid, emu) # Emu (Emulator) optional
 
 
 
@@ -359,7 +359,7 @@ if emu_exists == 0:
         plt.ylabel('Negative Log-Likelihood')
         plt.title('Gaussian Process Training Loss')
         plt.grid(True)
-        plt.show()
+        plt.savefig(f'Grid-Emulator_Files/{emu_file_name}_training_loss.png')
 
 
 # profiler.stop()
@@ -418,7 +418,7 @@ if emu_exists == 0:
 
 #%matplotlib inline
 # Inputs: Displayed parameter (1-X), other parameters' fixed index (0-(X-1))
-spec.plot_emulator(emu, grid, 2, 1)
+spec.plot_emulator(emu, grid, 1, 1)
 # plot_new_eigenspectra(emu, 51)  # <---- Yet to implement
 
 # =============================================================================|
@@ -885,9 +885,9 @@ print(model.labels)
 
 # ----- Inputs here ------|
 ncpu = cpu_count() - 2      # Pool CPU's used.
-nwalkers = 5 * ncpu         # Number of walkers in the MCMC.
+nwalkers = 1 * ncpu         # Number of walkers in the MCMC.
 # Maximum iterations of the MCMC if convergence is not reached.
-max_n = 4000
+max_n = 2000
 extra_steps = int(max_n / 10)  # Extra MCMC steps
 # ------------------------|
 
