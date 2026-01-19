@@ -342,6 +342,9 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
 
             grid_mode = "local"
 
+        # Pre-calculate unique values for each parameter to speed up dropdown creation
+        param_options = {col: sorted(lookup_df[col].unique()) for col in param_cols}
+
         num_runs = len(lookup_df)
         num_wavelengths = len(wavelengths)
         num_inclinations = len(inclination_angles)
@@ -365,6 +368,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
         lzma,
         num_runs,
         param_cols,
+        param_options,
         repo_id,
         selected_grid,
         wavelengths,
@@ -380,16 +384,24 @@ def _(mo):
 
 
 @app.cell
-def _(inclination_angles, mo, num_runs):
+def _(get_run_index, inclination_angles, mo, num_runs, set_run_index):
     # Run file selector slider with built-in editable input
+    # Synced with shared state
+
+    # Validation: Ensure index is within bounds (crucial when switching grids)
+    current_idx = get_run_index()
+    if current_idx >= num_runs:
+        current_idx = 0
+
     run_slider = mo.ui.slider(
         start=0,
         stop=num_runs - 1,
-        value=0,
+        value=current_idx,
         step=1,
         label="Run File Index:",
         show_value=True,
-        include_input=True
+        include_input=True,
+        on_change=set_run_index
     )
 
     # Inclination angle selector
@@ -458,9 +470,18 @@ def _(mo):
     # Initialize state for pinned spectra storage
     get_pinned_spectra, set_pinned_spectra = mo.state([])
 
+    # Initialize state for current run index (synced between slider and parameters)
+    get_run_index, set_run_index = mo.state(0)
+
     # Initialize cache tracker for HuggingFace downloads
     cache_tracker_state = mo.state(set())
-    return cache_tracker_state, get_pinned_spectra, set_pinned_spectra
+    return (
+        cache_tracker_state,
+        get_pinned_spectra,
+        get_run_index,
+        set_pinned_spectra,
+        set_run_index,
+    )
 
 
 @app.cell
@@ -801,18 +822,98 @@ def _(
 
 
 @app.cell
-def _(current_params, current_run_index, inclination_selector, lookup_df, mo):
-    # Display current parameters
+def _(
+    current_params,
+    current_run_index,
+    lookup_df,
+    mo,
+    param_options,
+    set_run_index,
+):
+    # Display current parameters with dropdowns for interactive modification
     run_number = lookup_df['Run Number'].iloc[current_run_index]
-    params_table_text = "### Current Spectrum Parameters\n\n"
-    params_table_text += f"**Run Index**: {current_run_index} | **Run Number**: {run_number} | **Inclination**: {inclination_selector.value}°\n\n"
-    params_table_text += "| Parameter | Value |\n"
-    params_table_text += "|-----------|-------|\n"
+
+    mo.md(f"### Current Spectrum Parameters\n**Run Index**: {current_run_index} | **Run Number**: {run_number}")
+
+    # Create a dictionary to hold the dropdowns
+    param_dropdowns = {}
+
+    # Define update function closure
+    def make_update_handler(param_name):
+        def on_change(new_value):
+            # 1. Filter Grid: Get all runs that have this new parameter value
+            candidates = lookup_df[lookup_df[param_name] == new_value].copy()
+
+            if candidates.empty:
+                return
+
+            # 2. Hierarchical Matching:
+            # We want to keep as many CURRENT parameters as possible.
+            # Crucially, we prioritize parameters in the order they appear in the file (Left -> Right).
+            # This ensures "Major" parameters stick, and "Minor/Dependent" parameters adapt.
+
+            sort_keys = []
+            for col in param_options.keys():
+                if col != param_name:
+                    # Create a boolean 'match' column for this parameter
+                    match_col = f"_match_{col}"
+                    # 1 if matches current value, 0 if not
+                    candidates[match_col] = (candidates[col] == current_params[col]).astype(int)
+                    sort_keys.append(match_col)
+
+            # 3. Sort candidates to find the best match
+            # sort_values with ascending=False puts '1' (matches) at the top
+            if sort_keys:
+                best_match = candidates.sort_values(by=sort_keys, ascending=False).iloc[0]
+            else:
+                best_match = candidates.iloc[0]
+
+            # Update the global run index
+            # We find the index in the original dataframe
+            # Note: best_match.name gives the index if we used copy() from original df
+            set_run_index(int(best_match.name))
+
+        return on_change
+
+    # Helper function to format numbers for the dropdowns
+    def format_val(v):
+        if isinstance(v, (int, float)):
+            if v == 0:
+                return "0"
+            abs_v = abs(v)
+            if abs_v >= 1e6 or abs_v < 1e-6:
+                return f"{v:.4e}"  # Scientific notation with 5 sig figs (1 digit + 4 decimals)
+            else:
+                return f"{v:.5g}"  # General format with 5 sig figs
+        return str(v)
 
     for param_name, param_value in current_params.items():
-        params_table_text += f"| {param_name} | {param_value:.6e} |\n"
+        # Always show ALL unique values for this parameter
+        # This prevents "Islands" where users get trapped in a subset
+        unique_vals = param_options[param_name]
 
-    mo.md(params_table_text)
+        # Create dictionary for options {formatted_label: actual_value}
+        # This keeps the display clean while preserving the exact float value for lookup
+        options_dict = {format_val(v): v for v in unique_vals}
+
+        # Create dropdown
+        # Note: When using a dict for options, marimo requires 'value' to be the label (key)
+        dropdown = mo.ui.dropdown(
+            options=options_dict,
+            value=format_val(param_value),
+            label=f"{param_name}",
+            on_change=make_update_handler(param_name)
+        )
+        param_dropdowns[param_name] = dropdown
+
+    # Display dropdowns in a single column layout
+    # Convert dict values to list
+    dropdown_list = list(param_dropdowns.values())
+
+    mo.vstack([
+        mo.md("⚠️ **Warning**: All grid values shown but not all combinations are available."),
+        *dropdown_list
+    ])
     return
 
 
