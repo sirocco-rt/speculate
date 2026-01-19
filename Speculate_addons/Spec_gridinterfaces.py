@@ -97,7 +97,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             flux_units = 'erg/s/cm^2/AA'
             
         super().__init__(
-            name='CV_BL_grid_v87f',
+            name='speculate_cv_bl_grid_v87f',
             param_names=param_names,
             points=points,
             wave_units='AA',
@@ -379,7 +379,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             flux_units = 'erg/s/cm^2/AA'
             
         super().__init__(
-            name='CV_NO-BL_grid_v87f',
+            name='speculate_cv_no-bl_grid_v87f',
             param_names=param_names,
             points=points,
             wave_units='AA',

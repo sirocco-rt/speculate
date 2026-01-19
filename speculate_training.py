@@ -84,7 +84,6 @@ def _(mo):
 
     #### Current Interface Bugs:
     - Changing grids doesn't change available parameters in the dropdown correctly.
-    - Grid names not matching with drop down.
     - Streamline text outputs and logging.
     - Better control over iteration logging, maybe stream a training loss curve instead?
     """)
@@ -176,13 +175,13 @@ def _(mo):
         "speculate_cv_bl_grid_v87f": {
             "class": Speculate_cv_bl_grid_v87f,
             "usecols": (1, 7),
-            "name": "CV_BL_Grid_v87f",
+            "name": "speculate_cv_bl_grid_v87f",
             "max_params": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         },
         "speculate_cv_no-bl_grid_v87f": {
             "class": Speculate_cv_no_bl_grid_v87f,
             "usecols": (1, 7),
-            "name": "CV_NO-BL_Grid_v87f",
+            "name": "speculate_cv_no-bl_grid_v87f",
             "max_params": [1, 2, 3, 4, 5, 6, 9, 10, 11]
         }
     }
@@ -288,10 +287,10 @@ def _(grid_configs, grid_selector, mo):
             # Set default parameters based on grid type
             if "bl" in selected_grid and "no-bl" not in selected_grid:
                 # BL grid: includes boundary layer parameters
-                default_params = [1, 5, 7, 8, 9]
+                default_params = [1, 2, 3, 4, 5, 6, 7, 8, 9]
             else:
                 # NO-BL grid: excludes boundary layer parameters
-                default_params = [1, 2, 3, 4, 5, 6]
+                default_params = [1, 2, 3, 4, 5, 6, 9]
 
             # Create options with name as key, number as value - only for available params
             params = mo.ui.multiselect(
@@ -312,6 +311,50 @@ def _(grid_configs, grid_selector, mo):
 
     params
     return (params,)
+
+
+@app.cell
+def _(mo, params):
+    # Calculate estimated grid size to warn about VRAM
+    high_vram = mo.md("")
+
+    if params is not None and params.value:
+        try:
+            # Parse selected parameter indices
+            selected = [int(p) for p in params.value]
+
+            # Calculate total permutations based on parameter weights
+            # Standard params (1-9) have 3 values
+            # Param 10 (Mid Inc) has 6 values (weight = 2x standard)
+            # Param 11 (Full Inc) has 12 values (weight = 4x standard)
+            total_points = 1
+            for p in selected:
+                if p == 11:
+                    total_points *= 12
+                elif p == 10:
+                    total_points *= 6
+                else:
+                    total_points *= 3
+
+            # Thresholds:
+            # 3^8 = 6,561 (High VRAM start)
+            # 3^9 = 19,683 (Very High VRAM start)
+
+            if total_points >= 19683:
+                high_vram = mo.callout(
+                    mo.md(f"⚠️ **Warning: Very High VRAM Usage (~{total_points:,} grid points)**\n\nGrid size likely exceeds 100GB in GPU VRAM."),
+                    kind="alert"
+                )
+            elif total_points >= 6561:
+                high_vram = mo.callout(
+                    mo.md(f"⚠️ **Warning: High VRAM Usage (~{total_points:,} grid points)**\n\nLarge grid size may exceed current GPU limits."),
+                    kind="warn"
+                )
+        except Exception:
+            pass
+
+    high_vram
+    return
 
 
 @app.cell
