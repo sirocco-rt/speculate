@@ -83,7 +83,6 @@ def _(mo):
     - ~4-16 GB RAM minimum (depends on grid size)
 
     #### Current Interface Bugs:
-    - Changing grids doesn't change available parameters in the dropdown correctly.
     - Streamline text outputs and logging.
     - Better control over iteration logging, maybe stream a training loss curve instead?
     """)
@@ -263,36 +262,47 @@ def _(mo):
 
 
 @app.cell
-def _(grid_configs, grid_selector, mo):
-    # Parameter names mapping (number -> name)
-    param_names = {
-        1: "Disk.mdot",
-        2: "wind.mdot",
-        3: "KWD.d",
-        4: "mdot_r_exponent",
-        5: "acceleration_length",
-        6: "acceleration_exponent",
-        7: "BL.luminosity",
-        8: "BL.temp",
-        9: "Inclination (sparse)",
-        10: "Inclination (mid)",
-        11: "Inclination (full)"
-    }
+def _(grid_configs, grid_selector, mo, sirocco_grids_path):
+    # Dynamically fetch parameter options from the grid interface
+    param_names = {}
 
-    # Dynamically show parameter options based on grid
     if grid_selector is not None and grid_selector.value:
         selected_grid = grid_selector.value
-        if selected_grid in grid_configs:
-            max_params = grid_configs[selected_grid]["max_params"]
-            # Set default parameters based on grid type
-            if "bl" in selected_grid and "no-bl" not in selected_grid:
-                # BL grid: includes boundary layer parameters
-                default_params = [1, 2, 3, 4, 5, 6, 7, 8, 9]
-            else:
-                # NO-BL grid: excludes boundary layer parameters
-                default_params = [1, 2, 3, 4, 5, 6, 9]
 
-            # Create options with name as key, number as value - only for available params
+        if selected_grid in grid_configs:
+            config = grid_configs[selected_grid]
+            max_params = config["max_params"]
+
+            try:
+                # Instantiate temporary interface to get descriptions
+                # We use the raw path + "/" as required by star fish interfaces usually
+                temp_path = str(sirocco_grids_path / selected_grid) + "/"
+
+                # Initialize with all possible parameters to get all descriptions
+                temp_interface = config["class"](
+                    path=temp_path,
+                    usecols=config["usecols"],
+                    model_parameters=tuple(max_params)
+                )
+
+                # Get dictionary {'param1': 'Desc', ...}
+                desc_map = temp_interface.parameters_description()
+
+                # Convert to {1: 'Desc', ...}
+                for p_key, p_desc in desc_map.items():
+                    p_idx = int(p_key.replace("param", ""))
+                    param_names[p_idx] = p_desc
+
+            except Exception as e:
+                # Fallback if interface fails (e.g. files missing)
+                param_names = {i: f"Parameter {i}" for i in max_params}
+
+            # Set default parameters logic
+            # Heuristic: exclude inclination alternatives (typically > 9 if 9 is sparse inc)
+            # Default to selecting "Standard" parameters + sparse inclination
+            default_params = [p for p in max_params if p <= 9]
+
+            # Create options
             params = mo.ui.multiselect(
                 options={param_names.get(i, f"Parameter {i}"): str(i) for i in max_params},
                 value=[param_names.get(p, f"Parameter {p}") for p in default_params if p in max_params],
@@ -300,11 +310,10 @@ def _(grid_configs, grid_selector, mo):
             )
         else:
             params = mo.ui.multiselect(
-                options={param_names.get(i, f"Parameter {i}"): str(i) for i in range(1, 10)},
-                value=[param_names.get(i, f"Parameter {i}") for i in [1, 2, 3, 4, 5, 6]],
+                options={},
+                value=[],
                 label="Select parameters to include:"
             )
-        params
     else:
         params = None
         mo.md("*Select a grid first*")
