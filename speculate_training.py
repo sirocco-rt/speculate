@@ -9,16 +9,48 @@ __generated_with = "0.18.1"
 app = marimo.App(width="full", app_title="Speculate Training Tool")
 
 
+@app.cell
+def _(mo):
+    get_loss_history, set_loss_history = mo.state([])
+    get_training_trigger, set_training_trigger = mo.state(0)
+    get_console_logs, set_console_logs = mo.state("")
+    get_training_status, set_training_status = mo.state(None)
+    return (
+        get_console_logs,
+        get_loss_history,
+        get_training_status,
+        get_training_trigger,
+        set_console_logs,
+        set_loss_history,
+        set_training_status,
+        set_training_trigger,
+    )
+
+
 @app.cell(hide_code=True)
 def _():
     import marimo as mo
-    mo.md(
-        """
-        # Speculate Training Tool
+    logo_path = "assets/logos/Speculate_logo2.png"
 
+    # Left column: Title and Description
+    title_col = mo.vstack([mo.md(
+        """
+        # Emulator Training Tool
+        """), mo.md(
+        """
         Train custom emulator models on spectral grids.
         """
-    )
+    )])
+
+    # Right column: Logo with link
+    # Using flex-end to align it to the right
+    logo_col = mo.vstack([
+        mo.image(src=logo_path, width=400),
+        mo.md('<p style="text-align: center; font-size: 0.8em;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
+    ], align="center")
+
+    # Combine in horizontal stack
+    mo.hstack([title_col, logo_col], justify="space-between", align="center")
     return (mo,)
 
 
@@ -57,15 +89,26 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    # Add logo
-    import pathlib
+    import torch
 
-    logo_path = pathlib.Path("assets/logos/Speculate_logo2.png")
+    # GPU Detection
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        try:
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            gpu_text = f"## 🟢 GPU Active: **{gpu_name}** ({vram_gb:.1f} GB VRAM)"
+        except:
+            gpu_text = f"## 🟢 GPU Active: **{gpu_name}**"
 
-    if logo_path.exists():
-        logo = mo.image(src=str(logo_path), width=300)
-        link = mo.md('<p style="text-align: center;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
-        mo.vstack([logo, link], align="center")
+        status_widget = mo.callout(mo.md(gpu_text), kind="success")
+
+    else:
+        status_widget = mo.callout(
+            mo.md("## 🟠 No NVIDIA GPU Detected - Large grids will train slower."), 
+            kind="warn"
+        )
+
+    status_widget
     return
 
 
@@ -73,18 +116,13 @@ def _(mo):
 def _(mo):
     mo.md("""
     ---
-    ## Training Configuration
+    ## ⚠️ Emulator Training Configuration Requirements
 
-    Configure your emulator training parameters below.
+    - Run a Local Installation of Speculate
+    - GPU recommended for large grids (2500+ grid points or 6+ parameters)
+    - RAM/VRAM requirements scales by an order of magnitude with each added parameters.
 
-    ### ⚠️ Requirements
-    - Local installation with full spectral grids
-    - GPU recommended for large grids (6561+ points)
-    - ~4-16 GB RAM minimum (depends on grid size)
-
-    #### Current Interface Bugs:
-    - Streamline text outputs and logging.
-    - Better control over iteration logging, maybe stream a training loss curve instead?
+    ## 💻 Emulator Specification:
     """)
     return
 
@@ -98,6 +136,9 @@ def _(mo):
     from pathlib import Path
     from tqdm import tqdm
     import logging
+    import pandas as pd
+    import altair as alt
+    import time
 
     # Import Starfish and Speculate modules
     from Starfish.grid_tools import HDF5Creator
@@ -171,17 +212,17 @@ def _(mo):
 
     # Map grid folder names to their configuration
     grid_configs = {
-        "speculate_cv_bl_grid_v87f": {
-            "class": Speculate_cv_bl_grid_v87f,
-            "usecols": (1, 7),
-            "name": "speculate_cv_bl_grid_v87f",
-            "max_params": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        },
         "speculate_cv_no-bl_grid_v87f": {
             "class": Speculate_cv_no_bl_grid_v87f,
             "usecols": (1, 7),
             "name": "speculate_cv_no-bl_grid_v87f",
             "max_params": [1, 2, 3, 4, 5, 6, 9, 10, 11]
+        },
+        "speculate_cv_bl_grid_v87f": {
+            "class": Speculate_cv_bl_grid_v87f,
+            "usecols": (1, 7),
+            "name": "speculate_cv_bl_grid_v87f",
+            "max_params": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         }
     }
 
@@ -199,14 +240,16 @@ def _(mo):
     return (
         Emulator,
         MarimoHDF5Creator,
+        alt,
         available_grids,
         grid_configs,
         logging,
         np,
         os,
-        plot_eigenspectra,
+        pd,
         sirocco_grids_path,
         sys,
+        time,
     )
 
 
@@ -236,29 +279,6 @@ def _(available_grids, mo):
         grid_selector = None
     grid_selector
     return (grid_selector,)
-
-
-@app.cell
-def _(mo):
-    mo.md("### 2. Model Parameters")
-
-    # Parameter selection info in an accordion
-    param_accordion = mo.accordion({
-        "Grid Parameter Details": mo.md("""
-        **Available Parameters by Grid:**
-
-        - **CV BL Grid (v87f)**: 
-          1. Disk.mdot, 2. wind.mdot, 3. KWD.d, 4. mdot_r_exponent, 5. acceleration_length, 
-          6. acceleration_exponent, 7. BL.luminosity, 8. BL.temp, 9/10/11. Inclination (sparse/mid/full)
-
-        - **CV NO-BL Grid (v87f)**: 
-          1. Disk.mdot, 2. wind.mdot, 3. KWD.d, 4. mdot_r_exponent, 5. acceleration_length, 
-          6. acceleration_exponent, 9/10/11. Inclination (sparse/mid/full)
-        """)
-    })
-
-    param_accordion
-    return
 
 
 @app.cell
@@ -359,6 +379,11 @@ def _(mo, params):
                     mo.md(f"⚠️ **Warning: High VRAM Usage (~{total_points:,} grid points)**\n\nLarge grid size may exceed current GPU limits."),
                     kind="warn"
                 )
+            else: 
+                high_vram = mo.callout(
+                    mo.md(f"✅ **Estimated Grid Size: ~{total_points:,} grid points**\n\nGrid size should be manageable on most GPUs."),
+                    kind="success"
+                )
         except Exception:
             pass
 
@@ -381,10 +406,7 @@ def _(mo):
 
     n_components = mo.ui.slider(start=2, stop=20, value=10, step=1, label="PCA Components:",show_value=True,)
 
-    mo.vstack([
-        mo.hstack([wl_min, wl_max], justify="start"),
-        mo.hstack([scale_selector, n_components], justify="start")
-    ])
+    mo.vstack([wl_min, wl_max, scale_selector, n_components])
     return n_components, scale_selector, wl_max, wl_min
 
 
@@ -398,21 +420,79 @@ def _(mo):
         label="Optimization Method:"
     )
 
-    max_iter = mo.ui.number(start=100, stop=10000, value=1000, step=100, label="Max Iterations:")
+    max_iter = mo.ui.number(start=100, stop=100000, value=10000, step=100, label="Max Iterations:")
 
     mo.vstack([method, max_iter])
     return max_iter, method
 
 
 @app.cell
-def _(mo):
+def _(
+    get_training_trigger,
+    grid_selector,
+    mo,
+    n_components,
+    np,
+    os,
+    params,
+    scale_selector,
+    set_loss_history,
+    wl_max,
+    wl_min,
+):
     mo.md("### 5. Start Training")
 
-    train_button = mo.ui.run_button(label="🚀 Train Emulator")
+    # Register dependency on training completion
+    _ = get_training_trigger()
+
+    # Determine filename to check for existence default
+    _emu_btn_label = "🚀 Train Emulator"
+    _emu_btn_kind = "success"
+    _emu_info_text = "Click to begin training. This may take several minutes to hours depending on grid size and hardware."
+
+    if grid_selector is not None and grid_selector.value and params is not None and params.value:
+         # Configuration (duplicate logic to check filename)
+        _model_params = tuple(sorted([int(p) for p in params.value]))
+        _model_params_str = ''.join(str(i) for i in _model_params)
+        _wl_range = (wl_min.value, wl_max.value)
+        _scale = scale_selector.value
+        _grid_name = grid_selector.value
+
+        # Standardize base name
+        _base_name = _grid_name.replace("-", "_") + "_"
+
+        # Determine emulator file name
+        _fixed_inc = 55
+        if any(x in _model_params for x in [9, 10, 11]):
+             _chk_name = f'{_base_name}emu_{_model_params_str}_{_scale}_{_wl_range[0]}-{_wl_range[1]}AA_{n_components.value}PCA'
+        else:
+             _chk_name = f'{_base_name}emu_{_model_params_str}_{_scale}_{_fixed_inc}inc_{_wl_range[0]}-{_wl_range[1]}AA_{n_components.value}PCA'
+
+        if os.path.exists(f'Grid-Emulator_Files/{_chk_name}.npz'):
+            _emu_btn_label = "♻️ Re-train (An Emulator Already Exists)"
+            _emu_btn_kind = "warn"
+            _emu_info_text = f"**Emulator found:** `{_chk_name}.npz`\n\nClick to **re-train** (overwrites existing)."
+
+            # Load existing loss history if available (Side Effect: Update Graph)
+            try:
+                # Load minimal data from npz to check for loss_history
+                # We do checking inside try/except to avoid crashes on old files
+                with np.load(f'Grid-Emulator_Files/{_chk_name}.npz', allow_pickle=True) as _data:
+                    if 'loss_history' in _data:
+                         set_loss_history(_data['loss_history'].tolist())
+                    else:
+                         set_loss_history([])
+            except Exception:
+                set_loss_history([])
+        else:
+             # If emulator doesn't exist (new config), clear the graph
+             set_loss_history([])
+
+    train_button = mo.ui.run_button(label=_emu_btn_label, kind=_emu_btn_kind)
 
     mo.callout(
-        mo.md("Click to begin training. This may take several minutes to hours depending on grid size and hardware."),
-        kind="info"
+        mo.md(_emu_info_text),
+        kind="info" if _emu_btn_kind == "success" else "warn"
     )
 
     train_button
@@ -574,7 +654,7 @@ def _(
         mo.vstack([config_md, results_md, emu_status])
     else:
         mo.md("*Configure all settings and click 'Train Emulator' to start*")
-    return emu_exists, emu_file_name, grid_file_name
+    return emu_file_name, grid_file_name
 
 
 @app.cell
@@ -588,8 +668,10 @@ def _(mo):
 @app.cell
 def _(
     Emulator,
-    emu_exists,
+    alt,
     emu_file_name,
+    get_console_logs,
+    get_training_status,
     grid_file_name,
     max_iter,
     method,
@@ -597,7 +679,13 @@ def _(
     n_components,
     np,
     os,
+    pd,
+    set_console_logs,
+    set_loss_history,
+    set_training_status,
+    set_training_trigger,
     sys,
+    time,
     train_button,
 ):
     import matplotlib.pyplot as plt
@@ -605,98 +693,194 @@ def _(
     training_complete = False
     emu = None
 
-    if train_button.value and not emu_exists:
-        # Train new emulator
-        # Use simple status text that will be replaced by the result
+    if train_button.value and grid_file_name:
+        import contextlib
+
+        # Clear previous history
+        set_loss_history([])
+        set_console_logs("")
+        set_training_status(None)
+
+        # Train new emulator (Always re-train if button is clicked)
         status_box = mo.md("🚀 **Training emulator...** Check the console below for progress.")
 
-        # Container for results
-        # result_container = mo.empty() # Removed: not a valid attribute
+        # Live Logger setup
+        log_buffer = []
+        current_chart = [None] # Mutable container for the latest chart
+        ui_state = {'last_update': 0}
 
-        # show initial status
-        mo.output.replace(status_box)
+        def update_ui(active_status, chart=None, force=False):
+            if chart is not None:
+                current_chart[0] = chart
+
+            current_time = time.time()
+            # Throttle UI updates to avoid flashing (max 4 times per second)
+            if not force and (current_time - ui_state['last_update'] < 0.25):
+                return
+
+            ui_state['last_update'] = current_time
+
+            text = "".join(log_buffer)
+
+            # Build accordion content
+            accordion_content = []
+            if current_chart[0]:
+                 # Add chart to accordion
+                accordion_content.append(mo.md("### 📈 Live Training Loss"))
+                # Use chart directly instead of ui wrapper to reduce flashing
+                accordion_content.append(current_chart[0])
+                accordion_content.append(mo.md("---"))
+
+            # Add logs to accordion
+            accordion_content.append(mo.md(f"```text\n{text}\n```"))
+
+            elements = [
+                active_status,
+                mo.accordion({"Training Progress & Logs": mo.vstack(accordion_content)})
+            ]
+
+            mo.output.replace(mo.vstack(elements))
+
+        class LiveLogger:
+            def write(self, text):
+                log_buffer.append(text)
+                # Update UI with current status (preserves chart)
+                update_ui(status_box)
+            def flush(self): pass
+
+        logger = LiveLogger()
+        update_ui(status_box, force=True)
 
         try:
-            with mo.status.spinner(title="Training Emulator", subtitle=" optimizing parameters... (logs printed below)") as _spinner:
-                with mo.redirect_stdout():
-                    print("--- Starting Emulator Training ---")
+            with contextlib.redirect_stdout(logger):
+                print("--- Starting Emulator Training ---")
 
-                    grid_path_npz = f'Grid-Emulator_Files/{grid_file_name}.npz'
-                    print(f"Loading grid data: {grid_path_npz}")
+                grid_path_npz = f'Grid-Emulator_Files/{grid_file_name}.npz'
+                print(f"Loading grid data: {grid_path_npz}")
 
-                    # Diagnostic: Check file integrity
-                    try:
-                        file_size = os.path.getsize(grid_path_npz)
-                        print(f"File size: {file_size / (1024*1024):.2f} MB")
+                # Diagnostic: Check file integrity
+                try:
+                    file_size = os.path.getsize(grid_path_npz)
+                    print(f"File size: {file_size / (1024*1024):.2f} MB")
 
-                        print("Verifying .npz file structure...")
-                        with np.load(grid_path_npz, allow_pickle=True) as verification_data:
-                            print(f"Keys found: {list(verification_data.keys())}")
-                            if 'flux' in verification_data:
-                                print(f"Flux shape: {verification_data['flux'].shape}")
-                                # rapid check for NaNs
-                                if np.isnan(verification_data['flux']).any():
-                                    print("⚠️ WARNING: NaNs detected in flux data!")
-                            if 'grid_points' in verification_data:
-                                print(f"Grid points shape: {verification_data['grid_points'].shape}")
-                        print("File verification passed.")
-                    except Exception as e:
-                        print(f"❌ Error inspecting grid file: {e}")
-                        print("The file might be corrupted. Try selecting optional parameters again to trigger regeneration, or delete the file manually.")
-                        raise e
+                    print("Verifying .npz file structure...")
+                    with np.load(grid_path_npz, allow_pickle=True) as verification_data:
+                        print(f"Keys found: {list(verification_data.keys())}")
+                        if 'flux' in verification_data:
+                            print(f"Flux shape: {verification_data['flux'].shape}")
+                            # rapid check for NaNs
+                            if np.isnan(verification_data['flux']).any():
+                                print("⚠️ WARNING: NaNs detected in flux data!")
+                        if 'grid_points' in verification_data:
+                            print(f"Grid points shape: {verification_data['grid_points'].shape}")
+                    print("File verification passed.")
+                except Exception as e:
+                    print(f"❌ Error inspecting grid file: {e}")
+                    print("The file might be corrupted. Try selecting optional parameters again to trigger regeneration, or delete the file manually.")
+                    raise e
 
-                    sys.stdout.flush()
+                sys.stdout.flush()
 
-                    # Create emulator
-                    # Matching arguments from Speculate_dev.py
-                    # block_diagonal=True and svd_solver="full" are used there
-                    print("Initializing Emulator (running PCA/SVD)...")
-                    sys.stdout.flush()
+                # Create emulator
+                # Matching arguments from Speculate_dev.py
+                # block_diagonal=True and svd_solver="full" are used there
+                print("Initializing Emulator (running PCA/SVD)...")
+                sys.stdout.flush()
 
-                    emu = Emulator.from_grid(
-                        grid_path_npz,
-                        n_components=n_components.value,
-                        svd_solver="full",
-                        block_diagonal=True
-                    )
+                emu = Emulator.from_grid(
+                    grid_path_npz,
+                    n_components=n_components.value,
+                    svd_solver="full",
+                    block_diagonal=True
+                )
 
-                    print(f"Grid loaded. Initialized {emu.ncomps} PCA components.")
-                    print(f"Starting optimization using {method.value} (max_iter={max_iter.value})...")
-                    print("Optimization output:")
-                    sys.stdout.flush()
+                print(f"Grid loaded. Initialized {emu.ncomps} PCA components.")
+                print(f"Starting optimization using {method.value} (max_iter={max_iter.value})...")
+                print("Optimization output:")
+                sys.stdout.flush()
 
-                    # Train emulator
-                    if method.value == "Nelder-Mead":
-                        # Use ftol for relative tolerance as discussed previously
-                        emu.train(method="Nelder-Mead", options=dict(maxiter=max_iter.value, disp=True, ftol=1e-3))
-                    else:
-                        emu.train_bfgs(options=dict(maxiter=max_iter.value, disp=True))
+                # --- Live Plotting Setup ---
 
-                    print("--- Training Finished ---")
+                # Callback for live plotting
+                callback_state = {'counter': 0}
 
-                    # Save emulator
-                    os.makedirs('Grid-Emulator_Files', exist_ok=True)
-                    emu.save(f'Grid-Emulator_Files/{emu_file_name}.npz')
-                    print(f"Emulator saved to Grid-Emulator_Files/{emu_file_name}.npz")
-                    training_complete = True
+                def training_callback(xk):
+                    callback_state['counter'] += 1
+
+                    # Update only if 10 iterations passed
+                    if callback_state['counter'] % 10 == 0:
+
+                        # Update Training Loss
+                        if hasattr(emu, 'loss_history') and len(emu.loss_history) > 0:
+                            # Update global state - Marimo will react to this eventually
+                            # We copy the list to ensure change detection
+                            current_history = list(emu.loss_history)
+                            set_loss_history(current_history)
+
+                            # Generate live chart frame
+                            df = pd.DataFrame({
+                                'Iteration': range(len(current_history)),
+                                'Loss': current_history
+                            })
+                            current_iter = len(current_history)
+
+                            base = alt.Chart(df).encode(
+                                x=alt.X('Iteration:Q', axis=alt.Axis(title='Iteration')),
+                                y=alt.Y('Loss:Q', axis=alt.Axis(title='Negative Log-Likelihood'), scale=alt.Scale(zero=False)),
+                            )
+
+                            line = base.mark_line(color='#3b82f6').properties(
+                                title=f'Training Progress (Iter {current_iter})',
+                                width=600,
+                                height=300
+                            )
+
+                            if len(current_history) > 0:
+                                min_val = min(current_history)
+                                min_rule = alt.Chart(pd.DataFrame({'y': [min_val]})).mark_rule(
+                                    color='green', strokeDash=[5,5], size=2
+                                ).encode(y='y')
+                                chart = (line + min_rule)
+                            else:
+                                chart = line
+
+                            # Update UI with new chart
+                            update_ui(status_box, chart=chart)
+
+                # Train emulator with callback
+                # Note: disp=False preferred to avoid cluttered output interfering with graph
+                if method.value == "Nelder-Mead":
+                    # Use ftol for relative tolerance as discussed previously
+                    emu.train(method="Nelder-Mead", options=dict(maxiter=max_iter.value, disp=False), callback=training_callback)
+                else:
+                    emu.train_bfgs(options=dict(maxiter=max_iter.value, disp=False), callback=training_callback)
+
+                print("--- Training Finished ---")
+
+                # Save emulator
+                os.makedirs('Grid-Emulator_Files', exist_ok=True)
+                print(emu)
+                emu.save(f'Grid-Emulator_Files/{emu_file_name}.npz')
+                print(f"Emulator saved to Grid-Emulator_Files/{emu_file_name}.npz")
+                training_complete = True
+
+                # Trigger button update
+                set_training_trigger(lambda v: v + 1)
+
+                # Save persistent state
+                set_console_logs("".join(log_buffer))
+                # Also save loss history
+                if hasattr(emu, 'loss_history'):
+                    set_loss_history(list(emu.loss_history))
 
             # Create result display
             train_result = mo.md(f"""
             ✅ **Training complete!**
-
-            - **Emulator saved:** `Grid-Emulator_Files/{emu_file_name}.npz`
-            - **PCA Components:** {emu.ncomps}
-            - **Grid Points:** {len(emu.grid_points)}
-            - **Wavelength Range:** {emu.wl[0]:.1f}-{emu.wl[-1]:.1f} Å
-
-            **Emulator Info:**
-            ```
-            {str(emu)}
-            ```
             """)
 
-            # Return the result stack
-            mo.vstack([train_result])
+            set_training_status(train_result)
+            # Update final UI
+            update_ui(train_result)
 
         except Exception as e:
             error_result = mo.md(f"""
@@ -706,50 +890,79 @@ def _(
 
             Check the logs for more details.
             """)
-            mo.vstack([error_result])
+            set_console_logs("".join(log_buffer))
+            set_training_status(error_result)
+            update_ui(error_result)
 
-    elif train_button.value and emu_exists:
-        # Load existing emulator
-        emu = Emulator.load(f'Grid-Emulator_Files/{emu_file_name}.npz')
-        training_complete = True
-
-        existing_result = mo.md(f"""
-        ℹ️ **Loaded existing emulator**
-
-        - **File:** `Grid-Emulator_Files/{emu_file_name}.npz`
-        - **PCA Components:** {emu.ncomps}
-        - **Grid Points:** {len(emu.grid_points)}
-        - **Wavelength Range:** {emu.wl[0]:.1f}-{emu.wl[-1]:.1f} Å
-
-        **Emulator Info:**
-        ```
-        {str(emu)}
-        ```
-        """)
-        existing_result
     else:
-        mo.md("*Train an emulator to see results*")
-    return emu, training_complete
+        # Check for persisted results (from previous run)
+        last_status = get_training_status()
+        last_logs = get_console_logs()
+
+        if last_status is not None:
+             mo.output.replace(mo.vstack([
+                last_status,
+                mo.accordion({"Training Console Output": mo.md(f"```text\n{last_logs}\n```")})
+            ]))
+
+             # Attempt to restore emulator for visualizations if file matches
+             if os.path.exists(f'Grid-Emulator_Files/{emu_file_name}.npz'):
+                 try:
+                    emu = Emulator.load(f'Grid-Emulator_Files/{emu_file_name}.npz')
+                    # Only mark complete if successful load
+                    training_complete = True
+                 except:
+                    pass
+        else:
+            mo.md("*Train an emulator to see results*")
+    return
 
 
 @app.cell
-def _(emu, mo, plot_eigenspectra, training_complete):
-    if training_complete and emu is not None:
-        mo.md("""
-        ---
-        ## 📊 Emulator Visualization
+def _(alt, get_loss_history, mo, pd):
+    # Reactive plot cell
+    loss_data = get_loss_history()
 
-        View the eigenspectra components that make up your emulator.
-        """)
-
-        # Plot eigenspectra
-        try:
-            fig = plot_eigenspectra(emu)
-            mo.mpl.interactive(fig)
-        except Exception as e:
-            mo.md(f"⚠️ Could not plot eigenspectra: {str(e)}")
+    # Create DataFrame (handles empty case)
+    if len(loss_data) > 0:
+        df = pd.DataFrame({
+            'Iteration': range(len(loss_data)),
+            'Loss': loss_data
+        })
+        current_iter = len(loss_data)
     else:
-        mo.md("*Eigenspectra visualization will appear after training*")
+        df = pd.DataFrame({'Iteration': [], 'Loss': []})
+        current_iter = 0
+
+    # Base chart
+    base = alt.Chart(df).encode(
+        x=alt.X('Iteration:Q', axis=alt.Axis(title='Iteration')),
+        y=alt.Y('Loss:Q', axis=alt.Axis(title='Negative Log-Likelihood'), scale=alt.Scale(zero=False)),
+        tooltip=['Iteration', 'Loss']
+    )
+
+    # Line chart
+    line = base.mark_line(color='#3b82f6').properties(
+        title=f'Emulator Training Progress (Iter {current_iter})',
+        width=600,
+        height=300
+    )
+
+    # Minimum loss rule (only if data exists)
+    if len(loss_data) > 0:
+        min_val = min(loss_data)
+        min_rule = alt.Chart(pd.DataFrame({'y': [min_val]})).mark_rule(
+            color='green', strokeDash=[5,5], size=2
+        ).encode(y='y')
+        chart = (line + min_rule)
+    else:
+        chart = line
+
+    # Always display the chart container
+    mo.vstack([
+        mo.md("### 📈 Trained Emulator Loss Curve"),
+        mo.ui.altair_chart(chart)
+    ])
     return
 
 

@@ -1,0 +1,148 @@
+{
+  "type": "grid",
+  "data": {
+    "columns": 24,
+    "rowHeight": 20,
+    "maxWidth": 1400,
+    "bordered": true,
+    "cells": [
+      {
+        "position": null
+      },
+      {
+        "position": [
+          0,
+          0,
+          8,
+          6
+        ]
+      },
+      {
+        "position": null
+      },
+      {
+        "position": [
+          16,
+          0,
+          8,
+          8
+        ]
+      },
+      {
+        "position": [
+          16,
+          8,
+          8,
+          13
+        ]
+      },
+      {
+        "position": [
+          7,
+          7,
+          9,
+          16
+        ]
+      },
+      {
+        "position": [
+          0,
+          10,
+          7,
+          3
+        ]
+      },
+      {
+        "position": null
+      },
+      {
+        "position": [
+          0,
+          13,
+          7,
+          2
+        ]
+      },
+      {
+        "position": null
+      },
+      {
+        "position": [
+          0,
+          15,
+          7,
+          2
+        ]
+      },
+      {
+        "position": [
+          0,
+          32,
+          10,
+          12
+        ]
+      },
+      {
+        "position": [
+          0,
+          21,
+          7,
+          8
+        ]
+      },
+      {
+        "position": [
+          0,
+          17,
+          7,
+          4
+        ]
+      },
+      {
+        "position": [
+          0,
+          29,
+          7,
+          3
+        ]
+      },
+      {
+        "position": [
+          0,
+          44,
+          9,
+          7
+        ],
+        "scrollable": true
+      },
+      {
+        "position": [
+          12,
+          24,
+          9,
+          2
+        ]
+      },
+      {
+        "position": [
+          0,
+          51,
+          24,
+          66
+        ],
+        "scrollable": true
+      },
+      {
+        "position": null
+      },
+      {
+        "position": [
+          12,
+          26,
+          12,
+          22
+        ]
+      }
+    ]
+  }
+}

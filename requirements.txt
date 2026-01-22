@@ -15,7 +15,7 @@ flatdict
 toml
 
 # Visualization
-altair
+altair<6
 vegafusion
 vl-convert-python>=1.8.0
 

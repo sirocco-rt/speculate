@@ -654,6 +654,11 @@ class Emulator:
             block_diagonal=block_diagonal
         )
         emulator._trained = trained
+        
+        # Load loss history if available
+        if "loss_history" in data:
+            emulator.loss_history = list(data["loss_history"])
+            
         return emulator
 
     def save(self, filename: Union[str, os.PathLike]):
@@ -688,6 +693,10 @@ class Emulator:
         
         if self.name is not None:
             save_data["name"] = self.name
+            
+        # Save loss history if available (for plotting later)
+        if hasattr(self, 'loss_history'):
+            save_data["loss_history"] = self.loss_history
             
         np.savez_compressed(filename, **save_data)
         self.log.info("Saved file at {}".format(filename))
@@ -1218,7 +1227,7 @@ class Emulator:
         # Use valid max_variance bounds (at least 1.0 to avoid too tight constraints on small components)
         max_variances = np.maximum(100.0 * weights_variance, 1.0)
         
-        def nll(P):
+        def nll(P, apply_penalty=True):
             if np.any(~np.isfinite(P)):
                 return np.inf
             self.set_param_vector(P)
@@ -1229,10 +1238,10 @@ class Emulator:
                 
             # Check variances (prevent runaway)
             current_variances = self.variances
-            if np.any(current_variances > max_variances):
+            if apply_penalty and np.any(current_variances > max_variances):
                  # Soft penalty instead of hard cutoff for better optimization behavior
                  penalty = np.sum(np.maximum(0, current_variances - max_variances))
-                 return 1e10 + penalty
+                 return 1e15 + penalty
             
             loss = -self.log_likelihood()
             self.loss_history.append(loss)
@@ -1268,16 +1277,65 @@ class Emulator:
             if "fatol" not in options:
                 # Check for a user-provided relative tolerance 'ftol' or default to 1e-4
                 # This makes the convergence criteria independent of the absolute loss value
-                rel_tol = options.pop("ftol", 1e-4) 
+                rel_tol = options.pop("ftol", 1e-6) 
                 
+                # Problem: Initial loss can be orders of magnitude larger than the working regime 
+                # (e.g., 1e10 vs 1e5), making calculated fatol too large and causing early stopping.
+                # Solution: Run a short "burn-in" optimization to find a realistic loss baseline.
+                max_iter_total = options.get("maxiter", 1000)
+                
+                # Burn-in must be large enough to initialize simplex (N+1 evals) and take steps
+                # 99 params -> 100 evals just to start. Safe buffer: 200 + 100 steps.
+                n_params = len(P0)
+                # Burn-in: Short run to initialize simplex and find non-penalized region
+                burn_in_iter = 50
+                
+                if max_iter_total > (burn_in_iter * 2):
+                    self.log.info(f"Running burn-in phase ({burn_in_iter} iters) to calibrate convergence tolerance...")
+                    print(f"Burn-in phase: {burn_in_iter} iterations")
+                    
+                    # Run burn-in with bare settings (REMOVE tolerances to prevent early stop)
+                    burn_in_options = options.copy()
+                    burn_in_options["maxiter"] = burn_in_iter
+                    burn_in_options.pop("xatol", None)
+                    burn_in_options.pop("fatol", None)
+                    burn_in_options.pop("ftol", None) 
+                    
+                    burn_in_kwargs = default_kwargs.copy()
+                    burn_in_kwargs["options"] = burn_in_options
+                    
+                    # Run minimization
+                    # Disable penalty during burn-in to find valid function range
+                    burn_in_soln = minimize(nll, P0, args=(False,), **burn_in_kwargs)
+                    
+                    # Update parameters for main run
+                    P0 = burn_in_soln.x.copy()
+                    current_loss = burn_in_soln.fun
+                    
+                    print(f"Burn-in complete: Loss {initial_loss:.2e} -> {current_loss:.2e}")
+                    
+                    # Reset iteration count and history
+                    self._iteration_count = 0
+                    self.loss_history = []
+                    
+                    # Since burn-in was unpenalized, we trust its loss value for tolerance
+                    # even if it's high (though it should be ~3e5).
+                    # If P0 is still technically in penalty region, main run will handle it.
+                    initial_loss = current_loss
+                    
+                    # Reduce remaining iterations? No, just let it run full amount to be safe.
+                    # options["maxiter"] = max_iter_total - burn_in_soln.nit
+                    print(f"Main run max_iter: {options.get('maxiter')} (full allowance)")
+
                 # fatol = initial_loss * rel_tol
-                # Ensure fatol is at least 1e-4 to prevent issues if loss is near zero
-                calculated_fatol = max(1e-4, abs(initial_loss) * rel_tol)
+                # Ensure fatol is at least 1e-8 to prevent issues if loss is near zero
+                calculated_fatol = max(1e-8, abs(initial_loss) * rel_tol)
                 options["fatol"] = calculated_fatol
                 print(f"Auto-scaled fatol: {calculated_fatol:.4f} (relative tolerance: {rel_tol})")
                 default_kwargs["options"] = options
         
-        soln = minimize(nll, P0,  **default_kwargs)
+        # Main run (with penalty enabled by default)
+        soln = minimize(nll, P0, args=(True,), **default_kwargs)
         
         if self._gpu_training_mode:
             self._gpu_training_mode = False
@@ -1290,11 +1348,12 @@ class Emulator:
 
         if not soln.success:
             self.log.warning("Optimization did not succeed.")
-            self.log.info(soln.message)
+            print(f"Optimization Status: {soln.message}") # Show user why it stopped
         else:
             self.set_param_vector(soln.x)
             self._trained = True
             self.log.info("Finished optimizing emulator hyperparameters")
+            print("Optimization converged successfully.")
             self.log.info(self)
             
         # Clean up progress tracking variables
