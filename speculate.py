@@ -5,27 +5,17 @@
 
 import marimo
 
-__generated_with = "0.18.1"
+__generated_with = "0.19.6"
 app = marimo.App(
     width="full",
     app_title="Speculate - Spectral Emulator Suite",
     layout_file="layouts/speculate.grid.json",
 )
 
-
 @app.cell(hide_code=True)
 def _():
     import marimo as mo
     return (mo,)
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    #Welcome to
-    """)
-    return
-
 
 @app.cell
 def _(mo):
