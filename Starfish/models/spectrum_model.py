@@ -964,6 +964,12 @@ class SpectrumModel:
 
         model_flux, model_cov = self()
 
+        if PYTORCH_AVAILABLE:
+            if isinstance(model_flux, torch.Tensor):
+                model_flux = model_flux.detach().cpu().numpy()
+            if isinstance(model_cov, torch.Tensor):
+                model_cov = model_cov.detach().cpu().numpy()
+
         # Comparison plot
         plot_params = {"lw": 0.7}
         plot_params.update(plot_kwargs)
