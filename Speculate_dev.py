@@ -6,7 +6,7 @@ import os
 import random
 import emcee
 import corner
-import arviz as az # something broke in the enviroment
+#import arviz as az # something broke in the enviroment
 import math as m
 import matplotlib.pyplot as plt
 import multiprocessing as mp
@@ -78,7 +78,7 @@ max_wl_range = (6385, 6735)            | 7) Boundary_layer.luminosity(ergs/s)
 """
 
 # ----- Inputs here -----------------------------------------------------------|
-model_parameters = (1,2,3,4,5,6,9)  # Including parameter 9 for inclination (30°, 55°, 80°)
+model_parameters = (1,2,9)  # Including parameter 9 for inclination (30°, 55°, 80°)
 wl_range = (850, 1850)       # Wavelength range of your emulator grid space.
                               # Later becomes truncated +/-10Angstom
                               
@@ -96,7 +96,7 @@ process_grid = False           # Turn off if planning to use existing grid file.
 speculate_cv_no_bl_grid_v87f = 1 # Turn on if planning to use speculate_cv_no_bl_grid_v87f
 speculate_cv_bl_grid_v87f = 0    # Turn on if planning to use speculate_cv_bl_grid_v87f
 
-n_components = 20             # Alter the number of PCA components used.
+n_components = 10             # Alter the number of PCA components used.
 # Integer for no. of components or decimal (0.0-1.0) for 0%-100% accuracy.
 block_diagonal = True         # Use block-diagonal optimization for covariance matrix
 # -----------------------------------------------------------------------------|

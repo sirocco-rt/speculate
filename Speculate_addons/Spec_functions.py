@@ -138,13 +138,14 @@ def simplex(model, priors):
     simplex = np.zeros((N+1, N)) # Required size of the simplex for given number of parameters
     iteration = 0 # loop count to add to the simplex columns
     for name, distribution in priors.items(): # priors being used
-        if isinstance(distribution.dist, type(st.uniform)): # check if distribution is uniform
+        if distribution.dist.name == 'uniform': # check if distribution is uniform
             data_column = uniform_prior(distribution, N) # returns an even data vector/'column'
-        elif isinstance(distribution.dist, type(st.norm)): # check if distribution is normal
+        elif distribution.dist.name == 'norm': # check if distribution is normal
             data_column = normal_prior(distribution, N) # returns an even data vector/'column'
         else:
-            raise(f"Error: {name} is {type(distribution.dist)} and not a uniform or normal distribution") 
+            raise ValueError(f"Error: {name} is {distribution.dist.name} and not a uniform or normal distribution") 
         simplex[:,iteration] = data_column # adding data column to simplex
+        print(f"Simplex {name}: min={min(data_column):.4f}, max={max(data_column):.4f}")
         iteration += 1 # next loop
 
     # rolling the simplex columns +1 each additional column
@@ -342,7 +343,7 @@ class InspectGrid:
         self.grid_slider.on_changed(self.slider_updating_spectrum)
         
         # Plot Style (⌐▀͡ ̯ʖ▀)
-        logo = matplotlib.image.imread('logos/Speculate_logo.png')
+        logo = matplotlib.image.imread('assets/logos/Speculate_logo.png')
         logo_ax = self.fig.add_axes([0.86, 0.85, 0.15, 0.15])
         logo_ax.imshow(logo)
         logo_ax.axis('off') # Stops a graph of the logo

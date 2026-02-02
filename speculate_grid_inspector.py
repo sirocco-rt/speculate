@@ -1021,11 +1021,11 @@ def _(mo, obs_file_selector, os, set_obs_refresh):
     # Select observational spectrum - Delete Action
     def delete_selected_file():
         protected_files = [
-            "ixvel_all.csv", 
-            "rwsex_all.csv", 
-            "rwtri_dered.csv", 
-            "uxuma_all.csv", 
-            "v3885sgr_all.csv"
+            "CV:ixvel_all.csv", 
+            "CV:rwsex_all.csv", 
+            "CV:rwtri_dered.csv", 
+            "CV:uxuma_all.csv", 
+            "CV:v3885sgr_all.csv"
         ]
 
         if obs_file_selector.value:

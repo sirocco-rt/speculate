@@ -7,6 +7,12 @@ from scipy.special import j1
 from Starfish.constants import c_kms
 from Starfish.utils import calculate_dv
 
+# NumPy 2.0+ compatibility
+if hasattr(np, "trapezoid"):
+    trapz = np.trapezoid
+else:
+    trapz = np.trapz
+
 
 def resample(wave, flux, new_wave):
     """
@@ -263,8 +269,8 @@ def renorm(wave, flux, reference_flux):
 
 
 def _get_renorm_factor(wave, flux, reference_flux):
-    ref_int = np.trapz(reference_flux, wave)
-    flux_int = np.trapz(flux, wave, axis=-1)
+    ref_int = trapz(reference_flux, wave)
+    flux_int = trapz(flux, wave, axis=-1)
     return ref_int / flux_int
 
 

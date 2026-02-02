@@ -8,6 +8,16 @@ from scipy.linalg import cho_factor, cho_solve
 from scipy.optimize import minimize
 import toml
 
+# Try to import PyTorch for GPU acceleration
+try:
+    import torch
+    PYTORCH_AVAILABLE = True
+    # Use float64 for precision in likelihood calculations
+    DTYPE = torch.float64
+except ImportError:
+    PYTORCH_AVAILABLE = False
+    DTYPE = None
+
 from Starfish import Spectrum
 from Starfish.emulator import Emulator
 from Starfish.transforms import (
@@ -274,15 +284,21 @@ class SpectrumModel:
         if key in self.frozen:
             self.frozen.remove(key)
 
-    def __call__(self):
+    def __call__(self, use_gpu=True):
         """
         Performs the transformations according to the parameters available in
         ``self.params``
 
+        Parameters
+        ----------
+        use_gpu : bool, optional
+            If True, try to use GPU acceleration. Default is True.
+
         Returns
         -------
         flux, cov : tuple
-            The transformed flux and covariance matrix from the model
+            The transformed flux and covariance matrix from the model.
+            If GPU is used, these will be PyTorch tensors.
         """
         wave = self.min_dv_wave
         fluxes = self.bulk_fluxes
@@ -303,6 +319,115 @@ class SpectrumModel:
             coeffs = [1, *self.cheb]
             fluxes = chebyshev_correct(self.data.wave, fluxes, coeffs)
 
+        # Check if we can use GPU
+        using_gpu = use_gpu and PYTORCH_AVAILABLE and torch.cuda.is_available()
+        
+        if using_gpu:
+            try:
+                device = torch.device('cuda')
+                # Call emulator with return_tensors=True
+                weights, weights_cov = self.emulator(self.grid_params, return_tensors=True)
+                
+                # If emulator returned numpy (fallback), switch to CPU mode
+                if not isinstance(weights, torch.Tensor):
+                    using_gpu = False
+            except Exception as e:
+                self.log.warning(f"GPU acceleration failed in __call__: {e}. Falling back to CPU.")
+                using_gpu = False
+
+        if using_gpu:
+            # GPU Path
+            # Move components to GPU
+            # fluxes is (n_comp + 2, n_pix)
+            fluxes_gpu = torch.from_numpy(fluxes).to(device, DTYPE)
+            eigenspectra = fluxes_gpu[:-2]
+            flux_mean = fluxes_gpu[-2]
+            flux_std = fluxes_gpu[-1]
+            
+            # Reconstruction
+            # weights: (n_comp,)
+            # X: (n_comp, n_pix)
+            X = eigenspectra * flux_std
+            flux = torch.matmul(weights, X) + flux_mean
+            
+            # optionally scale using absolute flux calibration
+            if self.norm:
+                norm = self.emulator.norm_factor(self.grid_params)
+            else:
+                norm = 1.0
+
+            # Renorm to data flux if no "log_scale" provided
+            if "log_scale" not in self.params:
+                # Fallback to CPU for renorm factor calculation (it's fast O(N))
+                flux_cpu = flux.cpu().numpy()
+                scale = _get_renorm_factor(self.data.wave, flux_cpu * norm, self.data.flux)
+                self._log_scale = np.log(scale)
+                scale *= norm
+                self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
+            else:
+                self._log_scale = self.params["log_scale"]
+                scale = np.exp(self.params["log_scale"]) * norm
+            
+            # Apply scale
+            flux = flux * scale
+            X = X * scale
+            
+            # Covariance
+            # weights_cov: (n_comp, n_comp)
+            # X: (n_comp, n_pix)
+            # cov = X.T @ weights_cov^{-1} @ X
+            # Use Cholesky solve
+            
+            # Ensure weights_cov is positive definite for Cholesky
+            # Add jitter if needed (usually handled in emulator, but good to be safe)
+            L_weights = torch.linalg.cholesky(weights_cov)
+            
+            # Solve weights_cov @ Z = X  => L @ L.T @ Z = X
+            # Z = weights_cov^{-1} @ X
+            # torch.linalg.solve_triangular is faster than general solve
+            Z = torch.linalg.solve_triangular(L_weights, X, upper=False)
+            Z = torch.linalg.solve_triangular(L_weights.T, Z, upper=True)
+            
+            # cov = X.T @ Z
+            cov = torch.matmul(X.T, Z)
+            
+            # Add trivial covariance
+            sigma_gpu = torch.from_numpy(self.data.sigma).to(device, DTYPE)
+            cov.diagonal().add_(sigma_gpu**2)
+            
+            # Global covariance
+            if "global_cov" in self.params:
+                if "global_cov" not in self.frozen or self._glob_cov is None:
+                    ag = np.exp(self.params["global_cov:log_amp"])
+                    lg = np.exp(self.params["global_cov:log_ls"])
+                    self._glob_cov = global_covariance_matrix(self.data.wave, ag, lg)
+
+            if self._glob_cov is not None:
+                # Move to GPU if not already
+                if not isinstance(self._glob_cov, torch.Tensor):
+                    self._glob_cov_gpu = torch.from_numpy(self._glob_cov).to(device, DTYPE)
+                cov += self._glob_cov_gpu
+
+            # Local covariance
+            if "local_cov" in self.params:
+                if "local_cov" not in self.frozen or self._loc_cov is None:
+                    self._loc_cov = 0
+                    for kernel in self.params.as_dict()["local_cov"]:
+                        mu = kernel["mu"]
+                        amplitude = np.exp(kernel["log_amp"])
+                        sigma = np.exp(kernel["log_sigma"])
+                        self._loc_cov += local_covariance_matrix(
+                            self.data.wave, amplitude, mu, sigma
+                        )
+
+            if self._loc_cov is not None:
+                if not isinstance(self._loc_cov, torch.Tensor):
+                    self._loc_cov_gpu = torch.from_numpy(self._loc_cov).to(device, DTYPE)
+                cov += self._loc_cov_gpu
+
+            return flux, cov
+
+        # CPU Fallback
         weights, weights_cov = self.emulator(self.grid_params)
 
         # Decompose the bulk_fluxes (see emulator/emulator.py for the ordering)
@@ -456,15 +581,54 @@ class SpectrumModel:
 
         # Likelihood
         flux, cov = self()
-        np.fill_diagonal(cov, cov.diagonal() + 1e-50) # Austen edit 1e-10 -> 1e-30
-        factor, flag = cho_factor(cov, overwrite_a=True)
-        logdet = 2 * np.sum(np.log(factor.diagonal()))
-        R = flux - self.data.flux
-        self.residuals.append(R)
-        sqmah = R @ cho_solve((factor, flag), R)
-        self._lnprob = -(logdet + sqmah) / 2
+        
+        if PYTORCH_AVAILABLE and isinstance(cov, torch.Tensor):
+            # GPU Path
+            # Add jitter for stability
+            cov.diagonal().add_(1e-50)
+            
+            try:
+                # Cholesky decomposition
+                L = torch.linalg.cholesky(cov)
+                
+                # Log determinant: 2 * sum(log(diag(L)))
+                logdet = 2 * torch.sum(torch.log(L.diagonal()))
+                
+                # Residuals
+                # self.data.flux is numpy, move to GPU
+                data_flux_gpu = torch.from_numpy(self.data.flux).to(cov.device, DTYPE)
+                R = flux - data_flux_gpu
+                
+                # Store residuals (move back to CPU for deque)
+                self.residuals.append(R.cpu().numpy())
+                
+                # Mahalanobis distance: R.T @ cov^{-1} @ R
+                # Solve cov @ alpha = R  => L @ L.T @ alpha = R
+                # alpha = cov^{-1} @ R
+                alpha = torch.linalg.solve_triangular(L, R.unsqueeze(-1), upper=False)
+                alpha = torch.linalg.solve_triangular(L.T, alpha, upper=True)
+                
+                sqmah = torch.matmul(R, alpha.squeeze())
+                
+                self._lnprob = -(logdet + sqmah) / 2
+                
+                # Return as float (CPU)
+                return float(self._lnprob.cpu()) + prior_lp
+                
+            except RuntimeError:
+                # Cholesky failed (not positive definite)
+                return -np.inf
+        else:
+            # CPU Path
+            np.fill_diagonal(cov, cov.diagonal() + 1e-50) # Austen edit 1e-10 -> 1e-30
+            factor, flag = cho_factor(cov, overwrite_a=True)
+            logdet = 2 * np.sum(np.log(factor.diagonal()))
+            R = flux - self.data.flux
+            self.residuals.append(R)
+            sqmah = R @ cho_solve((factor, flag), R)
+            self._lnprob = -(logdet + sqmah) / 2
 
-        return self._lnprob + prior_lp
+            return self._lnprob + prior_lp
 
     def get_param_dict(self, flat: bool = False) -> dict:
         """
