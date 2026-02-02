@@ -5,7 +5,7 @@
 
 import marimo
 
-__generated_with = "0.19.6"
+__generated_with = "0.18.4"
 app = marimo.App(width="full", app_title="Speculate Inference Tool")
 
 
@@ -171,7 +171,7 @@ def _(mo, os):
     else:
         grid_selector = mo.ui.dropdown(
             options=[],
-            disabled=True,
+            #disabled=True,
             label="No Grids Found",
             full_width=True
         )
@@ -226,7 +226,7 @@ def _(grid_selector, mo, os, param_map_db, re):
     else:
         emulator_selector = mo.ui.dropdown(
             options=[],
-            disabled=True,
+            #disabled=True,
             label="No Emulators for this Grid",
             full_width=True
         )
@@ -366,7 +366,7 @@ def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
     else:
          obs_file_selector = mo.ui.dropdown(
             options=[],
-            disabled=True,
+            #disabled=True,
             label="No Observations Found",
             full_width=True
         )
@@ -382,7 +382,7 @@ def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
     else:
         test_run_selector = mo.ui.dropdown(
             options=[],
-            disabled=True,
+            #disabled=True,
             label="No Test Grid Available",
             full_width=True
         )
@@ -561,7 +561,7 @@ def _(
         step=0.1, 
         label="Min Wavelength (Å)",
         full_width=True,
-        disabled=obs_data is None
+        #disabled=obs_data is None
     )
 
     wl_max_input = mo.ui.number(
@@ -569,7 +569,7 @@ def _(
         step=0.1, 
         label="Max Wavelength (Å)",
         full_width=True,
-        disabled=obs_data is None
+        #disabled=obs_data is None
     )
     return (
         data_source_info,
@@ -1227,7 +1227,7 @@ def _(get_mle_model, mo):
     run_mcmc_btn = mo.ui.run_button(
         label="🎲 Run MCMC", 
         kind="warn",
-        disabled=_model is None
+        #disabled=_model is None
     )
 
     if _model is None:

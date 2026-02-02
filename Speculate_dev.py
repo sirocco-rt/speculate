@@ -204,7 +204,7 @@ model_parameters_str = ''.join(str(i) for i in model_parameters)
 #     print(emu_file_name)
 
 if speculate_cv_no_bl_grid_v87f == 1:
-    base_name = 'speculate_cv_no_bl_grid_v87f_'
+    base_name = 'speculate_cv_no-bl_grid_v87f_'
     # saved grid file name
     grid_file_name = base_name + 'grid_' + model_parameters_str
     # Can change inclination inclination angle

@@ -459,7 +459,7 @@ def _(
         _grid_name = grid_selector.value
 
         # Standardize base name
-        _base_name = _grid_name.replace("-", "_") + "_"
+        _base_name = _grid_name + "_"
 
         # Determine emulator file name
         _fixed_inc = 55
@@ -533,7 +533,7 @@ def _(
         grid_path = sirocco_grids_path / grid_name
 
         # Standardize base name from grid folder name (e.g. no-bl -> no_bl)
-        base_name = grid_name.replace("-", "_") + "_"
+        base_name = grid_name + "_"
 
         # Generate file names
         grid_file_name = f"{base_name}grid_{model_parameters_str}"
