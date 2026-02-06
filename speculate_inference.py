@@ -1274,10 +1274,20 @@ def _(
                 # 6b. Loss curve plot
                 if len(_nll_history) > 10:
                     _fig_loss, _ax_loss = _plt.subplots(figsize=(8, 3))
-                    _ax_loss.plot(_nll_history, 'b-', alpha=0.7, linewidth=0.5)
+                    _ax_loss.plot(_nll_history, 'g-', alpha=0.7, linewidth=0.5)
                     # Rolling minimum
                     _rolling_min = np.minimum.accumulate(_nll_history)
                     _ax_loss.plot(_rolling_min, 'r-', linewidth=2, label='Best NLL')
+
+                    # Smart Scaling: Ignore initial drop (first 15%) and scale to Best NLL range
+                    _burn_in = max(5, int(len(_rolling_min) * 0.15))
+                    if _burn_in < len(_rolling_min):
+                         _view_data = _rolling_min[_burn_in:]
+                         _ymin, _ymax = _view_data.min(), _view_data.max()
+                         _yrange = _ymax - _ymin
+                         if _yrange == 0: _yrange = abs(_ymin) * 0.1 or 1.0
+                         _ax_loss.set_ylim(_ymin - 0.05*_yrange, _ymax + 0.05*_yrange)
+
                     _ax_loss.set_xlabel('Iteration')
                     _ax_loss.set_ylabel('Negative Log Likelihood')
                     _ax_loss.set_title('MLE Convergence')
