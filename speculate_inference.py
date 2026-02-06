@@ -12,6 +12,7 @@ app = marimo.App(width="full", app_title="Speculate Inference Tool")
 @app.cell
 def _():
     import marimo as mo
+    mo._runtime.context.get_context().marimo_config["runtime"]["output_max_bytes"] = 10_000_000_000
     import os
     import re
     import numpy as np
@@ -1427,10 +1428,15 @@ def _(
         with mo.status.spinner("Running MCMC..."):
             try:
                 import emcee as _emcee
+                import arviz as _az
+                import corner as _corner
+                import matplotlib.pyplot as _plt
+                import matplotlib
+                matplotlib.rcParams['figure.max_open_warning'] = 50
 
                 _nwalkers = mcmc_nwalkers.value
                 _nsteps = mcmc_nsteps.value
-                _burnin = mcmc_burnin.value
+                _burnin_manual = mcmc_burnin.value
                 _ndim = len(_model.labels)
 
                 # Define log probability function
@@ -1439,7 +1445,6 @@ def _(
                     return model.log_likelihood(priors)
 
                 # Initialize walkers in a ball around MLE solution
-                # Use small perturbations based on parameter scales
                 _default_scales = {
                     "param1": 0.05, "param2": 0.02, "param3": 0.1,
                     "param4": 0.05, "param5": 0.1, "param6": 0.1,
@@ -1464,35 +1469,158 @@ def _(
                 for _ in mo.status.progress_bar(range(_nsteps), title="MCMC Sampling"):
                     _sampler.run_mcmc(_ball if _sampler.iteration == 0 else None, 1, progress=False)
 
-                # Get chains
-                _samples = _sampler.get_chain(discard=_burnin, flat=True)
+                # ============================================================
+                # Stage 15: Raw MCMC Chains (Full, pre burn-in)
+                # ============================================================
+                # _sampler.get_chain() shape: (nsteps, nwalkers, ndim)
+                _full_chain = _sampler.get_chain()
 
-                # Calculate statistics
-                _results_md = "### MCMC Results\n\n"
-                _results_md += "| Parameter | Mean | Std | "
+                # Build arviz InferenceData for full chain
+                # arviz from_dict expects {name: (chains, draws)}
+                _full_dd = {}
+                for _i, _label in enumerate(_model.labels):
+                    _full_dd[_label] = _full_chain[:, :, _i].T  # (walkers, steps)
+                _full_data = _az.from_dict(posterior=_full_dd)
+
+                # Plot full chains (trace plot)
+                _fig_full_trace = _az.plot_trace(_full_data)
+                _fig_full_chain = _fig_full_trace.ravel()[0].figure
+                _fig_full_chain.suptitle("Raw MCMC Chains (Full)", y=1.02)
+                _fig_full_chain.tight_layout()
+
+                # ============================================================
+                # Stage 16: Autocorrelation & Burn-in
+                # ============================================================
+                # Compute autocorrelation time
+                try:
+                    _tau = _sampler.get_autocorr_time(tol=0)
+                    _tau_valid = not (np.isnan(_tau).any() or (_tau == 0).any())
+                except Exception:
+                    _tau = np.full(_ndim, np.nan)
+                    _tau_valid = False
+
+                if _tau_valid:
+                    _auto_burnin = int(_tau.max())
+                    _auto_thin = max(1, int(0.3 * np.min(_tau)))
+                    _burnin_used = max(_burnin_manual, _auto_burnin)
+                else:
+                    _auto_burnin = 0
+                    _auto_thin = 1
+                    _burnin_used = _burnin_manual
+
+                _thin_used = _auto_thin
+
+                # Ensure we don't discard everything
+                if _burnin_used >= _nsteps:
+                    _burnin_used = max(0, _nsteps // 2)
+
+                _burn_chain = _sampler.get_chain(discard=_burnin_used, thin=_thin_used)
+                _burn_samples = _burn_chain.reshape((-1, _ndim))
+
+                _burnin_info = (
+                    f"- **Manual burn-in requested:** {_burnin_manual}\n"
+                    f"- **Autocorrelation burn-in:** {_auto_burnin if _tau_valid else 'N/A (unconverged)'}\n"
+                    f"- **Burn-in used:** {_burnin_used}\n"
+                    f"- **Thinning:** {_thin_used}\n"
+                    f"- **Effective samples:** {_burn_samples.shape[0]} "
+                    f"({_burn_chain.shape[0]} steps × {_burn_chain.shape[1]} walkers)"
+                )
+                if _tau_valid:
+                    _tau_strs = [f"  - {_model.labels[_j]}: {_tau[_j]:.1f}" for _j in range(_ndim)]
+                    _burnin_info += "\n- **Autocorrelation times:**\n" + "\n".join(_tau_strs)
+
+                # ============================================================
+                # Stage 17: Burnt chain trace, summary & posteriors
+                # ============================================================
+                _burn_dd = {}
+                for _i, _label in enumerate(_model.labels):
+                    _burn_dd[_label] = _burn_chain[:, :, _i].T  # (walkers, steps_after_burn)
+                _burn_data = _az.from_dict(posterior=_burn_dd)
+
+                # Trace plot (post burn-in)
+                _fig_burn_trace = _az.plot_trace(_burn_data)
+                _fig_burn_chain = _fig_burn_trace.ravel()[0].figure
+                _fig_burn_chain.suptitle("MCMC Chains (Post Burn-in)", y=1.02)
+                _fig_burn_chain.tight_layout()
+
+                # Summary table
+                _summary_df = _az.summary(_burn_data, round_to=5)
+                _summary_md = _summary_df.to_markdown()
+
+                # Posterior distributions
+                _fig_posterior = _az.plot_posterior(
+                    _burn_data,
+                    var_names=list(_model.labels)
+                )
+                _fig_post = _fig_posterior.ravel()[0].figure
+                _fig_post.suptitle("Posterior Distributions", y=1.02)
+                _fig_post.tight_layout()
+
+                # ============================================================
+                # Stage 18: Corner plot
+                # ============================================================
+                # Build truths for corner plot from ground truth
+                _gt_key_map = {
+                    'param1': 'disk.mdot', 'param2': 'wind.mdot', 'param3': 'KWD.d',
+                    'param4': 'KWD.mdot_r_exponent', 'param5': 'KWD.acceleration_length',
+                    'param6': 'KWD.acceleration_exponent',
+                    'param7': 'Boundary_layer.luminosity', 'param8': 'Boundary_layer.temp',
+                    'param9': 'Inclination', 'param10': 'Inclination', 'param11': 'Inclination'
+                }
+
+                _truths = None
+                if ground_truth_params:
+                    _truths = []
+                    _has_any = False
+                    for _label in _model.labels:
+                        _gt_key = _gt_key_map.get(_label)
+                        if _gt_key and _gt_key in ground_truth_params:
+                            _truths.append(ground_truth_params[_gt_key])
+                            _has_any = True
+                        else:
+                            _truths.append(None)
+                    if not _has_any:
+                        _truths = None
+
+                _fig_corner = _corner.corner(
+                    _burn_samples,
+                    labels=list(_model.labels),
+                    show_titles=True,
+                    quantiles=[0.16, 0.5, 0.84],
+                    title_fmt=".4f",
+                    truths=_truths
+                )
+
+                # ============================================================
+                # Stage 19: Best-fit MCMC model plot
+                # ============================================================
+                _mcmc_means = {}
+                for _i, _label in enumerate(_model.labels):
+                    _mcmc_means[_label] = float(np.mean(_burn_samples[:, _i]))
+                _model.set_param_dict(_mcmc_means)
+
+                _model.plot(yscale="linear")
+                _fig_bestfit = _plt.gcf()
+                _fig_bestfit.suptitle("Best-Fit Model (MCMC Posterior Mean)", y=1.02)
+                _fig_bestfit.tight_layout()
+
+                # ============================================================
+                # Results table with ground truth comparison
+                # ============================================================
+                _results_md = "### MCMC Parameter Estimates\n\n"
+                _results_md += "| Parameter | Mean | Std | Median | "
                 if ground_truth_params:
                     _results_md += "Truth | Δσ |\n"
-                    _results_md += "|-----------|------|-----|-------|----|\n"
+                    _results_md += "|-----------|------|-----|--------|-------|----|\n"
                 else:
-                    _results_md += "\n|-----------|------|-----|\n"
-
-                _param_means = {}
-                _param_stds = {}
+                    _results_md += "\n|-----------|------|-----|--------|\n"
 
                 for _i, _label in enumerate(_model.labels):
-                    _mean = np.mean(_samples[:, _i])
-                    _std = np.std(_samples[:, _i])
-                    _param_means[_label] = _mean
-                    _param_stds[_label] = _std
+                    _mean = np.mean(_burn_samples[:, _i])
+                    _std = np.std(_burn_samples[:, _i])
+                    _median = np.median(_burn_samples[:, _i])
 
-                    _results_md += f"| **{_label}** | {_mean:.4f} | {_std:.4f} | "
-
-                    # Check ground truth
-                    _gt_key_map = {
-                        'param1': 'disk.mdot', 'param2': 'wind.mdot', 'param3': 'KWD.d',
-                        'param4': 'KWD.mdot_r_exponent', 'param5': 'KWD.acceleration_length',
-                        'param6': 'KWD.acceleration_exponent', 'param9': 'Inclination'
-                    }
+                    _results_md += f"| **{_label}** | {_mean:.4f} | {_std:.4f} | {_median:.4f} | "
 
                     if ground_truth_params:
                         _gt_key = _gt_key_map.get(_label)
@@ -1505,44 +1633,42 @@ def _(
                     else:
                         _results_md += "\n"
 
-                # Corner plot
-                import corner as _corner
-                import matplotlib.pyplot as _plt
-
-                _fig_corner = _corner.corner(
-                    _samples,
-                    labels=_model.labels,
-                    show_titles=True,
-                    quantiles=[0.16, 0.5, 0.84],
-                    title_fmt=".3f"
+                # ============================================================
+                # Assemble output with accordions
+                # ============================================================
+                _status_callout = mo.callout(
+                    mo.md(
+                        f"✅ MCMC Complete! ({_nsteps} steps, "
+                        f"{_nwalkers} walkers, burn-in {_burnin_used}, thin {_thin_used})"
+                    ),
+                    kind="success"
                 )
 
-                # Add ground truth lines if available
-                if ground_truth_params:
-                    _truths = []
-                    for _label in _model.labels:
-                        _gt_key = _gt_key_map.get(_label)
-                        if _gt_key and _gt_key in ground_truth_params:
-                            _truths.append(ground_truth_params[_gt_key])
-                        else:
-                            _truths.append(None)
-
-                    # Redraw with truths
-                    _plt.close(_fig_corner)
-                    _fig_corner = _corner.corner(
-                        _samples,
-                        labels=_model.labels,
-                        show_titles=True,
-                        quantiles=[0.16, 0.5, 0.84],
-                        title_fmt=".3f",
-                        truths=[_t for _t in _truths if _t is not None] if any(_t is not None for _t in _truths) else None
-                    )
+                _chain_accordion = mo.accordion({
+                    "🔗 Raw MCMC Chains (Full)": mo.vstack([
+                        mo.md("Walker traces for all parameters before burn-in removal."),
+                        _fig_full_chain
+                    ]),
+                    "🔥 Burnt MCMC Chains (Post Burn-in)": mo.vstack([
+                        mo.md(_burnin_info),
+                        _fig_burn_chain
+                    ]),
+                    "📊 Posterior Distributions": mo.vstack([
+                        _fig_post
+                    ]),
+                    "📋 Arviz Summary Statistics": mo.vstack([
+                        mo.md(_summary_md)
+                    ]),
+                })
 
                 mcmc_results = mo.vstack([
-                    mo.callout(mo.md(f"✅ MCMC Complete! ({_nsteps} steps, {_burnin} burn-in)"), kind="success"),
+                    _status_callout,
                     mo.md(_results_md),
-                    mo.md("### Corner Plot (Posterior Distributions)"),
-                    _fig_corner
+                    _chain_accordion,
+                    mo.md("### Corner Plot"),
+                    _fig_corner,
+                    mo.md("### Best-Fit Model (MCMC Posterior Mean)"),
+                    _fig_bestfit,
                 ])
 
             except Exception as _e:

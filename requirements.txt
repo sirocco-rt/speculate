@@ -1,5 +1,5 @@
 # Core dependencies
-marimo>=0.18.1
+marimo>=0.19.6
 uvicorn[standard]
 
 # Add other dependencies below
@@ -21,7 +21,7 @@ vl-convert-python>=1.8.0
 
 # Speculate Core
 emcee
-corner
+corner>=2.2.3
 astropy
 extinction
 sigfig
@@ -31,3 +31,7 @@ torchvision
 
 # Debugging and Profiling
 pyinstrument
+
+# Arviz for MCMC diagnostics (last to avoid potential conflicts with other dependencies)
+arviz>=0.23.0
+tabulate
