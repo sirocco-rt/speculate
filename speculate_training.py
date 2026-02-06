@@ -404,7 +404,7 @@ def _(mo):
         label="Flux Scale:"
     )
 
-    n_components = mo.ui.slider(start=2, stop=20, value=10, step=1, label="PCA Components:",show_value=True,)
+    n_components = mo.ui.slider(start=2, stop=30, value=10, step=1, label="PCA Components:",show_value=True,)
 
     mo.vstack([wl_min, wl_max, scale_selector, n_components])
     return n_components, scale_selector, wl_max, wl_min

@@ -188,6 +188,14 @@ class SpectrumModel:
         self._loc_cov = None
         self._log_scale = params.get("log_scale", None)
 
+        # GPU caches — avoid redundant CPU→GPU transfers and scipy calls
+        self._cached_resampled_fluxes = None  # cache resample() when wave is constant
+        self._cached_fluxes_gpu = None         # GPU tensor of resampled fluxes
+        self._cached_data_flux_gpu = None      # GPU tensor of data.flux
+        self._cached_data_sigma_gpu = None     # GPU tensor of data.sigma
+        self._cached_glob_cov_gpu = None       # GPU tensor of global_cov matrix
+        self._cached_glob_cov_params = None    # (log_amp, log_ls) used to build cache
+
         self.log = logging.getLogger(self.__class__.__name__)
 
     @property
@@ -303,13 +311,25 @@ class SpectrumModel:
         wave = self.min_dv_wave
         fluxes = self.bulk_fluxes
 
+        # Track whether wave/fluxes changed (vsini/vz invalidate cache)
+        _wave_changed = False
         if "vsini" in self.params:
             fluxes = rotational_broaden(wave, fluxes, self.params["vsini"])
+            _wave_changed = True
 
         if "vz" in self.params:
             wave = doppler_shift(wave, self.params["vz"])
+            _wave_changed = True
 
-        fluxes = resample(wave, fluxes, self.data.wave)
+        # Cache resample() — scipy spline interpolation is expensive and the
+        # inputs (wave, fluxes, data.wave) are constant when vsini/vz are absent.
+        if _wave_changed or self._cached_resampled_fluxes is None:
+            fluxes = resample(wave, fluxes, self.data.wave)
+            if not _wave_changed:
+                # Safe to cache since inputs won't change next call
+                self._cached_resampled_fluxes = fluxes
+        else:
+            fluxes = self._cached_resampled_fluxes
 
         if "Av" in self.params:
             fluxes = extinct(self.data.wave, fluxes, self.params["Av"])
@@ -337,16 +357,20 @@ class SpectrumModel:
 
         if using_gpu:
             # GPU Path
-            # Move components to GPU
-            # fluxes is (n_comp + 2, n_pix)
-            fluxes_gpu = torch.from_numpy(fluxes).to(device, DTYPE)
+            # Cache the fluxes GPU tensor when Av/cheb are not present (fluxes constant)
+            _av_or_cheb_active = "Av" in self.params or "cheb" in self.params
+            if _av_or_cheb_active or _wave_changed or self._cached_fluxes_gpu is None:
+                fluxes_gpu = torch.from_numpy(fluxes).to(device, DTYPE)
+                if not _av_or_cheb_active and not _wave_changed:
+                    self._cached_fluxes_gpu = fluxes_gpu
+            else:
+                fluxes_gpu = self._cached_fluxes_gpu
+
             eigenspectra = fluxes_gpu[:-2]
             flux_mean = fluxes_gpu[-2]
             flux_std = fluxes_gpu[-1]
             
             # Reconstruction
-            # weights: (n_comp,)
-            # X: (n_comp, n_pix)
             X = eigenspectra * flux_std
             flux = torch.matmul(weights, X) + flux_mean
             
@@ -358,8 +382,7 @@ class SpectrumModel:
 
             # Renorm to data flux if no "log_scale" provided
             if "log_scale" not in self.params:
-                # Fallback to CPU for renorm factor calculation (it's fast O(N))
-                flux_cpu = flux.cpu().numpy()
+                flux_cpu = flux.detach().cpu().numpy()
                 scale = _get_renorm_factor(self.data.wave, flux_cpu * norm, self.data.flux)
                 self._log_scale = np.log(scale)
                 scale *= norm
@@ -372,41 +395,57 @@ class SpectrumModel:
             flux = flux * scale
             X = X * scale
             
-            # Covariance
-            # weights_cov: (n_comp, n_comp)
-            # X: (n_comp, n_pix)
-            # cov = X.T @ weights_cov^{-1} @ X
-            # Use Cholesky solve
-            
-            # Ensure weights_cov is positive definite for Cholesky
-            # Add jitter if needed (usually handled in emulator, but good to be safe)
+            # Covariance via Cholesky solve
             L_weights = torch.linalg.cholesky(weights_cov)
-            
-            # Solve weights_cov @ Z = X  => L @ L.T @ Z = X
-            # Z = weights_cov^{-1} @ X
-            # torch.linalg.solve_triangular is faster than general solve
             Z = torch.linalg.solve_triangular(L_weights, X, upper=False)
             Z = torch.linalg.solve_triangular(L_weights.T, Z, upper=True)
-            
-            # cov = X.T @ Z
             cov = torch.matmul(X.T, Z)
             
-            # Add trivial covariance
-            sigma_gpu = torch.from_numpy(self.data.sigma).to(device, DTYPE)
-            cov.diagonal().add_(sigma_gpu**2)
+            # Add trivial covariance — cache sigma on GPU
+            if self._cached_data_sigma_gpu is None:
+                self._cached_data_sigma_gpu = torch.from_numpy(
+                    self.data.sigma).to(device, DTYPE)
+            cov.diagonal().add_(self._cached_data_sigma_gpu ** 2)
             
-            # Global covariance
+            # Global covariance — GPU-accelerated with parameter-based caching
             if "global_cov" in self.params:
-                if "global_cov" not in self.frozen or self._glob_cov is None:
-                    ag = np.exp(self.params["global_cov:log_amp"])
-                    lg = np.exp(self.params["global_cov:log_ls"])
-                    self._glob_cov = global_covariance_matrix(self.data.wave, ag, lg)
+                _cur_ag = self.params["global_cov:log_amp"]
+                _cur_lg = self.params["global_cov:log_ls"]
+                _cur_glob_params = (_cur_ag, _cur_lg)
 
-            if self._glob_cov is not None:
-                # Move to GPU if not already
-                if not isinstance(self._glob_cov, torch.Tensor):
-                    self._glob_cov_gpu = torch.from_numpy(self._glob_cov).to(device, DTYPE)
-                cov += self._glob_cov_gpu
+                if ("global_cov" not in self.frozen
+                        or self._cached_glob_cov_gpu is None):
+                    # Only recompute if hyperparams actually changed
+                    if self._cached_glob_cov_params != _cur_glob_params:
+                        ag = np.exp(_cur_ag)
+                        lg = np.exp(_cur_lg)
+                        # Build kernel directly on GPU to avoid CPU meshgrid
+                        wave_gpu = torch.from_numpy(
+                            self.data.wave).to(device, DTYPE)
+                        wx = wave_gpu.unsqueeze(0)  # (1, N)
+                        wy = wave_gpu.unsqueeze(1)  # (N, 1)
+                        from Starfish.constants import c_kms as _c_kms
+                        r = _c_kms / 2 * torch.abs(
+                            (wx - wy) / (wx + wy))
+                        r0 = 6 * lg
+                        mask = r <= r0
+                        kernel = torch.zeros_like(r)
+                        r_masked = r[mask]
+                        taper = 0.5 + 0.5 * torch.cos(
+                            torch.tensor(np.pi, device=device,
+                                         dtype=DTYPE) * r_masked / r0)
+                        kernel[mask] = (
+                            taper * ag
+                            * (1 + np.sqrt(3) * r_masked / lg)
+                            * torch.exp(-np.sqrt(3) * r_masked / lg)
+                        )
+                        self._cached_glob_cov_gpu = kernel
+                        self._cached_glob_cov_params = _cur_glob_params
+                        # Keep numpy version in sync for CPU fallback / plot
+                        self._glob_cov = kernel
+
+                if self._cached_glob_cov_gpu is not None:
+                    cov = cov + self._cached_glob_cov_gpu
 
             # Local covariance
             if "local_cov" in self.params:
@@ -422,7 +461,8 @@ class SpectrumModel:
 
             if self._loc_cov is not None:
                 if not isinstance(self._loc_cov, torch.Tensor):
-                    self._loc_cov_gpu = torch.from_numpy(self._loc_cov).to(device, DTYPE)
+                    self._loc_cov_gpu = torch.from_numpy(
+                        self._loc_cov).to(device, DTYPE)
                 cov += self._loc_cov_gpu
 
             return flux, cov
@@ -594,17 +634,17 @@ class SpectrumModel:
                 # Log determinant: 2 * sum(log(diag(L)))
                 logdet = 2 * torch.sum(torch.log(L.diagonal()))
                 
-                # Residuals
-                # self.data.flux is numpy, move to GPU
-                data_flux_gpu = torch.from_numpy(self.data.flux).to(cov.device, DTYPE)
-                R = flux - data_flux_gpu
+                # Residuals — cache data tensor on GPU
+                if self._cached_data_flux_gpu is None:
+                    self._cached_data_flux_gpu = torch.from_numpy(
+                        self.data.flux).to(cov.device, DTYPE)
+                R = flux - self._cached_data_flux_gpu
                 
-                # Store residuals (move back to CPU for deque)
-                self.residuals.append(R.cpu().numpy())
+                # Store residuals (only periodically to avoid GPU sync stalls)
+                if len(self.residuals) == 0 or len(self.residuals) % 50 == 0:
+                    self.residuals.append(R.detach().cpu().numpy())
                 
-                # Mahalanobis distance: R.T @ cov^{-1} @ R
-                # Solve cov @ alpha = R  => L @ L.T @ alpha = R
-                # alpha = cov^{-1} @ R
+                # Mahalanobis distance via Cholesky triangular solves
                 alpha = torch.linalg.solve_triangular(L, R.unsqueeze(-1), upper=False)
                 alpha = torch.linalg.solve_triangular(L.T, alpha, upper=True)
                 
@@ -612,8 +652,8 @@ class SpectrumModel:
                 
                 self._lnprob = -(logdet + sqmah) / 2
                 
-                # Return as float (CPU)
-                return float(self._lnprob.cpu()) + prior_lp
+                # Return as float (CPU) — .item() is faster than float(.cpu())
+                return self._lnprob.item() + prior_lp
                 
             except RuntimeError:
                 # Cholesky failed (not positive definite)

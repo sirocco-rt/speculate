@@ -5,7 +5,7 @@
 
 import marimo
 
-__generated_with = "0.18.4"
+__generated_with = "0.19.7"
 app = marimo.App(width="full", app_title="Speculate Inference Tool")
 
 
@@ -812,31 +812,39 @@ def _(emu, grid_indices, mo, param_map_db, re):
         # log_scale: natural log of flux scaling factor
         # Typically auto-calculated if not set, but can be optimized
         # Range allows for large scaling adjustments
-        bounds['log_scale'] = [-50.0, 10.0]
-        defaults['log_scale'] = 0.0  # No scaling by default
+        bounds['log_scale'] = [-80.0, 10.0]
+        defaults['log_scale'] = -35.0  # Typical for linear-scale spectra
 
-        bounds['log_amp'] = [-10.0, 0.0]
-        defaults['log_amp'] = -2.0
+        # log_amp: GP global covariance amplitude (natural log)
+        # For linear-scale spectra, typically around -52 (see Speculate_dev.py)
+        bounds['log_amp'] = [-80.0, 0.0]
+        defaults['log_amp'] = -52.0
 
-        bounds['log_ls'] = [0.0, 4.0] # 10^0 to 10^4 Angstroms
-        defaults['log_ls'] = 2.0  # 100 A
+        # log_ls: GP global covariance length scale (natural log)
+        # Typical range ~0.1 to 11 Angstroms (see Speculate_dev.py)
+        bounds['log_ls'] = [0.1, 11.0]
+        defaults['log_ls'] = 5.0
 
     # Create Widgets
-    w_fix = {}
-    w_val = {}
+    # w_fix uses mo.ui.dictionary so checkbox changes are reactive
+    _fix_dict = {}
+    _val_dict = {}
     w_min = {}
     w_max = {}
 
     for _name in param_names:
-        w_fix[_name] = mo.ui.checkbox(value=False, label="Fix?")
+        _fix_dict[_name] = mo.ui.checkbox(value=False)
 
         mn, mx = bounds.get(_name, [0.0, 1.0])
         default = defaults.get(_name, 0.5)
 
-        # Using simple numbers that will be part of the form
-        w_val[_name] = mo.ui.number(value=default, step=0.01, label=f"Value", full_width=True)
-        w_min[_name] = mo.ui.number(value=mn, step=0.01, label=f"Min", full_width=True)
-        w_max[_name] = mo.ui.number(value=mx, step=0.01, label=f"Max", full_width=True)
+        _val_dict[_name] = mo.ui.number(value=default, step=0.01, label="", full_width=True)
+        w_min[_name] = mo.ui.number(value=mn, step=0.01, label="Min", full_width=True)
+        w_max[_name] = mo.ui.number(value=mx, step=0.01, label="Max", full_width=True)
+
+    # Wrap in mo.ui.dictionary for Marimo reactivity
+    w_fix = mo.ui.dictionary(_fix_dict) if _fix_dict else mo.ui.dictionary({})
+    w_val = mo.ui.dictionary(_val_dict) if _val_dict else mo.ui.dictionary({})
     return bounds, param_names, w_fix, w_max, w_min, w_val
 
 
@@ -846,52 +854,87 @@ def _(bounds, mo, param_names, w_fix, w_max, w_min, w_val):
     if not param_names:
          param_settings = mo.md("*Load an emulator to see parameters.*")
     else:
-        rows = []
-        # Header
-        rows.append(
-            mo.hstack([
-                mo.md("**Parameter**"), 
-                mo.md("**Fix?**"), 
-                mo.md("**Configuration (Value | Min - Max)**")
-            ], widths=[2, 1, 5])
-        )
-        rows.append(mo.md("---"))
+        # Parameters that use a normal prior instead of uniform
+        _normal_prior_params = {'log_amp'}
+
+        # Friendly display names
+        _label_map = {
+            'log_scale': 'Log Scale (ln)',
+            'log_amp': 'GP Log Amp (ln)',
+            'log_ls': 'GP Log Length (ln)',
+        }
+
+        # Read the reactive dictionary values
+        _fix_values = w_fix.value   # dict: {name: bool}
+        _val_elements = w_val.elements  # dict: {name: widget}
+
+        # --- Build Grid Parameters Section ---
+        _grid_rows = []
+        _global_rows = []
 
         for _name in param_names:
-             is_fixed = w_fix[_name].value
+            is_fixed = _fix_values.get(_name, False)
+            display_name = _label_map.get(_name, _name)
+            _mn, _mx = bounds.get(_name, [0.0, 1.0])
+            is_global = _name in ('Av', 'log_scale', 'log_amp', 'log_ls')
 
-             label_map = {
-                'log_scale': 'Log Scale (ln)',
-                'log_amp': 'GP Log Amp (ln)',
-                'log_ls': 'GP Log Length (ln)'
-            }
-             display_name = label_map.get(_name, _name)
+            # Fix toggle — access the individual checkbox widget from w_fix
+            _fix_widget = w_fix.elements[_name]
 
-             # Get bounds for display
-             _mn, _mx = bounds.get(_name, [0.0, 1.0])
+            if is_fixed:
+                # FIXED: show value input + locked indicator
+                _prior_col = mo.hstack([
+                    _val_elements[_name],
+                    mo.md(f"<span style='color: orange;'>🔒 Fixed</span>"),
+                ], widths=[3, 2], align="center")
+            else:
+                # FREE: show prior distribution controls
+                if _name in _normal_prior_params:
+                    # Normal prior: Value = center, Min/Max define ±2σ range
+                    _prior_col = mo.hstack([
+                        mo.vstack([mo.md("<small>Center</small>"), _val_elements[_name]], gap=0),
+                        mo.vstack([mo.md("<small>-2σ</small>"), w_min[_name]], gap=0),
+                        mo.vstack([mo.md("<small>+2σ</small>"), w_max[_name]], gap=0),
+                        mo.md("<small style='color: cyan;'>𝒩 Normal</small>"),
+                    ], widths=[2, 2, 2, 1], align="end")
+                else:
+                    # Uniform prior: Min/Max define range
+                    _prior_col = mo.hstack([
+                        mo.vstack([mo.md("<small>Lower</small>"), w_min[_name]], gap=0),
+                        mo.vstack([mo.md("<small>Upper</small>"), w_max[_name]], gap=0),
+                    ], widths=[1, 1], align="end")
 
-             if is_fixed:
-                 # Show value input + bounds as informational text
-                 config_ui = mo.hstack([
-                     w_val[_name],
-                     mo.md(f"<small style='color: gray;'>Range: [{_mn:.2f}, {_mx:.2f}]</small>")
-                 ], widths=[2, 3], align="center")
-             else:
-                 config_ui = mo.hstack([w_min[_name], w_max[_name]])
+            _row = mo.hstack([
+                mo.md(f"**{display_name}**"),
+                _fix_widget,
+                _prior_col,
+            ], widths=[2, 1, 5], align="center")
 
-             rows.append(
-                 mo.hstack([
-                     mo.md(f"**{display_name}**"),
-                     w_fix[_name],
-                     config_ui
-                 ], widths=[2, 1, 5], align="center")
-             )
+            if is_global:
+                _global_rows.append(_row)
+            else:
+                _grid_rows.append(_row)
 
-        param_settings = mo.vstack(rows)
+        # Assemble sections
+        _sections = []
+        if _grid_rows:
+            _sections.append(mo.md("#### Grid Parameters"))
+            _sections.extend(_grid_rows)
+        if _global_rows:
+            _sections.append(mo.md("---"))
+            _sections.append(mo.md("#### Inference / Nuisance Parameters"))
+            _sections.extend(_global_rows)
+
+        param_settings = mo.vstack(_sections)
 
     mo.vstack([
-        mo.md("### Parameter Settings"),
-        mo.callout(mo.md("Configure priors (Min/Max) or fix parameters to specific values."), kind="neutral"),
+        mo.md("### Prior Configuration"),
+        mo.callout(mo.md(
+            "Set prior distributions for each parameter. "
+            "**Fix** a parameter to lock it at a specific value (tight δ-prior). "
+            "Free parameters use **Uniform** priors (lower–upper) except "
+            "GP Log Amp which uses a **Normal** prior (center ± 2σ)."
+        ), kind="neutral"),
         param_settings
     ])
     return
@@ -987,27 +1030,27 @@ def _(
                 phys_names = param_names[:num_grid_params]
 
                 # Initialize Grid Params from UI values
-                grid_params_init = [w_val[n].value for n in phys_names]
+                grid_params_init = [w_val.value[n] for n in phys_names]
 
                 # Global Params construction
                 global_params = {}
 
                 # Handle 'Av'
                 if 'Av' in param_names:
-                    global_params['Av'] = w_val['Av'].value
+                    global_params['Av'] = w_val.value['Av']
 
                 # Handle GP (log_amp, log_ls)
                 if 'log_amp' in param_names and 'log_ls' in param_names:
                     global_params['global_cov'] = {
-                        'log_amp': w_val['log_amp'].value,
-                        'log_ls': w_val['log_ls'].value
+                        'log_amp': w_val.value['log_amp'],
+                        'log_ls': w_val.value['log_ls']
                     }
 
                 # Handle log_scale (flux scaling)
                 # If user has fixed log_scale, use their value
                 # If free, let Starfish auto-calculate initially, then optimize
-                if 'log_scale' in param_names and w_fix['log_scale'].value:
-                    global_params['log_scale'] = w_val['log_scale'].value
+                if 'log_scale' in param_names and w_fix.value['log_scale']:
+                    global_params['log_scale'] = w_val.value['log_scale']
 
                 # 3. Initialize Model
                 _model = SpectrumModel(
@@ -1022,7 +1065,10 @@ def _(
 
                 # A. Grid Parameter Priors
                 for _internal, _ui in zip(emu.param_names, phys_names):
-                    if w_fix[_ui].value:
+                    if w_fix.value[_ui]:
+                        # Set the fixed value on the model, then freeze
+                        _fixed_val = w_val.value[_ui]
+                        _model.params[_internal] = _fixed_val
                         _model.freeze(_internal)
                     else:
                         _mn = w_min[_ui].value
@@ -1032,7 +1078,8 @@ def _(
 
                 # B. Global Parameter Priors
                 if 'Av' in param_names:
-                    if w_fix['Av'].value:
+                    if w_fix.value['Av']:
+                        _model.params['Av'] = w_val.value['Av']
                         _model.freeze('Av')
                     else:
                         _mn = w_min['Av'].value
@@ -1041,7 +1088,8 @@ def _(
 
                 # C. log_scale Prior (if not fixed and user wants to optimize it)
                 if 'log_scale' in param_names:
-                    if w_fix['log_scale'].value:
+                    if w_fix.value['log_scale']:
+                        _model.params['log_scale'] = w_val.value['log_scale']
                         _model.freeze('log_scale')
                     else:
                         # Bootstrap log_scale from auto-calculation
@@ -1056,20 +1104,116 @@ def _(
                         _mx = w_max['log_scale'].value
                         _priors['log_scale'] = stats.uniform(loc=_mn, scale=_mx - _mn)
 
-                # D. GP Priors
-                if 'log_amp' in param_names and 'log_ls' in param_names:
-                    if w_fix['log_amp'].value:
-                        _model.freeze('global_cov')
+                # D. GP Priors (log_amp and log_ls handled independently)
+                if 'log_amp' in param_names:
+                    if w_fix.value['log_amp']:
+                        _model.params['global_cov:log_amp'] = w_val.value['log_amp']
+                        _model.freeze('global_cov:log_amp')
                     else:
-                        _mn = w_min['log_amp'].value
-                        _mx = w_max['log_amp'].value 
-                        _priors['global_cov:log_amp'] = stats.uniform(loc=_mn, scale=_mx - _mn)
+                        # Normal prior for log_amp (matches Speculate_dev.py)
+                        _center = w_val.value['log_amp']
+                        _sigma = (w_max['log_amp'].value - w_min['log_amp'].value) / 4.0  # ±2σ spans range
+                        _priors['global_cov:log_amp'] = stats.norm(loc=_center, scale=_sigma)
 
+                if 'log_ls' in param_names:
+                    if w_fix.value['log_ls']:
+                        _model.params['global_cov:log_ls'] = w_val.value['log_ls']
+                        _model.freeze('global_cov:log_ls')
+                    else:
                         _mn = w_min['log_ls'].value
                         _mx = w_max['log_ls'].value
                         _priors['global_cov:log_ls'] = stats.uniform(loc=_mn, scale=_mx - _mn)
 
-                # 4. Run Training (MLE) with Progress Tracking
+                # If BOTH GP params are fixed, freeze the entire global_cov group
+                if ('log_amp' in param_names and 'log_ls' in param_names 
+                        and w_fix.value['log_amp'] and w_fix.value['log_ls']):
+                    _model.freeze('global_cov')
+
+                # 4. Build Initial Simplex
+                # Spans the prior space for ALL active parameters (grid + hyperparams)
+                # so Nelder-Mead starts from a sensible region instead of a single point.
+                _spinner.update("Building initial simplex...")
+
+                _active_labels = list(_model.labels)
+                _N = len(_active_labels)
+
+                def _get_loc_scale(dist):
+                    """Extract loc and scale from a frozen scipy distribution,
+                    regardless of whether it was built with positional or keyword args."""
+                    args = dist.args
+                    kwds = dist.kwds
+                    if len(args) >= 2:
+                        return args[0], args[1]
+                    elif len(args) == 1:
+                        return args[0], kwds.get('scale', 1.0)
+                    else:
+                        return kwds.get('loc', 0.0), kwds.get('scale', 1.0)
+
+                def _simplex_column_uniform(loc, scale, N):
+                    """Evenly spaced points across a truncated uniform range."""
+                    mn = loc
+                    mx = loc + scale
+                    rng = mx - mn
+                    margin = rng / 20  # 5% inset on each end
+                    t_mn, t_mx = mn + margin, mx - margin
+                    interval = (t_mx - t_mn) / N
+                    return [t_mn + interval * k for k in range(N + 1)]
+
+                def _simplex_column_norm(mean, std, N):
+                    """Evenly spaced points across ±2σ of a normal prior."""
+                    mn = mean - 2 * std
+                    mx = mean + 2 * std
+                    interval = (mx - mn) / N
+                    return [mn + interval * k for k in range(N + 1)]
+
+                _simplex = np.zeros((_N + 1, _N))
+                _simplex_info = []
+
+                for _col_idx, _label in enumerate(_active_labels):
+                    if _label in _priors:
+                        _dist = _priors[_label]
+                        _loc, _sc = _get_loc_scale(_dist)
+                        if _dist.dist.name == 'uniform':
+                            _col = _simplex_column_uniform(_loc, _sc, _N)
+                        elif _dist.dist.name == 'norm':
+                            _col = _simplex_column_norm(_loc, _sc, _N)
+                        else:
+                            # Fallback: small perturbation around current value
+                            _cv = _model.get_param_vector()[_col_idx]
+                            _col = [_cv + (_cv * 0.01 * k) for k in range(_N + 1)]
+                    else:
+                        # Parameter is active but has no explicit prior — use current value
+                        _cv = _model.get_param_vector()[_col_idx]
+                        _col = [_cv] * (_N + 1)
+
+                    _simplex[:, _col_idx] = _col
+                    _simplex_info.append(
+                        f"  {_label}: [{min(_col):.4f} .. {max(_col):.4f}]")
+
+                    # Roll each column by its index so rows are offset from each other
+                    _simplex[:, _col_idx] = np.roll(
+                        _simplex[:, _col_idx], _col_idx)
+
+                # --- Bootstrap log_scale into the simplex ---
+                # Evaluate the model at each simplex vertex to auto-calculate
+                # the appropriate log_scale, giving the optimizer a head start.
+                if 'log_scale' in _active_labels:
+                    _ls_idx = _active_labels.index('log_scale')
+                    for _row in range(_N + 1):
+                        try:
+                            _model.set_param_vector(_simplex[_row])
+                            _ = _model()  # triggers auto log_scale calc
+                            if (_model._log_scale is not None
+                                    and np.isfinite(_model._log_scale)):
+                                _simplex[_row, _ls_idx] = _model._log_scale
+                        except Exception:
+                            pass  # keep the prior-based value
+
+                # Restore model to the centroid of the simplex
+                _centroid = _simplex.mean(axis=0)
+                _model.set_param_vector(_centroid)
+
+                # 5. Run Training (MLE) with Progress Tracking
                 _spinner.update("Running MLE Optimization...")
 
                 # Track optimization progress
@@ -1100,7 +1244,12 @@ def _(
                     _nll_with_callback, 
                     _p0, 
                     method="Nelder-Mead",
-                    options=dict(maxiter=_max_iter, disp=False, adaptive=True)
+                    options=dict(
+                        maxiter=_max_iter,
+                        disp=False,
+                        adaptive=True,
+                        initial_simplex=_simplex,
+                    )
                 )
 
                 if _soln.success:
@@ -1116,13 +1265,13 @@ def _(
                     kind="success"
                 )
 
-                # 5. Plotting
+                # 6. Plotting
                 import matplotlib.pyplot as _plt
                 _model.plot(yscale="linear")
                 _fig = _plt.gcf()
                 _fig.tight_layout()
 
-                # 5b. Loss curve plot
+                # 6b. Loss curve plot
                 if len(_nll_history) > 10:
                     _fig_loss, _ax_loss = _plt.subplots(figsize=(8, 3))
                     _ax_loss.plot(_nll_history, 'b-', alpha=0.7, linewidth=0.5)
@@ -1138,7 +1287,7 @@ def _(
                 else:
                     _fig_loss = None
 
-                # 6. Result extraction with ground truth comparison
+                # 7. Result extraction with ground truth comparison
                 res_grid = _model.grid_params
                 res_global = _model.params
 
