@@ -701,6 +701,53 @@ class Emulator:
         np.savez_compressed(filename, **save_data)
         self.log.info("Saved file at {}".format(filename))
 
+
+    @classmethod
+    def test_pca(cls, grid, **pca_kwargs):
+        """
+        Perform a test PCA reconstruction to check explained variance.
+        
+        Parameters
+        ----------
+        grid : str or GridInterface
+            Path to the grid NPZ file or GridInterface object.
+        **pca_kwargs : dict
+            Arguments passed to PCA (e.g. n_components).
+            
+        Returns
+        -------
+        explained_variance : float
+            The sum of explained variance ratios.
+        n_components : int
+            The number of components used.
+        """
+        # Load grid if a string is given
+        if isinstance(grid, str):
+            grid = NPZInterface(grid)
+
+        fluxes = np.array(list(grid.fluxes))
+        # Normalize to an average of 1
+        norm_factors = fluxes.mean(1)
+        fluxes /= norm_factors[:, np.newaxis]
+        # Center and whiten
+        flux_mean = fluxes.mean(0)
+        fluxes -= flux_mean
+        flux_std = fluxes.std(0) 
+        # Avoid division by zero
+        flux_std[flux_std == 0] = 1.0
+        fluxes /= flux_std 
+        fluxes = np.nan_to_num(fluxes)
+
+        # Perform PCA
+        default_pca_kwargs = dict(n_components=0.99, svd_solver="full") 
+        default_pca_kwargs.update(pca_kwargs)
+        pca = PCA(**default_pca_kwargs)
+        pca.fit(fluxes)
+
+        exp_var = pca.explained_variance_ratio_.sum()
+        
+        return exp_var, pca.n_components_
+
     @classmethod
     def from_grid(cls, grid, block_diagonal=False, **pca_kwargs):
         """
@@ -1814,3 +1861,64 @@ class Emulator:
         )
         output += f"\nLog Likelihood: {self.log_likelihood():.2f}\n"
         return output
+
+import marimo
+
+__generated_with = "0.19.8"
+app = marimo.App()
+
+
+app._unparsable_cell(
+    """
+        @classmethod
+        def test_pca(cls, grid, **pca_kwargs):
+            \"\"\"
+            Perform a test PCA reconstruction to check explained variance.
+        
+            Parameters
+            ----------
+            grid : str or GridInterface
+                Path to the grid NPZ file or GridInterface object.
+            **pca_kwargs : dict
+                Arguments passed to PCA (e.g. n_components).
+            
+            Returns
+            -------
+            explained_variance : float
+                The sum of explained variance ratios.
+            n_components : int
+                The number of components used.
+            \"\"\"
+            # Load grid if a string is given
+            if isinstance(grid, str):
+                grid = NPZInterface(grid)
+
+            fluxes = np.array(list(grid.fluxes))
+            # Normalize to an average of 1
+            norm_factors = fluxes.mean(1)
+            fluxes /= norm_factors[:, np.newaxis]
+            # Center and whiten
+            flux_mean = fluxes.mean(0)
+            fluxes -= flux_mean
+            flux_std = fluxes.std(0) 
+            # Avoid division by zero
+            flux_std[flux_std == 0] = 1.0
+            fluxes /= flux_std 
+            fluxes = np.nan_to_num(fluxes)
+
+            # Perform PCA
+            default_pca_kwargs = dict(n_components=0.99, svd_solver=\"full\") 
+            default_pca_kwargs.update(pca_kwargs)
+            pca = PCA(**default_pca_kwargs)
+            pca.fit(fluxes)
+
+            exp_var = pca.explained_variance_ratio_.sum()
+        
+            return exp_var, pca.n_components_
+    """,
+    name="_"
+)
+
+
+if __name__ == "__main__":
+    app.run()

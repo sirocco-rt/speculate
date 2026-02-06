@@ -719,7 +719,7 @@ def _(
             ])
 
     # 3. Status Row
-    status_row = mo.hstack([status_widget, emu_status, obs_status], justify="start", gap="1rem", align="start")
+    status_row = mo.hstack([status_widget, emu_status, obs_status], justify="start", gap="1rem", align="center")
 
     # Final Stack
     display_elements = [

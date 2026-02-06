@@ -15,13 +15,16 @@ def _(mo):
     get_training_trigger, set_training_trigger = mo.state(0)
     get_console_logs, set_console_logs = mo.state("")
     get_training_status, set_training_status = mo.state(None)
+    get_pca_result, set_pca_result = mo.state("Click test to see variance")
     return (
         get_console_logs,
         get_loss_history,
+        get_pca_result,
         get_training_status,
         get_training_trigger,
         set_console_logs,
         set_loss_history,
+        set_pca_result,
         set_training_status,
         set_training_trigger,
     )
@@ -393,8 +396,6 @@ def _(mo, params):
 
 @app.cell
 def _(mo):
-    mo.md("### 3. Wavelength Range, Scale & PCA Components")
-
     wl_min = mo.ui.number(start=800, stop=8000, value=850, step=10, label="Min Wavelength (Å):")
     wl_max = mo.ui.number(start=800, stop=8000, value=1850, step=10, label="Max Wavelength (Å):")
 
@@ -406,8 +407,27 @@ def _(mo):
 
     n_components = mo.ui.slider(start=2, stop=30, value=10, step=1, label="PCA Components:",show_value=True,)
 
-    mo.vstack([wl_min, wl_max, scale_selector, n_components])
-    return n_components, scale_selector, wl_max, wl_min
+    test_pca_btn = mo.ui.run_button(label="Test PCA Reconstruction", kind="neutral")
+    return n_components, scale_selector, test_pca_btn, wl_max, wl_min
+
+
+@app.cell
+def _(
+    get_pca_result,
+    mo,
+    n_components,
+    scale_selector,
+    test_pca_btn,
+    wl_max,
+    wl_min,
+):
+    mo.md("### 3. Wavelength Range, Scale & PCA Components")
+
+    # Display result using state
+    pca_result_display = mo.md(f"_{get_pca_result()}_")
+
+    mo.vstack([wl_min, wl_max, scale_selector, mo.hstack([n_components, test_pca_btn, pca_result_display], justify="start", align="start")])
+    return (pca_result_display,)
 
 
 @app.cell
@@ -424,6 +444,45 @@ def _(mo):
 
     mo.vstack([method, max_iter])
     return max_iter, method
+
+
+@app.cell
+def _(
+    Emulator,
+    grid_selector,
+    mo,
+    n_components,
+    os,
+    params,
+    set_pca_result,
+    sirocco_grids_path,
+    test_pca_btn,
+    wl_max,
+    wl_min,
+):
+    if test_pca_btn.value:
+        if grid_selector is not None and grid_selector.value and params is not None and params.value:
+            # 1. Determine parameters
+            _model_params = tuple(sorted([int(p) for p in params.value]))
+            _model_params_str = ''.join(str(i) for i in _model_params)
+            _grid_name = grid_selector.value
+            _base_name = _grid_name + "_"
+            _grid_file_name_pca = f"{_base_name}grid_{_model_params_str}"
+            _grid_file_path_pca = f'Grid-Emulator_Files/{_grid_file_name_pca}.npz'
+
+            if os.path.exists(_grid_file_path_pca):
+                 try:
+                    set_pca_result("Running PCA...")
+                    # Perform Test
+                    _exp_var, _n_comps = Emulator.test_pca(_grid_file_path_pca, n_components=n_components.value)
+                    set_pca_result(f"Variance: {_exp_var:.5f} ({_exp_var*100:.3f}%) [{_n_comps} comps]")
+                 except Exception as e:
+                    set_pca_result(f"Error: {e}")
+            else:
+                 set_pca_result("Grid file not ready. Please Train first.")
+        else:
+             set_pca_result("Select grid/params first")
+    return
 
 
 @app.cell
