@@ -1376,7 +1376,7 @@ def _(mo):
 
 
 @app.cell
-def _(get_mle_model, mo):
+def _(emu, get_mle_model, mo, param_names, re):
     # MCMC Configuration
     _model = get_mle_model()
 
@@ -1387,20 +1387,51 @@ def _(get_mle_model, mo):
     run_mcmc_btn = mo.ui.run_button(
         label="🎲 Run MCMC", 
         kind="warn",
-        #disabled=_model is None
     )
+
+    # Build internal→friendly label map
+    # Model uses "param1", "param2", etc. internally; we map to "disk.mdot", etc.
+    mcmc_label_map = {}
+    if _model is not None and emu is not None:
+        _num_grid = len(emu.param_names)
+        _phys = param_names[:_num_grid]  # Friendly names from Stage 2
+        for _internal, _friendly in zip(emu.param_names, _phys):
+            mcmc_label_map[_internal] = _friendly
+        # Map global/nuisance params to friendly names
+        mcmc_label_map['Av'] = 'Av'
+        mcmc_label_map['log_scale'] = 'log_scale'
+        mcmc_label_map['global_cov:log_amp'] = 'GP log_amp'
+        mcmc_label_map['global_cov:log_ls'] = 'GP log_ls'
+
+    # Build freeze checkboxes for each active (thawed) parameter
+    _freeze_dict = {}
+    if _model is not None:
+        for _label in _model.labels:
+            _display = mcmc_label_map.get(_label, _label)
+            _freeze_dict[_label] = mo.ui.checkbox(value=False, label=f"{_display}")
+
+    mcmc_freeze = mo.ui.dictionary(_freeze_dict) if _freeze_dict else mo.ui.dictionary({})
 
     if _model is None:
         mcmc_config_ui = mo.callout(mo.md("⚠️ Run MLE first before MCMC"), kind="warn")
     else:
+        # Show friendly names in the active params list
+        _friendly_labels = [mcmc_label_map.get(l, l) for l in _model.labels]
         mcmc_config_ui = mo.vstack([
-            mo.md(f"**Active Parameters:** {', '.join(_model.labels)}"),
+            mo.md(f"**Active Parameters:** {', '.join(_friendly_labels)}"),
             mo.hstack([mcmc_nwalkers, mcmc_nsteps, mcmc_burnin], justify="start"),
+            mo.md("### 🔒 Freeze Parameters for MCMC"),
+            mo.callout(mo.md(
+                "Tick parameters to **freeze** them at their MLE best-fit values. "
+                "Frozen parameters will not be sampled by MCMC. "
+                "This is useful for nuisance/hyperparameters (e.g. GP amplitude, length scale)."
+            ), kind="neutral"),
+            mcmc_freeze,
             run_mcmc_btn
         ])
 
     mcmc_config_ui
-    return mcmc_burnin, mcmc_nsteps, mcmc_nwalkers, run_mcmc_btn
+    return mcmc_burnin, mcmc_freeze, mcmc_label_map, mcmc_nsteps, mcmc_nwalkers, run_mcmc_btn
 
 
 @app.cell
@@ -1409,6 +1440,8 @@ def _(
     get_mle_priors,
     ground_truth_params,
     mcmc_burnin,
+    mcmc_freeze,
+    mcmc_label_map,
     mcmc_nsteps,
     mcmc_nwalkers,
     mo,
@@ -1425,6 +1458,18 @@ def _(
         if _model is None or _priors is None:
             mo.stop(True, mo.md("Please run MLE first."))
 
+        # Apply freezes from UI checkboxes
+        _freeze_values = mcmc_freeze.value  # {internal_name: bool}
+        _frozen_list = []
+        for _key, _is_frozen in _freeze_values.items():
+            if _is_frozen:
+                _model.freeze(_key)
+                _frozen_list.append(mcmc_label_map.get(_key, _key))
+
+        # Helper to get friendly name from internal label
+        def _friendly(internal_label):
+            return mcmc_label_map.get(internal_label, internal_label)
+
         with mo.status.spinner("Running MCMC..."):
             try:
                 import emcee as _emcee
@@ -1432,7 +1477,9 @@ def _(
                 import corner as _corner
                 import matplotlib.pyplot as _plt
                 import matplotlib
+                import warnings as _warnings
                 matplotlib.rcParams['figure.max_open_warning'] = 50
+                _warnings.filterwarnings("ignore", module="arviz", message="More chains")
 
                 _nwalkers = mcmc_nwalkers.value
                 _nsteps = mcmc_nsteps.value
@@ -1445,18 +1492,27 @@ def _(
                     return model.log_likelihood(priors)
 
                 # Initialize walkers in a ball around MLE solution
+                # Scales use both internal and friendly names for robust lookup
                 _default_scales = {
+                    "disk.mdot": 0.05, "wind.mdot": 0.02, "KWD.d": 0.1,
+                    "KWD.mdot_r_exponent": 0.05, "KWD.acceleration_length": 0.1,
+                    "KWD.acceleration_exponent": 0.1,
+                    "Boundary_layer.luminosity": 0.05, "Boundary_layer.temp": 0.05,
+                    "Inclination (Sparse)": 2.0, "Inclination (Mid)": 2.0,
+                    "Inclination (Full)": 1.0,
                     "param1": 0.05, "param2": 0.02, "param3": 0.1,
                     "param4": 0.05, "param5": 0.1, "param6": 0.1,
                     "param7": 0.05, "param8": 0.05, "param9": 2.0,
                     "param10": 2.0, "param11": 1.0,
                     "global_cov:log_amp": 1.0, "global_cov:log_ls": 0.5,
-                    "Av": 0.1
+                    "GP log_amp": 1.0, "GP log_ls": 0.5,
+                    "Av": 0.1, "log_scale": 0.5
                 }
 
                 _ball = np.random.randn(_nwalkers, _ndim)
                 for _i, _key in enumerate(_model.labels):
-                    _scale = _default_scales.get(_key, 0.1)
+                    # Try internal name first, then friendly name
+                    _scale = _default_scales.get(_key, _default_scales.get(_friendly(_key), 0.1))
                     _ball[:, _i] *= _scale
                     _ball[:, _i] += _model[_key]
 
@@ -1477,8 +1533,10 @@ def _(
 
                 # Build arviz InferenceData for full chain
                 # arviz from_dict expects {name: (chains, draws)}
+                # Use friendly names for display
+                _friendly_labels = [_friendly(l) for l in _model.labels]
                 _full_dd = {}
-                for _i, _label in enumerate(_model.labels):
+                for _i, _label in enumerate(_friendly_labels):
                     _full_dd[_label] = _full_chain[:, :, _i].T  # (walkers, steps)
                 _full_data = _az.from_dict(posterior=_full_dd)
 
@@ -1526,14 +1584,14 @@ def _(
                     f"({_burn_chain.shape[0]} steps × {_burn_chain.shape[1]} walkers)"
                 )
                 if _tau_valid:
-                    _tau_strs = [f"  - {_model.labels[_j]}: {_tau[_j]:.1f}" for _j in range(_ndim)]
+                    _tau_strs = [f"  - {_friendly(_model.labels[_j])}: {_tau[_j]:.1f}" for _j in range(_ndim)]
                     _burnin_info += "\n- **Autocorrelation times:**\n" + "\n".join(_tau_strs)
 
                 # ============================================================
                 # Stage 17: Burnt chain trace, summary & posteriors
                 # ============================================================
                 _burn_dd = {}
-                for _i, _label in enumerate(_model.labels):
+                for _i, _label in enumerate(_friendly_labels):
                     _burn_dd[_label] = _burn_chain[:, :, _i].T  # (walkers, steps_after_burn)
                 _burn_data = _az.from_dict(posterior=_burn_dd)
 
@@ -1550,7 +1608,7 @@ def _(
                 # Posterior distributions
                 _fig_posterior = _az.plot_posterior(
                     _burn_data,
-                    var_names=list(_model.labels)
+                    var_names=_friendly_labels
                 )
                 _fig_post = _fig_posterior.ravel()[0].figure
                 _fig_post.suptitle("Posterior Distributions", y=1.02)
@@ -1560,21 +1618,17 @@ def _(
                 # Stage 18: Corner plot
                 # ============================================================
                 # Build truths for corner plot from ground truth
-                _gt_key_map = {
-                    'param1': 'disk.mdot', 'param2': 'wind.mdot', 'param3': 'KWD.d',
-                    'param4': 'KWD.mdot_r_exponent', 'param5': 'KWD.acceleration_length',
-                    'param6': 'KWD.acceleration_exponent',
-                    'param7': 'Boundary_layer.luminosity', 'param8': 'Boundary_layer.temp',
-                    'param9': 'Inclination', 'param10': 'Inclination', 'param11': 'Inclination'
-                }
-
+                # Use the friendly label map to look up ground truth keys
                 _truths = None
                 if ground_truth_params:
                     _truths = []
                     _has_any = False
                     for _label in _model.labels:
-                        _gt_key = _gt_key_map.get(_label)
-                        if _gt_key and _gt_key in ground_truth_params:
+                        _gt_key = _friendly(_label)
+                        # Handle inclination variants → common key
+                        if 'Inclination' in _gt_key:
+                            _gt_key = 'Inclination'
+                        if _gt_key in ground_truth_params:
                             _truths.append(ground_truth_params[_gt_key])
                             _has_any = True
                         else:
@@ -1584,7 +1638,7 @@ def _(
 
                 _fig_corner = _corner.corner(
                     _burn_samples,
-                    labels=list(_model.labels),
+                    labels=_friendly_labels,
                     show_titles=True,
                     quantiles=[0.16, 0.5, 0.84],
                     title_fmt=".4f",
@@ -1594,6 +1648,7 @@ def _(
                 # ============================================================
                 # Stage 19: Best-fit MCMC model plot
                 # ============================================================
+                # Set model to posterior means (using internal labels)
                 _mcmc_means = {}
                 for _i, _label in enumerate(_model.labels):
                     _mcmc_means[_label] = float(np.mean(_burn_samples[:, _i]))
@@ -1608,6 +1663,8 @@ def _(
                 # Results table with ground truth comparison
                 # ============================================================
                 _results_md = "### MCMC Parameter Estimates\n\n"
+                if _frozen_list:
+                    _results_md += f"**Frozen (not sampled):** {', '.join(_frozen_list)}\n\n"
                 _results_md += "| Parameter | Mean | Std | Median | "
                 if ground_truth_params:
                     _results_md += "Truth | Δσ |\n"
@@ -1616,15 +1673,18 @@ def _(
                     _results_md += "\n|-----------|------|-----|--------|\n"
 
                 for _i, _label in enumerate(_model.labels):
+                    _display_name = _friendly(_label)
                     _mean = np.mean(_burn_samples[:, _i])
                     _std = np.std(_burn_samples[:, _i])
                     _median = np.median(_burn_samples[:, _i])
 
-                    _results_md += f"| **{_label}** | {_mean:.4f} | {_std:.4f} | {_median:.4f} | "
+                    _results_md += f"| **{_display_name}** | {_mean:.4f} | {_std:.4f} | {_median:.4f} | "
 
                     if ground_truth_params:
-                        _gt_key = _gt_key_map.get(_label)
-                        if _gt_key and _gt_key in ground_truth_params:
+                        _gt_key = _display_name
+                        if 'Inclination' in _gt_key:
+                            _gt_key = 'Inclination'
+                        if _gt_key in ground_truth_params:
                             _gt_val = ground_truth_params[_gt_key]
                             _delta_sigma = (_mean - _gt_val) / _std if _std > 0 else 0
                             _results_md += f"{_gt_val:.4f} | {_delta_sigma:+.2f}σ |\n"
@@ -1636,10 +1696,12 @@ def _(
                 # ============================================================
                 # Assemble output with accordions
                 # ============================================================
+                _frozen_info = f", frozen: {', '.join(_frozen_list)}" if _frozen_list else ""
                 _status_callout = mo.callout(
                     mo.md(
                         f"✅ MCMC Complete! ({_nsteps} steps, "
-                        f"{_nwalkers} walkers, burn-in {_burnin_used}, thin {_thin_used})"
+                        f"{_nwalkers} walkers, burn-in {_burnin_used}, thin {_thin_used}"
+                        f"{_frozen_info})"
                     ),
                     kind="success"
                 )
