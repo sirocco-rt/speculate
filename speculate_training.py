@@ -16,15 +16,18 @@ def _(mo):
     get_console_logs, set_console_logs = mo.state("")
     get_training_status, set_training_status = mo.state(None)
     get_pca_result, set_pca_result = mo.state("Click test to see variance")
+    get_trained_emu, set_trained_emu = mo.state(None)
     return (
         get_console_logs,
         get_loss_history,
         get_pca_result,
+        get_trained_emu,
         get_training_status,
         get_training_trigger,
         set_console_logs,
         set_loss_history,
         set_pca_result,
+        set_trained_emu,
         set_training_status,
         set_training_trigger,
     )
@@ -553,6 +556,7 @@ def _(
 
 @app.cell
 def _(
+    Emulator,
     get_training_trigger,
     grid_selector,
     mo,
@@ -562,6 +566,7 @@ def _(
     params,
     scale_selector,
     set_loss_history,
+    set_trained_emu,
     use_smoothing,
     wl_max,
     wl_min,
@@ -611,9 +616,17 @@ def _(
                          set_loss_history([])
             except Exception:
                 set_loss_history([])
+
+            # Load existing emulator for GP diagnostics
+            try:
+                _existing_emu = Emulator.load(f'Grid-Emulator_Files/{_chk_name}.npz')
+                set_trained_emu(_existing_emu)
+            except Exception:
+                pass
         else:
-             # If emulator doesn't exist (new config), clear the graph
+             # If emulator doesn't exist (new config), clear the graph and diagnostics
              set_loss_history([])
+             set_trained_emu(None)
 
     train_button = mo.ui.run_button(label=_emu_btn_label, kind=_emu_btn_kind)
 
@@ -814,6 +827,7 @@ def _(
     pd,
     set_console_logs,
     set_loss_history,
+    set_trained_emu,
     set_training_status,
     set_training_trigger,
     sys,
@@ -995,6 +1009,7 @@ def _(
                 emu.save(f'Grid-Emulator_Files/{emu_file_name}.npz')
                 print(f"Emulator saved to Grid-Emulator_Files/{emu_file_name}.npz")
                 training_complete = True
+                set_trained_emu(emu)
 
                 # Trigger button update
                 set_training_trigger(lambda v: v + 1)
@@ -1043,6 +1058,7 @@ def _(
                     emu = Emulator.load(f'Grid-Emulator_Files/{emu_file_name}.npz')
                     # Only mark complete if successful load
                     training_complete = True
+                    set_trained_emu(emu)
                  except:
                     pass
         else:
@@ -1051,7 +1067,226 @@ def _(
 
 
 @app.cell
-def _(alt, get_loss_history, mo, pd):
+def _(get_trained_emu, mo, np):
+    _emu = get_trained_emu()
+
+    if _emu is not None:
+        _n_params = _emu.grid_points.shape[1]
+
+        # Parameter descriptions lookup
+        _desc_map = {
+            1: "Disk.mdot", 2: "Wind.mdot", 3: "KWD.d",
+            4: "KWD.mdot_r_exponent", 5: "KWD.accel_length",
+            6: "KWD.accel_exponent", 7: "BL.luminosity", 8: "BL.temp",
+            9: "Inc (sparse)", 10: "Inc (mid)", 11: "Inc (full)"
+        }
+
+        # Build parameter options: map display name -> column index
+        _param_indices = [int(pn.replace("param", "")) for pn in _emu.param_names]
+        _param_options = {}
+        for _col_idx, _p_idx in enumerate(_param_indices):
+            _desc = _desc_map.get(_p_idx, f"param{_p_idx}")
+            _param_options[f"{_desc} (param{_p_idx})"] = str(_col_idx)
+
+        gp_xaxis_selector = mo.ui.dropdown(
+            options=_param_options,
+            value=list(_param_options.keys())[0],
+            label="Varying Parameter (X-axis):"
+        )
+
+        _max_unique = max(len(np.unique(_emu.grid_points[:, _i])) for _i in range(_n_params))
+        gp_fixed_slider = mo.ui.slider(
+            start=0, stop=_max_unique - 1, value=0, step=1,
+            label="Fixed Parameter Index:", show_value=True
+        )
+
+        gp_comp_start = mo.ui.slider(
+            start=0, stop=_emu.ncomps - 1, value=0, step=1,
+            label="From Component:", show_value=True
+        )
+        gp_comp_end = mo.ui.slider(
+            start=0, stop=_emu.ncomps - 1, value=min(5, _emu.ncomps - 1), step=1,
+            label="To Component:", show_value=True
+        )
+    else:
+        gp_xaxis_selector = None
+        gp_fixed_slider = None
+        gp_comp_start = None
+        gp_comp_end = None
+    return gp_comp_end, gp_comp_start, gp_fixed_slider, gp_xaxis_selector
+
+
+@app.cell
+def _(
+    alt,
+    get_trained_emu,
+    gp_comp_end,
+    gp_comp_start,
+    gp_fixed_slider,
+    gp_xaxis_selector,
+    mo,
+    np,
+    pd,
+):
+    # GP diagnostics - placeholder when no emulator is loaded
+    gp_figure = mo.md("")
+    _emu = get_trained_emu()
+
+    if _emu is not None and gp_xaxis_selector is not None and gp_xaxis_selector.value is not None:
+        # Read UI values
+        _not_fixed_col = int(gp_xaxis_selector.value)
+        _fixed_idx = gp_fixed_slider.value
+        _comp_start = gp_comp_start.value
+        _comp_end = gp_comp_end.value
+        if _comp_end < _comp_start:
+            _comp_end = _comp_start
+
+        _n_params = _emu.grid_points.shape[1]
+
+        # Get unique values per parameter dimension
+        _unique_per_dim = [np.unique(_emu.grid_points[:, _i]) for _i in range(_n_params)]
+
+        # Build parameter combinations: vary _not_fixed_col, fix others at _fixed_idx
+        _fixed_values = []
+        for _i in range(_n_params):
+            _vals = _unique_per_dim[_i]
+            if _i == _not_fixed_col:
+                _fixed_values.append(_vals)  # all values for varying param
+            else:
+                _idx = min(_fixed_idx, len(_vals) - 1)
+                _fixed_values.append(_vals[_idx])  # single fixed value
+
+        # Create grid point combinations for actual weight lookup
+        _params_list = []
+        for _j in range(len(_fixed_values[_not_fixed_col])):
+            _point = []
+            for _i in range(_n_params):
+                if _i == _not_fixed_col:
+                    _point.append(_fixed_values[_i][_j])
+                else:
+                    _point.append(float(_fixed_values[_i]))
+            _params_list.append(tuple(_point))
+        _params_arr = np.array(_params_list)
+
+        # Get weight indices and actual weights at grid points
+        _idxs = np.array([_emu.get_index(_p) for _p in _params_arr])
+        _weights = _emu.weights[_idxs.astype("int")].T  # (ncomps, n_varying_points)
+
+        # X-axis: unique values of the varying parameter
+        _param_x = _unique_per_dim[_not_fixed_col]
+
+        # GP predictions along a fine test grid
+        _param_x_test = np.linspace(_param_x.min(), _param_x.max(), 100)
+        _Xtest = []
+        for _j in range(len(_param_x_test)):
+            _point = []
+            for _i in range(_n_params):
+                if _i == _not_fixed_col:
+                    _point.append(_param_x_test[_j])
+                else:
+                    _point.append(float(_fixed_values[_i]))
+            _Xtest.append(tuple(_point))
+        _Xtest = np.array(_Xtest)
+
+        # Evaluate GP at test points
+        _mus_list = []
+        _covs_list = []
+        for _X in _Xtest:
+            _m, _c = _emu(_X)
+            _mus_list.append(_m)
+            _covs_list.append(_c)
+        _mus = np.array(_mus_list)
+        _covs = np.array(_covs_list)
+        _sigs = np.sqrt(np.diagonal(_covs, axis1=-2, axis2=-1))
+
+        # Parameter description for x-axis label
+        _desc_map = {
+            1: "Disk.mdot", 2: "Wind.mdot", 3: "KWD.d",
+            4: "KWD.mdot_r_exponent", 5: "KWD.accel_length",
+            6: "KWD.accel_exponent", 7: "BL.luminosity", 8: "BL.temp",
+            9: "Inc (sparse)", 10: "Inc (mid)", 11: "Inc (full)"
+        }
+        _param_name = _emu.param_names[_not_fixed_col]
+        _p_idx = int(_param_name.replace("param", ""))
+        _xlabel = _desc_map.get(_p_idx, _param_name)
+
+        # Build Altair charts for selected components
+        _charts = []
+        for _comp in range(_comp_start, _comp_end + 1):
+            # Scatter: actual weights at grid points
+            _scatter_df = pd.DataFrame({
+                'x': _param_x,
+                'weight': _weights[_comp]
+            })
+
+            # GP prediction line + uncertainty band
+            _gp_df = pd.DataFrame({
+                'x': _param_x_test,
+                'mean': _mus[:, _comp],
+                'upper': _mus[:, _comp] + 2 * _sigs[:, _comp],
+                'lower': _mus[:, _comp] - 2 * _sigs[:, _comp],
+            })
+
+            _scatter = alt.Chart(_scatter_df).mark_circle(size=60, color='#3b82f6').encode(
+                x=alt.X('x:Q', title=f'log\u2081\u2080({_xlabel})'),
+                y=alt.Y('weight:Q', title=f'Weight {_comp}'),
+                tooltip=[alt.Tooltip('x:Q', title=_xlabel, format='.4f'),
+                         alt.Tooltip('weight:Q', title='Weight', format='.4e')]
+            )
+
+            _gp_line = alt.Chart(_gp_df).mark_line(color='#f97316').encode(
+                x='x:Q',
+                y='mean:Q'
+            )
+
+            _gp_band = alt.Chart(_gp_df).mark_area(opacity=0.3, color='#f97316').encode(
+                x='x:Q',
+                y='lower:Q',
+                y2='upper:Q'
+            )
+
+            _chart = (_gp_band + _gp_line + _scatter).properties(
+                title=f'PCA Component {_comp}',
+                width=650,
+                height=160
+            )
+            _charts.append(_chart)
+
+        if _charts:
+            _combined = alt.vconcat(*_charts).resolve_scale(x='shared')
+        else:
+            _combined = alt.Chart(pd.DataFrame({'x': [], 'y': []})).mark_point()
+
+        # Fixed parameters info string
+        _fixed_info_parts = []
+        for _i in range(_n_params):
+            if _i != _not_fixed_col:
+                _vals = _unique_per_dim[_i]
+                _idx = min(_fixed_idx, len(_vals) - 1)
+                _pn = _emu.param_names[_i]
+                _pi = int(_pn.replace("param", ""))
+                _pdesc = _desc_map.get(_pi, _pn)
+                _fixed_info_parts.append(f"{_pdesc}={_vals[_idx]:.4g}")
+        _fixed_info = ", ".join(_fixed_info_parts)
+
+        gp_figure = mo.accordion({
+            "\U0001f52c GP Weight Diagnostics": mo.vstack([
+                mo.md("Explore the Gaussian Process fit to the PCA weight latent space. "
+                       "Blue dots are the actual PCA weights at grid points. "
+                       "Orange line and shaded region show the GP mean \u00b1 2\u03c3."),
+                mo.hstack([gp_xaxis_selector, gp_fixed_slider], justify="start", gap=1),
+                mo.hstack([gp_comp_start, gp_comp_end], justify="start", gap=1),
+                mo.md(f"**Fixed parameters:** {_fixed_info}"),
+                _combined
+            ])
+        })
+
+    gp_figure
+    return (gp_figure,)
+
+
+@app.cell
+def _(alt, get_loss_history, gp_figure, mo, pd):
     # Reactive plot cell
     loss_data = get_loss_history()
 
@@ -1090,10 +1325,11 @@ def _(alt, get_loss_history, mo, pd):
     else:
         chart = line
 
-    # Always display the chart container
+    # Always display the chart container with GP diagnostics below
     mo.vstack([
         mo.md("### 📈 Trained Emulator Loss Curve"),
-        mo.ui.altair_chart(chart)
+        mo.ui.altair_chart(chart),
+        gp_figure
     ])
     return
 
