@@ -30,7 +30,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
     
     """
         
-    def __init__(self, path, usecols, air=False, wl_range=(800,8000), model_parameters=(1,2,3,4,5,6,7,8,9,10,11), scale='linear'):
+    def __init__(self, path, usecols, air=False, wl_range=(800,8000), model_parameters=(1,2,3,4,5,6,7,8,9,10,11), scale='linear', smoothing=False):
         """
         Initialises an empty grid with parameters and wavelengths.
         
@@ -45,12 +45,16 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             
             model_parameters (tuple, optional): Specifiy the parameters 
                 you wish to fit by adding intergers to the tuple. 
+            
+            smoothing (bool, optional): Whether to apply Gaussian smoothing (sigma=50) to spectra.
+                Default is False.
         """
         
         # The grid points in the parameter space are defined, 
         # param_points_1-3 correspond to the model parameters defined at the top in the respective order.
         self.model_parameters = model_parameters
         self.scale = scale # Flux space scale 
+        self.smoothing = smoothing # Gaussian smoothing toggle
         self.usecols = usecols # Wavelength and inclination tuple
         # self.skiprows = skiprows # Deprecated: calculated dynamically
         points = []
@@ -240,7 +244,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         """
         
         import logging
-        from scipy.ndimage import gaussian_filter1d # Instead of normalising, a 1d gaussian smoothing filter is applied 
+        import pandas as _pd
         
         # Get the filename for logging
         file_path = self.get_flux(parameters)
@@ -278,8 +282,10 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         flux = np.flip(flux)
         
         flux = flux[:len(self.wl_full)] # THIS CUT IS NEEDED, Random parameters appear in the grid space header leading to mismatching file lengths.
-        #flux = gaussian_filter1d(flux, 50)
+        if self.smoothing:
+            flux = _pd.Series(flux).rolling(window=5, center=True, min_periods=1).mean().values
         if self.scale == 'log':
+            flux = np.where(flux > 0, flux, 1e-30)  # Floor non-positive values to avoid log10(0) = -inf
             flux = np.log10(flux) # logged 10 
         if self.scale == 'scaled': # to values near order of magnitude 10^0. 
             flux = flux/np.mean(flux)
@@ -318,7 +324,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
     
     """
         
-    def __init__(self, path, usecols, air=False, wl_range=(800,8000), model_parameters=(1,2,3,4,5,6,9,10,11), scale='linear'):
+    def __init__(self, path, usecols, air=False, wl_range=(800,8000), model_parameters=(1,2,3,4,5,6,9,10,11), scale='linear', smoothing=False):
         """
         Initialises an empty grid with parameters and wavelengths.
         
@@ -333,12 +339,16 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             
             model_parameters (tuple, optional): Specifiy the parameters 
                 you wish to fit by adding intergers to the tuple. 
+            
+            smoothing (bool, optional): Whether to apply Gaussian smoothing (sigma=50) to spectra.
+                Default is False.
         """
         
         # The grid points in the parameter space are defined, 
         # param_points_1-3 correspond to the model parameters defined at the top in the respective order.
         self.model_parameters = model_parameters
         self.scale = scale # Flux space scale 
+        self.smoothing = smoothing # Gaussian smoothing toggle
         self.usecols = usecols # Wavelength and inclination tuple
         # self.skiprows = skiprows # Deprecated: calculated dynamically
         points = []
@@ -519,7 +529,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         """
         
         import logging
-        from scipy.ndimage import gaussian_filter1d # Instead of normalising, a 1d gaussian smoothing filter is applied 
+        import pandas as _pd
         
         # Get the filename for logging
         file_path = self.get_flux(parameters)
@@ -557,8 +567,10 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         flux = np.flip(flux)
         
         flux = flux[:len(self.wl_full)] # THIS CUT IS NEEDED, Random parameters appear in the grid space header leading to mismatching file lengths.
-        #flux = gaussian_filter1d(flux, 50)
+        if self.smoothing:
+            flux = _pd.Series(flux).rolling(window=5, center=True, min_periods=1).mean().values
         if self.scale == 'log':
+            flux = np.where(flux > 0, flux, 1e-30)  # Floor non-positive values to avoid log10(0) = -inf
             flux = np.log10(flux) # logged 10 
         if self.scale == 'scaled': # to values near order of magnitude 10^0. 
             flux = flux/np.mean(flux)

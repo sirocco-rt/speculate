@@ -448,11 +448,13 @@ def _(Emulator, emulator_selector, mo):
 def _(
     data_source_selector,
     emu,
+    emulator_selector,
     mo,
     np,
     obs_file_selector,
     os,
     pd,
+    re,
     test_grid_params_df,
     test_grid_path,
     test_inclination_selector,
@@ -462,8 +464,6 @@ def _(
     obs_data = None
     ground_truth_params = None  # For test grid validation
     _obs_dir = "observation_files"
-    min_wl = 0.0
-    max_wl = 10000.0
     data_source_info = ""
 
     is_test_grid = "Test Grid" in data_source_selector.value
@@ -502,9 +502,6 @@ def _(
                 'error': fluxes * 0.05  # Assume 5% error for test data
             })
 
-            min_wl = float(wavelengths.min())
-            max_wl = float(wavelengths.max())
-
             # Extract ground truth params from lookup table
             if test_grid_params_df is not None:
                 run_num = int(test_run_selector.value.replace('run', '').replace('.spec', ''))
@@ -537,9 +534,9 @@ def _(
 
             # Check for required columns
             if 'wavelength' in df.columns and 'flux' in df.columns:
+                # Sort by wavelength ascending (handles decreasing-wavelength files)
+                df = df.sort_values('wavelength', ascending=True).reset_index(drop=True)
                 obs_data = df
-                min_wl = float(df['wavelength'].min())
-                max_wl = float(df['wavelength'].max())
                 data_source_info = f"Observation: {obs_file_selector.value}"
             else:
                  mo.output.replace(mo.callout(mo.md("❌ Invalid file format. Metadata columns 'Wavelength' and 'Flux' not found."), kind="danger"))
@@ -547,55 +544,80 @@ def _(
         except Exception as e:
              mo.output.replace(mo.callout(mo.md(f"❌ Error reading file: {e}"), kind="danger"))
 
-    # Constrain to emulator wavelength range if available
-    if emu is not None and obs_data is not None:
-        emu_min = float(emu.wl.min())
-        emu_max = float(emu.wl.max())
-        # Truncate by 10 Angstroms on each side for safety (edge effects)
-        min_wl = max(min_wl, emu_min + 10)
-        max_wl = min(max_wl, emu_max - 10)
+    # --- Auto-detect flux scale from emulator filename ---
+    # Emulator filenames encode the scale: e.g. ..._linear_850-1850AA_... or ..._log_850-1850AA_...
+    _detected_scale = "linear"  # default
+    if emulator_selector.value:
+        _emu_name = emulator_selector.value.lower()
+        if '_log_' in _emu_name:
+            _detected_scale = "log"
+        elif '_scaled_' in _emu_name:
+            _detected_scale = "scaled"
 
-    # Range Slider for wavelength
-    # Number inputs for precise wavelength control
-    wl_min_input = mo.ui.number(
-        value=min_wl, 
-        step=0.1, 
-        label="Min Wavelength (Å)",
+    obs_flux_scale = mo.ui.dropdown(
+        options=["linear", "log", "scaled"],
+        value=_detected_scale,
+        label="Observation Flux Transform:",
         full_width=True,
-        #disabled=obs_data is None
     )
 
-    wl_max_input = mo.ui.number(
-        value=max_wl, 
-        step=0.1, 
-        label="Max Wavelength (Å)",
+    # --- Wavelength range slider bounded by emulator ---
+    if emu is not None:
+        _emu_min = float(emu.wl.min())
+        _emu_max = float(emu.wl.max())
+        # Inset by 10 Å for edge effects
+        _slider_min = _emu_min + 10
+        _slider_max = _emu_max - 10
+    elif obs_data is not None:
+        _slider_min = float(obs_data['wavelength'].min())
+        _slider_max = float(obs_data['wavelength'].max())
+    else:
+        _slider_min = 800.0
+        _slider_max = 8000.0
+
+    wl_range_slider = mo.ui.range_slider(
+        start=_slider_min,
+        stop=_slider_max,
+        value=[_slider_min, _slider_max],
+        step=1.0,
+        label="Wavelength Range (Å):",
+        show_value=True,
         full_width=True,
-        #disabled=obs_data is None
     )
     return (
         data_source_info,
         ground_truth_params,
         obs_data,
-        wl_max_input,
-        wl_min_input,
+        obs_flux_scale,
+        wl_range_slider,
     )
 
 
 @app.cell
-def _(alt, data_source_info, mo, obs_data, pd, wl_max_input, wl_min_input):
-    # Obs Plot (Reactive to range inputs)
+def _(alt, data_source_info, mo, np, obs_data, obs_flux_scale, pd, wl_range_slider):
+    # Obs Plot (Reactive to range slider and flux scale)
     obs_chart = None
     if obs_data is not None:
-         # Filter based on inputs
-         _current_min = wl_min_input.value if wl_min_input.value is not None else obs_data['wavelength'].min()
-         _current_max = wl_max_input.value if wl_max_input.value is not None else obs_data['wavelength'].max()
+         # Filter based on range slider
+         _current_min = wl_range_slider.value[0]
+         _current_max = wl_range_slider.value[1]
 
          _mask = (obs_data['wavelength'] >= _current_min) & (obs_data['wavelength'] <= _current_max)
          _plot_df = obs_data[_mask].copy()
 
+         # Apply flux transformation to match emulator scale
+         _flux_vals = np.array(_plot_df['flux'])
+         _scale_label = obs_flux_scale.value
+         if _scale_label == 'log':
+             _flux_vals = np.where(_flux_vals > 0, np.log10(_flux_vals), np.log10(np.abs(_flux_vals) + 1e-30))
+         elif _scale_label == 'scaled':
+             _flux_mean = np.mean(_flux_vals)
+             if _flux_mean != 0:
+                 _flux_vals = _flux_vals / _flux_mean
+
          _plot_df = pd.DataFrame({
              'Wavelength': _plot_df['wavelength'],
-             'Flux': _plot_df['flux'],
+             'Flux': _flux_vals,
              'Type': 'Observation'
          })
 
@@ -603,14 +625,27 @@ def _(alt, data_source_info, mo, obs_data, pd, wl_max_input, wl_min_input):
          if len(_plot_df) > 5000:
              _plot_df = _plot_df.iloc[::int(len(_plot_df)/5000)]
 
+         _y_title = f'Flux ({_scale_label})'
+         _y_format = '.1e' if _scale_label == 'linear' else '.2f'
+
+         # For log scale, set explicit y-limits based on data range to avoid
+         # Altair defaulting to include 0 (which compresses the plot)
+         if _scale_label == 'log':
+             _y_min = float(np.nanmin(_flux_vals))
+             _y_max = float(np.nanmax(_flux_vals))
+             _y_pad = (_y_max - _y_min) * 0.05
+             _y_scale = alt.Scale(domain=[_y_min - _y_pad, _y_max + _y_pad])
+         else:
+             _y_scale = alt.Undefined
+
          obs_chart = alt.Chart(_plot_df).mark_line(color='cyan').encode(
              x=alt.X('Wavelength', title='Wavelength (Å)'),
-             y=alt.Y('Flux', title='Flux', axis=alt.Axis(format='.1e')), # Scientific notation
+             y=alt.Y('Flux', title=_y_title, scale=_y_scale, axis=alt.Axis(format=_y_format)),
              tooltip=['Wavelength', 'Flux']
          ).properties(
              width="container",
              height=400,
-             title=data_source_info if data_source_info else "Spectrum"
+             title=f"{data_source_info} [{_scale_label}]" if data_source_info else "Spectrum"
          ).interactive()
 
     obs_plot_accordion = mo.accordion({
@@ -632,13 +667,13 @@ def _(
     mo,
     obs_data,
     obs_file_selector,
+    obs_flux_scale,
     obs_plot_accordion,
     param_info_accordion,
     status_widget,
     test_inclination_selector,
     test_run_selector,
-    wl_max_input,
-    wl_min_input,
+    wl_range_slider,
 ):
     # Display Status Stack
     loading_alert = None
@@ -660,9 +695,9 @@ def _(
 
     # Data Status
     if obs_data is not None:
-         # Update points based on slider
-        min_w = wl_min_input.value
-        max_w = wl_max_input.value
+         # Update points based on range slider
+        min_w = wl_range_slider.value[0]
+        max_w = wl_range_slider.value[1]
 
         visible_points = len(obs_data[(obs_data['wavelength'] >= min_w) & (obs_data['wavelength'] <= max_w)])
 
@@ -701,7 +736,8 @@ def _(
         data_control_row = mo.vstack([
             data_source_selector,
             mo.hstack([test_run_selector, test_inclination_selector], widths=[3, 1]),
-            mo.hstack([wl_min_input, wl_max_input], widths=[1, 1])
+            wl_range_slider,
+            obs_flux_scale,
         ])
     else:
         # Observation file selection
@@ -709,7 +745,8 @@ def _(
             data_control_row = mo.vstack([
                 data_source_selector,
                 mo.hstack([obs_file_selector, delete_obs_btn], align="end", widths=[6, 1]),
-                mo.hstack([wl_min_input, wl_max_input], widths=[1, 1]),
+                wl_range_slider,
+                obs_flux_scale,
                 file_upload_ui
             ])
         else:
@@ -987,8 +1024,8 @@ def _(
     w_max,
     w_min,
     w_val,
-    wl_max_input,
-    wl_min_input,
+    obs_flux_scale,
+    wl_range_slider,
 ):
     # Perform MLE Inference
     fit_status = None
@@ -1005,17 +1042,37 @@ def _(
                 import time as _time
 
                 # 1. Prepare Data
-                _min_w = wl_min_input.value if wl_min_input.value else obs_data['wavelength'].min()
-                _max_w = wl_max_input.value if wl_max_input.value else obs_data['wavelength'].max()
+                _min_w = wl_range_slider.value[0]
+                _max_w = wl_range_slider.value[1]
 
                 _mask = (obs_data['wavelength'] >= _min_w) & (obs_data['wavelength'] <= _max_w)
                 _data_subset = obs_data[_mask].copy()
 
+                # Apply flux transformation to match emulator training scale
+                _flux_scale = obs_flux_scale.value
+                _raw_flux = np.array(_data_subset['flux'])
+                if _flux_scale == 'log':
+                    # Guard against non-positive values
+                    _raw_flux = np.where(_raw_flux > 0, np.log10(_raw_flux), np.log10(np.abs(_raw_flux) + 1e-30))
+                elif _flux_scale == 'scaled':
+                    _flux_mean = np.mean(_raw_flux)
+                    if _flux_mean != 0:
+                        _raw_flux = _raw_flux / _flux_mean
+                # else: linear (no transform)
+                _data_subset['flux'] = _raw_flux
+
                 # Use error column if present, otherwise assume 5%
                 if 'error' in _data_subset.columns:
                     _sigma = np.array(_data_subset['error'])
+                    # Transform errors to match scale
+                    if _flux_scale == 'log':
+                        # Propagate error through log10: sigma_log = sigma / (val * ln(10))
+                        _orig_flux = np.array(obs_data[_mask]['flux'])
+                        _sigma = _sigma / (np.abs(_orig_flux) * np.log(10) + 1e-30)
+                    elif _flux_scale == 'scaled':
+                        _sigma = _sigma / _flux_mean if _flux_mean != 0 else _sigma
                 else:
-                    _sigma = np.abs(np.array(_data_subset['flux'])) * 0.05
+                    _sigma = np.abs(_raw_flux) * 0.05
 
                 # Ensure no zero/negative sigmas
                 _sigma = np.maximum(_sigma, np.abs(_data_subset['flux'].values) * 0.01)

@@ -5,7 +5,7 @@
 
 import marimo
 
-__generated_with = "0.18.1"
+__generated_with = "0.19.7"
 app = marimo.App(width="full", app_title="Speculate Training Tool")
 
 
@@ -405,10 +405,19 @@ def _(mo):
         label="Flux Scale:"
     )
 
+    use_smoothing = mo.ui.checkbox(value=False, label="Smooth Spectra (Boxcar=5)")
+
     n_components = mo.ui.slider(start=2, stop=30, value=10, step=1, label="PCA Components:",show_value=True,)
 
     test_pca_btn = mo.ui.run_button(label="Test PCA Reconstruction", kind="neutral")
-    return n_components, scale_selector, test_pca_btn, wl_max, wl_min
+    return (
+        n_components,
+        scale_selector,
+        test_pca_btn,
+        use_smoothing,
+        wl_max,
+        wl_min,
+    )
 
 
 @app.cell
@@ -418,6 +427,7 @@ def _(
     n_components,
     scale_selector,
     test_pca_btn,
+    use_smoothing,
     wl_max,
     wl_min,
 ):
@@ -426,8 +436,8 @@ def _(
     # Display result using state
     pca_result_display = mo.md(f"_{get_pca_result()}_")
 
-    mo.vstack([wl_min, wl_max, scale_selector, mo.hstack([n_components, test_pca_btn, pca_result_display], justify="start", align="start")])
-    return (pca_result_display,)
+    mo.vstack([wl_min, wl_max, mo.hstack([scale_selector, use_smoothing], justify="start", align="center"), mo.hstack([n_components, test_pca_btn, pca_result_display], justify="start", align="start")])
+    return
 
 
 @app.cell
@@ -449,14 +459,19 @@ def _(mo):
 @app.cell
 def _(
     Emulator,
+    MarimoHDF5Creator,
+    grid_configs,
     grid_selector,
-    mo,
+    logging,
     n_components,
+    np,
     os,
     params,
+    scale_selector,
     set_pca_result,
     sirocco_grids_path,
     test_pca_btn,
+    use_smoothing,
     wl_max,
     wl_min,
 ):
@@ -467,19 +482,70 @@ def _(
             _model_params_str = ''.join(str(i) for i in _model_params)
             _grid_name = grid_selector.value
             _base_name = _grid_name + "_"
-            _grid_file_name_pca = f"{_base_name}grid_{_model_params_str}"
+            _smoothing = use_smoothing.value
+            _scale = scale_selector.value
+            _smooth_suffix = "_smooth" if _smoothing else ""
+            _grid_file_name_pca = f"{_base_name}grid_{_model_params_str}_{_scale}{_smooth_suffix}"
             _grid_file_path_pca = f'Grid-Emulator_Files/{_grid_file_name_pca}.npz'
+            _grid_ready = True
 
-            if os.path.exists(_grid_file_path_pca):
-                 try:
+            # If grid file doesn't exist, create it first
+            if not os.path.exists(_grid_file_path_pca):
+                set_pca_result("Building grid file...")
+                try:
+                    _scale = scale_selector.value
+                    _wl_range = (wl_min.value, wl_max.value)
+                    _grid_path = sirocco_grids_path / _grid_name
+
+                    if _grid_name in grid_configs:
+                        _grid_config = grid_configs[_grid_name]
+                        _grid = _grid_config["class"](
+                            path=str(_grid_path) + "/",
+                            usecols=_grid_config["usecols"],
+                            wl_range=_wl_range,
+                            model_parameters=_model_params,
+                            scale=_scale,
+                            smoothing=_smoothing,
+                        )
+
+                        # Set up logging
+                        os.makedirs('logs', exist_ok=True)
+                        logging.basicConfig(
+                            level=logging.INFO,
+                            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                            handlers=[logging.FileHandler('logs/grid_processing.log', mode='w')],
+                            force=True,
+                        )
+
+                        _keyname = ["param{}{{}}".format(i) for i in _model_params]
+                        _keyname = ''.join(_keyname)
+
+                        os.makedirs('Grid-Emulator_Files', exist_ok=True)
+                        _creator = MarimoHDF5Creator(
+                            _grid,
+                            _grid_file_path_pca,
+                            key_name=_keyname,
+                            wl_range=_wl_range,
+                        )
+                        _creator.process_grid()
+
+                        _data = np.load(_grid_file_path_pca, allow_pickle=True)
+                        set_pca_result(f"Grid built ({_data['grid_points'].shape[0]} spectra). Running PCA...")
+                    else:
+                        set_pca_result(f"Error: Unknown grid config for {_grid_name}")
+                        _grid_ready = False
+                except Exception as e:
+                    set_pca_result(f"Grid build error: {e}")
+                    _grid_ready = False
+
+            # Now run the PCA test
+            if _grid_ready:
+                try:
                     set_pca_result("Running PCA...")
-                    # Perform Test
                     _exp_var, _n_comps = Emulator.test_pca(_grid_file_path_pca, n_components=n_components.value)
                     set_pca_result(f"Variance: {_exp_var:.5f} ({_exp_var*100:.3f}%) [{_n_comps} comps]")
-                 except Exception as e:
+                except Exception as e:
                     set_pca_result(f"Error: {e}")
-            else:
-                 set_pca_result("Grid file not ready. Please Train first.")
         else:
              set_pca_result("Select grid/params first")
     return
@@ -496,6 +562,7 @@ def _(
     params,
     scale_selector,
     set_loss_history,
+    use_smoothing,
     wl_max,
     wl_min,
 ):
@@ -516,6 +583,7 @@ def _(
         _wl_range = (wl_min.value, wl_max.value)
         _scale = scale_selector.value
         _grid_name = grid_selector.value
+        _smooth_tag = '_smooth' if use_smoothing.value else ''
 
         # Standardize base name
         _base_name = _grid_name + "_"
@@ -523,9 +591,9 @@ def _(
         # Determine emulator file name
         _fixed_inc = 55
         if any(x in _model_params for x in [9, 10, 11]):
-             _chk_name = f'{_base_name}emu_{_model_params_str}_{_scale}_{_wl_range[0]}-{_wl_range[1]}AA_{n_components.value}PCA'
+             _chk_name = f'{_base_name}emu_{_model_params_str}_{_scale}{_smooth_tag}_{_wl_range[0]}-{_wl_range[1]}AA_{n_components.value}PCA'
         else:
-             _chk_name = f'{_base_name}emu_{_model_params_str}_{_scale}_{_fixed_inc}inc_{_wl_range[0]}-{_wl_range[1]}AA_{n_components.value}PCA'
+             _chk_name = f'{_base_name}emu_{_model_params_str}_{_scale}{_smooth_tag}_{_fixed_inc}inc_{_wl_range[0]}-{_wl_range[1]}AA_{n_components.value}PCA'
 
         if os.path.exists(f'Grid-Emulator_Files/{_chk_name}.npz'):
             _emu_btn_label = "♻️ Re-train (An Emulator Already Exists)"
@@ -574,6 +642,7 @@ def _(
     scale_selector,
     sirocco_grids_path,
     train_button,
+    use_smoothing,
     wl_max,
     wl_min,
 ):
@@ -588,23 +657,25 @@ def _(
         model_parameters_str = ''.join(str(i) for i in model_parameters)
         wl_range = (wl_min.value, wl_max.value)
         scale = scale_selector.value
+        smoothing = use_smoothing.value
+        smooth_tag = '_smooth' if smoothing else ''
         grid_name = grid_selector.value
         grid_path = sirocco_grids_path / grid_name
 
         # Standardize base name from grid folder name (e.g. no-bl -> no_bl)
         base_name = grid_name + "_"
 
-        # Generate file names
-        grid_file_name = f"{base_name}grid_{model_parameters_str}"
+        # Generate file names (include scale since flux is transformed during grid processing)
+        grid_file_name = f"{base_name}grid_{model_parameters_str}_{scale}{smooth_tag}"
 
         # Determine emulator file name based on Speculate_dev.py conventions
         # Default fixed inclination is 55 degrees per grid_configs setup
         fixed_inc = 55
 
         if 9 in model_parameters or 10 in model_parameters or 11 in model_parameters:
-            emu_file_name = f'{base_name}emu_{model_parameters_str}_{scale}_{wl_range[0]}-{wl_range[1]}AA_{n_components.value}PCA'
+            emu_file_name = f'{base_name}emu_{model_parameters_str}_{scale}{smooth_tag}_{wl_range[0]}-{wl_range[1]}AA_{n_components.value}PCA'
         else:
-            emu_file_name = f'{base_name}emu_{model_parameters_str}_{scale}_{fixed_inc}inc_{wl_range[0]}-{wl_range[1]}AA_{n_components.value}PCA'
+            emu_file_name = f'{base_name}emu_{model_parameters_str}_{scale}{smooth_tag}_{fixed_inc}inc_{wl_range[0]}-{wl_range[1]}AA_{n_components.value}PCA'
 
         # Check for existing grid file
         grid_file_path_check = f'Grid-Emulator_Files/{grid_file_name}.npz'
@@ -619,6 +690,7 @@ def _(
         - **Parameters:** {model_parameters}
         - **Wavelength Range:** {wl_range[0]}-{wl_range[1]} Å
         - **Flux Scale:** {scale}
+        - **Smoothing:** {'Yes (Gaussian σ=50)' if smoothing else 'No'}
         - **PCA Components:** {n_components.value}
         - **Method:** {method.value}
         - **Max Iterations:** {max_iter.value}
@@ -638,7 +710,8 @@ def _(
                 usecols=grid_config["usecols"],
                 wl_range=wl_range,
                 model_parameters=model_parameters,
-                scale=scale
+                scale=scale,
+                smoothing=smoothing
             )
         else:
             error_md = mo.md(f"⚠️ **Error:** Unknown grid configuration for `{grid_name}`")
