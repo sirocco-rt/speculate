@@ -1199,6 +1199,12 @@ def _(
         _covs = np.array(_covs_list)
         _sigs = np.sqrt(np.diagonal(_covs, axis1=-2, axis2=-1))
 
+        # --- Universal Noise Variance Calculation ---
+        # Calculate the diagonal of the inverse dot product matrix directly.
+        # This avoids the NoneType error from GPU memory savings in the backend.
+        _dots = _emu.eigenspectra @ _emu.eigenspectra.T
+        _dots_inv_diag = np.diag(np.linalg.inv(_dots))
+
         # Parameter description for x-axis label
         _desc_map = {
             1: "Disk.mdot", 2: "Wind.mdot", 3: "KWD.d",
@@ -1213,10 +1219,17 @@ def _(
         # Build Altair charts for selected components
         _charts = []
         for _comp in range(_comp_start, _comp_end + 1):
-            # Scatter: actual weights at grid points
+            
+            # Extract the variance attributed to the PCA truncation error
+            _var = _dots_inv_diag[_comp] / _emu.lambda_xi
+            _err_bar = float(np.sqrt(_var))
+
+            # Scatter: actual weights at grid points (with error bar bounds)
             _scatter_df = pd.DataFrame({
                 'x': _param_x,
-                'weight': _weights[_comp]
+                'weight': _weights[_comp],
+                'err_upper': _weights[_comp] + _err_bar,
+                'err_lower': _weights[_comp] - _err_bar
             })
 
             # GP prediction line + uncertainty band
@@ -1234,6 +1247,13 @@ def _(
                          alt.Tooltip('weight:Q', title='Weight', format='.4e')]
             )
 
+            # Error bars (vertical lines)
+            _error_bars = alt.Chart(_scatter_df).mark_rule(color='#3b82f6', strokeWidth=1.5).encode(
+                x='x:Q',
+                y='err_lower:Q',
+                y2='err_upper:Q'
+            )
+
             _gp_line = alt.Chart(_gp_df).mark_line(color='#f97316').encode(
                 x='x:Q',
                 y='mean:Q'
@@ -1245,7 +1265,8 @@ def _(
                 y2='upper:Q'
             )
 
-            _chart = (_gp_band + _gp_line + _scatter).properties(
+            # Layer components: Band -> Line -> Error Bars -> Points
+            _chart = (_gp_band + _gp_line + _error_bars + _scatter).properties(
                 title=f'PCA Component {_comp}',
                 width=650,
                 height=160
@@ -1272,7 +1293,7 @@ def _(
         gp_figure = mo.accordion({
             "\U0001f52c GP Weight Diagnostics": mo.vstack([
                 mo.md("Explore the Gaussian Process fit to the PCA weight latent space. "
-                       "Blue dots are the actual PCA weights at grid points. "
+                       "Blue dots are the actual PCA weights at grid points. Vertical bars represent the noise ($\sigma_k$) assigned to the weights by the $\lambda_\\xi$ truncation penalty. "
                        "Orange line and shaded region show the GP mean \u00b1 2\u03c3."),
                 mo.hstack([gp_xaxis_selector, gp_fixed_slider], justify="start", gap=1),
                 mo.hstack([gp_comp_start, gp_comp_end], justify="start", gap=1),
