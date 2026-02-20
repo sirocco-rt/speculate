@@ -991,7 +991,16 @@ def _(mo):
     # MLE State - stores results for MCMC stage
     get_mle_model, set_mle_model = mo.state(None)
     get_mle_priors, set_mle_priors = mo.state(None)
-    return get_mle_model, get_mle_priors, set_mle_model, set_mle_priors
+    # MCMC State - stores results for export
+    get_mcmc_samples, set_mcmc_samples = mo.state(None)
+    get_mcmc_labels, set_mcmc_labels = mo.state(None)
+    get_mcmc_summary_df, set_mcmc_summary_df = mo.state(None)
+    return (
+        get_mle_model, get_mle_priors, set_mle_model, set_mle_priors,
+        get_mcmc_samples, set_mcmc_samples,
+        get_mcmc_labels, set_mcmc_labels,
+        get_mcmc_summary_df, set_mcmc_summary_df,
+    )
 
 
 @app.cell
@@ -1504,6 +1513,9 @@ def _(
     mo,
     np,
     run_mcmc_btn,
+    set_mcmc_labels,
+    set_mcmc_samples,
+    set_mcmc_summary_df,
 ):
     # Run MCMC
     mcmc_results = None
@@ -1662,6 +1674,11 @@ def _(
                 _summary_df = _az.summary(_burn_data, round_to=5)
                 _summary_md = _summary_df.to_markdown()
 
+                # Store MCMC results in state for export cell
+                set_mcmc_samples(_burn_samples.copy())
+                set_mcmc_labels(list(_friendly_labels))
+                set_mcmc_summary_df(_summary_df)
+
                 # Posterior distributions
                 _fig_posterior = _az.plot_posterior(
                     _burn_data,
@@ -1796,6 +1813,135 @@ def _(
                 mcmc_results = mo.callout(mo.md(f"❌ MCMC Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
 
     mcmc_results if mcmc_results else mo.md("*Configure and run MCMC after MLE*")
+    return
+
+
+# =====================================================================
+# Export .pf / Posterior CSV
+# =====================================================================
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    ## Export Results
+
+    Export the MCMC posterior to a **Sirocco `.pf` template** and/or a **CSV file**
+    of posterior samples for downstream analysis.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(
+    emu,
+    get_mcmc_labels,
+    get_mcmc_samples,
+    get_mcmc_summary_df,
+    get_mle_model,
+    mo,
+    np,
+    os,
+    time,
+):
+    _samples = get_mcmc_samples()
+    _labels = get_mcmc_labels()
+    _summary_df = get_mcmc_summary_df()
+    _model = get_mle_model()
+
+    if _samples is None or _model is None:
+        mo.output.replace(mo.callout(mo.md("Run MCMC first to enable export."), kind="neutral"))
+        mo.stop(True)
+
+    export_pf_btn = mo.ui.run_button(label="📄 Export .pf Template", kind="success")
+    export_csv_btn = mo.ui.run_button(label="📊 Export Posterior CSV", kind="success")
+    export_dir_input = mo.ui.text(value="benchmark_results/exports", label="Output directory")
+
+    mo.vstack([
+        mo.hstack([export_dir_input], gap=1),
+        mo.hstack([export_pf_btn, export_csv_btn], gap=1),
+    ])
+    return export_csv_btn, export_dir_input, export_pf_btn
+
+
+@app.cell
+def _(
+    emu,
+    export_csv_btn,
+    export_dir_input,
+    export_pf_btn,
+    get_mcmc_labels,
+    get_mcmc_samples,
+    get_mcmc_summary_df,
+    get_mle_model,
+    mo,
+    np,
+    os,
+    time,
+):
+    _samples = get_mcmc_samples()
+    _labels = get_mcmc_labels()
+    _summary_df = get_mcmc_summary_df()
+    _model = get_mle_model()
+    _out_dir = export_dir_input.value or "benchmark_results/exports"
+    _ts = time.strftime("%Y%m%d_%H%M%S")
+
+    _msg = ""
+
+    if export_pf_btn.value and _model is not None and _samples is not None:
+        try:
+            from Speculate_addons.speculate_benchmark import export_pf_template, emulator_to_physical
+
+            os.makedirs(_out_dir, exist_ok=True)
+
+            # Posterior means for grid params
+            _n_grid = len(emu.param_names)
+            _grid_means = np.mean(_samples[:, :_n_grid], axis=0)
+
+            # Uncertainties
+            _uncertainties = {}
+            for _i, _label in enumerate(_labels[:_n_grid]):
+                _lo = np.percentile(_samples[:, _i], 16)
+                _hi = np.percentile(_samples[:, _i], 84)
+                _uncertainties[_label] = (_lo, _hi)
+
+            # Global params
+            _global = {}
+            for _i in range(_n_grid, _samples.shape[1]):
+                _global[_labels[_i]] = float(np.mean(_samples[:, _i]))
+
+            _pf_path = os.path.join(_out_dir, f"speculate_export_{_ts}.pf")
+            export_pf_template(
+                emu, _grid_means, _pf_path,
+                uncertainties=_uncertainties,
+                global_params=_global,
+            )
+            _msg += f"✅ .pf template exported to `{_pf_path}`\n\n"
+        except Exception as _e:
+            _msg += f"❌ .pf export failed: {_e}\n\n"
+
+    if export_csv_btn.value and _samples is not None:
+        try:
+            from Speculate_addons.speculate_benchmark import export_posterior_csv
+
+            os.makedirs(_out_dir, exist_ok=True)
+
+            # Build summary dict from DataFrame if available
+            _summary_dict = None
+            if _summary_df is not None:
+                _summary_dict = {}
+                for _idx_name in _summary_df.index:
+                    _row = _summary_df.loc[_idx_name]
+                    _summary_dict[str(_idx_name)] = {
+                        k: float(v) for k, v in _row.items() if np.isfinite(v)
+                    }
+
+            _csv_path = os.path.join(_out_dir, f"speculate_posterior_{_ts}.csv")
+            export_posterior_csv(_samples, _labels, _csv_path, summary=_summary_dict)
+            _msg += f"✅ Posterior CSV exported to `{_csv_path}`\n\n"
+        except Exception as _e:
+            _msg += f"❌ CSV export failed: {_e}\n\n"
+
+    if _msg:
+        mo.output.replace(mo.callout(mo.md(_msg), kind="success"))
     return
 
 

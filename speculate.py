@@ -185,6 +185,7 @@ def _(current_mode, mo):
                 "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
                 "/training": f"###{mo.icon('lucide:brain')} Training Tool",
                 "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
+                "/benchmark": f"###{mo.icon('lucide:test-tubes')} Benchmark Suite",
             }, orientation="vertical"),
             mo.md(" "),
             mo.md("---"),

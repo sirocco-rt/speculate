@@ -10,6 +10,7 @@ server = (
     .with_app(path="/inspector", root="speculate_grid_inspector.py")
     .with_app(path="/training", root="speculate_training.py")
     .with_app(path="/inference", root="speculate_inference.py")
+    .with_app(path="/benchmark", root="speculate_benchmark_viewer.py")
 )
 
 # Build and export the ASGI application

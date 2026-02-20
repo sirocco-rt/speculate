@@ -55,7 +55,7 @@ try:
         """PyTorch log likelihood computation with GPU acceleration (float64)
         
         With 64-bit precision, this matches SciPy's numerical accuracy
-        while providing ~3-4x speedup on GPU. Uses cached operations for MCMC.
+        while providing speedup on GPU. Uses cached operations for MCMC.
         
         Args:
             v11: Covariance matrix (numpy array)
@@ -1182,6 +1182,238 @@ class Emulator:
         if norm:
             flux *= self.norm_factor(params)[:, np.newaxis]
         return np.squeeze(flux)
+
+    # ==================================================================
+    # Benchmark / Leave-One-Out Cross-Validation
+    # ==================================================================
+
+    def loo_cv(self, grid=None):
+        """
+        Analytical leave-one-out (LOO) cross-validation for the trained GP.
+
+        For each PCA component *k* and training point *i*, the LOO predictive
+        mean and variance are computed from the inverse covariance matrix
+        without retraining (Rasmussen & Williams §5.4.2):
+
+            mu_{-i,k}    = w_{i,k} - (K_k^{-1} w_k)_i / (K_k^{-1})_{ii}
+            sigma2_{-i,k} = 1 / (K_k^{-1})_{ii}
+
+        If *grid* is provided (path to grid NPZ or a GridInterface) the LOO
+        weight predictions are projected back to flux space and compared with
+        the original spectra, giving a per-spectrum RMSE.
+
+        Uses GPU acceleration (PyTorch) when available; falls back to NumPy
+        otherwise.
+
+        Parameters
+        ----------
+        grid : str, GridInterface, or None
+            If given, also computes flux-space reconstruction metrics.
+
+        Returns
+        -------
+        results : dict with keys:
+            'loo_mu'          : (ncomps, M) LOO predicted weights
+            'loo_var'         : (ncomps, M) LOO predictive variances
+            'loo_residuals'   : (ncomps, M) true − predicted weights
+            'loo_std_resid'   : (ncomps, M) standardised residuals
+            'loo_mse_per_comp': (ncomps,) MSE per component
+            'loo_rmse_per_comp': (ncomps,) RMSE per component
+
+            If *grid* is supplied, extra keys:
+            'pca_recon_rmse'  : (M,) per-spectrum PCA reconstruction RMSE
+            'loo_flux_rmse'   : (M,) per-spectrum LOO flux RMSE
+            'pca_recon_rmse_median' : float
+            'pca_recon_rmse_95'     : float
+            'loo_flux_rmse_median'  : float
+            'loo_flux_rmse_95'      : float
+            'max_fractional_resid'  : float
+        """
+        if not self._trained:
+            warnings.warn(
+                "Emulator is not trained — LOO results will be unreliable."
+            )
+
+        M = self.grid_points.shape[0]  # number of training points
+
+        # Reshape w_hat to (ncomps, M)
+        w_hat_all = self.w_hat.reshape(self.ncomps, M)
+
+        # -----------------------------------------------------------
+        # Decide GPU vs CPU path
+        # -----------------------------------------------------------
+        use_gpu = (
+            PYTORCH_AVAILABLE
+            and torch.cuda.is_available()
+            and self._v11_gpu is not None
+        )
+
+        if use_gpu:
+            loo_mu, loo_var = self._loo_cv_gpu(w_hat_all, M)
+        else:
+            loo_mu, loo_var = self._loo_cv_cpu(w_hat_all, M)
+
+        # -----------------------------------------------------------
+        # Derived weight-space metrics (always on CPU/numpy)
+        # -----------------------------------------------------------
+        loo_residuals = w_hat_all - loo_mu
+        loo_std_resid = loo_residuals / np.sqrt(np.maximum(loo_var, 1e-30))
+        loo_mse = np.mean(loo_residuals ** 2, axis=1)
+        loo_rmse = np.sqrt(loo_mse)
+
+        results = {
+            'loo_mu': loo_mu,
+            'loo_var': loo_var,
+            'loo_residuals': loo_residuals,
+            'loo_std_resid': loo_std_resid,
+            'loo_mse_per_comp': loo_mse,
+            'loo_rmse_per_comp': loo_rmse,
+        }
+
+        # -----------------------------------------------------------
+        # Optional flux-space metrics
+        # -----------------------------------------------------------
+        if grid is not None:
+            if isinstance(grid, str):
+                grid = NPZInterface(grid)
+
+            # Original normalised spectra (same transform as from_grid:
+            # raw → divide by per-spectrum mean → we compare against this)
+            fluxes_raw = np.array(list(grid.fluxes))
+            norm_factors = fluxes_raw.mean(1)
+            original = fluxes_raw / norm_factors[:, np.newaxis]
+
+            # Inverse PCA transform:  flux = weights @ (eigenspectra * flux_std) + flux_mean
+            # This matches load_flux() exactly — using the emulator's stored
+            # eigenspectra, flux_std and flux_mean (not recomputed from grid).
+            X = self.eigenspectra * self.flux_std  # (K, P)
+
+            # a) PCA truncation error (true weights → reconstructed flux)
+            pca_recon = self.weights @ X + self.flux_mean  # (M, P)
+            pca_recon_err = original - pca_recon
+            pca_recon_rmse = np.sqrt(np.mean(pca_recon_err ** 2, axis=1))
+
+            # b) LOO error (LOO predicted weights → reconstructed flux)
+            loo_weights = loo_mu.T  # (M, K)
+            loo_recon = loo_weights @ X + self.flux_mean  # (M, P)
+            loo_flux_err = original - loo_recon
+            loo_flux_rmse = np.sqrt(np.mean(loo_flux_err ** 2, axis=1))
+
+            # Max fractional residual across all spectra and wavelengths
+            with np.errstate(divide='ignore', invalid='ignore'):
+                fractional = np.abs(loo_flux_err) / (np.abs(original) + 1e-30)
+            max_frac = float(np.nanmax(fractional))
+
+            results.update({
+                'original_flux': original,          # (M, P) normalised grid spectra
+                'pca_recon_flux': pca_recon,         # (M, P) PCA truncation recon
+                'loo_recon_flux': loo_recon,          # (M, P) LOO GP recon
+                'wavelength': self.wl,               # (P,)
+                'pca_recon_rmse': pca_recon_rmse,
+                'loo_flux_rmse': loo_flux_rmse,
+                'pca_recon_rmse_median': float(np.median(pca_recon_rmse)),
+                'pca_recon_rmse_95': float(np.percentile(pca_recon_rmse, 95)),
+                'loo_flux_rmse_median': float(np.median(loo_flux_rmse)),
+                'loo_flux_rmse_95': float(np.percentile(loo_flux_rmse, 95)),
+                'max_fractional_resid': max_frac,
+            })
+
+        return results
+
+    def _loo_cv_gpu(self, w_hat_all: np.ndarray, M: int):
+        """
+        GPU-accelerated LOO-CV using PyTorch.
+
+        Performs Cholesky decomposition and inverse computation entirely on
+        GPU, avoiding the expensive GPU→CPU transfer of v11 and the even
+        more expensive numpy Cholesky on large M×M matrices.
+
+        Parameters
+        ----------
+        w_hat_all : ndarray (ncomps, M)
+        M : int
+
+        Returns
+        -------
+        loo_mu, loo_var : ndarray (ncomps, M) each
+        """
+        device = self._v11_gpu.device
+        dtype = self._v11_gpu.dtype
+
+        w_hat_gpu = torch.from_numpy(w_hat_all).to(device, dtype)
+        eye_M = torch.eye(M, device=device, dtype=dtype)
+
+        loo_mu_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
+        loo_var_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
+        is_block_diagonal = (self._v11_gpu.dim() == 3)
+
+        for k in range(self.ncomps):
+            # Extract per-component covariance block
+            if is_block_diagonal:
+                K_k = self._v11_gpu[k]                                   # (M, M)
+            else:
+                K_k = self._v11_gpu[k * M:(k + 1) * M, k * M:(k + 1) * M]
+
+            # Cholesky → solve for K_inv  (K L = I → K_inv = cholesky_solve(I, L))
+            try:
+                L = torch.linalg.cholesky(K_k)
+                K_inv = torch.cholesky_solve(eye_M, L)                    # (M, M)
+            except torch.linalg.LinAlgError:
+                # Jitter and retry
+                K_k_jit = K_k + 1e-8 * eye_M
+                L = torch.linalg.cholesky(K_k_jit)
+                K_inv = torch.cholesky_solve(eye_M, L)
+
+            w_k = w_hat_gpu[k]                                           # (M,)
+            K_inv_w = K_inv @ w_k                                        # (M,)
+            K_inv_diag = K_inv.diagonal()                                # (M,)
+
+            loo_mu_gpu[k] = w_k - K_inv_w / K_inv_diag
+            loo_var_gpu[k] = 1.0 / K_inv_diag
+
+        # Transfer results back to CPU (small: 2 × ncomps × M floats)
+        return loo_mu_gpu.cpu().numpy(), loo_var_gpu.cpu().numpy()
+
+    def _loo_cv_cpu(self, w_hat_all: np.ndarray, M: int):
+        """
+        CPU fallback for LOO-CV using NumPy/SciPy.
+
+        Parameters
+        ----------
+        w_hat_all : ndarray (ncomps, M)
+        M : int
+
+        Returns
+        -------
+        loo_mu, loo_var : ndarray (ncomps, M) each
+        """
+        v11_cpu = self.v11  # property handles lazy GPU→CPU if needed
+        if v11_cpu is None:
+            raise RuntimeError("Cannot access v11 for LOO computation.")
+
+        loo_mu = np.zeros((self.ncomps, M))
+        loo_var = np.zeros((self.ncomps, M))
+
+        for k in range(self.ncomps):
+            if self.block_diagonal:
+                K_k = v11_cpu[k]
+            else:
+                K_k = v11_cpu[k * M:(k + 1) * M, k * M:(k + 1) * M]
+
+            try:
+                L = np.linalg.cholesky(K_k)
+                K_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(M)))
+            except np.linalg.LinAlgError:
+                K_inv = np.linalg.inv(K_k + 1e-8 * np.eye(M))
+
+            w_k = w_hat_all[k]
+            K_inv_w = K_inv @ w_k
+            K_inv_diag = np.diag(K_inv)
+
+            loo_mu[k] = w_k - K_inv_w / K_inv_diag
+            loo_var[k] = 1.0 / K_inv_diag
+
+        return loo_mu, loo_var
 
     def norm_factor(self, params: Union[Sequence[float], np.ndarray]) -> float:
         """
