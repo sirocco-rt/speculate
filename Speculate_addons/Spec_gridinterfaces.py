@@ -56,6 +56,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         self.scale = scale # Flux space scale 
         self.smoothing = smoothing # Gaussian smoothing toggle
         self.usecols = usecols # Wavelength and inclination tuple
+        self._skiprows_cache = {}
         # self.skiprows = skiprows # Deprecated: calculated dynamically
         points = []
         if 1 in model_parameters:
@@ -152,7 +153,6 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         param11_name = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85] # Inclination angle (degrees) - full (5° steps)
         
         # For file lookup: only parameters 1-8 (determines filename)
-        #file_lookup_names = [param1_name, param2_name, param3_name, param4_name, param5_name, param6_name, param7_name, param8_name]
         fixed_params = [param1_name[1], param2_name[1], param3_name[1], param4_name[1], param5_name[1], param6_name[1], param7_name[1], param8_name[1]]
         
         # Build the 8-parameter array for file lookup (excluding parameters 9 and 10)
@@ -167,20 +167,19 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
                 # Use fixed middle value for missing parameters 1-8
                 file_params.append(fixed_params[param_num - 1])
         
-        file_params = np.array(file_params)
-        
-        # Create file lookup combinations (only parameters 1-8)
-        import itertools
-        file_combinations = []
-        temp_grid = np.array([param1_name, param2_name, param3_name, param4_name, param5_name, param6_name, param7_name, param8_name])
-        for i in itertools.product(*temp_grid):
-            file_combinations.append(list(i))
+        def _grid_index(grid_values, value):
+            grid_values = np.asarray(grid_values)
+            matches = np.where(np.isclose(grid_values, value, rtol=1e-9, atol=1e-8))[0]
+            if len(matches) != 1:
+                raise ValueError(f"Parameter value {value} does not map uniquely to grid values {grid_values.tolist()}")
+            return int(matches[0])
 
-        # Find the matching file using 8-parameter combination
-        for i in range(len(file_combinations)):
-            if np.all(np.isclose(file_params, file_combinations[i], rtol=1e-9, atol=1e-8)):
-                file_name = f'run{i}.spec' # if matched, index is run number
-                break
+        grids = [param1_name, param2_name, param3_name, param4_name, param5_name, param6_name, param7_name, param8_name]
+        run_index = 0
+        for grid_values, value in zip(grids, file_params):
+            value_index = _grid_index(grid_values, value)
+            run_index = run_index * len(grid_values) + value_index
+        file_name = f'run{run_index}.spec'
         
         return self.path + file_name # returning the correct filename/path
 
@@ -213,6 +212,8 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         Scans the file to find the number of header lines.
         Assumes header lines start with '#' or 'Freq.' (after stripping whitespace).
         """
+        if filepath in self._skiprows_cache:
+            return self._skiprows_cache[filepath]
         with open(filepath, 'r') as f:
             for i, line in enumerate(f):
                 line = line.strip()
@@ -220,7 +221,9 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
                 if line.startswith('#'): continue
                 if line.startswith('Freq.'): continue
                 # Found the first data line
+                self._skiprows_cache[filepath] = i
                 return i
+        self._skiprows_cache[filepath] = 0
         return 0
 
     def load_flux(self, parameters, header=False, norm=False):
@@ -243,12 +246,8 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             dict (Optional): Dictionary of parameter names and values
         """
         
-        import logging
-        import pandas as _pd
         
-        # Get the filename for logging
         file_path = self.get_flux(parameters)
-        file_name = os.path.basename(file_path)
         
         # Determine which column to use for inclination
         # Check for any inclination parameter (9, 10, or 11)
@@ -262,20 +261,11 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             
             # Map inclination angle to column index (30°->2, 35°->3, ..., 85°->13)
             inclination_column = int(2 + (inclination_angle - 30) / 5)
-            
-            # LOG THE DETAILS
-            logger = logging.getLogger(__name__)
-            logger.info(f"GRID PROCESSING [Param{inclination_param_num}]: File={file_name}, Parameters={parameters}, Inclination={inclination_angle}°, Column={inclination_column}")
         else:
             # Use the default column from usecols if no inclination parameter in model_parameters
             inclination_column = self.usecols[1]
-            
-            # LOG THE DETAILS
-            logger = logging.getLogger(__name__)
-            logger.info(f"GRID PROCESSING [Default]: File={file_name}, Parameters={parameters}, Default_Column={inclination_column}")
         
         # Load flux using wavelength (column 0) and calculated inclination column
-        # Using comments=['#', 'Freq.'] to handle variable header length
         # Optimized: Pre-scan for header length to avoid line-by-line comment checking in loadtxt
         skiprows = self._get_skiprows(file_path)
         wl, flux = np.loadtxt(file_path, usecols=(0, inclination_column), skiprows=skiprows, unpack=True)
@@ -283,7 +273,8 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         
         flux = flux[:len(self.wl_full)] # THIS CUT IS NEEDED, Random parameters appear in the grid space header leading to mismatching file lengths.
         if self.smoothing:
-            flux = _pd.Series(flux).rolling(window=5, center=True, min_periods=1).mean().values
+            kernel = np.ones(5, dtype=np.float64)
+            flux = np.convolve(flux, kernel, mode='same') / np.convolve(np.ones_like(flux), kernel, mode='same')
         if self.scale == 'log':
             flux = np.where(flux > 0, flux, 1e-30)  # Floor non-positive values to avoid log10(0) = -inf
             flux = np.log10(flux) # logged 10 
@@ -350,6 +341,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         self.scale = scale # Flux space scale 
         self.smoothing = smoothing # Gaussian smoothing toggle
         self.usecols = usecols # Wavelength and inclination tuple
+        self._skiprows_cache = {}
         # self.skiprows = skiprows # Deprecated: calculated dynamically
         points = []
         if 1 in model_parameters:
@@ -437,8 +429,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         param10_name = [30, 40, 50, 60, 70, 80] # Inclination angle (degrees) - mid
         param11_name = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85] # Inclination angle (degrees) - full (5° steps)
         
-        # For file lookup: only parameters 1-8 (determines filename)
-        #file_lookup_names = [param1_name, param2_name, param3_name, param4_name, param5_name, param6_name]
+        # For file lookup: only parameters 1-6 (determines filename)
         fixed_params = [param1_name[1], param2_name[1], param3_name[1], param4_name[1], param5_name[1], param6_name[1]]
         
         # Build the 8-parameter array for file lookup (excluding parameters 9 and 10)
@@ -453,20 +444,19 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
                 # Use fixed middle value for missing parameters 1-6
                 file_params.append(fixed_params[param_num - 1])
         
-        file_params = np.array(file_params)
-        
-        # Create file lookup combinations (only parameters 1-8)
-        import itertools
-        file_combinations = []
-        temp_grid = np.array([param1_name, param2_name, param3_name, param4_name, param5_name, param6_name])
-        for i in itertools.product(*temp_grid):
-            file_combinations.append(list(i))
+        def _grid_index(grid_values, value):
+            grid_values = np.asarray(grid_values)
+            matches = np.where(np.isclose(grid_values, value, rtol=1e-9, atol=1e-8))[0]
+            if len(matches) != 1:
+                raise ValueError(f"Parameter value {value} does not map uniquely to grid values {grid_values.tolist()}")
+            return int(matches[0])
 
-        # Find the matching file using 8-parameter combination
-        for i in range(len(file_combinations)):
-            if np.all(np.isclose(file_params, file_combinations[i], rtol=1e-9, atol=1e-8)):
-                file_name = f'run{i}.spec' # if matched, index is run number
-                break
+        grids = [param1_name, param2_name, param3_name, param4_name, param5_name, param6_name]
+        run_index = 0
+        for grid_values, value in zip(grids, file_params):
+            value_index = _grid_index(grid_values, value)
+            run_index = run_index * len(grid_values) + value_index
+        file_name = f'run{run_index}.spec'
     
         
         return self.path + file_name # returning the correct filename/path
@@ -498,6 +488,8 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         Scans the file to find the number of header lines.
         Assumes header lines start with '#' or 'Freq.' (after stripping whitespace).
         """
+        if filepath in self._skiprows_cache:
+            return self._skiprows_cache[filepath]
         with open(filepath, 'r') as f:
             for i, line in enumerate(f):
                 line = line.strip()
@@ -505,7 +497,9 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
                 if line.startswith('#'): continue
                 if line.startswith('Freq.'): continue
                 # Found the first data line
+                self._skiprows_cache[filepath] = i
                 return i
+        self._skiprows_cache[filepath] = 0
         return 0
 
     def load_flux(self, parameters, header=False, norm=False):
@@ -528,12 +522,8 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             dict (Optional): Dictionary of parameter names and values
         """
         
-        import logging
-        import pandas as _pd
         
-        # Get the filename for logging
         file_path = self.get_flux(parameters)
-        file_name = os.path.basename(file_path)
         
         # Determine which column to use for inclination
         # Check for any inclination parameter (9, 10, or 11)
@@ -547,20 +537,11 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             
             # Map inclination angle to column index (30°->2, 35°->3, ..., 85°->13)
             inclination_column = int(2 + (inclination_angle - 30) / 5)
-            
-            # LOG THE DETAILS
-            logger = logging.getLogger(__name__)
-            logger.info(f"GRID PROCESSING [Param{inclination_param_num}]: File={file_name}, Parameters={parameters}, Inclination={inclination_angle}°, Column={inclination_column}")
         else:
             # Use the default column from usecols if no inclination parameter in model_parameters
             inclination_column = self.usecols[1]
-            
-            # LOG THE DETAILS
-            logger = logging.getLogger(__name__)
-            logger.info(f"GRID PROCESSING [Default]: File={file_name}, Parameters={parameters}, Default_Column={inclination_column}")
         
         # Load flux using wavelength (column 0) and calculated inclination column
-        # Using comments=['#', 'Freq.'] to handle variable header length
         # Optimized: Pre-scan for header length to avoid line-by-line comment checking in loadtxt
         skiprows = self._get_skiprows(file_path)
         wl, flux = np.loadtxt(file_path, usecols=(0, inclination_column), skiprows=skiprows, unpack=True)
@@ -568,7 +549,8 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         
         flux = flux[:len(self.wl_full)] # THIS CUT IS NEEDED, Random parameters appear in the grid space header leading to mismatching file lengths.
         if self.smoothing:
-            flux = _pd.Series(flux).rolling(window=5, center=True, min_periods=1).mean().values
+            kernel = np.ones(5, dtype=np.float64)
+            flux = np.convolve(flux, kernel, mode='same') / np.convolve(np.ones_like(flux), kernel, mode='same')
         if self.scale == 'log':
             flux = np.where(flux > 0, flux, 1e-30)  # Floor non-positive values to avoid log10(0) = -inf
             flux = np.log10(flux) # logged 10 
