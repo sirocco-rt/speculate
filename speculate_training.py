@@ -36,6 +36,7 @@ def _(mo):
 @app.cell(hide_code=True)
 def _():
     import marimo as mo
+    mo._runtime.context.get_context().marimo_config["runtime"]["output_max_bytes"] = 10_000_000_000
     logo_path = "assets/logos/Speculate_logo2.png"
 
     # Left column: Title and Description
@@ -349,8 +350,8 @@ def _(grid_configs, grid_selector, mo, sirocco_grids_path):
 
 
 @app.cell
-def _(mo, params):
-    # Calculate estimated grid size to warn about VRAM
+def _(mo, n_components, params):
+    # Calculate estimated grid size and VRAM usage
     high_vram = mo.md("")
 
     if params is not None and params.value:
@@ -371,24 +372,85 @@ def _(mo, params):
                 else:
                     total_points *= 3
 
-            # Thresholds:
-            # 3^8 = 6,561 (High VRAM start)
-            # 3^9 = 19,683 (Very High VRAM start)
+            # ============================================================
+            # Adaptive VRAM Estimation
+            # ============================================================
+            # V11 is the dominant memory consumer during training.
+            # With block_diagonal=True, V11 is stored as (n_comp, M, M) float64.
+            # Use the actual PCA component slider value for estimation.
+            # Additional overhead: ~2x V11 for Cholesky workspace + kernel intermediates.
+            n_comp_estimate = n_components.value
+            elem_bytes = 8  # float64
+            v11_bytes = n_comp_estimate * total_points * total_points * elem_bytes
+            # Working memory: Cholesky factor L + intermediate solve buffers ≈ 2x V11
+            estimated_total_bytes = v11_bytes * 3
+            estimated_gb = estimated_total_bytes / (1024**3)
 
-            if total_points >= 19683:
+            # Detect actual GPU VRAM
+            gpu_vram_gb = None
+            try:
+                if torch.cuda.is_available():
+                    gpu_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            except Exception:
+                pass
+
+            # Format sizes
+            v11_mb = v11_bytes / (1024**2)
+            v11_display = f"{v11_mb:.0f} MB" if v11_mb < 1024 else f"{v11_mb/1024:.1f} GB"
+            total_display = f"{estimated_gb:.1f} GB"
+
+            if gpu_vram_gb is not None:
+                usage_pct = (estimated_gb / gpu_vram_gb) * 100
+                vram_info = f"GPU VRAM: **{gpu_vram_gb:.1f} GB** &nbsp;|&nbsp; Est. usage: **{total_display}** ({usage_pct:.0f}%)"
+
+                if estimated_gb > gpu_vram_gb:
+                    # Peak VRAM in memory-efficient mode: ~2 × M² × 8 bytes
+                    efficient_bytes = 2 * total_points * total_points * elem_bytes
+                    efficient_gb = efficient_bytes / (1024**3)
+                    efficient_display = f"{efficient_gb:.1f} GB"
+                    
+                    if efficient_gb > gpu_vram_gb:
+                        # Even a single block won't fit — truly too large
+                        high_vram = mo.callout(
+                            mo.md(f"🛑 **Grid too large for this GPU (~{total_points:,} grid points)**\n\n"
+                                  f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Standard mode: ~{total_display}\n\n"
+                                  f"{vram_info}\n\n"
+                                  f"Memory-efficient peak: ~{efficient_display} — even a single M×M block exceeds GPU VRAM. "
+                                  f"Reduce parameters."),
+                            kind="alert"
+                        )
+                    else:
+                        # Memory-efficient mode can handle it
+                        high_vram = mo.callout(
+                            mo.md(f"⚠️ **Training will use memory-efficient mode (~{total_points:,} grid points)**\n\n"
+                                  f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Standard mode: ~{total_display}\n\n"
+                                  f"{vram_info}\n\n"
+                                  f"Memory-efficient peak: ~{efficient_display} — builds V11 blocks on-the-fly instead of storing the full tensor. "
+                                  f"Mathematically identical results, training may be slightly slower. Ensure high performance is used."),
+                            kind="warn"
+                        )
+                elif usage_pct > 70:
+                    high_vram = mo.callout(
+                        mo.md(f"⚠️ **Warning: High VRAM usage (~{total_points:,} grid points)**\n\n"
+                              f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Total estimated: ~{total_display}\n\n"
+                              f"{vram_info}\n\n"
+                              f"Training should fit but memory will be tight. A high performance GPU is recommended."),
+                        kind="warn"
+                    )
+                else:
+                    high_vram = mo.callout(
+                        mo.md(f"✅ **Estimated Grid Size: ~{total_points:,} grid points**\n\n"
+                              f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Total estimated: ~{total_display}\n\n"
+                              f"{vram_info}"),
+                        kind="success"
+                    )
+            else:
+                # No GPU detected — show estimate without comparison
                 high_vram = mo.callout(
-                    mo.md(f"⚠️ **Warning: Very High VRAM Usage (~{total_points:,} grid points)**\n\nGrid size likely exceeds 100GB in GPU VRAM."),
-                    kind="alert"
-                )
-            elif total_points >= 6561:
-                high_vram = mo.callout(
-                    mo.md(f"⚠️ **Warning: High VRAM Usage (~{total_points:,} grid points)**\n\nLarge grid size may exceed current GPU limits."),
-                    kind="warn"
-                )
-            else: 
-                high_vram = mo.callout(
-                    mo.md(f"✅ **Estimated Grid Size: ~{total_points:,} grid points**\n\nGrid size should be manageable on most GPUs."),
-                    kind="success"
+                    mo.md(f"ℹ️ **Estimated Grid Size: ~{total_points:,} grid points**\n\n"
+                          f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Total estimated: ~{total_display}\n\n"
+                          f"No GPU detected. CPU training will be used. Likely very slow for moderate grids."),
+                    kind="info"
                 )
         except Exception:
             pass
@@ -455,8 +517,23 @@ def _(mo):
 
     max_iter = mo.ui.number(start=100, stop=100000, value=10000, step=100, label="Max Iterations:")
 
-    mo.vstack([method, max_iter])
-    return max_iter, method
+    strict_weight_fit = mo.ui.checkbox(
+        value=False,
+        label="Strict Weight Fit (bypass λ_ξ truncation penalty)"
+    )
+
+    mo.vstack([
+        method,
+        max_iter,
+        strict_weight_fit,
+        mo.md(
+            "_When enabled, the GP is trained to fit the PCA weights directly "
+            "without the Czekala et al. (2015) truncation noise matrix. "
+            "This can produce tighter fits at the cost of losing the formal "
+            "flux-space equivalence._"
+        )
+    ])
+    return max_iter, method, strict_weight_fit
 
 
 @app.cell
@@ -654,6 +731,7 @@ def _(
     params,
     scale_selector,
     sirocco_grids_path,
+    strict_weight_fit,
     train_button,
     use_smoothing,
     wl_max,
@@ -707,6 +785,7 @@ def _(
         - **PCA Components:** {n_components.value}
         - **Method:** {method.value}
         - **Max Iterations:** {max_iter.value}
+        - **Strict Weight Fit:** {'Yes (λ_ξ penalty bypassed)' if strict_weight_fit.value else 'No (standard Czekala+2015)'}
         - **Process Grid:** {'Auto (File not found, creating new)' if process_grid_auto else 'Auto (File found, loading existing)'}
         - **Grid File:** `{grid_file_name}.npz`
         - **Emulator File:** `{emu_file_name}.npz`
@@ -830,6 +909,7 @@ def _(
     set_trained_emu,
     set_training_status,
     set_training_trigger,
+    strict_weight_fit,
     sys,
     time,
     train_button,
@@ -937,7 +1017,8 @@ def _(
                     grid_path_npz,
                     n_components=n_components.value,
                     svd_solver="full",
-                    block_diagonal=True
+                    block_diagonal=True,
+                    strict_weight_fit=strict_weight_fit.value
                 )
 
                 print(f"Grid loaded. Initialized {emu.ncomps} PCA components.")
@@ -1188,16 +1269,11 @@ def _(
             _Xtest.append(tuple(_point))
         _Xtest = np.array(_Xtest)
 
-        # Evaluate GP at test points
-        _mus_list = []
-        _covs_list = []
-        for _X in _Xtest:
-            _m, _c = _emu(_X)
-            _mus_list.append(_m)
-            _covs_list.append(_c)
-        _mus = np.array(_mus_list)
-        _covs = np.array(_covs_list)
-        _sigs = np.sqrt(np.diagonal(_covs, axis1=-2, axis2=-1))
+        # Evaluate GP at all test points in a single batched call
+        # This is critical for large grids: avoids 100× redundant Cholesky decompositions
+        _mus, _covs = _emu(_Xtest, full_cov=False, reinterpret_batch=True)
+        # _mus: (n_test, n_comp), _covs: (n_test, n_comp) — variances per component per point
+        _sigs = np.sqrt(_covs)
 
         # --- Universal Noise Variance Calculation ---
         # Calculate the diagonal of the inverse dot product matrix directly.
@@ -1219,7 +1295,7 @@ def _(
         # Build Altair charts for selected components
         _charts = []
         for _comp in range(_comp_start, _comp_end + 1):
-            
+
             # Extract the variance attributed to the PCA truncation error
             _var = _dots_inv_diag[_comp] / _emu.lambda_xi
             _err_bar = float(np.sqrt(_var))
@@ -1293,7 +1369,7 @@ def _(
         gp_figure = mo.accordion({
             "\U0001f52c GP Weight Diagnostics": mo.vstack([
                 mo.md("Explore the Gaussian Process fit to the PCA weight latent space. "
-                       "Blue dots are the actual PCA weights at grid points. Vertical bars represent the noise ($\sigma_k$) assigned to the weights by the $\lambda_\\xi$ truncation penalty. "
+                       "Blue dots are the actual PCA weights at grid points. Vertical bars represent the noise ($\\sigma_k$) assigned to the weights by the $\\lambda_\\xi$ truncation penalty. "
                        "Orange line and shaded region show the GP mean \u00b1 2\u03c3."),
                 mo.hstack([gp_xaxis_selector, gp_fixed_slider], justify="start", gap=1),
                 mo.hstack([gp_comp_start, gp_comp_end], justify="start", gap=1),
