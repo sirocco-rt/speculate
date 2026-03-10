@@ -35,3 +35,6 @@ pyinstrument
 # Arviz for MCMC diagnostics (last to avoid potential conflicts with other dependencies)
 arviz>=0.23.0
 tabulate
+
+# Versioning
+python-semantic-release
