@@ -141,31 +141,42 @@ def _(mo):
 def _(ORG_ID, REPO_TYPE, dataset_dropdown, list_repo_files, mo):
     # Fetch files from selected dataset
     spec_files = []
+    aux_files = []
     repo_id = None
 
     if dataset_dropdown.value:
         try:
             repo_id = f"{ORG_ID}/{dataset_dropdown.value}"
-            all_files = list_repo_files(repo_id=repo_id, repo_type=REPO_TYPE)
+            all_files = list(list_repo_files(repo_id=repo_id, repo_type=REPO_TYPE))
             spec_files = [f for f in all_files if f.startswith("run") and f.endswith(".spec.xz")]
 
             # Sort numerically by extracting the number from the filename
             spec_files.sort(key=lambda x: int(x.replace("run", "").replace(".spec.xz", "")))
 
+            # Auxiliary files (e.g. lookup tables) — anything that isn't a
+            # spec file and isn't a git/HF metadata file.
+            _skip = {".gitattributes", "README.md"}
+            aux_files = [
+                f for f in all_files
+                if f not in _skip and not (f.startswith("run") and f.endswith(".spec.xz"))
+            ]
+
+            _aux_note = f" + {len(aux_files)} auxiliary file(s)" if aux_files else ""
             file_info = mo.md(f"""
             **Dataset:** `{dataset_dropdown.value}`
 
-            **Files found:** {len(spec_files)} spectral files (.spec.xz)
+            **Files found:** {len(spec_files)} spectral files (.spec.xz){_aux_note}
             """)
 
         except Exception as e:
             spec_files = []
+            aux_files = []
             file_info = mo.md(f"❌ Error fetching files: {e}")
     else:
         file_info = mo.md("⚠️ Please select a dataset first")
 
     file_info
-    return repo_id, spec_files
+    return aux_files, repo_id, spec_files
 
 
 @app.cell(hide_code=True)
@@ -362,6 +373,7 @@ def _(mo):
 @app.cell
 def _(
     REPO_TYPE,
+    aux_files,
     dataset_dropdown,
     decompress_only_button,
     download_and_decompress_button,
@@ -394,10 +406,23 @@ def _(
                     mo.output.append(mo.md(f"❌ Failed to download `{filename}`: {e}"))
                 bar.update()
 
+        # Always download auxiliary files (e.g. lookup tables) into the
+        # extraction directory so they sit alongside the spec files.
+        os.makedirs(extraction_dir, exist_ok=True)
+        for _aux in aux_files:
+            try:
+                _aux_local = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=_aux,
+                    repo_type=REPO_TYPE
+                )
+                _dest = os.path.join(extraction_dir, _aux)
+                shutil.copy2(_aux_local, _dest)
+            except Exception as e:
+                mo.output.append(mo.md(f"⚠️ Could not fetch auxiliary file `{_aux}`: {e}"))
+
         # Decompress if requested
         if download_and_decompress_button.value:
-            os.makedirs(extraction_dir, exist_ok=True)
-
             with mo.status.progress_bar(total=len(download_results), title="Decompressing...") as bar:
                 for filename, local_path, error in download_results:
                     if local_path:
@@ -421,6 +446,20 @@ def _(
         # Decompress previously downloaded files
         extraction_dir = f"sirocco_grids/{dataset_dropdown.value}/"
         os.makedirs(extraction_dir, exist_ok=True)
+
+        # Also fetch auxiliary files if not already present
+        for _aux in aux_files:
+            _dest = os.path.join(extraction_dir, _aux)
+            if not os.path.exists(_dest):
+                try:
+                    _aux_local = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=_aux,
+                        repo_type=REPO_TYPE
+                    )
+                    shutil.copy2(_aux_local, _dest)
+                except Exception:
+                    pass
 
         with mo.status.progress_bar(total=len(files_to_download), title="Decompressing cached files...") as bar:
             for filename in files_to_download:
