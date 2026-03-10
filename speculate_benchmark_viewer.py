@@ -16,25 +16,25 @@ def _():
     return (mo,)
 
 @app.cell(hide_code=True)
-def _():
-    logo_path = "assets/logos/Speculate_logo2.png"
+def _(mo):
+    _logo_path = "assets/logos/Speculate_logo2.png"
 
     # Left column: Title and Description
-    title_col = mo.vstack([
+    _title_col = mo.vstack([
         mo.md("# Benchmark Suite"),
         mo.md("Evaluate emulator performance across three tiers: "
                "grid reconstruction, parameter recovery, and observational spectra."),
     ])
     # Right column: Logo with link
     # Using flex-end to align it to the right
-    logo_col = mo.vstack([
-        mo.image(src=logo_path, width=400),
+    _logo_col = mo.vstack([
+        mo.image(src=_logo_path, width=400, height=95),
         mo.md('<p style="text-align: center; font-size: 0.8em;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
     ], align="center")
 
     # Combine in horizontal stack
-    mo.hstack([title_col, logo_col], justify="space-between", align="center")
-    return (mo,)
+    mo.hstack([_title_col, _logo_col], justify="space-between", align="center")
+    return
 
 @app.cell
 def _(mo):
@@ -181,10 +181,10 @@ def _(
 @app.cell(hide_code=True)
 def _(get_report, mo, np, plt):
     _report = get_report()
-
-    if _report is None:
-        mo.output.replace(mo.md("*Load a report above, or run a benchmark below.*"))
-        mo.stop(True)
+    mo.stop(
+        _report is None,
+        mo.md("*Load a report above, or run a benchmark below.*"),
+    )
 
     # Build tab content
     _tabs = {}
@@ -195,7 +195,41 @@ def _(get_report, mo, np, plt):
         _t1_items = []
         _t1_items.append(mo.md("## Tier 1 — Grid Reconstruction Fidelity"))
 
-        # Summary metrics
+        # --- Emulator Accuracy Score banner ---
+        _eas = _t1.get("emulator_accuracy_score")
+        if _eas is not None:
+            _eas_color = (
+                "#2ecc71" if _eas >= 95
+                else "#f39c12" if _eas >= 85
+                else "#e74c3c"
+            )
+            _pca_ev_raw = _t1.get("pca_explained_variance")
+            _loo_rmse_raw = _t1.get("loo_flux_rmse_median")
+            _pca_str = f"{_pca_ev_raw*100:.1f}%" if _pca_ev_raw is not None else "n/a"
+            _loo_str = f"{_loo_rmse_raw:.4f}" if _loo_rmse_raw is not None else "n/a"
+            # Warn when a component drags EAS down
+            _pca_warn = " ⚠ GP worse than mean predictor" if (_pca_ev_raw is not None and _pca_ev_raw < 0) else ""
+            _loo_warn = " ⚠ RMSE > normalised flux scale" if (_loo_rmse_raw is not None and _loo_rmse_raw > 1.0) else ""
+            _t1_items.append(mo.md(
+                f'<div style="border:2px solid {_eas_color}; border-radius:8px; '
+                f'padding:12px 20px; display:inline-block; margin-bottom:8px;">'
+                f'<span style="font-size:1.1em; color:#aaa;">Emulator Accuracy Score</span><br>'
+                f'<span style="font-size:2.4em; font-weight:bold; color:{_eas_color};">{_eas:.2f}%</span><br>'
+                f'<span style="font-size:0.85em; color:#aaa;">'
+                f'PCA explained variance: <b>{_pca_str}</b>{_pca_warn} &nbsp;|&nbsp; '
+                f'Leave-One-Out flux RMSE (median): <b>{_loo_str}</b>{_loo_warn}</span><br>'
+                f'<span style="font-size:0.75em; color:#888;">'
+                f'EAS = clamp(PCA EV, 0\u20131) &times; max(0, 1 &minus; Leave-One-Out RMSE) &times; 100 '
+                f'&mdash; 100% is perfect, both components must be high</span>'
+                f'</div>'
+            ))
+        else:
+            _t1_items.append(mo.callout(
+                mo.md("*Emulator Accuracy Score unavailable — re-run Tier 1 with a grid path to compute flux-space metrics.*"),
+                kind="warn",
+            ))
+
+        # Summary metrics (EAS has its own banner above)
         _summary_rows = []
         for _key in ["n_components", "n_grid_points", "n_params", "tier1_time_s",
                       "pca_explained_variance", "loo_flux_rmse_median",
@@ -216,18 +250,18 @@ def _(get_report, mo, np, plt):
             _fig, _axes = plt.subplots(1, 2, figsize=(12, 4))
             _axes[0].bar(range(len(_rmses)), _rmses, color="steelblue")
             _axes[0].set_xlabel("PCA Component")
-            _axes[0].set_ylabel("LOO RMSE")
-            _axes[0].set_title("LOO RMSE by Component")
+            _axes[0].set_ylabel("Leave-One-Out RMSE")
+            _axes[0].set_title("Leave-One-Out RMSE by Component")
 
             # Standardised residuals
             _std_resid = _t1.get("loo_std_resid", [])
             if _std_resid:
                 _flat = np.array(_std_resid).flatten()
-                _axes[1].hist(_flat, bins=50, density=True, alpha=0.7, color="steelblue", label="LOO")
+                _axes[1].hist(_flat, bins=50, density=True, alpha=0.7, color="steelblue", label="Leave-One-Out")
                 _xgauss = np.linspace(-4, 4, 200)
                 _axes[1].plot(_xgauss, 1.0/(np.sqrt(2*np.pi))*np.exp(-0.5*_xgauss**2), "r-", label="N(0,1)")
                 _axes[1].set_xlabel("Standardised Residual")
-                _axes[1].set_title("LOO Residual Distribution")
+                _axes[1].set_title("Leave-One-Out Residual Distribution")
                 _axes[1].legend()
 
             plt.tight_layout()
@@ -241,11 +275,47 @@ def _(get_report, mo, np, plt):
     if _t2:
         _t2_items = []
         _t2_items.append(mo.md("## Tier 2 — Test Grid Parameter Recovery"))
-        _t2_items.append(mo.md(
-            f"**{_t2.get('n_processed', '?')}/{_t2.get('n_spectra', '?')} spectra** "
-            f"processed ({_t2.get('n_failures', 0)} failures) in "
-            f"{_t2.get('tier2_time_s', 0):.0f}s"
-        ))
+        _n_proc = _t2.get('n_processed', 0)
+        _n_spec = _t2.get('n_spectra', '?')
+        _n_fail = _t2.get('n_failures', 0)
+        _n_nc = _t2.get('n_not_converged', 0)
+        _t2_time = _t2.get('tier2_time_s', 0)
+        _status_parts = [f"**{_n_proc}/{_n_spec} spectra** processed"]
+        if _n_fail:
+            _status_parts.append(f"{_n_fail} failed")
+        if _n_nc:
+            _status_parts.append(f"{_n_nc} not converged")
+        _status_parts.append(f"in {_t2_time:.0f}s")
+        _t2_items.append(mo.md(" — ".join(_status_parts)))
+
+        # --- Failure log ---
+        _flog = _t2.get("failure_log", [])
+        if _flog:
+            _fail_kind = "danger" if _n_proc == 0 else "warn"
+            _flog_rows = [
+                {"Run": _e["run"], "Stage": _e["stage"], "Error": _e["error"]}
+                for _e in _flog
+            ]
+            _tb_blocks = "\n\n".join(
+                f"**{_e['run']} ({_e['stage']}):**\n```\n{_e.get('traceback','').strip()}\n```"
+                for _e in _flog if _e.get("traceback", "").strip()
+            )
+            _t2_items.append(mo.callout(
+                mo.vstack([
+                    mo.md(f"**{len(_flog)} failure(s) recorded.** "
+                          "Check the table and tracebacks below to diagnose."),
+                    mo.ui.table(_flog_rows, label="Failure Log"),
+                    mo.md("#### Tracebacks") if _tb_blocks else mo.md(""),
+                    mo.md(_tb_blocks) if _tb_blocks else mo.md(""),
+                ]),
+                kind=_fail_kind,
+            ))
+        elif _n_proc == 0:
+            _t2_items.append(mo.callout(
+                mo.md("All spectra failed but no failure log was recorded. "
+                      "Re-run the benchmark to capture error details."),
+                kind="danger",
+            ))
 
         _agg = _t2.get("aggregate", {})
         if _agg:
@@ -363,11 +433,10 @@ def _(get_report, mo, np, plt):
 @app.cell(hide_code=True)
 def _(get_tier1_arrays, mo):
     _arrs = get_tier1_arrays()
-    if _arrs is None:
-        mo.output.replace(mo.md(
-            "*Run a Tier 1 benchmark below to view the interactive reconstruction plot.*"
-        ))
-        mo.stop(True)
+    mo.stop(
+        _arrs is None,
+        mo.md("*Run a Tier 1 benchmark below to view the interactive reconstruction plot.*"),
+    )
 
     _M = _arrs["original_flux"].shape[0]
     _pnames = _arrs["param_names"]
@@ -382,7 +451,7 @@ def _(get_tier1_arrays, mo):
     mo.vstack([
         mo.md("## Interactive Reconstruction Explorer"),
         mo.md(f"Browse all **{_M}** training spectra. "
-               "Overlay original grid spectrum, PCA reconstruction, and LOO GP reconstruction."),
+               "Overlay original grid spectrum, PCA reconstruction, and Leave-One-Out GP reconstruction."),
         spectrum_slider,
     ])
     return recon_param_names, spectrum_slider
@@ -410,7 +479,7 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
 
     _readout = mo.md(
         f"{_param_badges}  \n"
-        f"LOO RMSE: **{_rmse_loo:.6g}** &nbsp; PCA RMSE: **{_rmse_pca:.6g}** "
+        f"Leave-One-Out RMSE: **{_rmse_loo:.6g}** &nbsp; PCA RMSE: **{_rmse_pca:.6g}** "
         f"&nbsp; Max fractional residual: **{_max_frac:.4g}**"
     )
 
@@ -421,16 +490,16 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
         "Series": (
             ["Original"] * len(_wl) +
             ["PCA Recon"] * len(_wl) +
-            ["LOO GP Recon"] * len(_wl)
+            ["Leave-One-Out GP Recon"] * len(_wl)
         ),
     })
 
     _color_scale = alt.Scale(
-        domain=["Original", "PCA Recon", "LOO GP Recon"],
+        domain=["Original", "PCA Recon", "Leave-One-Out GP Recon"],
         range=["#4c78a8", "#f58518", "#54a24b"],
     )
     _dash_scale = alt.Scale(
-        domain=["Original", "PCA Recon", "LOO GP Recon"],
+        domain=["Original", "PCA Recon", "Leave-One-Out GP Recon"],
         range=[[0, 0], [6, 4], [4, 2]],
     )
 
@@ -454,11 +523,11 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
     _df_resid = pd.DataFrame({
         "Wavelength": np.tile(_wl, 2),
         "Residual": np.concatenate([_resid_loo, _resid_pca]),
-        "Series": ["LOO GP Residual"] * len(_wl) + ["PCA Residual"] * len(_wl),
+        "Series": ["Leave-One-Out GP Residual"] * len(_wl) + ["PCA Residual"] * len(_wl),
     })
 
     _resid_color = alt.Scale(
-        domain=["LOO GP Residual", "PCA Residual"],
+        domain=["Leave-One-Out GP Residual", "PCA Residual"],
         range=["#54a24b", "#f58518"],
     )
 
@@ -514,7 +583,7 @@ def _(get_tier1_arrays, mo, np):
             np.abs(_orig - _loo) / (np.abs(_orig) + 1e-30), axis=1
         )
 
-    # Sort by descending LOO RMSE
+    # Sort by descending Leave-One-Out RMSE
     _order = np.argsort(-_loo_rmse)
 
     _rows = []
@@ -522,14 +591,14 @@ def _(get_tier1_arrays, mo, np):
         _row = {"Rank": _rank + 1, "Index": int(_i)}
         for _j, _pn in enumerate(_pnames):
             _row[_pn] = round(float(_gp[_i, _j]), 4)
-        _row["LOO RMSE"] = f"{_loo_rmse[_i]:.6g}"
+        _row["Leave-One-Out RMSE"] = f"{_loo_rmse[_i]:.6g}"
         _row["PCA RMSE"] = f"{_pca_rmse[_i]:.6g}"
         _row["Max Frac Resid"] = f"{_max_frac[_i]:.4g}"
         _rows.append(_row)
 
     mo.vstack([
         mo.md("#### Worst-Reconstructed Spectra"),
-        mo.md("Sorted by descending LOO RMSE. Use the slider above to inspect any spectrum."),
+        mo.md("Sorted by descending Leave-One-Out RMSE. Use the slider above to inspect any spectrum."),
         mo.ui.table(_rows, label="All spectra", page_size=15),
     ])
     return
@@ -538,9 +607,10 @@ def _(get_tier1_arrays, mo, np):
 @app.cell(hide_code=True)
 def _(get_comparison_reports, mo, np, plt):
     _comp_reports = get_comparison_reports()
-    if not _comp_reports or len(_comp_reports) < 2:
-        mo.output.replace(mo.md("*Select 2+ reports above to compare.*"))
-        mo.stop(True)
+    mo.stop(
+        not _comp_reports or len(_comp_reports) < 2,
+        mo.md("*Select 2+ reports above to compare.*"),
+    )
 
     _comp_items = [mo.md("## Report Comparison")]
 
@@ -548,12 +618,27 @@ def _(get_comparison_reports, mo, np, plt):
     for _i, _rep in enumerate(_comp_reports):
         _tag = _rep.get("config", {}).get("tag", f"report_{_i}")
         _t1 = _rep.get("tier1", {})
-        if "loo_flux_rmse_median" in _t1:
-            _t1_data[_tag] = _t1["loo_flux_rmse_median"]
+        _t1_data[_tag] = {
+            "eas": _t1.get("emulator_accuracy_score"),
+            "loo_rmse": _t1.get("loo_flux_rmse_median"),
+            "pca_ev": _t1.get("pca_explained_variance"),
+        }
 
     if _t1_data:
-        _rows = [{"Report": _k, "Tier 1 LOO Flux RMSE (median)": f"{_v:.6g}"} for _k, _v in _t1_data.items()]
+        _rows = [
+            {
+                "Report": _k,
+                "EAS (%)": f"{_v['eas']:.2f}" if _v["eas"] is not None else "—",
+                "Leave-One-Out Flux RMSE (median)": f"{_v['loo_rmse']:.6g}" if _v["loo_rmse"] is not None else "—",
+                "PCA Explained Var.": f"{_v['pca_ev']:.6g}" if _v["pca_ev"] is not None else "—",
+            }
+            for _k, _v in _t1_data.items()
+        ]
         _comp_items.append(mo.md("### Tier 1 Comparison"))
+        _comp_items.append(mo.md(
+            "**EAS** (Emulator Accuracy Score) = PCA explained variance × (1 − Leave-One-Out flux RMSE) × 100. "
+            "Higher is better; 100% is perfect."
+        ))
         _comp_items.append(mo.ui.table(_rows))
 
     _all_params = set()
@@ -731,54 +816,250 @@ def _(
     _t0 = time.time()
 
     try:
+        from pathlib import Path as _Path
         from Starfish.emulator import Emulator as _Emulator
         from Speculate_addons.speculate_benchmark import (
             run_tier1 as _run_tier1,
-            run_tier2 as _run_tier2,
             run_tier3_single as _run_tier3_single,
             build_report_card as _build_report_card,
             save_report as _save_report,
+            # Tier 2 helpers — viewer drives the loop for nested progress
+            load_test_grid_spectrum as _load_spec,
+            extract_ground_truth as _extract_gt,
+            ensure_lookup_table as _ensure_lookup,
+            internal_to_friendly as _to_friendly,
+            run_mle_single as _run_mle,
+            run_mcmc_single as _run_mcmc,
+            aggregate_tier2_results as _agg_t2,
         )
+        import numpy as _np
+        import traceback as _tb
 
         _emu_path = emu_picker.value
         if not _emu_path or not os.path.isfile(_emu_path):
             set_status_msg("Error: select a valid emulator file.")
             mo.stop(True)
 
-        _emu = _Emulator.load(_emu_path)
+        # ---- Load emulator (spinner — single long operation) ----
+        with mo.status.spinner(
+            title="Loading Emulator",
+            subtitle=f"Loading {os.path.basename(_emu_path)}…",
+            remove_on_exit=True,
+        ):
+            _emu = _Emulator.load(_emu_path)
 
         _tiers = [_v for _v in (tier_picker.value or [])]
         _tier1_result = None
         _tier2_result = None
         _tier3_results = None
 
+        # ---- Tier 1 (spinner — single LOO cross-validation pass) ----
         if 1 in _tiers and matched_grid_path:
-            set_status_msg("Running Tier 1...")
-            _tier1_result = _run_tier1(_emu, matched_grid_path)
+            with mo.status.spinner(
+                title="Tier 1 — Grid Reconstruction",
+                subtitle="Running LOO cross-validation…",
+                remove_on_exit=True,
+            ):
+                _tier1_result = _run_tier1(_emu, matched_grid_path)
 
             # Store flux arrays in state for the interactive plot
             _t1_arrays = _tier1_result.pop("_arrays", None)
             if _t1_arrays is not None:
                 set_tier1_arrays(_t1_arrays)
 
+        # ---- Tier 2 (progress_bar per spectrum + spinner per stage) ----
         if 2 in _tiers and matched_testgrid_path:
-            set_status_msg("Running Tier 2...")
-            _tier2_result = _run_tier2(
-                _emu,
-                matched_testgrid_path,
-                mcmc_steps=mcmc_steps_slider.value,
-                max_spectra=max_spectra_slider.value,
+            _t2_t0 = time.time()
+            _test_path = _Path(matched_testgrid_path)
+            _spec_files = sorted(_test_path.glob("run*.spec"))
+            if max_spectra_slider.value:
+                _spec_files = _spec_files[: max_spectra_slider.value]
+            _n_t2 = len(_spec_files)
+
+            _parquet = _ensure_lookup(_test_path)
+            _friendly = _to_friendly(_emu.param_names)
+            _n_params = len(_emu.param_names)
+
+            _per_spectrum = []
+            _all_samples = {n: [] for n in _friendly}
+            _all_truths = {n: [] for n in _friendly}
+            _failures = 0
+            _n_not_converged = 0
+            _failure_log = []
+            _mcmc_steps_val = mcmc_steps_slider.value
+
+            with mo.status.progress_bar(
+                total=_n_t2,
+                title="Tier 2 — Parameter Recovery",
+                subtitle="Starting…",
+                completion_title="Tier 2 — Parameter Recovery",
+                completion_subtitle="Complete ✓",
+                show_rate=True,
+                show_eta=True,
+                remove_on_exit=True,
+            ) as _t2_bar:
+                for _si, _sf in enumerate(_spec_files):
+                    _run_idx = int(_sf.stem.replace("run", ""))
+                    _sname = _sf.name
+
+                    # -- Load spectrum --
+                    _t2_bar.update(increment=0, subtitle=f"Loading {_sname}…")
+                    try:
+                        _wl, _flux, _sigma = _load_spec(str(_sf), 55.0, (850, 1850))
+                    except Exception as _e:
+                        _failure_log.append({
+                            "run": _sname, "stage": "load",
+                            "error": str(_e), "traceback": _tb.format_exc(),
+                        })
+                        _failures += 1
+                        _t2_bar.update(increment=1, subtitle=f"✗ {_sname} failed to load")
+                        continue
+
+                    # Ground truth
+                    _gt = {}
+                    if _parquet.exists():
+                        try:
+                            _gt = _extract_gt(str(_parquet), _run_idx, _emu.param_names)
+                        except Exception:
+                            pass
+
+                    # -- MLE (spinner with iteration updates) --
+                    with mo.status.spinner(
+                        title=f"MLE — {_sname}",
+                        subtitle=f"Optimising ({_si + 1}/{_n_t2})…",
+                        remove_on_exit=True,
+                    ) as _mle_spin:
+                        def _mle_cb(it, mx, best_nll, elapsed):
+                            _mle_spin.update(
+                                subtitle=(
+                                    f"Iteration {it}/{mx} | "
+                                    f"Best NLL: {best_nll:.2f} | "
+                                    f"Time: {elapsed:.1f}s"
+                                )
+                            )
+                        try:
+                            _mle = _run_mle(
+                                _emu, _wl, _flux, _sigma, flux_scale="linear",
+                                max_iter=10_000, iteration_callback=_mle_cb,
+                            )
+                        except Exception as _e:
+                            _failure_log.append({
+                                "run": _sname, "stage": "MLE",
+                                "error": str(_e), "traceback": _tb.format_exc(),
+                            })
+                            _failures += 1
+                            _t2_bar.update(increment=1, subtitle=f"✗ {_sname} MLE failed")
+                            continue
+
+                    # -- MCMC (spinner with step updates) --
+                    with mo.status.spinner(
+                        title=f"MCMC — {_sname}",
+                        subtitle=f"Sampling {_mcmc_steps_val} steps ({_si + 1}/{_n_t2})…",
+                        remove_on_exit=True,
+                    ) as _mcmc_spin:
+                        def _mcmc_cb(step, total, elapsed):
+                            _mcmc_spin.update(
+                                subtitle=(
+                                    f"Step {step}/{total} | "
+                                    f"Time: {elapsed:.1f}s"
+                                )
+                            )
+                        try:
+                            _mcmc = _run_mcmc(
+                                _mle["model"], _mle["priors"],
+                                nwalkers=32,
+                                nsteps=_mcmc_steps_val,
+                                burnin=200,
+                                iteration_callback=_mcmc_cb,
+                            )
+                        except Exception as _e:
+                            _failure_log.append({
+                                "run": _sname, "stage": "MCMC",
+                                "error": str(_e), "traceback": _tb.format_exc(),
+                            })
+                            _failures += 1
+                            _t2_bar.update(increment=1, subtitle=f"✗ {_sname} MCMC failed")
+                            continue
+
+                    if not _mcmc["converged"]:
+                        _n_not_converged += 1
+
+                    # Collect results
+                    _spec_res = {
+                        "run": _run_idx,
+                        "mle_success": _mle["success"],
+                        "mcmc_converged": _mcmc["converged"],
+                        "n_effective": _mcmc["n_effective"],
+                        "mle_grid_params": _mle["grid_params"],
+                    }
+                    for _pi, _fn in enumerate(_friendly):
+                        if _fn in _mcmc["summary"]:
+                            _spec_res[f"{_fn}_mean"] = _mcmc["summary"][_fn]["mean"]
+                            _spec_res[f"{_fn}_std"] = _mcmc["summary"][_fn]["std"]
+                            _all_samples[_fn].append(_mcmc["samples"][:, _pi])
+                            if _fn in _gt:
+                                _all_truths[_fn].append(_gt[_fn])
+                                _spec_res[f"{_fn}_truth"] = _gt[_fn]
+                                _spec_res[f"{_fn}_delta_sigma"] = (
+                                    _mcmc["summary"][_fn]["mean"] - _gt[_fn]
+                                ) / max(_mcmc["summary"][_fn]["std"], 1e-10)
+
+                    _per_spectrum.append(_spec_res)
+
+                    _status_lbl = (
+                        f"✓ {_sname} complete"
+                        if _mcmc["converged"]
+                        else f"⚠ {_sname} (not converged)"
+                    )
+                    _t2_bar.update(increment=1, subtitle=_status_lbl)
+
+            # Aggregate
+            _tier2_result = _agg_t2(
+                per_spectrum=_per_spectrum,
+                all_samples=_all_samples,
+                all_truths=_all_truths,
+                friendly_names=_friendly,
+                n_params=_n_params,
+                emu_min_params=_emu.min_params,
+                emu_max_params=_emu.max_params,
+                spec_files_count=_n_t2,
+                failures=_failures,
+                failure_log=_failure_log,
+                mcmc_walkers=32,
+                mcmc_steps=_mcmc_steps_val,
+                mcmc_burnin=200,
+                elapsed=time.time() - _t2_t0,
+                n_not_converged=_n_not_converged,
             )
 
+        # ---- Tier 3 (progress bar — one step per observation) ----
         if 3 in _tiers and obs_picker.value:
-            set_status_msg("Running Tier 3...")
+            _obs_list = obs_picker.value
             _tier3_results = []
-            for _obs_path in obs_picker.value:
-                _r = _run_tier3_single(
-                    _emu, _obs_path,
-                    mcmc_steps=mcmc_steps_slider.value,
-                )
-                _tier3_results.append(_r)
+            with mo.status.progress_bar(
+                total=len(_obs_list),
+                title="Tier 3 — Observational Spectra",
+                subtitle="Starting…",
+                completion_title="Tier 3 — Observational Spectra",
+                completion_subtitle="Complete ✓",
+                show_rate=True,
+                show_eta=True,
+                remove_on_exit=True,
+            ) as _t3_bar:
+                for _obs_path in _obs_list:
+                    _t3_bar.update(
+                        increment=0,
+                        subtitle=f"Fitting {os.path.basename(_obs_path)}…",
+                    )
+                    _r = _run_tier3_single(
+                        _emu, _obs_path,
+                        mcmc_steps=mcmc_steps_slider.value,
+                    )
+                    _tier3_results.append(_r)
+                    _t3_bar.update(
+                        increment=1,
+                        subtitle=f"✓ {os.path.basename(_obs_path)} complete",
+                    )
 
         _config = {
             "emulator": _emu_path,
@@ -798,7 +1079,28 @@ def _(
 
         set_report(_report)
         _elapsed = time.time() - _t0
-        set_status_msg(f"Benchmark complete in {_elapsed:.1f}s — saved to {_out_path}")
+
+        # Final summary
+        _summary_parts = [f"**Benchmark complete in {_elapsed:.1f}s** — saved to `{_out_path}`"]
+        if _tier1_result:
+            _eas = _tier1_result.get("emulator_accuracy_score")
+            if _eas is not None:
+                _summary_parts.append(f"Tier 1 EAS: **{_eas:.2f}%**")
+        if _tier2_result:
+            _t2_fail = _tier2_result.get('n_failures', 0)
+            _t2_nc = _tier2_result.get('n_not_converged', 0)
+            _t2_parts = [
+                f"Tier 2: {_tier2_result.get('n_processed', 0)}/{_tier2_result.get('n_spectra', '?')} spectra"
+            ]
+            if _t2_fail:
+                _t2_parts.append(f"{_t2_fail} failed")
+            if _t2_nc:
+                _t2_parts.append(f"{_t2_nc} not converged")
+            _summary_parts.append(" — ".join(_t2_parts))
+        if _tier3_results:
+            _summary_parts.append(f"Tier 3: {len(_tier3_results)} observation(s)")
+
+        set_status_msg("  \n".join(_summary_parts))
 
     except Exception as _e:
         import traceback as _tb
@@ -810,7 +1112,8 @@ def _(
 def _(get_status_msg, mo):
     _msg = get_status_msg()
     if _msg:
-        mo.output.replace(mo.callout(mo.md(_msg), kind="info"))
+        _kind = "success" if "complete" in _msg.lower() else "danger" if "error" in _msg.lower() else "info"
+        mo.output.replace(mo.callout(mo.md(_msg), kind=_kind))
     return
 
 

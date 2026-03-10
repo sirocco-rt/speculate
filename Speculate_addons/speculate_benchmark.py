@@ -3,7 +3,7 @@ Speculate Benchmark Module
 ===========================
 Core functions for evaluating emulator performance across three tiers:
 
-    Tier 1 — Grid Reconstruction Fidelity (PCA + LOO-CV)
+    Tier 1 — Grid Reconstruction Fidelity (PCA + Leave-One-Out CV)
     Tier 2 — Test Grid Parameter Recovery  (MLE + MCMC + calibration)
     Tier 3 — Observational Spectra         (goodness-of-fit + PPC)
 
@@ -98,7 +98,7 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
         A trained emulator instance.
     grid_path : str or None
         Path to the grid NPZ file. If provided, flux-space metrics are
-        computed in addition to weight-space LOO metrics.
+        computed in addition to weight-space Leave-One-Out metrics.
 
     Returns
     -------
@@ -118,6 +118,25 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     results["n_grid_points"] = emu.grid_points.shape[0]
     results["n_params"] = emu.grid_points.shape[1]
     results["tier1_time_s"] = time.time() - t0
+
+    # Emulator Accuracy Score (EAS): single 0–100% summary metric.
+    # Combines PCA explained variance (how well n_components capture the grid
+    # variance) with Leave-One-Out flux reconstruction accuracy (how well the GP
+    # interpolates unseen training points in flux space).  100% = perfect.
+    # Both components are clamped to [0, 1]: a negative pca_explained_variance
+    # (Leave-One-Out weight-MSE > weight variance — GP worse than mean) scores 0, not
+    # a negative EAS which would be misleading.
+    # Only computable when grid_path is provided (flux-space metrics present).
+    _pca_ev = results["pca_explained_variance"]
+    _loo_rmse_med = results.get("loo_flux_rmse_median")
+    if _loo_rmse_med is not None:
+        results["emulator_accuracy_score"] = float(
+            100.0
+            * max(0.0, min(1.0, _pca_ev))
+            * max(0.0, 1.0 - _loo_rmse_med)
+        )
+    else:
+        results["emulator_accuracy_score"] = None
 
     # Separate large flux arrays (kept in-memory, never serialised)
     _ARRAY_KEYS = {"original_flux", "pca_recon_flux", "loo_recon_flux", "wavelength"}
@@ -162,7 +181,8 @@ def _load_test_grid_spectrum(
                 break
 
     data = np.loadtxt(spec_file, skiprows=skiprows)
-    wl = np.flip(data[:, 0])  # Freq → Wavelength
+    # Column 0 = Freq (Hz), column 1 = Lambda (Å) — always use Lambda
+    wl = np.flip(data[:, 1])
     # Inclination → column: 30°=col2, 35°=col3, ...
     col = int(2 + (inclination - 30) / 5)
     flux = np.flip(data[:, col])
@@ -170,6 +190,15 @@ def _load_test_grid_spectrum(
     mask = (wl >= wl_range[0]) & (wl <= wl_range[1])
     wl = wl[mask]
     flux = flux[mask]
+
+    if len(wl) < 2:
+        raise ValueError(
+            f"Only {len(wl)} wavelength point(s) remain after filtering to "
+            f"wl_range={wl_range} in {spec_file}. "
+            "Check that wl_range matches the spectrum's wavelength array (Å) "
+            "and that the correct inclination column is being read."
+        )
+
     sigma = np.abs(flux) * 0.05  # 5% assumed error
     sigma = np.maximum(sigma, np.abs(flux) * 0.01)
     return wl, flux, sigma
@@ -233,6 +262,37 @@ def _extract_ground_truth(
     return gt
 
 
+def _get_loc_scale(dist):
+    """Extract loc and scale from a frozen scipy distribution."""
+    args = dist.args
+    kwds = dist.kwds
+    if len(args) >= 2:
+        return args[0], args[1]
+    elif len(args) == 1:
+        return args[0], kwds.get("scale", 1.0)
+    else:
+        return kwds.get("loc", 0.0), kwds.get("scale", 1.0)
+
+
+def _simplex_column_uniform(loc, scale, N):
+    """Evenly spaced points across a truncated uniform range."""
+    mn = loc
+    mx = loc + scale
+    rng = mx - mn
+    margin = rng / 20  # 5% inset on each end
+    t_mn, t_mx = mn + margin, mx - margin
+    interval = (t_mx - t_mn) / N
+    return [t_mn + interval * k for k in range(N + 1)]
+
+
+def _simplex_column_norm(mean, std, N):
+    """Evenly spaced points across ±2σ of a normal prior."""
+    mn = mean - 2 * std
+    mx = mean + 2 * std
+    interval = (mx - mn) / N
+    return [mn + interval * k for k in range(N + 1)]
+
+
 def run_mle_single(
     emu,
     wl: np.ndarray,
@@ -240,7 +300,9 @@ def run_mle_single(
     sigma: np.ndarray,
     priors: Optional[dict] = None,
     flux_scale: str = "linear",
-    max_iter: int = 5000,
+    max_iter: int = 10_000,
+    freeze_av: bool = True,
+    iteration_callback=None,
 ) -> dict:
     """
     Run MLE inference on a single spectrum.
@@ -256,6 +318,13 @@ def run_mle_single(
         'linear', 'log', or 'scaled'.
     max_iter : int
         Maximum Nelder-Mead iterations.
+    freeze_av : bool
+        If True (default), fix Av=0.  Use True for synthetic test-grid
+        spectra (Tier 2) which have no dust; False for observational
+        spectra (Tier 3) where Av should be optimised.
+    iteration_callback : callable or None
+        If provided, called as ``iteration_callback(iter_num, max_iter, best_nll, elapsed_s)``
+        every 50 iterations during optimisation.
 
     Returns
     -------
@@ -288,41 +357,129 @@ def run_mle_single(
         emulator=emu,
         data=spec,
         grid_params=grid_init,
-        global_cov={"log_amp": -36.0, "log_ls": 4.0},
+        global_cov={"log_amp": -55.0, "log_ls": 4.5},
     )
 
-    # Build default priors from emulator bounds
+    # Optionally fix Av = 0 (synthetic test-grid spectra have no dust
+    # extinction, so allowing Av to float wastes degrees of freedom and
+    # can push the optimizer into poor local minima).
+    if freeze_av:
+        model.params["Av"] = 0.0
+        model.freeze("Av")
+
+    # Bootstrap log_scale from auto-calculation *before* building priors
+    # so we can centre the log_scale prior on the data-informed value.
+    _bootstrapped_ls = -25.0  # sensible fallback
+    try:
+        _ = model()
+        if model._log_scale is not None and np.isfinite(model._log_scale):
+            _bootstrapped_ls = float(model._log_scale)
+            model.params["log_scale"] = _bootstrapped_ls
+    except Exception:
+        model.params["log_scale"] = _bootstrapped_ls
+
+    # Build default priors — tightly bounded to match the inference tool's
+    # optimised settings.  Tight priors are critical: the initial simplex
+    # spans these ranges, so wide priors place most vertices in regions of
+    # parameter space where the model produces garbage NLL, causing
+    # Nelder-Mead to converge immediately to a poor local minimum.
     if priors is None:
         priors = {}
         for i, pn in enumerate(emu.param_names):
             lo, hi = float(emu.min_params[i]), float(emu.max_params[i])
-            margin = (hi - lo) * 0.05
-            priors[pn] = stats.uniform(loc=lo - margin, scale=(hi - lo) + 2 * margin)
-        priors["Av"] = stats.uniform(loc=0, scale=2.0)
-        priors["log_scale"] = stats.uniform(loc=-80, scale=120)
-        priors["global_cov:log_amp"] = stats.norm(loc=-36.0, scale=5.0)
-        priors["global_cov:log_ls"] = stats.uniform(loc=0, scale=12)
-
-    # Bootstrap log_scale
-    try:
-        _ = model()
-        if model._log_scale is not None and np.isfinite(model._log_scale):
-            model.params["log_scale"] = model._log_scale
-    except Exception:
-        model.params["log_scale"] = 0.0
+            priors[pn] = stats.uniform(loc=lo, scale=hi - lo)
+        if not freeze_av:
+            priors["Av"] = stats.uniform(loc=0, scale=2.0)
+        # log_scale: data-informed ±5 range around the bootstrapped value
+        priors["log_scale"] = stats.uniform(
+            loc=_bootstrapped_ls - 5.0, scale=10.0
+        )
+        # GP log_amp: normal prior centred on -55 with σ=2.5 (±2σ = [-60, -50])
+        priors["global_cov:log_amp"] = stats.norm(loc=-55.0, scale=2.5)
+        # GP log_ls: [1, 8] — matches inference tool optimised range
+        priors["global_cov:log_ls"] = stats.uniform(loc=1.0, scale=7.0)
 
     labels_before = list(model.labels)
 
+    # ── Build initial simplex spanning the prior space ──────────────
+    # This gives Nelder-Mead a well-distributed starting region instead
+    # of a single midpoint, dramatically improving convergence.
+    active_labels = list(model.labels)
+    N = len(active_labels)
+    simplex = np.zeros((N + 1, N))
+
+    for col_idx, label in enumerate(active_labels):
+        if label in priors:
+            dist = priors[label]
+            loc, sc = _get_loc_scale(dist)
+            if dist.dist.name == "uniform":
+                col = _simplex_column_uniform(loc, sc, N)
+            elif dist.dist.name == "norm":
+                col = _simplex_column_norm(loc, sc, N)
+            else:
+                cv = model.get_param_vector()[col_idx]
+                col = [cv + (cv * 0.01 * k) for k in range(N + 1)]
+        else:
+            cv = model.get_param_vector()[col_idx]
+            col = [cv] * (N + 1)
+
+        simplex[:, col_idx] = col
+        # Roll each column by its index so rows are offset from each other
+        simplex[:, col_idx] = np.roll(simplex[:, col_idx], col_idx)
+
+    # Bootstrap log_scale at every simplex vertex so the optimizer starts
+    # with a data-informed scale at each point in parameter space.
+    if "log_scale" in active_labels:
+        ls_idx = active_labels.index("log_scale")
+        for row in range(N + 1):
+            try:
+                model.set_param_vector(simplex[row])
+                _ = model()  # triggers auto log_scale calc
+                if model._log_scale is not None and np.isfinite(model._log_scale):
+                    simplex[row, ls_idx] = model._log_scale
+            except Exception:
+                pass  # keep the prior-based value
+
+    # Restore model to the centroid of the simplex
+    centroid = simplex.mean(axis=0)
+    model.set_param_vector(centroid)
+
+    _nll_history = []
+    _iter_count = [0]
+    _mle_t0 = time.time()
+
     def nll(P):
         model.set_param_vector(P)
-        return -model.log_likelihood(priors)
+        # Penalise out-of-bounds grid params so Nelder-Mead steers back in range
+        # rather than propagating an exception and aborting the whole run.
+        gp = np.array(model.grid_params)
+        violation = (
+            np.sum(np.maximum(0.0, emu.min_params - gp) ** 2)
+            + np.sum(np.maximum(0.0, gp - emu.max_params) ** 2)
+        )
+        if violation > 0.0:
+            return 1e10 * (1.0 + violation)
+        try:
+            val = -model.log_likelihood(priors)
+        except Exception:
+            val = 1e10
+        _nll_history.append(val)
+        _iter_count[0] += 1
+        if iteration_callback is not None and _iter_count[0] % 50 == 0:
+            _best = min(_nll_history) if _nll_history else val
+            iteration_callback(_iter_count[0], max_iter, _best, time.time() - _mle_t0)
+        return val
 
     p0 = model.get_param_vector()
     soln = scipy_minimize(
         nll,
         p0,
         method="Nelder-Mead",
-        options={"maxiter": max_iter, "adaptive": True},
+        options={
+            "maxiter": max_iter,
+            "adaptive": True,
+            "initial_simplex": simplex,
+        },
     )
 
     if soln.success:
@@ -346,9 +503,16 @@ def run_mcmc_single(
     nwalkers: int = 32,
     nsteps: int = 1000,
     burnin: int = 200,
+    iteration_callback=None,
 ) -> dict:
     """
     Run MCMC on a SpectrumModel already set to MLE best-fit.
+
+    Parameters
+    ----------
+    iteration_callback : callable or None
+        If provided, called as ``iteration_callback(step, nsteps, elapsed_s)``
+        every 50 steps.
 
     Returns
     -------
@@ -372,10 +536,29 @@ def run_mcmc_single(
 
     def log_prob(P):
         model.set_param_vector(P)
-        return model.log_likelihood(priors)
+        # Reject proposals outside emulator bounds (return -inf so emcee
+        # discards this step instead of crashing with a ValueError).
+        gp = np.array(model.grid_params)
+        if np.any(gp < model.emulator.min_params) or np.any(gp > model.emulator.max_params):
+            return -np.inf
+        try:
+            return model.log_likelihood(priors)
+        except (ValueError, np.linalg.LinAlgError):
+            return -np.inf
 
     sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob)
-    sampler.run_mcmc(ball, nsteps, progress=False)
+
+    # Run MCMC, calling iteration_callback every 50 steps if provided
+    if iteration_callback is not None:
+        _mcmc_t0 = time.time()
+        _state = None
+        for _step, _state in enumerate(
+            sampler.sample(ball, iterations=nsteps), start=1
+        ):
+            if _step % 50 == 0:
+                iteration_callback(_step, nsteps, time.time() - _mcmc_t0)
+    else:
+        sampler.run_mcmc(ball, nsteps, progress=False)
 
     # Autocorrelation & burn-in
     try:
@@ -516,6 +699,121 @@ def compute_coverage(
     return alphas, coverage
 
 
+# --- Public aliases for helpers used by the viewer-driven loop ---------
+load_test_grid_spectrum = _load_test_grid_spectrum
+extract_ground_truth = _extract_ground_truth
+
+
+def ensure_lookup_table(test_grid_path: Union[str, Path]) -> Path:
+    """Return the path to the parquet lookup table, downloading it if missing."""
+    p = Path(test_grid_path) / "grid_run_lookup_table.parquet"
+    if not p.exists():
+        dataset_name = Path(test_grid_path).name
+        try:
+            import shutil
+            from huggingface_hub import hf_hub_download
+            local = hf_hub_download(
+                repo_id=f"Sirocco-rt/{dataset_name}",
+                filename="grid_run_lookup_table.parquet",
+                repo_type="dataset",
+            )
+            shutil.copy2(local, str(p))
+            log.info(f"Downloaded lookup table to {p}")
+        except Exception as e:
+            log.warning(f"Could not download lookup table: {e}")
+    return p
+
+
+def aggregate_tier2_results(
+    per_spectrum: List[dict],
+    all_samples: Dict[str, list],
+    all_truths: Dict[str, list],
+    friendly_names: List[str],
+    n_params: int,
+    emu_min_params: np.ndarray,
+    emu_max_params: np.ndarray,
+    spec_files_count: int,
+    failures: int,
+    failure_log: List[dict],
+    mcmc_walkers: int,
+    mcmc_steps: int,
+    mcmc_burnin: int,
+    elapsed: float,
+    n_not_converged: int = 0,
+) -> dict:
+    """Aggregate per-spectrum Tier 2 results into final metrics dict.
+
+    This is the post-loop aggregation extracted from ``run_tier2`` so that
+    callers can drive the per-spectrum loop themselves (e.g. to show
+    nested progress widgets) while still reusing the same scoring logic.
+    """
+    aggregate = {}
+    for fname in friendly_names:
+        if len(all_truths[fname]) == 0:
+            continue
+
+        truths_arr = np.array(all_truths[fname])
+        means_arr = np.array(
+            [ps.get(f"{fname}_mean", np.nan) for ps in per_spectrum]
+        )
+        means_arr = means_arr[~np.isnan(means_arr)]
+
+        if len(means_arr) == len(truths_arr):
+            rmse = float(np.sqrt(np.mean((means_arr - truths_arr) ** 2)))
+            bias = float(np.mean(means_arr - truths_arr))
+        else:
+            rmse = np.nan
+            bias = np.nan
+
+        crps_vals = []
+        for samples, truth in zip(all_samples[fname], all_truths[fname]):
+            crps_vals.append(compute_crps(samples, truth))
+        crps_mean = float(np.mean(crps_vals)) if crps_vals else np.nan
+
+        prior_range = float(
+            emu_max_params[friendly_names.index(fname)]
+            - emu_min_params[friendly_names.index(fname)]
+        ) if fname in friendly_names[:n_params] else np.nan
+        post_stds = [ps.get(f"{fname}_std", np.nan) for ps in per_spectrum]
+        mean_post_std = float(np.nanmean(post_stds))
+        shrinkage = (
+            1.0 - mean_post_std / (prior_range / np.sqrt(12))
+            if np.isfinite(prior_range) and prior_range > 0
+            else np.nan
+        )
+
+        alphas, cov = compute_coverage(all_samples[fname], all_truths[fname])
+        cov_68 = float(np.interp(0.68, alphas, cov))
+        cov_95 = float(np.interp(0.95, alphas, cov))
+
+        aggregate[fname] = {
+            "rmse": rmse,
+            "bias": bias,
+            "crps": crps_mean,
+            "shrinkage": shrinkage,
+            "coverage_68": cov_68,
+            "coverage_95": cov_95,
+            "coverage_alphas": alphas.tolist(),
+            "coverage_values": cov.tolist(),
+        }
+
+    return {
+        "per_spectrum": per_spectrum,
+        "aggregate": aggregate,
+        "n_spectra": spec_files_count,
+        "n_processed": len(per_spectrum),
+        "n_failures": failures,
+        "n_not_converged": n_not_converged,
+        "failure_log": failure_log,
+        "mcmc_config": {
+            "walkers": mcmc_walkers,
+            "steps": mcmc_steps,
+            "burnin": mcmc_burnin,
+        },
+        "tier2_time_s": elapsed,
+    }
+
+
 def run_tier2(
     emu,
     test_grid_path: str,
@@ -527,6 +825,7 @@ def run_tier2(
     mcmc_burnin: int = 200,
     max_mle_iter: int = 5000,
     max_spectra: Optional[int] = None,
+    progress_callback=None,
 ) -> dict:
     """
     Tier 2 benchmark: test grid parameter recovery.
@@ -543,6 +842,9 @@ def run_tier2(
     max_mle_iter : int
     max_spectra : int or None
         If set, limit the number of test spectra processed.
+    progress_callback : callable or None
+        If provided, called as ``progress_callback(current, total, spec_name, stage)``
+        after each spectrum completes (or fails). Useful for live UI updates.
 
     Returns
     -------
@@ -559,9 +861,8 @@ def run_tier2(
     if not spec_files:
         raise FileNotFoundError(f"No .spec files found in {test_grid_path}")
 
-    # Ground truth
-    parquet_file = test_path / "grid_run_lookup_table.parquet"
-    has_gt = parquet_file.exists()
+    # Ground truth lookup table
+    parquet_file = ensure_lookup_table(test_path)
 
     friendly_names = internal_to_friendly(emu.param_names)
     n_params = len(emu.param_names)
@@ -570,37 +871,64 @@ def run_tier2(
     all_samples = {name: [] for name in friendly_names}
     all_truths = {name: [] for name in friendly_names}
     failures = 0
+    n_not_converged = 0
+    failure_log: List[dict] = []  # surfaced to viewer
 
-    for sf in spec_files:
+    _n_total = len(spec_files)
+    for _spec_idx, sf in enumerate(spec_files):
         run_idx = int(sf.stem.replace("run", ""))
         log.info(f"Processing {sf.name}...")
+
+        if progress_callback is not None:
+            progress_callback(_spec_idx, _n_total, sf.name, "loading")
 
         try:
             wl, flux, sigma = _load_test_grid_spectrum(str(sf), inclination, wl_range)
         except Exception as e:
-            log.warning(f"Failed to load {sf.name}: {e}")
+            import traceback as _tb
+            _msg = str(e)
+            log.warning(f"Failed to load {sf.name}: {_msg}")
+            failure_log.append({"run": sf.name, "stage": "load", "error": _msg,
+                                 "traceback": _tb.format_exc()})
             failures += 1
+            if progress_callback is not None:
+                progress_callback(_spec_idx + 1, _n_total, sf.name, "failed:load")
             continue
 
         # Ground truth
         gt = {}
-        if has_gt:
+        if parquet_file.exists():
             try:
                 gt = _extract_ground_truth(str(parquet_file), run_idx, emu.param_names)
             except Exception as e:
-                log.warning(f"Failed to extract GT for {sf.name}: {e}")
+                _msg = str(e)
+                log.warning(f"Failed to extract GT for {sf.name}: {_msg}")
+                failure_log.append({"run": sf.name, "stage": "ground_truth", "error": _msg,
+                                     "traceback": ""})
 
         # MLE
+        if progress_callback is not None:
+            progress_callback(_spec_idx, _n_total, sf.name, "MLE")
+
         try:
             mle_result = run_mle_single(
                 emu, wl, flux, sigma, flux_scale=flux_scale, max_iter=max_mle_iter
             )
         except Exception as e:
-            log.warning(f"MLE failed for {sf.name}: {e}")
+            import traceback as _tb
+            _msg = str(e)
+            log.warning(f"MLE failed for {sf.name}: {_msg}")
+            failure_log.append({"run": sf.name, "stage": "MLE", "error": _msg,
+                                 "traceback": _tb.format_exc()})
             failures += 1
+            if progress_callback is not None:
+                progress_callback(_spec_idx + 1, _n_total, sf.name, "failed:MLE")
             continue
 
         # MCMC
+        if progress_callback is not None:
+            progress_callback(_spec_idx, _n_total, sf.name, "MCMC")
+
         try:
             mcmc_result = run_mcmc_single(
                 mle_result["model"],
@@ -610,12 +938,18 @@ def run_tier2(
                 burnin=mcmc_burnin,
             )
         except Exception as e:
-            log.warning(f"MCMC failed for {sf.name}: {e}")
+            import traceback as _tb
+            _msg = str(e)
+            log.warning(f"MCMC failed for {sf.name}: {_msg}")
+            failure_log.append({"run": sf.name, "stage": "MCMC", "error": _msg,
+                                 "traceback": _tb.format_exc()})
             failures += 1
+            if progress_callback is not None:
+                progress_callback(_spec_idx + 1, _n_total, sf.name, "failed:MCMC")
             continue
 
         if not mcmc_result["converged"]:
-            failures += 1
+            n_not_converged += 1
 
         # Store per-parameter samples and truths
         spec_result = {
@@ -642,6 +976,10 @@ def run_tier2(
                     ) / max(mcmc_result["summary"][fname]["std"], 1e-10)
 
         per_spectrum.append(spec_result)
+
+        if progress_callback is not None:
+            _status = "done" if mcmc_result["converged"] else "done:not_converged"
+            progress_callback(_spec_idx + 1, _n_total, sf.name, _status)
 
     # Aggregate metrics
     aggregate = {}
@@ -699,6 +1037,8 @@ def run_tier2(
         "n_spectra": len(spec_files),
         "n_processed": len(per_spectrum),
         "n_failures": failures,
+        "n_not_converged": n_not_converged,
+        "failure_log": failure_log,
         "mcmc_config": {
             "walkers": mcmc_walkers,
             "steps": mcmc_steps,
@@ -757,7 +1097,8 @@ def run_tier3_single(
     sigma = np.maximum(sigma, np.abs(flux) * 0.01)
 
     # MLE
-    mle = run_mle_single(emu, wl, flux, sigma, flux_scale=flux_scale, max_iter=max_mle_iter)
+    mle = run_mle_single(emu, wl, flux, sigma, flux_scale=flux_scale,
+                          max_iter=max_mle_iter, freeze_av=False)
     model = mle["model"]
     priors = mle["priors"]
 
@@ -966,6 +1307,9 @@ def build_report_card(
             "n_spectra": tier2["n_spectra"],
             "n_processed": tier2["n_processed"],
             "n_failures": tier2["n_failures"],
+            "n_not_converged": tier2.get("n_not_converged", 0),
+            "failure_log": tier2.get("failure_log", []),
+            "per_spectrum": tier2.get("per_spectrum", []),
             "tier2_time_s": tier2["tier2_time_s"],
             "mcmc_config": tier2["mcmc_config"],
             "aggregate": tier2["aggregate"],
