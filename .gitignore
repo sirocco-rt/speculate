@@ -217,7 +217,6 @@ Starfish/__pycache__
 Claude_tests/
 Profiler_results/
 CV_release_grid_spec_light/
-.github/
 .ipynb_checkpoints/
 logs/
 Starfish/__pycache__/
@@ -231,5 +230,6 @@ speculate_dev/
 .DS_Store
 raw_scripts_of_notebooks/
 old_scripts/
+benchmark_results/*
 
 
