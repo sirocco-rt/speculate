@@ -39,7 +39,7 @@ def _():
     # Right column: Logo with link
     # Using flex-end to align it to the right
     logo_col = mo.vstack([
-        mo.image(src=logo_path, width=400),
+        mo.image(src=logo_path, width=400, height=95),
         mo.md('<p style="text-align: center; font-size: 0.8em;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
     ], align="center")
 
@@ -844,24 +844,23 @@ def _(emu, grid_indices, mo, param_map_db, re):
         param_names.extend(inf_params)
 
         # Defaults for Global Params
-        bounds['Av'] = [0.0, 5.0]
+        bounds['Av'] = [0.0, 2.0]
         defaults['Av'] = 0.0
 
         # log_scale: natural log of flux scaling factor
         # Typically auto-calculated if not set, but can be optimized
-        # Range allows for large scaling adjustments
-        bounds['log_scale'] = [-80.0, 10.0]
-        defaults['log_scale'] = -35.0  # Typical for linear-scale spectra
+        # Tighter range centred on typical linear-scale values
+        bounds['log_scale'] = [-30.0, -20.0]
+        defaults['log_scale'] = -25.0
 
         # log_amp: GP global covariance amplitude (natural log)
-        # For linear-scale spectra, typically around -52 (see Speculate_dev.py)
-        bounds['log_amp'] = [-80.0, 0.0]
-        defaults['log_amp'] = -52.0
+        # Normal prior: center ± 2σ defines the bounds displayed in the UI
+        bounds['log_amp'] = [-60.0, -50.0]
+        defaults['log_amp'] = -55.0
 
         # log_ls: GP global covariance length scale (natural log)
-        # Typical range ~0.1 to 11 Angstroms (see Speculate_dev.py)
-        bounds['log_ls'] = [0.1, 11.0]
-        defaults['log_ls'] = 5.0
+        bounds['log_ls'] = [1.0, 8.0]
+        defaults['log_ls'] = 4.5
 
     # Create Widgets
     # w_fix uses mo.ui.dictionary so checkbox changes are reactive
@@ -1847,9 +1846,10 @@ def _(
     _summary_df = get_mcmc_summary_df()
     _model = get_mle_model()
 
-    if _samples is None or _model is None:
-        mo.output.replace(mo.callout(mo.md("Run MCMC first to enable export."), kind="neutral"))
-        mo.stop(True)
+    mo.stop(
+        _samples is None or _model is None,
+        mo.callout(mo.md("Run MCMC first to enable export."), kind="neutral"),
+    )
 
     export_pf_btn = mo.ui.run_button(label="📄 Export .pf Template", kind="success")
     export_csv_btn = mo.ui.run_button(label="📊 Export Posterior CSV", kind="success")

@@ -35,7 +35,7 @@ def _(mo):
 
     logo_path = pathlib.Path("assets/logos/Speculate_logo2.png")
 
-    logo = mo.image(src=str(logo_path), width=400)
+    logo = mo.image(src=str(logo_path), width=400, height=95)
     link = mo.md('<p style="text-align: center;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
     mo.vstack([mo.md("---"), logo, link], align="center")
     return

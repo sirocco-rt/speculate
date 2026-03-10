@@ -52,7 +52,7 @@ def _():
     # Right column: Logo with link
     # Using flex-end to align it to the right
     logo_col = mo.vstack([
-        mo.image(src=logo_path, width=400),
+        mo.image(src=logo_path, width=400, height=95),
         mo.md('<p style="text-align: center; font-size: 0.8em;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
     ], align="center")
 
