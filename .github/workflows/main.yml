@@ -20,4 +20,4 @@ jobs:
       - name: Push to hub
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: git push https://AustenWallis:$HF_TOKEN@huggingface.co/spaces/Sirocco-rt/Speculate main
+        run: git push --force https://AustenWallis:$HF_TOKEN@huggingface.co/spaces/Sirocco-rt/Speculate main
