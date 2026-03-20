@@ -156,6 +156,7 @@ def _(current_mode, mo):
             mo.md(" "),
             mo.md(f"###{mo.icon('lucide:brain')} Training Tool"),
             mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:test-tubes')} Benchmark Suite"),
             mo.md("---"),
             mo.md("---"),
             mo.nav_menu({
@@ -185,6 +186,7 @@ def _(current_mode, mo):
                 "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
                 "/training": f"###{mo.icon('lucide:brain')} Training Tool",
                 "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
+                "/benchmark": f"###{mo.icon('lucide:test-tubes')} Benchmark Suite",
             }, orientation="vertical"),
             mo.md(" "),
             mo.md("---"),

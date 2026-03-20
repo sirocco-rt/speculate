@@ -33,7 +33,6 @@ def rbf_kernel(X, Z, variance, lengthscale):
         The lengthscale for the RBF kernel. Must have same second dimension as `X`
 
     """
-
     sq_dist = sp.spatial.distance.cdist(X / lengthscale, Z / lengthscale, "sqeuclidean")
     return variance * np.exp(-0.5 * sq_dist)
 
@@ -364,7 +363,7 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', 
         raise RuntimeError("PyTorch not available. Install with: pip install torch")
     
     device_obj = torch.device(device if torch.cuda.is_available() else 'cpu')
-    
+
     # Convert to PyTorch tensors if needed (accept both numpy and torch inputs)
     if isinstance(X, np.ndarray):
         X_torch = torch.from_numpy(np.asarray(X)).to(device_obj, DTYPE)
@@ -388,7 +387,7 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', 
     
     n_components = len(variances_torch)
     n_X, n_Z = X_torch.shape[0], Z_torch.shape[0]
-    
+
     # Pre-allocate result on GPU or use provided output
     if out is not None:
         result = out
@@ -408,21 +407,13 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', 
         X_scaled = X_torch / ls
         Z_scaled = Z_torch / ls
         
-        # Memory Efficient Implementation:
-        # 1. Compute distances (allocates 1 block)
-        # Note: We use a temporary variable to ensure we don't keep multiple large blocks
+        # Compute squared Euclidean distances via cdist
         dist = torch.cdist(X_scaled, Z_scaled, p=2.0)
         
-        # 2. Square in-place
+        # Apply RBF kernel in-place: variance * exp(-0.5 * dist²)
         dist.pow_(2)
-        
-        # 3. Multiply by -0.5 in-place
         dist.mul_(-0.5)
-        
-        # 4. Exponentiate in-place
         torch.exp(dist, out=dist)
-        
-        # 5. Multiply by variance in-place
         dist.mul_(var)
         
         if return_stacked:

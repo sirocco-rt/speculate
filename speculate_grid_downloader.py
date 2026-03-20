@@ -2,6 +2,20 @@
 # [tool.marimo.display]
 # theme = "dark"
 # ///
+#
+# Speculate Grid Downloader
+# =========================
+# Download and decompress Sirocco spectral grid files from HuggingFace
+# datasets hosted under the **Sirocco-rt** organisation.  The tool:
+#
+#   1. Discovers available grid datasets via the HuggingFace Hub API.
+#   2. Lists the compressed spectrum files (.spec.xz) and auxiliary
+#      metadata (lookup table, README, etc.) in the selected dataset.
+#   3. Downloads selected files into the HuggingFace cache, then
+#      decompresses them with LZMA into ``sirocco_grids/<dataset>/``.
+#
+# Once extracted, the files are consumable by the Training Tool, Grid
+# Inspector, Benchmark Suite, and Inference Tool.
 
 import marimo
 
@@ -35,7 +49,7 @@ def _(mo):
 
     logo_path = pathlib.Path("assets/logos/Speculate_logo2.png")
 
-    logo = mo.image(src=str(logo_path), width=400)
+    logo = mo.image(src=str(logo_path), width=400, height=95)
     link = mo.md('<p style="text-align: center;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
     mo.vstack([mo.md("---"), logo, link], align="center")
     return
@@ -43,7 +57,9 @@ def _(mo):
 
 @app.cell
 def _():
-    # Imports and configuration
+    # ── Imports and HuggingFace configuration ──
+    # Progress bars and verbose logging from huggingface_hub are suppressed
+    # because the notebook provides its own progress widgets.
     import os
     import lzma
     import shutil
@@ -59,6 +75,8 @@ def _():
     # Suppress huggingface_hub logging
     logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
+    # All Speculate grid datasets are published under the Sirocco-rt org
+    # on HuggingFace as "dataset" repos (not model repos).
     ORG_ID = "Sirocco-rt"
     REPO_TYPE = "dataset"
     return (
@@ -83,7 +101,9 @@ def _(mo):
 
 @app.cell
 def _(ORG_ID, list_datasets, mo):
-    # Fetch available datasets from Sirocco-rt organization
+    # ── Dataset discovery ──
+    # Query the Sirocco-rt org for any dataset whose name contains "grid".
+    # Each matching dataset ID becomes a selectable option in Step 1.
     grid_datasets = []
     try:
         all_datasets = list(list_datasets(author=ORG_ID))
@@ -139,33 +159,46 @@ def _(mo):
 
 @app.cell
 def _(ORG_ID, REPO_TYPE, dataset_dropdown, list_repo_files, mo):
-    # Fetch files from selected dataset
+    # Inspect the selected HuggingFace dataset and split its contents into the
+    # compressed spectral payloads versus auxiliary metadata files.
     spec_files = []
+    aux_files = []
     repo_id = None
 
     if dataset_dropdown.value:
         try:
             repo_id = f"{ORG_ID}/{dataset_dropdown.value}"
-            all_files = list_repo_files(repo_id=repo_id, repo_type=REPO_TYPE)
+            all_files = list(list_repo_files(repo_id=repo_id, repo_type=REPO_TYPE))
             spec_files = [f for f in all_files if f.startswith("run") and f.endswith(".spec.xz")]
 
-            # Sort numerically by extracting the number from the filename
+            # Keep the spectrum files in run-number order so the UI and lookup
+            # table refer to the same sequence of simulations.
             spec_files.sort(key=lambda x: int(x.replace("run", "").replace(".spec.xz", "")))
 
+            # Everything else is treated as auxiliary material to be staged next
+            # to the spectra after download, except repository bookkeeping files.
+            _skip = {".gitattributes", "README.md"}
+            aux_files = [
+                f for f in all_files
+                if f not in _skip and not (f.startswith("run") and f.endswith(".spec.xz"))
+            ]
+
+            _aux_note = f" + {len(aux_files)} auxiliary file(s)" if aux_files else ""
             file_info = mo.md(f"""
             **Dataset:** `{dataset_dropdown.value}`
 
-            **Files found:** {len(spec_files)} spectral files (.spec.xz)
+            **Files found:** {len(spec_files)} spectral files (.spec.xz){_aux_note}
             """)
 
         except Exception as e:
             spec_files = []
+            aux_files = []
             file_info = mo.md(f"❌ Error fetching files: {e}")
     else:
         file_info = mo.md("⚠️ Please select a dataset first")
 
     file_info
-    return repo_id, spec_files
+    return aux_files, repo_id, spec_files
 
 
 @app.cell(hide_code=True)
@@ -216,7 +249,11 @@ def _(download_mode, mo, specific_file_dropdown):
 
 @app.cell
 def _(ORG_ID, REPO_TYPE, dataset_dropdown, mo):
-    # Load the parameter lookup table for the selected dataset
+    # ── Lookup-table preview ──
+    # Fetch the run-lookup parquet directly over HTTP so the notebook can show
+    # parameter metadata without downloading the entire dataset first.  This
+    # table maps each run number back to its physical parameter values (e.g.
+    # Disk.mdot, KWD.d, Inclination) and is bundled with every published grid.
     import pandas as pd
     from huggingface_hub import hf_hub_url
 
@@ -228,14 +265,16 @@ def _(ORG_ID, REPO_TYPE, dataset_dropdown, mo):
             repo_id_lookup = f"{ORG_ID}/{dataset_dropdown.value}"
             lookup_file = "grid_run_lookup_table.parquet"
 
-            # Get direct URL to the parquet file (no download needed)
+            # Build the signed HuggingFace URL explicitly; pandas can read the
+            # parquet stream directly from that endpoint.
             file_url = hf_hub_url(
                 repo_id=repo_id_lookup,
                 filename=lookup_file,
                 repo_type=REPO_TYPE
             )
 
-            # Read the parquet file directly from URL
+            # This table powers the per-run parameter preview in "Specific file"
+            # mode and mirrors the metadata bundled with the dataset.
             lookup_df = pd.read_parquet(file_url)
             lookup_status = mo.md(f"✓ Loaded parameter lookup table with **{len(lookup_df)}** runs")
 
@@ -302,7 +341,8 @@ def _(
     spec_files,
     specific_file_dropdown,
 ):
-    # Determine which files to download
+    # Normalize the UI selection into the exact list of compressed spectrum files
+    # the download/decompress cell should act on.
     files_to_download = []
 
     if spec_files:
@@ -310,7 +350,8 @@ def _(
             files_to_download = spec_files
             download_summary = mo.md(f"📦 Ready to download **{len(files_to_download)}** files")
         else:
-            # Specific file mode
+            # "Specific file" mode keeps the workflow identical but collapses the
+            # target list to a single selected run.
             if specific_file_dropdown is not None and specific_file_dropdown.value:
                 files_to_download = [specific_file_dropdown.value]
                 download_summary = mo.md(f"📦 Ready to download: `{specific_file_dropdown.value}`")
@@ -320,7 +361,8 @@ def _(
     else:
         download_summary = mo.md("⚠️ No files available")
 
-    # Show save location if files are ready to download
+    # The extracted files always land under a dataset-named local directory so
+    # other tools can find them with the same naming convention.
     _summary_display = download_summary
     if files_to_download and dataset_dropdown is not None and dataset_dropdown.value:
         save_location = os.path.abspath(f"sirocco_grids/{dataset_dropdown.value}/")
@@ -341,7 +383,10 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    # Action buttons
+    # Step 3 action buttons.
+    # "Download & Decompress" is the typical workflow (cache + extract).
+    # The split buttons let the user decouple downloading from extraction,
+    # useful when re-extracting from a populated HuggingFace cache.
     download_and_decompress_button = mo.ui.run_button(label="📥 Download & Decompress")
     download_only_button = mo.ui.run_button(label="Download Only")
     decompress_only_button = mo.ui.run_button(label="Decompress Downloaded Files")
@@ -362,6 +407,7 @@ def _(mo):
 @app.cell
 def _(
     REPO_TYPE,
+    aux_files,
     dataset_dropdown,
     decompress_only_button,
     download_and_decompress_button,
@@ -374,12 +420,15 @@ def _(
     repo_id,
     shutil,
 ):
-    # Download logic
+    # Execute the chosen workflow: download only, download+extract, or extract
+    # already-cached files from the local HuggingFace cache.
     download_results = []
 
     if (download_only_button.value or download_and_decompress_button.value) and files_to_download:
         extraction_dir = f"sirocco_grids/{dataset_dropdown.value}/"
 
+        # Download the selected compressed spectra into the HuggingFace cache and
+        # keep track of which ones succeeded for the extraction pass.
         with mo.status.progress_bar(total=len(files_to_download), title="Downloading...") as bar:
             for i, filename in enumerate(files_to_download, 1):
                 try:
@@ -394,10 +443,25 @@ def _(
                     mo.output.append(mo.md(f"❌ Failed to download `{filename}`: {e}"))
                 bar.update()
 
-        # Decompress if requested
-        if download_and_decompress_button.value:
-            os.makedirs(extraction_dir, exist_ok=True)
+        # Always stage auxiliary files into the extraction directory so the grid
+        # inspection and validation tools see the same on-disk layout regardless
+        # of whether the user downloaded one spectrum or the whole dataset.
+        os.makedirs(extraction_dir, exist_ok=True)
+        for _aux in aux_files:
+            try:
+                _aux_local = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=_aux,
+                    repo_type=REPO_TYPE
+                )
+                _dest = os.path.join(extraction_dir, _aux)
+                shutil.copy2(_aux_local, _dest)
+            except Exception as e:
+                mo.output.append(mo.md(f"⚠️ Could not fetch auxiliary file `{_aux}`: {e}"))
 
+        # In the combined mode, immediately expand each .xz archive into its raw
+        # .spec file under the dataset directory.
+        if download_and_decompress_button.value:
             with mo.status.progress_bar(total=len(download_results), title="Decompressing...") as bar:
                 for filename, local_path, error in download_results:
                     if local_path:
@@ -418,14 +482,31 @@ def _(
             mo.md("### ✅ Download complete!\n\nFiles cached by HuggingFace (use 'Decompress' to extract)")
 
     elif decompress_only_button.value and files_to_download:
-        # Decompress previously downloaded files
+        # Rehydrate raw .spec files from archives that should already exist in the
+        # HuggingFace cache, without forcing a full redownload.
         extraction_dir = f"sirocco_grids/{dataset_dropdown.value}/"
         os.makedirs(extraction_dir, exist_ok=True)
+
+        # Make the extracted directory self-contained by backfilling any missing
+        # auxiliary metadata before expanding the spectra.
+        for _aux in aux_files:
+            _dest = os.path.join(extraction_dir, _aux)
+            if not os.path.exists(_dest):
+                try:
+                    _aux_local = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=_aux,
+                        repo_type=REPO_TYPE
+                    )
+                    shutil.copy2(_aux_local, _dest)
+                except Exception:
+                    pass
 
         with mo.status.progress_bar(total=len(files_to_download), title="Decompressing cached files...") as bar:
             for filename in files_to_download:
                 try:
-                    # Files should already be cached
+                    # hf_hub_download resolves the existing cached archive path and
+                    # only contacts the hub if the cache is missing.
                     local_path = hf_hub_download(
                         repo_id=repo_id,
                         filename=filename,
