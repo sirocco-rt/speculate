@@ -2,6 +2,20 @@
 # [tool.marimo.display]
 # theme = "dark"
 # ///
+#
+# Speculate Inference Tool
+# ========================
+# Interactive notebook for fitting spectral models to observations or
+# validation test-grid spectra.  The workflow proceeds through four stages:
+#
+#   Stage 1 — Setup & Data Loading  (grid, emulator, observation/test run)
+#   Stage 2 — Parameter Configuration  (priors, fixed/free toggles)
+#   Stage 3 — MLE  (Nelder-Mead simplex optimisation over negative log-likelihood)
+#   Stage 4 — MCMC  (emcee ensemble sampler for posterior exploration)
+#   Export  — Write .pf templates and posterior CSV files
+#
+# Depends on the Starfish spectral emulator library and the Speculate
+# benchmark add-on for export helpers.
 
 import marimo
 
@@ -11,6 +25,12 @@ app = marimo.App(width="full", app_title="Speculate Inference Tool")
 
 @app.cell
 def _():
+    # ── Imports & global configuration ──
+    # Starfish provides the core emulation primitives:
+    #   Emulator  – PCA + GP spectral emulator trained on a Sirocco grid
+    #   Spectrum  – lightweight wavelength/flux/sigma container
+    #   SpectrumModel – wraps an Emulator + Spectrum for likelihood evaluation
+    # scipy.stats supplies the frozen prior distributions used in Stages 2-4.
     import marimo as mo
     mo._runtime.context.get_context().marimo_config["runtime"]["output_max_bytes"] = 10_000_000_000
     import os
@@ -117,20 +137,29 @@ def _(mo):
 @app.cell
 def _():
     # Parameter Mapping Dictionary
-    # Maps parameter index (1-based) to (Name, Default Min, Default Max)
-    # Based on Speculate_dev.py
+    # Maps the 1-based parameter index used in emulator filenames to a
+    # (friendly_name, default_min, default_max) tuple.  Default bounds of
+    # (0, 1) are placeholders overridden once the emulator is loaded;
+    # inclination bounds are physical (degrees).
+    #
+    # Indices 1-6  : Knigge-Wood-Drew (KWD) accretion disc wind model.
+    # Indices 7-8  : Boundary-layer emission (only in "bl" grids).
+    # Indices 9-11 : Observer inclination at increasing angular resolution.
+    #
+    # In emulator space param1 and param5 are stored in log10.
+    # param2 (wind.mdot) is stored as the ratio wind/disk mass-loss rate.
     param_map_db = {
-        1: ("disk.mdot", 0.0, 1.0),
-        2: ("wind.mdot", 0.0, 1.0), 
-        3: ("KWD.d", 0.0, 1.0),
-        4: ("KWD.mdot_r_exponent", 0.0, 1.0),
-        5: ("KWD.acceleration_length", 0.0, 1.0),
+        1: ("disk.mdot", 0.0, 1.0),              # log10(Msol/yr)
+        2: ("wind.mdot", 0.0, 1.0),              # ratio: wind / disk
+        3: ("KWD.d", 0.0, 1.0),                  # wind launch radius (r_star)
+        4: ("KWD.mdot_r_exponent", 0.0, 1.0),    # radial mdot power law
+        5: ("KWD.acceleration_length", 0.0, 1.0), # log10(cm)
         6: ("KWD.acceleration_exponent", 0.0, 1.0),
         7: ("Boundary_layer.luminosity", 0.0, 1.0),
         8: ("Boundary_layer.temp", 0.0, 1.0),
-        9: ("Inclination (Sparse)", 30.0, 80.0),  # 30, 55, 80
-        10: ("Inclination (Mid)", 30.0, 80.0),    # More inc points
-        11: ("Inclination (Full)", 30.0, 80.0),   # All inc points
+        9: ("Inclination (Sparse)", 30.0, 80.0),  # 3 angles (30, 55, 80)
+        10: ("Inclination (Mid)", 30.0, 80.0),    # 6 angles
+        11: ("Inclination (Full)", 30.0, 80.0),   # 12 angles
     }
     return (param_map_db,)
 
@@ -138,6 +167,10 @@ def _():
 @app.cell
 def _(mo, os):
     # --- Grid Selection ---
+    # Scan the Grid-Emulator_Files directory for .npz emulator files and
+    # extract unique grid stem names (everything before "_emu_").  The stem
+    # encodes the Sirocco grid version and physics variant (e.g.
+    # "speculate_cv_bl_grid_v87f").
 
     _emu_dir = "Grid-Emulator_Files"
     _unique_grids = set()
@@ -182,6 +215,11 @@ def _(mo, os):
 @app.cell
 def _(grid_selector, mo, os, param_map_db, re):
     # --- Emulator Selection (Dependent on Grid) ---
+    # Filter the .npz files to those matching the selected grid stem and
+    # discover which parameter indices this grid supports.  Indices are
+    # parsed from the filename digits after "_emu_" or "_grid_", then
+    # augmented with known conventions for CV grids (e.g. inclination
+    # variants always present, boundary-layer params absent in "no_bl").
 
     _emu_dir = "Grid-Emulator_Files"
     _filtered_emus = []
@@ -253,7 +291,11 @@ def _(grid_selector, mo, os, param_map_db, re):
 
 @app.cell
 def _(mo):
-    # Update trigger for file list
+    # UI widgets for the data-source half of Stage 1.  The user switches
+    # between two modes:
+    #   "Observation File"   — user-uploaded CSV with Wavelength/Flux columns
+    #   "Test Grid"          — extracted Sirocco .spec files from a paired
+    #                          validation grid, for ground-truth comparison.
     get_obs_refresh, set_obs_refresh = mo.state(0)
 
     # Source Type Selector: Observation vs Test Grid
@@ -286,7 +328,8 @@ def _(mo):
 
 @app.cell
 def _(mo, obs_file_uploader, os, set_obs_refresh):
-    # Handle file upload logic (Recycled from Grid Inspector)
+    # Persist an uploaded observation into the shared observation directory and
+    # bump the refresh state so downstream file-picker cells rerun.
     if obs_file_uploader.value:
         # Create directory if it doesn't exist
         _obs_dir = "observation_files"
@@ -311,7 +354,8 @@ def _(mo, obs_file_uploader, os, set_obs_refresh):
 
 @app.cell(hide_code=True)
 def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
-    # Select observational spectrum - File List Calculation
+    # Build the selectable observation-file list and, when possible, the paired
+    # test-grid metadata derived from the currently selected emulator grid.
 
     # Trigger refresh on upload or delete
     _ = obs_file_uploader.value
@@ -333,19 +377,21 @@ def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
     test_grid_params_df = None
 
     if grid_selector.value:
-        # Derive test grid name from main grid name
-        # e.g., speculate_cv_no-bl_grid_v87f -> speculate_cv_no-bl_testgrid_v87f
+        # The emulator grids and validation test grids follow the same naming
+        # convention, with only the "_grid_" / "_testgrid_" token changing.
         _grid_name = grid_selector.value
         _test_grid_name = _grid_name.replace("_grid_", "_testgrid_")
         test_grid_path = f"sirocco_grids/{_test_grid_name}"
 
         if os.path.exists(test_grid_path):
-            # Get .spec files
+            # Discover available validation spectra in run-number order so the UI
+            # presents the same ordering as the lookup table.
             test_grid_files = sorted(
                 [f for f in os.listdir(test_grid_path) if f.endswith('.spec')],
                 key=lambda x: int(x.replace('run', '').replace('.spec', '')) if x.replace('run', '').replace('.spec', '').isdigit() else 0
             )
-            # Try to load lookup table for ground truth params
+            # Load the optional lookup table that maps each run back to its known
+            # physical parameters for later validation against the inference result.
             _lookup_path = os.path.join(test_grid_path, "grid_run_lookup_table.parquet")
             if os.path.exists(_lookup_path):
                 import pandas as _pd
@@ -388,7 +434,8 @@ def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
             full_width=True
         )
 
-    # Delete button (only for observation files)
+    # The delete action only applies to uploaded observation files; test-grid
+    # spectra remain immutable because they are part of the grid dataset.
     def delete_selected_file():
         if obs_file_selector.value:
             try:
@@ -425,7 +472,8 @@ def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
 
 @app.cell
 def _(Emulator, emulator_selector, mo):
-    # Load the emulator when selected
+    # Load the selected emulator eagerly so later cells can stop early if the
+    # model file is missing or incompatible.
 
     emu = None
     stop_computation = False
@@ -469,12 +517,13 @@ def _(
     is_test_grid = "Test Grid" in data_source_selector.value
 
     if is_test_grid and test_run_selector.value and test_grid_path:
-        # Load from Test Grid (.spec file)
+        # Validation mode reads a raw Sirocco .spec file and converts the chosen
+        # inclination column into the same dataframe shape used for observations.
         try:
             spec_path = os.path.join(test_grid_path, test_run_selector.value)
 
-            # Parse .spec file (Sirocco format)
-            # First, find the header length
+            # Sirocco .spec files contain a variable-length text header, so scan
+            # for the first data row before passing the file to numpy.
             skiprows = 0
             with open(spec_path, 'r') as _f:
                 for _i, line in enumerate(_f):
@@ -484,25 +533,28 @@ def _(
                     skiprows = _i
                     break
 
-            # Determine inclination column
-            # Columns: Freq, Lambda, then 12 inclination columns (A30P0.50, A35P0.50, etc.)
+            # After frequency and wavelength, the remaining columns are fluxes at
+            # fixed viewing angles; map the selected angle onto that column index.
             inc_val = int(test_inclination_selector.value)
             inc_options = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85]
             inc_col_idx = inc_options.index(inc_val) + 2  # +2 for Freq, Lambda columns
 
-            # Load data
+            # Flip both arrays so wavelength increases left-to-right in the UI.
             data_raw = np.loadtxt(spec_path, skiprows=skiprows, unpack=True)
             wavelengths = np.flip(data_raw[1])  # Lambda column, flip to ascending
             fluxes = np.flip(data_raw[inc_col_idx])  # Selected inclination flux
 
-            # Create DataFrame
+            # Treat synthetic validation data like observations by attaching a
+            # simple fractional uncertainty column.
             obs_data = pd.DataFrame({
                 'wavelength': wavelengths,
                 'flux': fluxes,
                 'error': fluxes * 0.05  # Assume 5% error for test data
             })
 
-            # Extract ground truth params from lookup table
+            # Translate the lookup-table values into the emulator parameterisation:
+            # some parameters are stored in log space and wind.mdot is recovered as
+            # the wind-to-disk mass-loss ratio rather than an absolute value.
             if test_grid_params_df is not None:
                 run_num = int(test_run_selector.value.replace('run', '').replace('.spec', ''))
                 gt_row = test_grid_params_df[test_grid_params_df['Run Number'] == run_num]
@@ -523,7 +575,8 @@ def _(
             mo.output.replace(mo.callout(mo.md(f"❌ Error loading test grid: {e}"), kind="danger"))
 
     elif obs_file_selector.value:
-        # Load from observation file (CSV)
+        # Observation mode accepts user-uploaded tabular data as long as it has
+        # wavelength and flux columns after column-name normalization.
         try:
             path = os.path.join(_obs_dir, obs_file_selector.value)
             # Try flexible loading
@@ -544,8 +597,8 @@ def _(
         except Exception as e:
              mo.output.replace(mo.callout(mo.md(f"❌ Error reading file: {e}"), kind="danger"))
 
-    # --- Auto-detect flux scale from emulator filename ---
-    # Emulator filenames encode the scale: e.g. ..._linear_850-1850AA_... or ..._log_850-1850AA_...
+    # Infer the most likely flux transform from the emulator filename so the UI
+    # starts on the training scale, while still letting the user override it.
     _detected_scale = "linear"  # default
     if emulator_selector.value:
         _emu_name = emulator_selector.value.lower()
@@ -595,17 +648,20 @@ def _(
 
 @app.cell
 def _(alt, data_source_info, mo, np, obs_data, obs_flux_scale, pd, wl_range_slider):
-    # Obs Plot (Reactive to range slider and flux scale)
+    # Rebuild the preview chart whenever the wavelength window or requested flux
+    # transform changes, without mutating the underlying loaded dataframe.
     obs_chart = None
     if obs_data is not None:
-         # Filter based on range slider
+         # Restrict the preview to the current wavelength window before applying
+         # any display-only flux transformation.
          _current_min = wl_range_slider.value[0]
          _current_max = wl_range_slider.value[1]
 
          _mask = (obs_data['wavelength'] >= _current_min) & (obs_data['wavelength'] <= _current_max)
          _plot_df = obs_data[_mask].copy()
 
-         # Apply flux transformation to match emulator scale
+         # Mirror the emulator training transform so the plotted data matches the
+         # scale used during inference.
          _flux_vals = np.array(_plot_df['flux'])
          _scale_label = obs_flux_scale.value
          if _scale_label == 'log':
@@ -621,15 +677,15 @@ def _(alt, data_source_info, mo, np, obs_data, obs_flux_scale, pd, wl_range_slid
              'Type': 'Observation'
          })
 
-         # Downsample for visualization if too large (>5000 points)
+         # Downsample only for plotting so large spectra remain responsive in Altair.
          if len(_plot_df) > 5000:
              _plot_df = _plot_df.iloc[::int(len(_plot_df)/5000)]
 
          _y_title = f'Flux ({_scale_label})'
          _y_format = '.1e' if _scale_label == 'linear' else '.2f'
 
-         # For log scale, set explicit y-limits based on data range to avoid
-         # Altair defaulting to include 0 (which compresses the plot)
+         # Log-scale plots need an explicit domain because Altair otherwise tries
+         # to include zero, which visually collapses the spectrum.
          if _scale_label == 'log':
              _y_min = float(np.nanmin(_flux_vals))
              _y_max = float(np.nanmax(_flux_vals))
@@ -675,7 +731,8 @@ def _(
     test_run_selector,
     wl_range_slider,
 ):
-    # Display Status Stack
+    # Assemble the top-level Stage 1 layout from reusable UI blocks so the same
+    # cell can switch cleanly between observation mode and test-grid mode.
     loading_alert = None
     _is_test_grid = "Test Grid" in data_source_selector.value
 
@@ -712,7 +769,8 @@ def _(
     else:
         obs_status = mo.md("")
 
-    # Ground Truth Display (for test grid validation)
+    # Ground truth only exists in validation mode, where the selected run is tied
+    # back to the lookup table loaded from the paired test grid.
     gt_display = None
     if ground_truth_params and _is_test_grid:
         gt_lines = ["**Ground Truth Parameters:**"]
@@ -731,6 +789,8 @@ def _(
     ])
 
     # 2. Data Source Row - conditional UI based on selection
+    # Swap the data controls to match the source type: test grids need run +
+    # inclination selectors, while uploaded observations need file management.
     if _is_test_grid:
         # Test grid selection: run selector + inclination
         data_control_row = mo.vstack([
@@ -784,6 +844,21 @@ def _(mo):
 
 @app.cell
 def _(emu, grid_indices, mo, param_map_db, re):
+    # ── Stage 2: Prior & Parameter Setup ──
+    # Build per-parameter UI widgets (fixed/free toggle, value, min, max) that
+    # drive the prior construction in Stage 3.  Parameters fall into two groups:
+    #
+    #   Grid parameters — the physical model axes stored in the emulator (e.g.
+    #       disk.mdot, KWD.d, Inclination).  Bounds are seeded from the
+    #       emulator’s training-grid limits.
+    #
+    #   Inference / nuisance parameters — added on top of the grid axes:
+    #       Av         – interstellar extinction in magnitudes
+    #       log_scale  – ln(flux scaling factor), absorbs distance/geometry
+    #       log_amp    – ln(GP global covariance amplitude)
+    #       log_ls     – ln(GP global covariance length scale)
+    #
+    # All bounds and defaults can be adjusted interactively before MLE/MCMC.
 
     param_names = []
     defaults = {}
@@ -794,8 +869,9 @@ def _(emu, grid_indices, mo, param_map_db, re):
         current_names = []
         sorted_indices = sorted(list(grid_indices)) if grid_indices else []
 
-        # Attempt to map Emulator params (usually "param1", "param2") to Names using grid_indices
-        # We assume grid_indices found in filename correspond 1:1 with emulator dimensions when sorted.
+        # Recover human-readable parameter names for the active emulator axes.
+        # When the filename already encodes the grid indices, prefer that mapping;
+        # otherwise fall back to parsing the internal paramX labels directly.
         if len(sorted_indices) == len(emu.param_names):
              for idx in sorted_indices:
                  if idx in param_map_db:
@@ -818,7 +894,8 @@ def _(emu, grid_indices, mo, param_map_db, re):
 
         param_names.extend(current_names)
 
-        # Setup bounds (Physical Parameters)
+        # Seed the UI bounds from the emulator limits. These values are already in
+        # emulator space, so the UI stays consistent with the model inputs.
         if hasattr(emu, 'min_params') and hasattr(emu, 'max_params'):
             for _i, _name in enumerate(current_names):
                 mn = float(emu.min_params[_i])
@@ -831,10 +908,15 @@ def _(emu, grid_indices, mo, param_map_db, re):
                 defaults[_name] = 0.5
 
     # Add Inference Parameters (Global / Nuisance)
-    # These deal with Extinction, Scaling, and GP Noise properties
+    # These are not part of the emulator grid but are optimised alongside
+    # the grid parameters during MLE/MCMC.  They account for:
+    #   Av        – dust reddening / extinction
+    #   log_scale – overall flux normalisation (distance + solid angle)
+    #   log_amp   – GP global covariance amplitude (model flexibility)
+    #   log_ls    – GP global covariance length scale (smoothness)
     inf_params = [
         'Av',        # Extinction (magnitudes)
-        'log_scale', # Log Flux Scaling Factor (natural log) - combines distance/solid angle
+        'log_scale', # Log Flux Scaling Factor (natural log)
         'log_amp',   # GP Global Covariance Amplitude (natural log)
         'log_ls'     # GP Global Covariance Length Scale (natural log)
     ] 
@@ -862,8 +944,8 @@ def _(emu, grid_indices, mo, param_map_db, re):
         bounds['log_ls'] = [1.0, 8.0]
         defaults['log_ls'] = 4.5
 
-    # Create Widgets
-    # w_fix uses mo.ui.dictionary so checkbox changes are reactive
+    # Build one widget bundle per parameter: a fixed/free toggle, a point value,
+    # and lower/upper controls for the prior bounds shown in Stage 2.
     _fix_dict = {}
     _val_dict = {}
     w_min = {}
@@ -905,7 +987,8 @@ def _(bounds, mo, param_names, w_fix, w_max, w_min, w_val):
         _fix_values = w_fix.value   # dict: {name: bool}
         _val_elements = w_val.elements  # dict: {name: widget}
 
-        # --- Build Grid Parameters Section ---
+        # Keep physical grid parameters separate from nuisance / GP parameters so
+        # the user can see which controls map to the emulator grid itself.
         _grid_rows = []
         _global_rows = []
 
@@ -987,13 +1070,15 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    # MLE State - stores results for MCMC stage
-    get_mle_model, set_mle_model = mo.state(None)
-    get_mle_priors, set_mle_priors = mo.state(None)
+    # Reactive state holders for the MLE → MCMC → Export pipeline.
+    # Each state variable is set by the producing cell and consumed by the
+    # next stage, allowing the notebook to remain correct under partial reruns.
+    get_mle_model, set_mle_model = mo.state(None)       # fitted SpectrumModel
+    get_mle_priors, set_mle_priors = mo.state(None)     # frozen scipy priors dict
     # MCMC State - stores results for export
-    get_mcmc_samples, set_mcmc_samples = mo.state(None)
-    get_mcmc_labels, set_mcmc_labels = mo.state(None)
-    get_mcmc_summary_df, set_mcmc_summary_df = mo.state(None)
+    get_mcmc_samples, set_mcmc_samples = mo.state(None)     # (n_samples, n_dim) array
+    get_mcmc_labels, set_mcmc_labels = mo.state(None)       # friendly parameter names
+    get_mcmc_summary_df, set_mcmc_summary_df = mo.state(None) # ArviZ summary table
     return (
         get_mle_model, get_mle_priors, set_mle_model, set_mle_priors,
         get_mcmc_samples, set_mcmc_samples,
@@ -1035,7 +1120,21 @@ def _(
     obs_flux_scale,
     wl_range_slider,
 ):
-    # Perform MLE Inference
+    # ── Stage 3: Maximum Likelihood Estimation (MLE) ──
+    # Workflow:
+    #  1. Crop observation to the wavelength window and apply the emulator’s
+    #     flux transform (linear / log10 / mean-scaled).
+    #  2. Build a SpectrumModel from the emulator + transformed observation.
+    #  3. Translate Stage 2 UI state into frozen scipy prior objects; freeze
+    #     any parameters the user locked.
+    #  4. Construct an initial simplex that spans the full prior volume so
+    #     Nelder-Mead starts from a sensible region (not a single point).
+    #  5. Bootstrap log_scale at each simplex vertex via one model evaluation.
+    #  6. Run adaptive Nelder-Mead on the negative log-posterior with a live
+    #     spinner reporting iteration count, best NLL, and elapsed time.
+    #  7. Store the fitted model + priors in reactive state for Stage 4.
+    #  8. Render the best-fit overlay, NLL convergence curve, and a result
+    #     table with optional ground-truth comparison.
     fit_status = None
     fit_results = None
 
@@ -1043,20 +1142,22 @@ def _(
         if emu is None or obs_data is None:
             mo.stop(True, mo.md("Please load both an emulator and data."))
 
-        # Use output context for live updates
+        # Use a spinner rather than a static markdown block so the notebook keeps
+        # surfacing progress while the optimizer and plotting code run.
         with mo.status.spinner("Preparing MLE...") as _spinner:
             try:
                 from scipy.optimize import minimize as scipy_minimize
                 import time as _time
 
-                # 1. Prepare Data
+                # Restrict the observation to the selected wavelength window before
+                # transforming fluxes and uncertainties onto the emulator scale.
                 _min_w = wl_range_slider.value[0]
                 _max_w = wl_range_slider.value[1]
 
                 _mask = (obs_data['wavelength'] >= _min_w) & (obs_data['wavelength'] <= _max_w)
                 _data_subset = obs_data[_mask].copy()
 
-                # Apply flux transformation to match emulator training scale
+                # Apply exactly the same flux transform used during emulator training.
                 _flux_scale = obs_flux_scale.value
                 _raw_flux = np.array(_data_subset['flux'])
                 if _flux_scale == 'log':
@@ -1069,10 +1170,11 @@ def _(
                 # else: linear (no transform)
                 _data_subset['flux'] = _raw_flux
 
-                # Use error column if present, otherwise assume 5%
+                # Respect provided uncertainties when present; otherwise use a simple
+                # fractional-error model so SpectrumModel always receives sigmas.
                 if 'error' in _data_subset.columns:
                     _sigma = np.array(_data_subset['error'])
-                    # Transform errors to match scale
+                    # Propagate uncertainties through the same transform applied to flux.
                     if _flux_scale == 'log':
                         # Propagate error through log10: sigma_log = sigma / (val * ln(10))
                         _orig_flux = np.array(obs_data[_mask]['flux'])
@@ -1091,7 +1193,8 @@ def _(
                     sigmas=_sigma
                 )
 
-                # 2. Prepare Parameters
+                # Split UI controls into grid parameters and global nuisance terms,
+                # because SpectrumModel expects them in different constructor slots.
                 num_grid_params = len(emu.param_names)
                 phys_names = param_names[:num_grid_params]
 
@@ -1126,7 +1229,8 @@ def _(
                        **global_params
                 )
 
-                # Setup Priors
+                # Translate the Stage 2 UI state into scipy prior objects and freeze
+                # any parameters the user explicitly locked.
                 _priors = {}
 
                 # A. Grid Parameter Priors
@@ -1363,7 +1467,8 @@ def _(
                 else:
                     _fig_loss = None
 
-                # 7. Result extraction with ground truth comparison
+                # Present the fitted grid parameters in the same friendly order used
+                # in Stage 2, with optional comparison against validation truth.
                 res_grid = _model.grid_params
                 res_global = _model.params
 
@@ -1401,7 +1506,8 @@ def _(
                 if 'global_cov:log_ls' in res_global:
                     _results_md += f"- **log_ls**: {res_global['global_cov:log_ls']:.4f}\n"
 
-                # Build results display
+                # Keep the result view as a single stack so the fit summary, loss
+                # curve, and model figure stay coupled during reactive reruns.
                 _result_elements = [
                     fit_status,
                     mo.md(_results_md),
@@ -1442,7 +1548,14 @@ def _(mo):
 
 @app.cell
 def _(emu, get_mle_model, mo, param_names, re):
-    # MCMC Configuration
+    # ── Stage 4 configuration: MCMC sampling controls ──
+    # The user sets walker count, step count, and manual burn-in, then
+    # optionally freezes select parameters at their MLE values so the
+    # sampler explores a reduced subspace.  Defaults were chosen for a
+    # reasonable balance of speed vs. posterior quality:
+    #   32 walkers  – twice the typical active-parameter count
+    #   1000 steps  – gives ~30 000 post-burn samples at thin=1
+    #   200 burn-in – conservative; the auto-burn heuristic may override
     _model = get_mle_model()
 
     mcmc_nwalkers = mo.ui.number(value=32, label="Walkers", step=4, start=8)
@@ -1516,7 +1629,22 @@ def _(
     set_mcmc_samples,
     set_mcmc_summary_df,
 ):
-    # Run MCMC
+    # ── Stage 4: MCMC Posterior Exploration ──
+    # Steps:
+    #  1. Optionally freeze parameters the user flagged (GP hypers, etc.).
+    #  2. Build a Gaussian proposal ball around the MLE best-fit, scaled
+    #     per-parameter to match typical posterior widths.
+    #  3. Run emcee’s EnsembleSampler with 1-step increments inside a
+    #     marimo progress bar.
+    #  4. Estimate autocorrelation times; use max(τ) as the automatic
+    #     burn-in and 0.3×min(τ) as thinning (ArviZ/emcee heuristic).
+    #  5. Convert chains to ArviZ InferenceData for trace plots, posterior
+    #     distributions, and summary statistics.
+    #  6. Generate a corner plot (truths drawn from the lookup table when
+    #     running in test-grid validation mode).
+    #  7. Set the model to the posterior mean and plot the best-fit.
+    #  8. Persist the cleaned samples and labels in reactive state for the
+    #     export cells.
     mcmc_results = None
 
     if run_mcmc_btn.value:
@@ -1526,7 +1654,8 @@ def _(
         if _model is None or _priors is None:
             mo.stop(True, mo.md("Please run MLE first."))
 
-        # Apply freezes from UI checkboxes
+        # Apply the optional MCMC-only freezes to the already-fit model so the
+        # sampler explores only the subset of parameters the user left thawed.
         _freeze_values = mcmc_freeze.value  # {internal_name: bool}
         _frozen_list = []
         for _key, _is_frozen in _freeze_values.items():
@@ -1559,8 +1688,8 @@ def _(
                     model.set_param_vector(P)
                     return model.log_likelihood(priors)
 
-                # Initialize walkers in a ball around MLE solution
-                # Scales use both internal and friendly names for robust lookup
+                # The proposal ball is keyed by both internal and display labels so
+                # sampling stays stable even when Stage 2 renamed parameters.
                 _default_scales = {
                     "disk.mdot": 0.05, "wind.mdot": 0.02, "KWD.d": 0.1,
                     "KWD.mdot_r_exponent": 0.05, "KWD.acceleration_length": 0.1,
@@ -1599,9 +1728,8 @@ def _(
                 # _sampler.get_chain() shape: (nsteps, nwalkers, ndim)
                 _full_chain = _sampler.get_chain()
 
-                # Build arviz InferenceData for full chain
-                # arviz from_dict expects {name: (chains, draws)}
-                # Use friendly names for display
+                # Convert the raw emcee chain into ArviZ's (chains, draws) layout
+                # using friendly parameter names for all user-facing plots.
                 _friendly_labels = [_friendly(l) for l in _model.labels]
                 _full_dd = {}
                 for _i, _label in enumerate(_friendly_labels):
@@ -1617,7 +1745,9 @@ def _(
                 # ============================================================
                 # Stage 16: Autocorrelation & Burn-in
                 # ============================================================
-                # Compute autocorrelation time
+                # Autocorrelation estimates drive the automatic burn-in and thinning
+                # heuristics, but the code falls back gracefully when chains are too
+                # short or unstable for ArviZ/emcee to estimate tau reliably.
                 try:
                     _tau = _sampler.get_autocorr_time(tol=0)
                     _tau_valid = not (np.isnan(_tau).any() or (_tau == 0).any())
@@ -1673,7 +1803,8 @@ def _(
                 _summary_df = _az.summary(_burn_data, round_to=5)
                 _summary_md = _summary_df.to_markdown()
 
-                # Store MCMC results in state for export cell
+                # Persist the post-burn samples and summary table so the export cells
+                # can write files without rerunning the sampler.
                 set_mcmc_samples(_burn_samples.copy())
                 set_mcmc_labels(list(_friendly_labels))
                 set_mcmc_summary_df(_summary_df)
@@ -1690,8 +1821,9 @@ def _(
                 # ============================================================
                 # Stage 18: Corner plot
                 # ============================================================
-                # Build truths for corner plot from ground truth
-                # Use the friendly label map to look up ground truth keys
+                # Corner-plot truths are matched through the same friendly-name map
+                # used elsewhere, with all inclination variants collapsed onto the
+                # single lookup-table "Inclination" key.
                 _truths = None
                 if ground_truth_params:
                     _truths = []
@@ -1846,6 +1978,8 @@ def _(
     _summary_df = get_mcmc_summary_df()
     _model = get_mle_model()
 
+    # Gate export behind a completed MCMC run so the buttons only appear when the
+    # notebook already has the posterior samples needed to write files.
     mo.stop(
         _samples is None or _model is None,
         mo.callout(mo.md("Run MCMC first to enable export."), kind="neutral"),
@@ -1892,18 +2026,21 @@ def _(
 
             os.makedirs(_out_dir, exist_ok=True)
 
-            # Posterior means for grid params
+            # The .pf export uses posterior-mean grid parameters as the template
+            # centre and attaches percentile-based uncertainties per grid axis.
             _n_grid = len(emu.param_names)
             _grid_means = np.mean(_samples[:, :_n_grid], axis=0)
 
-            # Uncertainties
+            # Export uncertainties as 16th/84th percentile bounds in the same
+            # friendly label space used in the results tables.
             _uncertainties = {}
             for _i, _label in enumerate(_labels[:_n_grid]):
                 _lo = np.percentile(_samples[:, _i], 16)
                 _hi = np.percentile(_samples[:, _i], 84)
                 _uncertainties[_label] = (_lo, _hi)
 
-            # Global params
+            # Preserve posterior-mean nuisance parameters alongside the grid values
+            # so the exported template records the full fitted configuration.
             _global = {}
             for _i in range(_n_grid, _samples.shape[1]):
                 _global[_labels[_i]] = float(np.mean(_samples[:, _i]))
@@ -1924,7 +2061,8 @@ def _(
 
             os.makedirs(_out_dir, exist_ok=True)
 
-            # Build summary dict from DataFrame if available
+            # Convert the ArviZ summary table back into a plain dict so the CSV
+            # export can append human-readable summary statistics as metadata.
             _summary_dict = None
             if _summary_df is not None:
                 _summary_dict = {}

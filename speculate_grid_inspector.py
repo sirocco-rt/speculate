@@ -4,10 +4,25 @@
 # [tool.marimo.runtime]
 # output_max_bytes = 50_000_000
 # ///
+#
+# Speculate Grid Inspector
+# ========================
+# Interactive notebook for browsing and visualising the raw Sirocco spectral
+# grid data before emulator training.  Works in two execution modes:
+#
+#   Local mode        — reads decompressed .spec files from sirocco_grids/.
+#   HuggingFace mode  — streams .spec.xz archives on demand from the
+#                       Sirocco-rt HuggingFace organisation.
+#
+# Features:
+#   • Slider-based browsing through all run files at any inclination angle.
+#   • Pin spectra for comparison and toggle dimensionless (shape-only) mode.
+#   • Hierarchical parameter dropdowns that snap to the nearest valid run.
+#   • Observation file overlay for quick visual comparison.
 
 import marimo
 
-__generated_with = "0.18.1"
+__generated_with = "0.19.7"
 app = marimo.App(
     width="full",
     app_title="Speculate Grid Inspector",
@@ -87,6 +102,9 @@ def _(mo):
 
 @app.cell
 def _():
+    # ── Core data-science imports ──
+    # VegaFusion is enabled because a single spectrum can have thousands of
+    # wavelength points and Altair’s default inline limit is 5 000 rows.
     import os
     import numpy as np
     import pandas as pd
@@ -97,6 +115,8 @@ def _():
     alt.data_transformers.enable("vegafusion")
 
     # Detect environment
+    # When running on HuggingFace Spaces the grid files are fetched over
+    # HTTP; locally they are read straight from the filesystem.
     IS_HUGGINGFACE_SPACE = os.environ.get("SPACE_ID") is not None
     return IS_HUGGINGFACE_SPACE, Path, alt, np, os, pd
 
@@ -123,9 +143,12 @@ def _(IS_HUGGINGFACE_SPACE, mo):
 
 @app.cell
 def _(IS_HUGGINGFACE_SPACE, Path, mo):
-    # Grid selection based on environment
+    # Offer the same grid picker in both execution environments, but populate it
+    # from different sources: hard-coded hub datasets in Spaces, local folders on
+    # a workstation install.
     if IS_HUGGINGFACE_SPACE:
-        # HuggingFace: select from available datasets
+        # In the hosted Space the available grids are fixed dataset IDs rather
+        # than directories on disk.
         available_grids = [
             "speculate_cv_bl_grid_v87f",
             "speculate_cv_no-bl_grid_v87f",
@@ -136,7 +159,8 @@ def _(IS_HUGGINGFACE_SPACE, Path, mo):
             label="Select Grid Dataset:"
         )
     else:
-        # Local: scan sirocco_grids directory
+        # Local mode discovers whatever datasets the downloader has already
+        # unpacked into the shared sirocco_grids directory.
         sirocco_grids_path = Path("sirocco_grids")
         if sirocco_grids_path.exists():
             available_grids = [
@@ -162,11 +186,14 @@ def _(IS_HUGGINGFACE_SPACE, Path, mo):
 
 @app.cell
 def _(IS_HUGGINGFACE_SPACE, cache_tracker_state, grid_selector, mo):
-    # Clear cache when grid changes (HuggingFace mode only)
+    # In HuggingFace mode each viewed spectrum is cached locally after download;
+    # clear those cached .xz files when the selected dataset changes so one grid
+    # cannot leak stale files into another grid session.
     if IS_HUGGINGFACE_SPACE:
         get_cache_check, set_cache_check = cache_tracker_state
 
-        # Track previous grid to detect changes
+        # Persist the previously selected dataset name in the process environment
+        # because this cell is reactive but the cache lives across reruns.
         import os as os_cache
 
         prev_grid_key = "_prev_selected_grid"
@@ -189,7 +216,7 @@ def _(IS_HUGGINGFACE_SPACE, cache_tracker_state, grid_selector, mo):
             if cleared > 0:
                 mo.md(f"🧹 Cleared {cleared} cached spectra from previous grid")
 
-        # Update tracked grid
+        # Remember the active dataset for the next rerun.
         if current_grid:
             os_cache.environ[prev_grid_key] = current_grid
 
@@ -202,7 +229,14 @@ def _(IS_HUGGINGFACE_SPACE, cache_tracker_state, grid_selector, mo):
 
 @app.cell
 def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
-    # Load grid metadata
+    # ── Load grid metadata ──
+    # Regardless of mode, the outcome is:
+    #   lookup_df           – parquet table mapping Run Number → parameter values
+    #   wavelengths         – common wavelength array (flipped to ascending)
+    #   inclination_angles  – list of observer angles extracted from the .spec
+    #                         column header (e.g. A30P0.50 → 30)
+    #   param_cols          – column names in lookup_df (excluding Run Number)
+    #   param_options       – {col: sorted unique values} for dropdown widgets
     import lzma
 
     with mo.status.spinner(title="Loading grid metadata..."):
@@ -467,7 +501,12 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    # Initialize state for pinned spectra storage
+    # ── State initialisation ──
+    # pinned_spectra  – list of (run_index, inclination) tuples shown as
+    #                   fixed background traces in the plot
+    # run_index       – shared slider ↔ parameter-dropdown position
+    # cache_tracker   – set of file paths downloaded from HuggingFace so
+    #                   the grid-switch cell can clean up stale archives
     get_pinned_spectra, set_pinned_spectra = mo.state([])
 
     # Initialize state for current run index (synced between slider and parameters)
@@ -553,11 +592,12 @@ def _(
     param_cols,
     repo_id,
 ):
-    # Cache management functions
+    # Build spectrum-loading helpers once per rerun so both the current spectrum
+    # and the pinned/background spectra share the same code path.
     get_cache, set_cache = cache_tracker_state
 
     def clear_spectrum_cache():
-        """Clear all cached spectrum files from HuggingFace downloads"""
+        """Delete every tracked HuggingFace archive cached for the current session."""
         cached_files = get_cache()
         cleared_count = 0
 
@@ -574,19 +614,23 @@ def _(
         return cleared_count
 
     def track_cached_file(file_path):
-        """Add file to cache tracker"""
+        """Record a downloaded archive path so it can be cleaned up later."""
         cached_files = get_cache()
         cached_files.add(file_path)
         set_cache(cached_files)
 
-    # Function to load a spectrum by run index and inclination
     def load_spectrum_with_skiprows(file_handle):
-        """Helper to find correct skiprows and load data"""
-        # Read lines to find where "Freq." header is
+        """Read a Sirocco spectrum file after locating the dynamic header boundary.
+
+        Sirocco .spec files start with a variable-length text header ending
+        with a row beginning "Freq.".  This helper scans for that sentinel
+        and delegates to numpy for the numeric block."""
+        # The spectrum files start with a variable-length text header, so scan for
+        # the "Freq." line before delegating to numpy.
         lines = file_handle.readlines()
         file_handle.seek(0)  # Reset file position
 
-        # Find the line with "Freq." header
+        # Skip the header row itself and start loading from the numeric block.
         skiprows = 0
         for i, line in enumerate(lines):
             if 'Freq.' in line:
@@ -598,12 +642,17 @@ def _(
         return data
 
     def load_spectrum(run_idx, inclination):
-        """Load spectrum flux by run index and inclination angle"""
-        # Find which column corresponds to the inclination
+        """Load one run at one inclination, regardless of local or hub-backed mode.
+
+        Returns (flux, params) where flux is the wavelength-ascending array
+        and params is a dict of {column_name: value} from the lookup table."""
+        # The first two columns are frequency and wavelength; the remaining ones
+        # are inclination-specific flux columns in the order listed above.
         col_idx = inclination_angles.index(inclination) + 2  # +2 because cols 0=Freq, 1=Lambda
 
         if grid_mode == "huggingface":
-            # HuggingFace: download and decompress
+            # Hosted mode streams the compressed archive into the local HF cache,
+            # then decompresses it in-memory for immediate parsing.
             run_number = lookup_df['Run Number'].iloc[run_idx]
             spec_file = f"run{run_number}.spec.xz"
 
@@ -613,7 +662,8 @@ def _(
                 repo_type="dataset"
             )
 
-            # Track this file in cache
+            # Keep track of the cached archive so the dataset-switch cleanup cell
+            # can delete it later.
             track_cached_file(spec_path_temp)
 
             with lzma.open(spec_path_temp, 'rt') as f:
@@ -621,7 +671,8 @@ def _(
                 flux = np.flip(data[col_idx])
 
         else:
-            # Local: read from file using run number from lookup table
+            # Local mode reads the already-extracted .spec file produced by the
+            # downloader, using the lookup table to recover the run number.
             run_number = lookup_df['Run Number'].iloc[run_idx]
             spec_file_path = Path(grid_path) / f"run{run_number}.spec"
 
@@ -629,7 +680,8 @@ def _(
                 data = load_spectrum_with_skiprows(f)
                 flux = np.flip(data[col_idx])
 
-        # Get parameters for this run from lookup table
+        # Always return the associated parameter row so the inspector UI can keep
+        # its parameter dropdowns synchronized with the displayed spectrum.
         params = {col: lookup_df[col].iloc[run_idx] for col in param_cols}
 
         return flux, params
@@ -660,19 +712,22 @@ def _(
     wavelength_range,
     wavelengths,
 ):
-    # Get wavelength range filter
+    # Filter and transform every plotted series through the same wavelength mask
+    # so pinned, current, and observational spectra share one x-axis domain.
     wl_min, wl_max = wavelength_range.value
     wl_mask = (wavelengths >= wl_min) & (wavelengths <= wl_max)
     filtered_wavelengths = wavelengths[wl_mask]
 
-    # Helper for smoothing
+    # Apply the optional rolling mean uniformly to every spectrum type before any
+    # normalization, so visual comparisons stay consistent.
     def smooth_flux(flux_array):
         if use_smoothing.value:
             # Use min_periods=1 to handle edges without dropping data
             return pd.Series(flux_array).rolling(window=5, center=True, min_periods=1).mean().values
         return flux_array
 
-    # Prepare data for Altair
+    # Collect each visible series as a dataframe and concatenate them into the
+    # long-form layout Altair expects for layered categorical plotting.
     plot_data_list = []
 
     # 1. Add Pinned spectra first (background)
@@ -685,7 +740,8 @@ def _(
                 # Apply smoothing
                 pinned_flux_plot = smooth_flux(pinned_flux)
 
-                # Apply dimensionless transformation if requested
+                # Dimensionless mode removes absolute scaling so pinned spectra can
+                # be compared by shape rather than by flux level.
                 if use_dimensionless.value:
                     norm_factor = pinned_flux_plot.mean()
                     pinned_flux_plot = pinned_flux_plot / norm_factor
@@ -708,7 +764,8 @@ def _(
         # Apply smoothing
         current_flux_plot = smooth_flux(current_flux_plot)
 
-        # Apply dimensionless transformation if requested
+        # Apply the same shape-only normalization as the pinned spectra so the
+        # current run remains directly comparable when that mode is active.
         if use_dimensionless.value:
             norm_factor = current_flux_plot.mean()
             current_flux_plot /= norm_factor
@@ -732,7 +789,8 @@ def _(
             obs_df.columns = [c.upper() for c in obs_df.columns]
 
             if 'WAVELENGTH' in obs_df.columns and 'FLUX' in obs_df.columns:
-                # Smooth full dataset before filtering
+                # Smooth before filtering so edge handling is based on the full
+                # observation rather than the cropped wavelength window.
                 obs_flux_full = obs_df['FLUX'].values
                 obs_flux_full = smooth_flux(obs_flux_full)
                 obs_df['FLUX'] = obs_flux_full # Update DataFrame
@@ -744,6 +802,8 @@ def _(
                 if not obs_data.empty:
                     obs_flux = obs_data['FLUX'].values
 
+                    # Use the same normalization rule here so observations can be
+                    # overplotted directly against model spectra by shape.
                     if use_dimensionless.value:
                         norm_factor = obs_flux.mean()
                         obs_flux = obs_flux / norm_factor - 1.0
@@ -759,7 +819,9 @@ def _(
         except Exception as e:
             pass # Keep silent on error
 
-    # Combine all data
+    # Once every visible series has been normalized into the same schema, render
+    # one interactive Altair chart with styling driven by the synthetic/observed
+    # series type rather than by separate plot objects.
     if plot_data_list:
         plot_df = pd.concat(plot_data_list, ignore_index=True)
 
@@ -830,7 +892,13 @@ def _(
     param_options,
     set_run_index,
 ):
-    # Display current parameters with dropdowns for interactive modification
+    # ── Hierarchical parameter dropdowns ──
+    # Each dropdown shows the full domain of one grid parameter.  When the
+    # user changes a dropdown value the handler performs a "hierarchical
+    # match": it filters the lookup table to all runs with the requested
+    # value, then among those picks the run that preserves as many of the
+    # other current parameter values as possible (left-to-right priority).
+    # This gives clean navigation through a multi-dimensional discrete grid.
     run_number = lookup_df['Run Number'].iloc[current_run_index]
 
     mo.md(f"### Current Spectrum Parameters\n**Run Index**: {current_run_index} | **Run Number**: {run_number}")
@@ -838,7 +906,8 @@ def _(
     # Create a dictionary to hold the dropdowns
     param_dropdowns = {}
 
-    # Define update function closure
+    # Each parameter dropdown chooses the "closest" valid run that matches the
+    # requested value while trying to preserve the rest of the current settings.
     def make_update_handler(param_name):
         def on_change(new_value):
             # 1. Filter Grid: Get all runs that have this new parameter value
@@ -868,9 +937,8 @@ def _(
             else:
                 best_match = candidates.iloc[0]
 
-            # Update the global run index
-            # We find the index in the original dataframe
-            # Note: best_match.name gives the index if we used copy() from original df
+            # best_match.name still points back to the source dataframe index, so
+            # updating the shared run index rerenders the inspector everywhere else.
             set_run_index(int(best_match.name))
 
         return on_change
@@ -888,12 +956,12 @@ def _(
         return str(v)
 
     for param_name, param_value in current_params.items():
-        # Always show ALL unique values for this parameter
-        # This prevents "Islands" where users get trapped in a subset
+        # Show the full parameter domain, not just values reachable from the
+        # current row, so users can always jump to a different region of the grid.
         unique_vals = param_options[param_name]
 
-        # Create dictionary for options {formatted_label: actual_value}
-        # This keeps the display clean while preserving the exact float value for lookup
+        # Keep user-facing labels compact while preserving the exact underlying
+        # float values needed to locate the matching row in the lookup table.
         options_dict = {format_val(v): v for v in unique_vals}
 
         # Create dropdown

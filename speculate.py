@@ -156,6 +156,7 @@ def _(current_mode, mo):
             mo.md(" "),
             mo.md(f"###{mo.icon('lucide:brain')} Training Tool"),
             mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:test-tubes')} Benchmark Suite"),
             mo.md("---"),
             mo.md("---"),
             mo.nav_menu({

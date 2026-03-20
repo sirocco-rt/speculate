@@ -2,6 +2,21 @@
 # [tool.marimo.display]
 # theme = "dark"
 # ///
+#
+# Speculate Training Tool
+# =======================
+# Interactive notebook for training PCA + Gaussian Process emulators on
+# Sirocco spectral grids.  The pipeline is:
+#
+#   1. Select a downloaded grid and the parameters to include.
+#   2. Optionally run a quick PCA variance test to choose n_components.
+#   3. Process the raw .spec files into a compact grid NPZ if needed.
+#   4. Train the emulator (PCA decomposition → GP weight fitting via
+#      Nelder-Mead) with live loss plotting and a training log.
+#   5. Inspect GP weight diagnostics and the final loss curve.
+#
+# The notebook writes the trained emulator to Grid-Emulator_Files/ as a
+# .npz file consumable by the Inference Tool and Benchmark Suite.
 
 import marimo
 
@@ -11,6 +26,15 @@ app = marimo.App(width="full", app_title="Speculate Training Tool")
 
 @app.cell
 def _(mo):
+    # ── Reactive state variables ──
+    # These act as the cross-cell communication bus for the training pipeline:
+    #   loss_history     – NLL per Nelder-Mead iteration (drives live chart)
+    #   training_trigger – bumped after training to re-evaluate the "retrain?"
+    #                      button label
+    #   console_logs     – aggregated stdout captured during training
+    #   training_status  – success/failure callout widget
+    #   pca_result       – summary string from the quick PCA variance test
+    #   trained_emu      – the Emulator instance (for GP diagnostics)
     get_loss_history, set_loss_history = mo.state([])
     get_training_trigger, set_training_trigger = mo.state(0)
     get_console_logs, set_console_logs = mo.state("")
@@ -136,6 +160,11 @@ def _(mo):
 
 @app.cell
 def _(mo):
+    # ── Imports and grid interface setup ──
+    # Starfish.grid_tools.HDF5Creator is the upstream grid-processing base
+    # class; MarimoHDF5Creator overrides its loop to inject a marimo progress
+    # bar.  The Speculate grid interfaces (Speculate_cv_bl_grid_v87f, etc.)
+    # know how to parse raw Sirocco .spec files for each grid variant.
     import os
     import sys
     import numpy as np
@@ -155,15 +184,24 @@ def _(mo):
     from Speculate_addons.Spec_gridinterfaces import Speculate_cv_no_bl_grid_v87f
 
     class MarimoHDF5Creator(HDF5Creator):
+        """Override the grid-processing loop to surface a marimo progress bar
+        instead of a plain tqdm counter.  The resulting NPZ contains:
+          wl            – common wavelength grid
+          grid_points   – (N, n_params) array of parameter coordinates
+          flux_data     – dict mapping key_name → {flux, header}
+          param_names   – list of "paramN" strings
+        """
         def process_grid(self):
             """
             Run :meth:`process_flux` for all of the spectra within the `ranges`
             and store the processed spectra in the HDF5 file.
             """
-            # param_list will be a list of numpy arrays, specifying the parameters
+            # Enumerate the Cartesian product of every allowed parameter value in
+            # the active grid interface; each row becomes one candidate spectrum.
             param_list = []
 
-            # use itertools.product to create permutations of all possible values
+            # itertools.product expands the per-parameter grids into the full set
+            # of model coordinates the creator will try to load from disk.
             for i in itertools.product(*self.points):
                 param_list.append(np.array(i))
 
@@ -172,7 +210,8 @@ def _(mo):
 
             self.log.debug("Total of {} files to process.".format(len(param_list)))
 
-            # Use marimo progress bar
+            # Process each valid parameter tuple once, storing both the transformed
+            # flux array and the cleaned FITS-style header metadata in the NPZ.
             for i, param in enumerate(mo.status.progress_bar(all_params, title="Processing Grid Points")):
                 try:
                     flux, header = self.grid_interface.load_flux(param, header=True)
@@ -185,9 +224,11 @@ def _(mo):
 
                 _, fl_final = self.transform(flux)
 
-                # Store flux data in dictionary
+                # The key_name format mirrors the parameter ordering so later tools
+                # can reconstruct which processed spectrum belongs to which point.
                 flux_key = self.key_name.format(*param)
-                # Filter out empty FITS keywords  
+                # Drop blank/comment-only FITS header entries because numpy's NPZ
+                # serialization handles plain dict metadata better than raw cards.
                 clean_header = {k: v for k, v in header.items() 
                               if k != "" and k != "COMMENT" and v != ""}
 
@@ -196,7 +237,8 @@ def _(mo):
                     "header": clean_header
                 }
 
-            # Remove parameters that do no exist
+            # Remove any grid points whose backing spectrum file was missing so the
+            # saved grid_points array matches the serialized flux_data exactly.
             all_params = np.delete(all_params, invalid_params, axis=0)
 
             # Save all data to NPZ file
@@ -213,11 +255,15 @@ def _(mo):
                 grid_name=self.grid_name
             )
 
-    # Check available grids in sirocco_grids folder
+    # Discover which downloaded grid folders are both present on disk and known
+    # to this tool's interface registry.
     sirocco_grids_path = Path("sirocco_grids")
     available_grids = {}
 
-    # Map grid folder names to their configuration
+    # grid_configs is the bridge from a folder name to the concrete grid interface,
+    # the FITS columns to read, and the parameter indices supported by that grid.
+    # "max_params" lists every axis the interface can expose; the user selects a
+    # subset in the multiselect widget.
     grid_configs = {
         "speculate_cv_no-bl_grid_v87f": {
             "class": Speculate_cv_no_bl_grid_v87f,
@@ -290,7 +336,9 @@ def _(available_grids, mo):
 
 @app.cell
 def _(grid_configs, grid_selector, mo, sirocco_grids_path):
-    # Dynamically fetch parameter options from the grid interface
+    # Introspect the selected grid interface so the Stage 1 multiselect shows the
+    # parameters that grid actually exposes, using the interface's own metadata
+    # when possible.
     param_names = {}
 
     if grid_selector is not None and grid_selector.value:
@@ -301,11 +349,14 @@ def _(grid_configs, grid_selector, mo, sirocco_grids_path):
             max_params = config["max_params"]
 
             try:
-                # Instantiate temporary interface to get descriptions
-                # We use the raw path + "/" as required by star fish interfaces usually
+                # Build a temporary interface instance solely to query the available
+                # parameter descriptions without committing to a training run yet.
+                # The trailing slash matches the path format expected by these grid
+                # interfaces when they build internal file paths.
                 temp_path = str(sirocco_grids_path / selected_grid) + "/"
 
-                # Initialize with all possible parameters to get all descriptions
+                # Request the maximum supported parameter set so descriptions for
+                # every selectable axis are available to the UI.
                 temp_interface = config["class"](
                     path=temp_path,
                     usecols=config["usecols"],
@@ -324,9 +375,8 @@ def _(grid_configs, grid_selector, mo, sirocco_grids_path):
                 # Fallback if interface fails (e.g. files missing)
                 param_names = {i: f"Parameter {i}" for i in max_params}
 
-            # Set default parameters logic
-            # Heuristic: exclude inclination alternatives (typically > 9 if 9 is sparse inc)
-            # Default to selecting "Standard" parameters + sparse inclination
+            # Default to the "standard" physical axes plus the sparse inclination
+            # variant; the denser inclination encodings are optional expansions.
             default_params = [p for p in max_params if p <= 9]
 
             # Create options
@@ -351,18 +401,18 @@ def _(grid_configs, grid_selector, mo, sirocco_grids_path):
 
 @app.cell
 def _(mo, n_components, params):
-    # Calculate estimated grid size and VRAM usage
+    # Estimate the combinatorial grid size and the dominant GPU memory footprint
+    # before training begins, using the selected parameterization and PCA size.
     high_vram = mo.md("")
 
     if params is not None and params.value:
         try:
-            # Parse selected parameter indices
+            # The UI stores parameter ids as strings; convert them back to ints for
+            # the size heuristics used below.
             selected = [int(p) for p in params.value]
 
-            # Calculate total permutations based on parameter weights
-            # Standard params (1-9) have 3 values
-            # Param 10 (Mid Inc) has 6 values (weight = 2x standard)
-            # Param 11 (Full Inc) has 12 values (weight = 4x standard)
+            # The inclination encodings have higher cardinality than the other grid
+            # axes, so they contribute disproportionately to total grid size.
             total_points = 1
             for p in selected:
                 if p == 11:
@@ -372,17 +422,14 @@ def _(mo, n_components, params):
                 else:
                     total_points *= 3
 
-            # ============================================================
-            # Adaptive VRAM Estimation
-            # ============================================================
-            # V11 is the dominant memory consumer during training.
-            # With block_diagonal=True, V11 is stored as (n_comp, M, M) float64.
-            # Use the actual PCA component slider value for estimation.
-            # Additional overhead: ~2x V11 for Cholesky workspace + kernel intermediates.
+            # V11 is the dominant dense tensor in emulator training. In standard
+            # mode it scales as (n_components, M, M), so memory grows roughly with
+            # the square of the number of grid points.
             n_comp_estimate = n_components.value
             elem_bytes = 8  # float64
             v11_bytes = n_comp_estimate * total_points * total_points * elem_bytes
-            # Working memory: Cholesky factor L + intermediate solve buffers ≈ 2x V11
+            # Add rough working-room for factorization and solve buffers on top of
+            # the raw V11 tensor itself.
             estimated_total_bytes = v11_bytes * 3
             estimated_gb = estimated_total_bytes / (1024**3)
 
@@ -404,7 +451,8 @@ def _(mo, n_components, params):
                 vram_info = f"GPU VRAM: **{gpu_vram_gb:.1f} GB** &nbsp;|&nbsp; Est. usage: **{total_display}** ({usage_pct:.0f}%)"
 
                 if estimated_gb > gpu_vram_gb:
-                    # Peak VRAM in memory-efficient mode: ~2 × M² × 8 bytes
+                    # Memory-efficient mode never materializes the full V11 tensor;
+                    # it only needs a couple of MxM working blocks at a time.
                     efficient_bytes = 2 * total_points * total_points * elem_bytes
                     efficient_gb = efficient_bytes / (1024**3)
                     efficient_display = f"{efficient_gb:.1f} GB"
@@ -522,6 +570,10 @@ def _(mo):
         label="Strict Weight Fit (bypass λ_ξ truncation penalty)"
     )
 
+    # λ_ξ (lambda_xi) is the Czekala et al. (2015) truncation noise matrix that
+    # inflates the effective measurement noise used during GP weight training.
+    # Bypassing it ("strict") minimises the GP loss on the raw PCA weights at
+    # the cost of losing formal flux-space equivalence.
     mo.vstack([
         method,
         max_iter,
@@ -653,13 +705,15 @@ def _(
     # Register dependency on training completion
     _ = get_training_trigger()
 
-    # Determine filename to check for existence default
+        # Recompute the expected emulator filename reactively so the UI can warn when
+        # the current configuration would overwrite an existing trained model.
     _emu_btn_label = "🚀 Train Emulator"
     _emu_btn_kind = "success"
     _emu_info_text = "Click to begin training. This may take several minutes to hours depending on grid size and hardware."
 
     if grid_selector is not None and grid_selector.value and params is not None and params.value:
-         # Configuration (duplicate logic to check filename)
+            # Duplicate the naming logic from the training cell so this preview stays
+            # consistent with the file that would actually be written on train.
         _model_params = tuple(sorted([int(p) for p in params.value]))
         _model_params_str = ''.join(str(i) for i in _model_params)
         _wl_range = (wl_min.value, wl_max.value)
@@ -670,7 +724,9 @@ def _(
         # Standardize base name
         _base_name = _grid_name + "_"
 
-        # Determine emulator file name
+           # Inclination-aware models follow a shorter filename convention because the
+           # inclination axis is already part of the parameter tuple; otherwise the
+           # fixed 55-degree training assumption is encoded into the name explicitly.
         _fixed_inc = 55
         if any(x in _model_params for x in [9, 10, 11]):
              _chk_name = f'{_base_name}emu_{_model_params_str}_{_scale}{_smooth_tag}_{_wl_range[0]}-{_wl_range[1]}AA_{n_components.value}PCA'
@@ -682,7 +738,8 @@ def _(
             _emu_btn_kind = "warn"
             _emu_info_text = f"**Emulator found:** `{_chk_name}.npz`\n\nClick to **re-train** (overwrites existing)."
 
-            # Load existing loss history if available (Side Effect: Update Graph)
+            # If a prior training run saved loss_history, hydrate it now so the
+            # diagnostics panel shows something useful before retraining starts.
             try:
                 # Load minimal data from npz to check for loss_history
                 # We do checking inside try/except to avoid crashes on old files
@@ -694,7 +751,8 @@ def _(
             except Exception:
                 set_loss_history([])
 
-            # Load existing emulator for GP diagnostics
+            # Preload the existing emulator so the GP diagnostics widgets remain
+            # populated even before the user decides whether to retrain.
             try:
                 _existing_emu = Emulator.load(f'Grid-Emulator_Files/{_chk_name}.npz')
                 set_trained_emu(_existing_emu)
@@ -737,13 +795,15 @@ def _(
     wl_max,
     wl_min,
 ):
-    # Initialize return variables
+    # This cell resolves the on-disk filenames, reports the planned training
+    # configuration, and creates the processed grid file on demand.
     emu_exists = False
     emu_file_name = ""
     grid_file_name = ""
 
     if train_button.value and grid_selector is not None and params is not None:
-        # Configuration
+        # Normalize the selected UI controls into the exact identifiers used by the
+        # downstream grid-processing and emulator-training code.
         model_parameters = tuple(sorted([int(p) for p in params.value]))
         model_parameters_str = ''.join(str(i) for i in model_parameters)
         wl_range = (wl_min.value, wl_max.value)
@@ -756,7 +816,8 @@ def _(
         # Standardize base name from grid folder name (e.g. no-bl -> no_bl)
         base_name = grid_name + "_"
 
-        # Generate file names (include scale since flux is transformed during grid processing)
+        # Include the flux scale and smoothing tag in the grid filename because the
+        # processed spectra themselves differ when either option changes.
         grid_file_name = f"{base_name}grid_{model_parameters_str}_{scale}{smooth_tag}"
 
         # Determine emulator file name based on Speculate_dev.py conventions
@@ -768,7 +829,8 @@ def _(
         else:
             emu_file_name = f'{base_name}emu_{model_parameters_str}_{scale}{smooth_tag}_{fixed_inc}inc_{wl_range[0]}-{wl_range[1]}AA_{n_components.value}PCA'
 
-        # Check for existing grid file
+        # Auto-process the grid only when the processed NPZ for this exact config
+        # does not already exist.
         grid_file_path_check = f'Grid-Emulator_Files/{grid_file_name}.npz'
         process_grid_auto = not os.path.isfile(grid_file_path_check)
 
@@ -793,7 +855,8 @@ def _(
         ---
         """)
 
-        # Initialize grid interface
+        # Build the concrete grid interface that knows how to read this grid's raw
+        # spectra and convert them into the processed training representation.
         grid = None
         if grid_name in grid_configs:
             grid_config = grid_configs[grid_name]
@@ -809,9 +872,11 @@ def _(
             error_md = mo.md(f"⚠️ **Error:** Unknown grid configuration for `{grid_name}`")
             mo.vstack([config_md, error_md])
 
-        # Process grid if requested
+        # Grid processing is the expensive preprocessing step that converts the raw
+        # Sirocco files into the compact NPZ consumed by emulator training.
         if process_grid_auto and grid is not None:
-            # Set up logging
+            # Log grid processing to disk because this can take a long time and the
+            # notebook UI alone is not sufficient for post-mortem debugging.
             os.makedirs('logs', exist_ok=True)
             logging.basicConfig(
                 level=logging.INFO,
@@ -824,7 +889,8 @@ def _(
 
             status_md = mo.md("🔧 **Processing grid...** (logging to `logs/grid_processing.log`)")
 
-            # Create grid file
+            # key_name reproduces the parameter ordering inside each flux-data entry
+            # of the processed NPZ so later code can decode the stored spectra.
             keyname = ["param{}{{}}".format(i) for i in model_parameters]
             keyname = ''.join(keyname)
 
@@ -837,7 +903,8 @@ def _(
             )
             creator.process_grid()
 
-            # Load and verify grid
+            # Reload the processed grid immediately to surface its shape and unique
+            # parameter values in the notebook before training begins.
             data = np.load(f'Grid-Emulator_Files/{grid_file_name}.npz', allow_pickle=True)
             grid_points = data['grid_points']
 
@@ -853,7 +920,8 @@ def _(
 
             results_md = mo.md(grid_info)
         else:
-            # Check if grid file exists
+            # If the grid was already processed, summarize the cached NPZ instead
+            # of rebuilding it.
             if os.path.isfile(f'Grid-Emulator_Files/{grid_file_name}.npz'):
                 data = np.load(f'Grid-Emulator_Files/{grid_file_name}.npz', allow_pickle=True)
                 grid_points = data['grid_points']
@@ -1149,6 +1217,12 @@ def _(
 
 @app.cell
 def _(get_trained_emu, mo, np):
+    # ── GP Weight Diagnostics: UI setup ──
+    # After training, the GP diagnostics panel lets the user inspect how well
+    # the Gaussian Processes map the parameter space to PCA weight values.
+    # The X-axis selector chooses the parameter to vary; all other parameters
+    # are held at a single grid value controlled by the "Fixed Parameter Index"
+    # slider.  The component range selects which PCA components to plot.
     _emu = get_trained_emu()
 
     if _emu is not None:
@@ -1276,8 +1350,11 @@ def _(
         _sigs = np.sqrt(_covs)
 
         # --- Universal Noise Variance Calculation ---
-        # Calculate the diagonal of the inverse dot product matrix directly.
-        # This avoids the NoneType error from GPU memory savings in the backend.
+        # λ_ξ (lambda_xi) from Czekala et al. (2015) assigns a truncation noise
+        # variance to each PCA weight.  The noise bar on each grid-point scatter
+        # marker shows ±σ_k = sqrt( diag((ΦᵀΦ)⁻¹)_k / λ_ξ ),  where Φ is
+        # the eigenspectra matrix.  This visualises how much freedom the GP has
+        # to deviate from the exact PCA weights at each training point.
         _dots = _emu.eigenspectra @ _emu.eigenspectra.T
         _dots_inv_diag = np.diag(np.linalg.inv(_dots))
 

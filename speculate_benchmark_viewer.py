@@ -2,6 +2,19 @@
 # [tool.marimo.display]
 # theme = "dark"
 # ///
+#
+# Speculate Benchmark Viewer
+# ==========================
+# Interactive notebook for viewing, comparing, and running emulator
+# benchmark reports produced by ``Speculate_addons/speculate_benchmark.py``.
+#
+# Features:
+#   • Load saved JSON reports and render per-tier result tabs
+#     (Tier 1 reconstruction, Tier 2 parameter recovery, Tier 3 observations).
+#   • Interactive Tier 1 reconstruction explorer (slider over all grid spectra
+#     with original / PCA / LOO overlays and residuals).
+#   • Side-by-side comparison of 2+ reports on shared metric axes.
+#   • Inline live benchmark runner with nested progress bars for Tier 1–3.
 
 import marimo
 
@@ -70,6 +83,9 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _():
+    # ── Third-party imports ──
+    # VegaFusion is enabled so Altair charts degrade gracefully when
+    # the dataset exceeds the default 5 000-row inline limit.
     import json
     import os
     import re
@@ -80,13 +96,19 @@ def _():
     import altair as alt
     alt.data_transformers.enable("vegafusion")
     import matplotlib
-    matplotlib.use("Agg")
+    matplotlib.use("Agg")  # non-interactive backend for server environments
     import matplotlib.pyplot as plt
     return alt, glob, json, np, os, pd, plt, re, time
 
 
 @app.cell
 def _(mo):
+    # ── Reactive state ──
+    # report         – the active JSON report being viewed in the tabs
+    # tier1_arrays   – full in-memory flux matrices from a *live* Tier 1 run
+    #                  (original, PCA-recon, LOO-recon); not stored in JSON
+    # comparison_reports – list of JSON payloads for the side-by-side view
+    # status_msg     – latest benchmark runner status text
     get_report, set_report = mo.state(None)
     get_tier1_arrays, set_tier1_arrays = mo.state(None)
     get_comparison_reports, set_comparison_reports = mo.state([])
@@ -153,22 +175,28 @@ def _(
     set_tier1_arrays,
     upload_btn,
 ):
-    # Trigger side-effects on button clicks
+    # Each button mutates notebook state only when clicked; the returned state is
+    # then consumed by the rendering cells below.
     if load_btn.value:
         _path = report_picker.value
         if _path and os.path.isfile(_path):
             with open(_path) as _f:
                 set_report(json.load(_f))
-            # Loaded-from-file reports have no in-memory arrays
+            # Reports loaded from disk contain summaries only, so clear any stale
+            # Tier 1 arrays left behind by a previous live benchmark run.
             set_tier1_arrays(None)
 
     if upload_btn.value:
+        # Accept the first uploaded JSON file and treat it the same way as a
+        # report loaded from the local picker.
         for _f in upload_btn.value:
             set_report(json.loads(_f.contents.decode()))
             set_tier1_arrays(None)
             break
 
     if compare_btn.value:
+        # Comparison works on multiple independent report payloads rather than
+        # the single active report shown in the main tabs.
         _reports = []
         for _path in (compare_picker.value or []):
             if os.path.isfile(_path):
@@ -180,6 +208,12 @@ def _(
 
 @app.cell(hide_code=True)
 def _(get_report, mo, np, plt):
+    # ── Tier result tabs ──
+    # Render the active report as a set of tabs, one per benchmark tier.
+    # Each tab is self-contained: Tier 1 shows EAS + LOO diagnostics,
+    # Tier 2 shows aggregate RMSE/bias/CRPS/coverage + PP-plot, and
+    # Tier 3 shows chi² + PPC bar charts per observation.  A "Config"
+    # tab records the execution settings so reports remain reproducible.
     _report = get_report()
     mo.stop(
         _report is None,
@@ -195,7 +229,9 @@ def _(get_report, mo, np, plt):
         _t1_items = []
         _t1_items.append(mo.md("## Tier 1 — Grid Reconstruction Fidelity"))
 
-        # --- Emulator Accuracy Score banner ---
+        # Surface the composite Tier 1 score first because it is the quickest
+        # sanity check for whether an emulator is usable before inspecting the
+        # more granular diagnostic plots below.
         _eas = _t1.get("emulator_accuracy_score")
         if _eas is not None:
             _eas_color = (
@@ -229,7 +265,8 @@ def _(get_report, mo, np, plt):
                 kind="warn",
             ))
 
-        # Summary metrics (EAS has its own banner above)
+        # Keep the raw Tier 1 metrics visible even when EAS is present so the
+        # user can see which component of the score is limiting performance.
         _summary_rows = []
         for _key in ["n_components", "n_grid_points", "n_params", "tier1_time_s",
                       "pca_explained_variance", "loo_flux_rmse_median",
@@ -244,7 +281,9 @@ def _(get_report, mo, np, plt):
         if _summary_rows:
             _t1_items.append(mo.ui.table(_summary_rows, label="Summary"))
 
-        # Per-component RMSE
+        # The left panel shows which PCA components are hardest for the GP to
+        # reconstruct, while the right panel checks whether residuals resemble a
+        # well-calibrated unit normal.
         _rmses = _t1.get("loo_rmse_per_comp", [])
         if _rmses:
             _fig, _axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -288,7 +327,8 @@ def _(get_report, mo, np, plt):
         _status_parts.append(f"in {_t2_time:.0f}s")
         _t2_items.append(mo.md(" — ".join(_status_parts)))
 
-        # --- Failure log ---
+        # Preserve stage-specific failures so a partial Tier 2 run is still
+        # diagnosable instead of silently collapsing into aggregate metrics.
         _flog = _t2.get("failure_log", [])
         if _flog:
             _fail_kind = "danger" if _n_proc == 0 else "warn"
@@ -441,6 +481,8 @@ def _(get_tier1_arrays, mo):
     _M = _arrs["original_flux"].shape[0]
     _pnames = _arrs["param_names"]
 
+    # The slider indexes the original training grid ordering used when the live
+    # Tier 1 run cached the reconstruction arrays in notebook state.
     spectrum_slider = mo.ui.slider(
         start=0, stop=_M - 1, value=0, step=1, show_value=True,
         label="Grid point index",
@@ -469,7 +511,9 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
     _gp = _arrs["grid_points"][_idx]
     _pnames = recon_param_names
 
-    # --- Readout: parameter values and metrics ---
+    # Pair the flux plots with the exact parameter point and scalar error metrics
+    # so the user can correlate bad reconstructions with specific regions of the
+    # training grid.
     _param_badges = " | ".join(
         f"**{_pnames[_j]}** = {_gp[_j]:.4g}" for _j in range(len(_pnames))
     )
@@ -483,7 +527,8 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
         f"&nbsp; Max fractional residual: **{_max_frac:.4g}**"
     )
 
-    # --- Altair overlay chart ---
+    # Plot all three spectra on the same wavelength grid because the key Tier 1
+    # question is how much structure the PCA-only and GP-assisted models miss.
     _df_spec = pd.DataFrame({
         "Wavelength": np.tile(_wl, 3),
         "Flux": np.concatenate([_orig, _pca, _loo]),
@@ -517,7 +562,8 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
         .interactive()
     )
 
-    # --- Residual panel ---
+    # Residuals make small local mismatches visible even when the overlaid flux
+    # curves look nearly identical by eye.
     _resid_loo = _orig - _loo
     _resid_pca = _orig - _pca
     _df_resid = pd.DataFrame({
@@ -575,7 +621,8 @@ def _(get_tier1_arrays, mo, np):
     _loo = _arrs["loo_recon_flux"]
     _M = _gp.shape[0]
 
-    # Compute per-spectrum metrics
+    # Rank every cached Tier 1 spectrum by reconstruction quality so the worst
+    # cases are easy to inspect without manually scrubbing the slider.
     _loo_rmse = np.sqrt(np.mean((_orig - _loo) ** 2, axis=1))
     _pca_rmse = np.sqrt(np.mean((_orig - _pca) ** 2, axis=1))
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -583,7 +630,8 @@ def _(get_tier1_arrays, mo, np):
             np.abs(_orig - _loo) / (np.abs(_orig) + 1e-30), axis=1
         )
 
-    # Sort by descending Leave-One-Out RMSE
+    # Leave-One-Out RMSE is used as the primary ranking because it reflects the
+    # full PCA+GP reconstruction path that Tier 1 is benchmarking.
     _order = np.argsort(-_loo_rmse)
 
     _rows = []
@@ -614,6 +662,8 @@ def _(get_comparison_reports, mo, np, plt):
 
     _comp_items = [mo.md("## Report Comparison")]
 
+    # Comparison reduces each report to a small shared schema so reports from
+    # different runs can still be compared even if some optional fields differ.
     _t1_data = {}
     for _i, _rep in enumerate(_comp_reports):
         _tag = _rep.get("config", {}).get("tag", f"report_{_i}")
@@ -650,6 +700,8 @@ def _(get_comparison_reports, mo, np, plt):
         _comp_items.append(mo.md("### Tier 2 Parameter RMSE Comparison"))
         _params = sorted(_all_params)
         _fig, _ax = plt.subplots(figsize=(max(10, len(_params)*2), 5))
+        # Grouped bars keep each report aligned on the same parameter axis so
+        # changes in recovery quality are easy to scan across experiments.
         _bar_width = 0.8 / len(_comp_reports)
         for _i, _rep in enumerate(_comp_reports):
             _tag = _rep.get("config", {}).get("tag", f"report_{_i}")
@@ -672,6 +724,9 @@ def _(get_comparison_reports, mo, np, plt):
 
 @app.cell(hide_code=True)
 def _(glob, mo, os):
+    # ── Live benchmark runner: file pickers ──
+    # Discover available emulators and observation CSVs on disk so the user
+    # can launch a fresh Tier 1/2/3 benchmark without leaving this notebook.
     mo.md("---")
 
     # Discover files
@@ -721,34 +776,37 @@ def _(emu_picker, glob, mo, os, re):
     emu_grid_info = mo.md("")  # default: empty
 
     if "_emu_" in _emu_base:
-        # Extract grid stem (everything before _emu_)
+        # The naming convention lets the viewer recover the matching training
+        # grid and test-grid without asking the user to pick three separate paths.
         _grid_stem = _emu_base.split("_emu_")[0]  # e.g. speculate_cv_bl_grid_v87f
 
-        # Extract param-scale tag: digits + scale + optional "smooth"
-        # e.g. from "1234_linear_55inc_850-1850AA_15PCA.npz" → "1234_linear"
+        # Extract the parameter-scale tag from the emulator filename so the
+        # lookup lands on the matching processed grid NPZ.
         _after_emu = _emu_base.split("_emu_")[1]  # 1234_linear_55inc_850-...
-        # Tag is everything before the first segment matching \d+inc
+        # The inclination segment is the first reliable delimiter in these names.
         _tag_match = re.match(r"(.+?)_\d+inc_", _after_emu)
         if _tag_match:
             _param_tag = _tag_match.group(1)
         else:
-            # Fallback: try splitting on known suffixes
+            # Fallback for older filenames that predate the stricter pattern.
             _param_tag = _after_emu.split("_850")[0].split("_1000")[0]
 
-        # Find matching grid NPZ
+        # Tier 1 consumes the processed NPZ grid, while Tier 2 consumes the raw
+        # test-grid directory that contains individual .spec files.
         _grid_pattern = f"Grid-Emulator_Files/{_grid_stem}_grid_{_param_tag}.npz"
         _grid_matches = sorted(glob.glob(_grid_pattern))
         if _grid_matches:
             matched_grid_path = _grid_matches[0]
 
-        # Find matching test grid directory
+        # The test-grid stem mirrors the training-grid stem with a name swap.
         _testgrid_stem = _grid_stem.replace("_grid_", "_testgrid_")
         _testgrid_pattern = f"sirocco_grids/{_testgrid_stem}*"
         _tg_matches = sorted(glob.glob(_testgrid_pattern))
         if _tg_matches:
             matched_testgrid_path = _tg_matches[0]
 
-        # Build info display
+        # Show the inferred paths even when matching fails so the user can catch
+        # naming mismatches before launching a live benchmark.
         _grid_display = os.path.basename(matched_grid_path) if matched_grid_path else "*(not found)*"
         _tg_display = os.path.basename(matched_testgrid_path) if matched_testgrid_path else "*(not found)*"
 
@@ -809,13 +867,17 @@ def _(
     tier_picker,
     time,
 ):
+    # Keep this cell inert during normal reactive reruns; the heavy work only
+    # starts when the explicit run button is pressed.
     if not run_btn.value:
         mo.stop(True)
 
+    # Surface an immediate status update before any imports or disk I/O.
     set_status_msg("Running benchmark...")
     _t0 = time.time()
 
     try:
+        # Import the runtime-only benchmark machinery inside the execution cell.
         from pathlib import Path as _Path
         from Starfish.emulator import Emulator as _Emulator
         from Speculate_addons.speculate_benchmark import (
@@ -848,6 +910,8 @@ def _(
         ):
             _emu = _Emulator.load(_emu_path)
 
+        # The picker stores numeric tier ids; keep the selected run isolated to
+        # this execution so later reactive reruns do not reuse stale results.
         _tiers = [_v for _v in (tier_picker.value or [])]
         _tier1_result = None
         _tier2_result = None
@@ -862,7 +926,8 @@ def _(
             ):
                 _tier1_result = _run_tier1(_emu, matched_grid_path)
 
-            # Store flux arrays in state for the interactive plot
+            # Keep the large flux arrays in marimo state rather than in the JSON
+            # report so the interactive reconstruction explorer can reuse them.
             _t1_arrays = _tier1_result.pop("_arrays", None)
             if _t1_arrays is not None:
                 set_tier1_arrays(_t1_arrays)
@@ -871,15 +936,20 @@ def _(
         if 2 in _tiers and matched_testgrid_path:
             _t2_t0 = time.time()
             _test_path = _Path(matched_testgrid_path)
+            # Tier 2 works spectrum-by-spectrum from the decompressed test-grid files.
             _spec_files = sorted(_test_path.glob("run*.spec"))
             if max_spectra_slider.value:
                 _spec_files = _spec_files[: max_spectra_slider.value]
             _n_t2 = len(_spec_files)
 
+            # The lookup table is optional metadata used to compare recovered
+            # parameters against the known test-grid inputs.
             _parquet = _ensure_lookup(_test_path)
             _friendly = _to_friendly(_emu.param_names)
             _n_params = len(_emu.param_names)
 
+            # Accumulate both per-spectrum summaries and the raw posterior draws
+            # needed by the aggregate Tier 2 metrics.
             _per_spectrum = []
             _all_samples = {n: [] for n in _friendly}
             _all_truths = {n: [] for n in _friendly}
@@ -899,6 +969,7 @@ def _(
                 remove_on_exit=True,
             ) as _t2_bar:
                 for _si, _sf in enumerate(_spec_files):
+                    # Spectrum filenames encode the run number used by the lookup table.
                     _run_idx = int(_sf.stem.replace("run", ""))
                     _sname = _sf.name
 
@@ -915,7 +986,8 @@ def _(
                         _t2_bar.update(increment=1, subtitle=f"✗ {_sname} failed to load")
                         continue
 
-                    # Ground truth
+                    # Ground truth is best-effort only; missing lookup metadata should
+                    # not block the inference pass.
                     _gt = {}
                     if _parquet.exists():
                         try:
@@ -929,6 +1001,8 @@ def _(
                         subtitle=f"Optimising ({_si + 1}/{_n_t2})…",
                         remove_on_exit=True,
                     ) as _mle_spin:
+                        # Forward the optimizer callback into the spinner so long
+                        # runs still expose iteration and NLL progress in the UI.
                         def _mle_cb(it, mx, best_nll, elapsed):
                             _mle_spin.update(
                                 subtitle=(
@@ -957,6 +1031,8 @@ def _(
                         subtitle=f"Sampling {_mcmc_steps_val} steps ({_si + 1}/{_n_t2})…",
                         remove_on_exit=True,
                     ) as _mcmc_spin:
+                        # Mirror the sampler callback into the spinner for coarse
+                        # step-level progress during the posterior draw phase.
                         def _mcmc_cb(step, total, elapsed):
                             _mcmc_spin.update(
                                 subtitle=(
@@ -984,7 +1060,7 @@ def _(
                     if not _mcmc["converged"]:
                         _n_not_converged += 1
 
-                    # Collect results
+                    # Persist the compact per-spectrum summary used by the Tier 2 report.
                     _spec_res = {
                         "run": _run_idx,
                         "mle_success": _mle["success"],
@@ -994,10 +1070,15 @@ def _(
                     }
                     for _pi, _fn in enumerate(_friendly):
                         if _fn in _mcmc["summary"]:
+                            # Keep both the scalar posterior summary and the raw draws;
+                            # the aggregate step uses the draws to compute coverage-style
+                            # metrics across all spectra.
                             _spec_res[f"{_fn}_mean"] = _mcmc["summary"][_fn]["mean"]
                             _spec_res[f"{_fn}_std"] = _mcmc["summary"][_fn]["std"]
                             _all_samples[_fn].append(_mcmc["samples"][:, _pi])
                             if _fn in _gt:
+                                # When ground truth is available, record the truth and the
+                                # offset in posterior standard deviations for later review.
                                 _all_truths[_fn].append(_gt[_fn])
                                 _spec_res[f"{_fn}_truth"] = _gt[_fn]
                                 _spec_res[f"{_fn}_delta_sigma"] = (
@@ -1013,7 +1094,7 @@ def _(
                     )
                     _t2_bar.update(increment=1, subtitle=_status_lbl)
 
-            # Aggregate
+            # Collapse the per-spectrum bookkeeping into the JSON-safe Tier 2 report.
             _tier2_result = _agg_t2(
                 per_spectrum=_per_spectrum,
                 all_samples=_all_samples,
@@ -1047,6 +1128,8 @@ def _(
                 remove_on_exit=True,
             ) as _t3_bar:
                 for _obs_path in _obs_list:
+                    # Tier 3 reports are independent, so the loop only needs to append
+                    # each completed result and advance the progress bar.
                     _t3_bar.update(
                         increment=0,
                         subtitle=f"Fitting {os.path.basename(_obs_path)}…",
@@ -1061,6 +1144,8 @@ def _(
                         subtitle=f"✓ {os.path.basename(_obs_path)} complete",
                     )
 
+        # Store the execution settings alongside the benchmark outputs so a saved
+        # report still records which emulator, grid, and limits produced it.
         _config = {
             "emulator": _emu_path,
             "grid": matched_grid_path,
@@ -1071,7 +1156,7 @@ def _(
         }
         _report = _build_report_card(_tier1_result, _tier2_result, _tier3_results, _config)
 
-        # Auto-save
+        # Save each live run under a timestamped filename to avoid clobbering earlier reports.
         os.makedirs("benchmark_results", exist_ok=True)
         _ts = time.strftime("%Y%m%d_%H%M%S")
         _out_path = f"benchmark_results/benchmark_report_live_{_ts}.json"
@@ -1080,7 +1165,7 @@ def _(
         set_report(_report)
         _elapsed = time.time() - _t0
 
-        # Final summary
+        # Build a short markdown summary for the callout shown below the runner.
         _summary_parts = [f"**Benchmark complete in {_elapsed:.1f}s** — saved to `{_out_path}`"]
         if _tier1_result:
             _eas = _tier1_result.get("emulator_accuracy_score")
@@ -1104,6 +1189,8 @@ def _(
 
     except Exception as _e:
         import traceback as _tb
+        # Surface the traceback in the status callout so notebook users can debug
+        # failures without opening a separate terminal session.
         set_status_msg(f"Error: {_e}\n```\n{_tb.format_exc()}\n```")
     return
 

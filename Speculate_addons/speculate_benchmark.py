@@ -30,19 +30,30 @@ log = logging.getLogger(__name__)
 # ======================================================================
 # Parameter Mapping
 # ======================================================================
+# Maps the 1-based parameter index used in emulator filenames (e.g.
+# "param1", "param3") to a (friendly_name, sirocco_keyword) pair.
+#
+# Indices 1-6 are the Knigge-Wood-Drew (KWD) wind model parameters that
+# define the accretion disk and biconical wind geometry in Sirocco.
+# Indices 7-8 add a boundary-layer emission component (only present in
+# grids labelled "bl").  Indices 9-11 encode the observer inclination
+# at progressively finer angular resolution (sparse / mid / full).
+#
+# In emulator space, parameters 1 and 5 are stored in log10; parameter 2
+# is the wind-to-disk mass-loss *ratio* rather than the absolute value.
 
 PARAM_MAP = {
-    1: ("disk.mdot", "Disk.mdot(msol/yr)"),
-    2: ("wind.mdot", "Wind.mdot(msol/yr)"),
-    3: ("KWD.d", "KWD.d(in_units_of_rstar)"),
-    4: ("KWD.mdot_r_exponent", "KWD.mdot_r_exponent"),
-    5: ("KWD.acceleration_length", "KWD.acceleration_length(cm)"),
-    6: ("KWD.acceleration_exponent", "KWD.acceleration_exponent"),
+    1: ("disk.mdot", "Disk.mdot(msol/yr)"),          # log10(Msol/yr)
+    2: ("wind.mdot", "Wind.mdot(msol/yr)"),          # ratio: wind/disk
+    3: ("KWD.d", "KWD.d(in_units_of_rstar)"),        # wind launch radius
+    4: ("KWD.mdot_r_exponent", "KWD.mdot_r_exponent"),  # radial mdot power law
+    5: ("KWD.acceleration_length", "KWD.acceleration_length(cm)"),  # log10(cm)
+    6: ("KWD.acceleration_exponent", "KWD.acceleration_exponent"),  # velocity law exponent
     7: ("Boundary_layer.luminosity", "Boundary_layer.luminosity(ergs/s)"),
     8: ("Boundary_layer.temp", "Boundary_layer.temp(K)"),
-    9: ("Inclination", "Inclination"),
-    10: ("Inclination", "Inclination"),
-    11: ("Inclination", "Inclination"),
+    9: ("Inclination", "Inclination"),   # sparse: 3 angles (30, 55, 80)
+    10: ("Inclination", "Inclination"),  # mid:    6 angles
+    11: ("Inclination", "Inclination"),  # full:  12 angles
 }
 
 
@@ -67,16 +78,22 @@ def emulator_to_physical(param_names: Sequence[str], values: np.ndarray) -> dict
     for pn, v in zip(param_names, vals):
         idx = int(pn.replace("param", ""))
         friendly, sirocco_key = PARAM_MAP.get(idx, (pn, pn))
+        # The emulator does not store every parameter in native Sirocco units:
+        # some axes are log-transformed and param2 is represented as a ratio.
         if idx == 1:
             physical[sirocco_key] = 10 ** v  # log10(Msol/yr) -> Msol/yr
         elif idx == 2:
-            physical[sirocco_key] = v  # fraction; absolute needs disk.mdot
+            # Wind mass loss is inferred as a fraction of disk.mdot and becomes
+            # an absolute quantity only after disk.mdot has been converted.
+            physical[sirocco_key] = v
         elif idx == 5:
             physical[sirocco_key] = 10 ** v  # log10(cm) -> cm
         else:
             physical[sirocco_key] = v
     # Compute absolute wind.mdot if both present
     if "Disk.mdot(msol/yr)" in physical and "Wind.mdot(msol/yr)" in physical:
+        # Once both pieces exist in physical space, collapse the stored ratio into
+        # the absolute wind mass-loss rate expected by downstream Sirocco inputs.
         physical["Wind.mdot(msol/yr)"] = (
             physical["Wind.mdot(msol/yr)"] * physical["Disk.mdot(msol/yr)"]
         )
@@ -169,8 +186,16 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
 def _load_test_grid_spectrum(
     spec_file: str, inclination: float, wl_range: Tuple[float, float]
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load a ``.spec`` file and extract wavelength, flux, and error arrays."""
-    # Determine header lines
+    """Load a Sirocco ``.spec`` file and extract wavelength, flux, and error arrays.
+
+    Sirocco .spec files have a variable-length text header (comments starting
+    with '#' and a column-label row beginning with 'Freq.'), followed by numeric
+    data columns.  Column 0 is frequency (Hz), column 1 is wavelength (Å), and
+    columns 2+ hold the flux at successive viewing inclinations in 5-degree steps
+    starting from 30°.  Wavelengths in the file are descending; this function
+    flips them to ascending order.
+    """
+    # Determine header lines (skip comments, blank lines, and the 'Freq.' label row)
     skiprows = 0
     with open(spec_file, "r") as f:
         for i, line in enumerate(f):
@@ -181,9 +206,11 @@ def _load_test_grid_spectrum(
                 break
 
     data = np.loadtxt(spec_file, skiprows=skiprows)
-    # Column 0 = Freq (Hz), column 1 = Lambda (Å) — always use Lambda
+    # Column 0 = Freq (Hz), column 1 = Lambda (Å) — always use Lambda.
+    # Flip to ascending wavelength order for consistency with the emulator.
     wl = np.flip(data[:, 1])
-    # Inclination → column: 30°=col2, 35°=col3, ...
+    # Map the requested inclination angle to the correct data column:
+    # 30° → col 2, 35° → col 3, 40° → col 4, …
     col = int(2 + (inclination - 30) / 5)
     flux = np.flip(data[:, col])
 
@@ -207,7 +234,14 @@ def _load_test_grid_spectrum(
 def _extract_ground_truth(
     parquet_path: str, run_idx: int, emu_param_names: Sequence[str]
 ) -> dict:
-    """Extract ground truth parameters from the test grid lookup table."""
+    """Extract ground-truth parameters from the test grid's lookup table.
+
+    The lookup table (a parquet file co-located with the .spec files) records the
+    Sirocco simulation inputs for every run.  This function reads the raw physical
+    values, then applies the same forward transforms used during emulator training
+    (log10 for params 1 and 5; wind/disk ratio for param 2) so the returned dict
+    lives in emulator space and is directly comparable to inference outputs.
+    """
     df = pd.read_parquet(parquet_path)
 
     # Try common column names for run number
@@ -334,7 +368,8 @@ def run_mle_single(
     from Starfish.spectrum import Spectrum
     from Starfish.models import SpectrumModel
 
-    # Transform flux if needed
+    # Match the observation onto the emulator's training scale before building a
+    # SpectrumModel, including consistent propagation of the uncertainties.
     if flux_scale == "log":
         flux = np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
         sigma = sigma / (np.abs(flux) * np.log(10) + 1e-30)
@@ -379,10 +414,9 @@ def run_mle_single(
         model.params["log_scale"] = _bootstrapped_ls
 
     # Build default priors — tightly bounded to match the inference tool's
-    # optimised settings.  Tight priors are critical: the initial simplex
-    # spans these ranges, so wide priors place most vertices in regions of
-    # parameter space where the model produces garbage NLL, causing
-    # Nelder-Mead to converge immediately to a poor local minimum.
+    # optimised settings. Tight priors matter twice here: they regularize the
+    # likelihood itself, and they define the simplex footprint used to seed
+    # Nelder-Mead below.
     if priors is None:
         priors = {}
         for i, pn in enumerate(emu.param_names):
@@ -390,7 +424,8 @@ def run_mle_single(
             priors[pn] = stats.uniform(loc=lo, scale=hi - lo)
         if not freeze_av:
             priors["Av"] = stats.uniform(loc=0, scale=2.0)
-        # log_scale: data-informed ±5 range around the bootstrapped value
+        # Keep log_scale centered on the bootstrap estimate so the optimizer does
+        # not waste its early iterations finding the gross normalization.
         priors["log_scale"] = stats.uniform(
             loc=_bootstrapped_ls - 5.0, scale=10.0
         )
@@ -401,9 +436,9 @@ def run_mle_single(
 
     labels_before = list(model.labels)
 
-    # ── Build initial simplex spanning the prior space ──────────────
-    # This gives Nelder-Mead a well-distributed starting region instead
-    # of a single midpoint, dramatically improving convergence.
+    # Build a simplex whose vertices span the prior support of every active
+    # parameter. This is much more stable than starting Nelder-Mead from a single
+    # midpoint in this highly coupled likelihood surface.
     active_labels = list(model.labels)
     N = len(active_labels)
     simplex = np.zeros((N + 1, N))
@@ -413,10 +448,15 @@ def run_mle_single(
             dist = priors[label]
             loc, sc = _get_loc_scale(dist)
             if dist.dist.name == "uniform":
+                # Spread the simplex across the truncated support so each row sees
+                # a different region of the allowed parameter interval.
                 col = _simplex_column_uniform(loc, sc, N)
             elif dist.dist.name == "norm":
+                # For normal priors, approximate the interesting support as ±2σ.
                 col = _simplex_column_norm(loc, sc, N)
             else:
+                # Unknown prior families fall back to a small perturbation around
+                # the current parameter vector instead of failing outright.
                 cv = model.get_param_vector()[col_idx]
                 col = [cv + (cv * 0.01 * k) for k in range(N + 1)]
         else:
@@ -424,7 +464,8 @@ def run_mle_single(
             col = [cv] * (N + 1)
 
         simplex[:, col_idx] = col
-        # Roll each column by its index so rows are offset from each other
+        # Rotate each column so simplex vertices are not all aligned on the same
+        # coordinate-wise corner of the prior hyper-rectangle.
         simplex[:, col_idx] = np.roll(simplex[:, col_idx], col_idx)
 
     # Bootstrap log_scale at every simplex vertex so the optimizer starts
@@ -536,8 +577,8 @@ def run_mcmc_single(
 
     def log_prob(P):
         model.set_param_vector(P)
-        # Reject proposals outside emulator bounds (return -inf so emcee
-        # discards this step instead of crashing with a ValueError).
+        # Returning -inf is the emcee-compatible way to reject proposals outside
+        # the emulator grid without aborting the whole sampling run.
         gp = np.array(model.grid_params)
         if np.any(gp < model.emulator.min_params) or np.any(gp > model.emulator.max_params):
             return -np.inf
@@ -560,7 +601,8 @@ def run_mcmc_single(
     else:
         sampler.run_mcmc(ball, nsteps, progress=False)
 
-    # Autocorrelation & burn-in
+    # Use the estimated autocorrelation time to choose a conservative burn-in and
+    # thinning rule, but degrade gracefully when the chain is too short for tau.
     try:
         tau = sampler.get_autocorr_time(tol=0)
         tau_valid = not (np.isnan(tau).any() or (tau == 0).any())
@@ -599,7 +641,7 @@ def run_mcmc_single(
     r_hat_dict = {}
     ess_dict = {}
 
-    # Per-chain means for r_hat
+    # Compute simple Gelman-Rubin style diagnostics from the walker-wise chains.
     per_chain = chain.transpose(1, 0, 2)  # (walkers, steps_after, ndim)
 
     for i, label in enumerate(all_labels):
@@ -612,7 +654,8 @@ def run_mcmc_single(
             "hdi_97": float(np.percentile(vals, 97)),
         }
 
-        # Simple r_hat (between-chain vs within-chain variance)
+        # Compare within-walker variance to between-walker variance; r_hat values
+        # close to 1 indicate the walkers are exploring the same stationary region.
         chain_means = np.array([np.mean(per_chain[w, :, i]) for w in range(nwalkers)])
         chain_vars = np.array([np.var(per_chain[w, :, i]) for w in range(nwalkers)])
         W = np.mean(chain_vars)
@@ -621,9 +664,13 @@ def run_mcmc_single(
         r_hat = np.sqrt(var_est / W) if W > 0 else np.nan
         r_hat_dict[label] = float(r_hat)
 
-        # Effective sample size (simple estimate)
+        # The code currently uses the post-thinning flat sample count as a simple,
+        # conservative ESS proxy rather than an autocorrelation-based estimator.
         ess_dict[label] = int(flat.shape[0])  # conservative: total thinned samples
 
+    # Treat convergence as a pragmatic quality gate for the viewer: all finite
+    # r_hat values must be below 1.05 and there must be enough retained samples
+    # to support posterior summaries.
     converged = all(rh < 1.05 for rh in r_hat_dict.values() if np.isfinite(rh))
     converged = converged and flat.shape[0] >= 100
 
@@ -853,7 +900,8 @@ def run_tier2(
     t0 = time.time()
     test_path = Path(test_grid_path)
 
-    # Find spec files
+    # Tier 2 is driven directly from the decompressed test-grid spectra, with the
+    # optional max_spectra cap used to keep exploratory runs tractable in the UI.
     spec_files = sorted(test_path.glob("run*.spec"))
     if max_spectra is not None:
         spec_files = spec_files[:max_spectra]
@@ -861,7 +909,7 @@ def run_tier2(
     if not spec_files:
         raise FileNotFoundError(f"No .spec files found in {test_grid_path}")
 
-    # Ground truth lookup table
+    # The lookup parquet links each run file back to its known simulation inputs.
     parquet_file = ensure_lookup_table(test_path)
 
     friendly_names = internal_to_friendly(emu.param_names)
@@ -895,7 +943,8 @@ def run_tier2(
                 progress_callback(_spec_idx + 1, _n_total, sf.name, "failed:load")
             continue
 
-        # Ground truth
+        # Ground truth extraction is best-effort: a missing or malformed lookup
+        # row should be logged, but it should not prevent inference on the flux.
         gt = {}
         if parquet_file.exists():
             try:
@@ -951,7 +1000,8 @@ def run_tier2(
         if not mcmc_result["converged"]:
             n_not_converged += 1
 
-        # Store per-parameter samples and truths
+        # Keep both a compact per-spectrum summary and the raw posterior draws
+        # needed for aggregate calibration metrics across the whole test grid.
         spec_result = {
             "run": run_idx,
             "mle_success": mle_result["success"],
@@ -981,7 +1031,17 @@ def run_tier2(
             _status = "done" if mcmc_result["converged"] else "done:not_converged"
             progress_callback(_spec_idx + 1, _n_total, sf.name, _status)
 
-    # Aggregate metrics
+    # ----- Aggregate metrics across all test spectra -----
+    # For each physical parameter we compute:
+    #   RMSE   — root-mean-square error of posterior means vs ground truth
+    #   Bias   — signed mean offset (positive = overestimate)
+    #   CRPS   — Continuous Ranked Probability Score (proper scoring rule that
+    #            penalises both miscalibration and low sharpness)
+    #   Shrinkage — how much the posterior narrows relative to the prior
+    #              (1 = perfectly informative, 0 = no information gain)
+    #   Coverage — empirical coverage at 68% and 95% credible levels (if
+    #             well-calibrated, ~68% and ~95% of truths fall inside the
+    #             posterior intervals at those levels)
     aggregate = {}
     for fname in friendly_names:
         if len(all_truths[fname]) == 0:
@@ -993,7 +1053,7 @@ def run_tier2(
         )
         means_arr = means_arr[~np.isnan(means_arr)]
 
-        # RMSE of posterior mean
+        # RMSE and bias of posterior means vs ground truth
         if len(means_arr) == len(truths_arr):
             rmse = float(np.sqrt(np.mean((means_arr - truths_arr) ** 2)))
             bias = float(np.mean(means_arr - truths_arr))
@@ -1001,21 +1061,23 @@ def run_tier2(
             rmse = np.nan
             bias = np.nan
 
-        # CRPS
+        # CRPS: averaged over all test spectra for this parameter
         crps_vals = []
         for samples, truth in zip(all_samples[fname], all_truths[fname]):
             crps_vals.append(compute_crps(samples, truth))
         crps_mean = float(np.mean(crps_vals)) if crps_vals else np.nan
 
-        # Posterior shrinkage
+        # Posterior shrinkage: 1 − (mean posterior σ) / (prior σ)
+        # Uses the standard deviation of the uniform prior: range / √12
         prior_range = float(emu.max_params[friendly_names.index(fname)] - emu.min_params[friendly_names.index(fname)]) if fname in friendly_names[:n_params] else np.nan
         post_stds = [ps.get(f"{fname}_std", np.nan) for ps in per_spectrum]
         mean_post_std = float(np.nanmean(post_stds))
         shrinkage = 1.0 - mean_post_std / (prior_range / np.sqrt(12)) if np.isfinite(prior_range) and prior_range > 0 else np.nan
 
-        # Coverage
+        # PP-plot coverage: the fraction of test cases whose ground truth falls
+        # inside the α-level credible interval, evaluated at many α values.
         alphas, cov = compute_coverage(all_samples[fname], all_truths[fname])
-        # Extract coverage at 68% and 95%
+        # Interpolate to standard reporting levels
         cov_68 = float(np.interp(0.68, alphas, cov))
         cov_95 = float(np.interp(0.95, alphas, cov))
 
@@ -1127,7 +1189,11 @@ def run_tier3_single(
             "mle_params": mle["grid_params"],
         }
 
-    # Posterior Predictive Check
+    # Posterior Predictive Check (PPC)
+    # Draw random posterior samples, evaluate the model flux at each one, and
+    # check what fraction of the observed data falls within the 2.5–97.5%
+    # envelope of the predicted flux.  A well-calibrated model should cover
+    # ~95% of the data points.
     ppc_in = 0
     n_ppc = min(n_ppc_draws, mcmc["samples"].shape[0])
     indices = np.random.choice(mcmc["samples"].shape[0], size=n_ppc, replace=False)
