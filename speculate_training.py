@@ -565,6 +565,11 @@ def _(mo):
         label="Strict Weight Fit (bypass λ_ξ truncation penalty)"
     )
 
+    per_component = mo.ui.checkbox(
+        value=False,
+        label="Per-Component Training (optimize each PCA component independently)"
+    )
+
     # λ_ξ (lambda_xi) is the Czekala et al. (2015) truncation noise matrix that
     # inflates the effective measurement noise used during GP weight training.
     # Bypassing it ("strict") minimises the GP loss on the raw PCA weights at
@@ -578,9 +583,15 @@ def _(mo):
             "without the Czekala et al. (2015) truncation noise matrix. "
             "This can produce tighter fits at the cost of losing the formal "
             "flux-space equivalence._"
+        ),
+        per_component,
+        mo.md(
+            "_Per-component training runs a separate low-dimensional Nelder-Mead "
+            "optimization for each PCA component instead of one large joint "
+            "optimization. Requires block-diagonal mode._"
         )
     ])
-    return max_iter, method, strict_weight_fit
+    return max_iter, method, per_component, strict_weight_fit
 
 
 @app.cell
@@ -782,6 +793,7 @@ def _(
     np,
     os,
     params,
+    per_component,
     scale_selector,
     sirocco_grids_path,
     strict_weight_fit,
@@ -843,6 +855,7 @@ def _(
         - **Method:** {method.value}
         - **Max Iterations:** {max_iter.value}
         - **Strict Weight Fit:** {'Yes (λ_ξ penalty bypassed)' if strict_weight_fit.value else 'No (standard Czekala+2015)'}
+        - **Per-Component Training:** {'Yes' if per_component.value else 'No'}
         - **Process Grid:** {'Auto (File not found, creating new)' if process_grid_auto else 'Auto (File found, loading existing)'}
         - **Grid File:** `{grid_file_name}.npz`
         - **Emulator File:** `{emu_file_name}.npz`
@@ -967,6 +980,7 @@ def _(
     np,
     os,
     pd,
+    per_component,
     set_console_logs,
     set_loss_history,
     set_trained_emu,
@@ -1081,7 +1095,8 @@ def _(
                     n_components=n_components.value,
                     svd_solver="full",
                     block_diagonal=True,
-                    strict_weight_fit=strict_weight_fit.value
+                    strict_weight_fit=strict_weight_fit.value,
+                    per_component=per_component.value
                 )
 
                 print(f"Grid loaded. Initialized {emu.ncomps} PCA components.")

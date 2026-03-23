@@ -99,10 +99,12 @@ try:
             # dist is now K_i (M, M)
             
             # Add diagonal: iPhiPhi/lambda_xi + jitter
+            # Variance-scaled jitter keeps condition number ~1e6
+            jitter = max(1e-5, 1e-6 * variances_gpu[i].item()) if strict_weight_fit else 1e-5
             if strict_weight_fit:
-                dist.diagonal().add_(1e-5)
+                dist.diagonal().add_(jitter)
             else:
-                dist.diagonal().add_(dots_inv_diag_gpu[i].item() / lambda_xi + 1e-5)
+                dist.diagonal().add_(dots_inv_diag_gpu[i].item() / lambda_xi + jitter)
             
             # dist is now V11_i (M, M) — the complete block
             
@@ -338,6 +340,7 @@ class Emulator:
         name: Optional[str] = None,
         block_diagonal: bool = False,
         strict_weight_fit: bool = False,
+        per_component: bool = False,
         _param_min: Optional[np.ndarray] = None,
         _param_range: Optional[np.ndarray] = None,
         ):
@@ -353,6 +356,7 @@ class Emulator:
         self.factors = factors
         self.block_diagonal = block_diagonal
         self.strict_weight_fit = strict_weight_fit
+        self.per_component = per_component
         
         # Parameter normalization: scale grid_points to [0,1] for GP kernel operations
         if _param_min is not None and _param_range is not None:
@@ -429,9 +433,13 @@ class Emulator:
                     eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
                     
                     if self.strict_weight_fit:
-                        v11_gpu = 1e-5 * eye_M.unsqueeze(0).expand(self.ncomps, -1, -1).clone()
+                        # Variance-scaled jitter keeps condition number ~1e6
+                        variances_t = torch.from_numpy(self.variances).to(device, TORCH_FLOAT64)
+                        jitter_t = torch.clamp(1e-6 * variances_t, min=1e-5)
+                        v11_gpu = (jitter_t.view(-1, 1, 1) * eye_M.unsqueeze(0)).clone()
                     else:
                         v11_gpu = (dots_inv_diag.view(-1, 1, 1) * eye_M.unsqueeze(0)) / self.lambda_xi
+                        v11_gpu += 1e-5 * eye_M.unsqueeze(0)
                     
                     # Add kernel to v11_gpu in-place
                     batch_kernel_pytorch_gpu_only(
@@ -499,8 +507,10 @@ class Emulator:
                     )
                 
                 if self.strict_weight_fit:
+                    # Variance-scaled jitter keeps condition number ~1e6
                     eye_M_arr = np.eye(M)
-                    v11_cpu = kernel_cpu + (1e-5 * eye_M_arr)
+                    jitter_arr = np.maximum(1e-6 * self.variances, 1e-5)  # (ncomps,)
+                    v11_cpu = kernel_cpu + jitter_arr[:, None, None] * eye_M_arr
                 else:
                     v11_cpu = iPhiPhi_cpu / self.lambda_xi + kernel_cpu
                 
@@ -671,6 +681,9 @@ class Emulator:
         else:
             strict_weight_fit = False
         
+        # Load per_component flag if present (backward compatibility)
+        per_component = bool(data["per_component"]) if "per_component" in data else False
+        
         if "name" in data:
             name = str(data["name"])
         else:
@@ -696,6 +709,7 @@ class Emulator:
             factors=factors,
             block_diagonal=block_diagonal,
             strict_weight_fit=strict_weight_fit,
+            per_component=per_component,
             _param_min=_param_min,
             _param_range=_param_range,
         )
@@ -736,6 +750,7 @@ class Emulator:
             "lengthscales": self.lengthscales,
             "block_diagonal": self.block_diagonal,
             "strict_weight_fit": self.strict_weight_fit,
+            "per_component": self.per_component,
             "_param_min": self._param_min,
             "_param_range": self._param_range,
         }
@@ -798,7 +813,7 @@ class Emulator:
         return exp_var, pca.n_components_
 
     @classmethod
-    def from_grid(cls, grid, block_diagonal=False, strict_weight_fit=False, **pca_kwargs):
+    def from_grid(cls, grid, block_diagonal=False, strict_weight_fit=False, per_component=False, **pca_kwargs):
         """
         Create an Emulator using PCA decomposition from a GridInterface.
 
@@ -870,6 +885,7 @@ class Emulator:
             factors=norm_factors,
             block_diagonal=block_diagonal,
             strict_weight_fit=strict_weight_fit,
+            per_component=per_component,
         )
         # profiler.stop()
         # profiler.print()
@@ -1666,11 +1682,13 @@ class Emulator:
             torch.exp(K_k, out=K_k)
             K_k.mul_(self._variances_gpu[k])
 
-            # Add diagonal (match training: dots_inv_diag/lambda_xi + 1e-5 jitter)
+            # Add diagonal (match training: dots_inv_diag/lambda_xi + jitter)
+            # Variance-scaled jitter keeps condition number ~1e6
+            jitter = max(1e-5, 1e-6 * self._variances_gpu[k].item()) if self.strict_weight_fit else 1e-5
             if self.strict_weight_fit:
-                K_k.diagonal().add_(1e-5)
+                K_k.diagonal().add_(jitter)
             else:
-                K_k.diagonal().add_(self._dots_inv_diag_gpu[k].item() / self.lambda_xi + 1e-5)
+                K_k.diagonal().add_(self._dots_inv_diag_gpu[k].item() / self.lambda_xi + jitter)
 
             # Cholesky → K_inv via solve
             try:
@@ -1679,7 +1697,7 @@ class Emulator:
                 K_inv = torch.cholesky_solve(eye_M, L)
                 del L
             except torch.linalg.LinAlgError:
-                K_k += 1e-8 * eye_M
+                K_k += jitter * eye_M
                 L = torch.linalg.cholesky(K_k)
                 del K_k
                 K_inv = torch.cholesky_solve(eye_M, L)
@@ -1809,6 +1827,11 @@ class Emulator:
 
         """
         import time
+        
+        # Per-component training: optimize each PCA component independently
+        if self.per_component and self.block_diagonal:
+            self._train_per_component(**opt_kwargs)
+            return
         
         if PYTORCH_AVAILABLE and torch.cuda.is_available():
             self._gpu_training_mode = True
@@ -2021,7 +2044,266 @@ class Emulator:
         delattr(self, '_iteration_count')
         delattr(self, '_best_loss')
         delattr(self, '_last_progress_time')
-            
+
+    def _train_per_component(self, **opt_kwargs):
+        """Train each PCA component's GP independently.
+
+        In block_diagonal mode the negative log-likelihood decomposes into
+        K independent terms, one per component.  Instead of optimizing all
+        K*(1+d) parameters jointly (which puts Nelder-Mead in a very
+        high-dimensional space), we run K separate low-dimensional
+        optimizations (1 variance + d lengthscales each).
+
+        lambda_xi is frozen — it only appears as a scalar shift on the
+        diagonal and is shared across components.
+        """
+        import time
+
+        self.loss_history = []
+        self._training_start_time = time.time()
+        self._iteration_count = 0
+        self._best_loss = np.inf
+        self._last_progress_time = time.time()
+
+        d = self._grid_points_norm.shape[1]  # number of grid parameters
+        M = self.grid_points.shape[0]
+
+        # Lengthscale bounds (in normalized [0,1] space)
+        ls_floor = 0.5 * self._grid_sep      # (d,) — minimum useful resolution
+        ls_ceil  = 5.0 * np.ones(d)           # (d,) — beyond this the GP is ~constant
+
+        # Parse user options
+        default_kwargs = {
+            "method": "Nelder-Mead",
+            "options": {"maxiter": 10000, "disp": False},
+        }
+        default_kwargs.update(opt_kwargs)
+        total_max_iter = default_kwargs.get("options", {}).get("maxiter", 10000)
+        # Each component gets the FULL iteration budget — 5D Nelder-Mead
+        # is cheap (~6 function evals per iteration vs 76 in the joint 75D case)
+        per_comp_max_iter = total_max_iter
+
+        print(f"Per-component training: {self.ncomps} components × {1+d} params each")
+        print(f"  Per-component max_iter: {per_comp_max_iter}")
+        print(f"  Lengthscale bounds: floor={ls_floor}, ceil={ls_ceil}")
+
+        # Prepare GPU tensors once
+        use_gpu = PYTORCH_AVAILABLE and torch.cuda.is_available()
+        if use_gpu:
+            device = torch.device("cuda")
+            grid_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)
+            w_hat_reshaped = torch.from_numpy(
+                self.w_hat.reshape(self.ncomps, M)
+            ).to(device, TORCH_FLOAT64)
+            if not self.strict_weight_fit:
+                if hasattr(self, "_dots_inv_diag_gpu") and self._dots_inv_diag_gpu is not None:
+                    dots_inv_diag = self._dots_inv_diag_gpu
+                else:
+                    dots = self.eigenspectra @ self.eigenspectra.T
+                    dots_inv_diag = torch.from_numpy(
+                        np.diag(np.linalg.inv(dots))
+                    ).to(device, TORCH_FLOAT64)
+        else:
+            w_hat_reshaped_np = self.w_hat.reshape(self.ncomps, M)
+            if not self.strict_weight_fit:
+                dots = self.eigenspectra @ self.eigenspectra.T
+                dots_inv_diag_np = np.diag(np.linalg.inv(dots))
+
+        callback = opt_kwargs.pop("callback", None)
+
+        for k in range(self.ncomps):
+            comp_start = time.time()
+            comp_best_loss = np.inf
+            comp_best_P = None
+
+            # Initial parameter vector for component k: [log_var, log_ls_0, ..., log_ls_{d-1}]
+            p0 = np.empty(1 + d)
+            p0[0] = np.log(self.variances[k])
+            p0[1:] = np.log(self.lengthscales[k])
+
+            def nll_k(P, _k=k):
+                if np.any(~np.isfinite(P)):
+                    return np.inf
+
+                log_var = P[0]
+                log_ls = P[1:]
+                var_k = np.exp(log_var)
+                ls_k = np.exp(log_ls)
+
+                # Lengthscale bounds
+                if np.any(ls_k < ls_floor) or np.any(ls_k > ls_ceil):
+                    return np.inf
+
+                # Variance-scaled jitter for numerical stability
+                # Keeps condition number bounded at ~1e6 regardless of variance scale
+                jitter = max(1e-5, 1e-6 * var_k) if self.strict_weight_fit else 1e-5
+
+                if use_gpu:
+                    var_t = torch.tensor(var_k, device=device, dtype=TORCH_FLOAT64)
+                    ls_t = torch.from_numpy(ls_k).to(device, TORCH_FLOAT64)
+
+                    X_scaled = grid_gpu / ls_t
+                    dist = torch.cdist(X_scaled, X_scaled, p=2.0)
+                    dist.pow_(2).mul_(-0.5)
+                    torch.exp(dist, out=dist)
+                    dist.mul_(var_t)
+
+                    if self.strict_weight_fit:
+                        dist.diagonal().add_(jitter)
+                    else:
+                        dist.diagonal().add_(
+                            dots_inv_diag[_k].item() / self.lambda_xi + jitter
+                        )
+
+                    try:
+                        L = torch.linalg.cholesky(dist)
+                    except torch.linalg.LinAlgError:
+                        return np.inf
+                    del dist
+
+                    logdet = 2.0 * torch.sum(torch.log(L.diagonal())).item()
+
+                    z = torch.linalg.solve_triangular(
+                        L, w_hat_reshaped[_k].unsqueeze(-1), upper=False
+                    )
+                    solved = torch.linalg.solve_triangular(
+                        L.T, z, upper=True
+                    ).squeeze(-1)
+                    del L
+
+                    sqmah = torch.dot(w_hat_reshaped[_k], solved).item()
+                    del solved, z
+                else:
+                    # CPU path
+                    K = rbf_kernel(
+                        self._grid_points_norm, self._grid_points_norm,
+                        var_k, ls_k,
+                    )
+                    if self.strict_weight_fit:
+                        K[np.diag_indices_from(K)] += jitter
+                    else:
+                        K[np.diag_indices_from(K)] += (
+                            dots_inv_diag_np[_k] / self.lambda_xi + jitter
+                        )
+                    try:
+                        Lc, flag = cho_factor(K)
+                    except np.linalg.LinAlgError:
+                        return np.inf
+                    logdet = 2 * np.sum(np.log(Lc.diagonal()))
+                    solved = cho_solve((Lc, flag), w_hat_reshaped_np[_k])
+                    sqmah = np.dot(w_hat_reshaped_np[_k], solved)
+
+                loss = (logdet + sqmah) / 2.0
+                self.loss_history.append(loss)
+                self._iteration_count += 1
+
+                # Track best-ever params for this component
+                nonlocal comp_best_loss, comp_best_P
+                if loss < comp_best_loss:
+                    comp_best_loss = loss
+                    comp_best_P = P.copy()
+                if loss < self._best_loss:
+                    self._best_loss = loss
+
+                now = time.time()
+                if (self._iteration_count % 10 == 0) or (now - self._last_progress_time > 30):
+                    elapsed = now - self._training_start_time
+                    print(
+                        f"  Comp {_k+1:2d}/{self.ncomps} | "
+                        f"Iter {self._iteration_count:5d} | "
+                        f"Loss: {loss:10.2f} | Best(comp): {comp_best_loss:10.2f} | "
+                        f"Time: {elapsed:6.1f}s"
+                    )
+                    self._last_progress_time = now
+
+                # Invoke Marimo callback for live chart updates
+                if callback is not None and self._iteration_count % 10 == 0:
+                    callback(None)
+
+                return loss
+
+            # --- Burn-in for fatol calibration ---
+            # Short run to reach the working-regime loss, then calibrate fatol
+            # from that instead of the (often huge) initial loss.
+            # Same loss function throughout — no penalty switching.
+            burn_in_iter = 50
+            burn_in_opts = {"maxiter": burn_in_iter, "disp": False}
+            burn_soln = minimize(
+                nll_k, p0,
+                method="Nelder-Mead", options=burn_in_opts,
+                callback=callback,
+            )
+            p0 = burn_soln.x.copy()
+            baseline_loss = burn_soln.fun if np.isfinite(burn_soln.fun) else comp_best_loss
+            fatol = max(1e-8, abs(baseline_loss) * 1e-6)
+
+            print(f"  Comp {k+1:2d}/{self.ncomps} | Burn-in done: loss {baseline_loss:.2f} → fatol={fatol:.2e}")
+
+            # --- Main optimisation for this component ---
+            comp_opts = {
+                "maxiter": per_comp_max_iter,
+                "fatol": fatol,
+                "disp": False,
+            }
+            soln = minimize(
+                nll_k, p0,
+                method="Nelder-Mead", options=comp_opts,
+                callback=callback,
+            )
+
+            # Restore best-ever parameters (soln.x is usually the best, but
+            # this guards against Nelder-Mead returning a non-optimal final simplex vertex)
+            best_P = comp_best_P if comp_best_P is not None else soln.x
+            self.hyperparams[f"log_variance:{k}"] = best_P[0]
+            for j in range(d):
+                self.hyperparams[f"log_lengthscale:{k}:{j}"] = best_P[1 + j]
+
+            comp_elapsed = time.time() - comp_start
+            print(
+                f"  Component {k+1}/{self.ncomps} done | "
+                f"Best loss: {comp_best_loss:.2f} | Time: {comp_elapsed:.1f}s | "
+                f"var={np.exp(best_P[0]):.4f} ls={np.exp(best_P[1:])}"
+            )
+
+        # --- Post-training housekeeping ---
+        # Check if V11 fits in memory; if so rebuild, otherwise leave for
+        # memory-efficient inference.
+        if use_gpu:
+            v11_bytes = self.ncomps * M * M * 8 * 3
+            gpu_vram = torch.cuda.get_device_properties(0).total_memory
+            if v11_bytes > gpu_vram:
+                self._v11_gpu = None
+                self._v11 = None
+                self._L_gpu = None
+                self._alpha_gpu = None
+                self._L_gpu_source_id = None
+                self._mem_eff_L_blocks = None
+                self._mem_eff_alpha_blocks = None
+                print("(Skipping V11 rebuild — memory-efficient inference will be used)")
+            else:
+                self._gpu_training_mode = True
+                self.set_param_dict(self.get_param_dict())
+                self._gpu_training_mode = False
+        else:
+            self.set_param_dict(self.get_param_dict())
+
+        total_elapsed = time.time() - self._training_start_time
+        print(f"\nPer-component training complete")
+        print(
+            f"Total time: {total_elapsed:.1f}s | "
+            f"Total iters: {self._iteration_count} | "
+            f"Best total loss: {self._best_loss:.2f}"
+        )
+
+        self._trained = True
+        self.log.info(self)
+
+        # Clean up progress tracking variables
+        delattr(self, "_training_start_time")
+        delattr(self, "_iteration_count")
+        delattr(self, "_best_loss")
+        delattr(self, "_last_progress_time")
+
     # def train_fast(self, **opt_kwargs):
     #     """
     #     Fast training using L-BFGS-B
@@ -2291,8 +2573,9 @@ class Emulator:
                     eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
                     
                     if self.strict_weight_fit:
-                        # Strict weight fit: skip iPhiPhi/lambda_xi noise matrix, just use jitter
-                        v11_gpu = 1e-5 * eye_M.unsqueeze(0).expand(self.ncomps, -1, -1).clone()
+                        # Variance-scaled jitter keeps condition number ~1e6
+                        jitter_t = torch.clamp(1e-6 * self._variances_gpu, min=1e-5)
+                        v11_gpu = (jitter_t.view(-1, 1, 1) * eye_M.unsqueeze(0)).clone()
                     else:
                         v11_gpu = (self._dots_inv_diag_gpu.view(-1, 1, 1) * eye_M.unsqueeze(0)) / self.lambda_xi
                         v11_gpu += 1e-5 * eye_M.unsqueeze(0)
@@ -2346,8 +2629,10 @@ class Emulator:
                     )
                 
                 if self.strict_weight_fit:
+                    # Variance-scaled jitter keeps condition number ~1e6
                     eye_M = np.eye(M)
-                    self.v11 = kernel_cpu + (1e-5 * eye_M)
+                    jitter_arr = np.maximum(1e-6 * self.variances, 1e-5)  # (ncomps,)
+                    self.v11 = kernel_cpu + jitter_arr[:, None, None] * eye_M
                 else:
                     if self.iPhiPhi is None:
                         # Reconstruct diagonal scaling factors if iPhiPhi is missing (memory optimization)
