@@ -338,6 +338,8 @@ class Emulator:
         name: Optional[str] = None,
         block_diagonal: bool = False,
         strict_weight_fit: bool = False,
+        _param_min: Optional[np.ndarray] = None,
+        _param_range: Optional[np.ndarray] = None,
         ):
         self.log = logging.getLogger(self.__class__.__name__)
         
@@ -352,7 +354,20 @@ class Emulator:
         self.block_diagonal = block_diagonal
         self.strict_weight_fit = strict_weight_fit
         
+        # Parameter normalization: scale grid_points to [0,1] for GP kernel operations
+        if _param_min is not None and _param_range is not None:
+            # Loaded from file — normalization params already known
+            self._param_min = _param_min
+            self._param_range = _param_range
+        else:
+            # Fresh construction — compute normalization from grid
+            self._param_min = grid_points.min(axis=0)
+            self._param_range = grid_points.max(axis=0) - self._param_min
+            self._param_range[self._param_range == 0] = 1.0
+        self._grid_points_norm = (grid_points - self._param_min) / self._param_range
+        
         # Create optimal interpolator (RegularGrid if possible, LinearND fallback)
+        # Uses ORIGINAL-space grid_points for physical-space interpolation
         self.factor_interpolator = _create_optimal_interpolator(
             grid_points, factors, logger=self.log
         )
@@ -369,11 +384,11 @@ class Emulator:
             variances if variances is not None else 1e4 * np.ones(self.ncomps)
         )
 
-        unique = [sorted(np.unique(param_set)) for param_set in self.grid_points.T]
+        unique = [sorted(np.unique(param_set)) for param_set in self._grid_points_norm.T]
         self._grid_sep = np.array([np.diff(param).max() for param in unique])
 
         if lengthscales is None:
-            lengthscales = np.tile(3 * self._grid_sep, (self.ncomps, 1))
+            lengthscales = np.tile(2 * self._grid_sep, (self.ncomps, 1))
 
         self.lengthscales = lengthscales
 
@@ -420,7 +435,7 @@ class Emulator:
                     
                     # Add kernel to v11_gpu in-place
                     batch_kernel_pytorch_gpu_only(
-                        self.grid_points, self.grid_points, self.variances, self.lengthscales, 
+                        self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, 
                         device='cuda', return_stacked=True, out=v11_gpu, add_to_out=True
                     )
             else:
@@ -429,7 +444,7 @@ class Emulator:
                 iPhiPhi_gpu = torch.kron(dots_inv.contiguous(), eye_M.contiguous())
                 
                 kernel_gpu = batch_kernel_pytorch_gpu_only(
-                    self.grid_points, self.grid_points, self.variances, self.lengthscales, device='cuda'
+                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, device='cuda'
                 )
                 
                 if self.strict_weight_fit:
@@ -477,8 +492,8 @@ class Emulator:
                 from .kernels import rbf_kernel
                 for i in range(self.ncomps):
                     kernel_cpu[i] = rbf_kernel(
-                        self.grid_points, 
-                        self.grid_points, 
+                        self._grid_points_norm, 
+                        self._grid_points_norm, 
                         self.variances[i], 
                         self.lengthscales[i]
                     )
@@ -498,7 +513,7 @@ class Emulator:
                 phi_squared = get_phi_squared_optimized(eigenspectra_matrix, M)
                 self._iPhiPhi = np.linalg.inv(phi_squared)
                 kernel_auto = batch_kernel_auto(
-                    self.grid_points, self.grid_points, self.variances, self.lengthscales
+                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales
                 )
                 if self.strict_weight_fit:
                     self._v11 = kernel_auto + (1e-5 * np.eye(M * self.ncomps))
@@ -661,6 +676,10 @@ class Emulator:
         else:
             name = ".".join(filename.split(".")[:-1])
 
+        # Load normalization params if present (backward compatibility)
+        _param_min = data["_param_min"] if "_param_min" in data else None
+        _param_range = data["_param_range"] if "_param_range" in data else None
+
         emulator = cls(
             grid_points=grid_points,
             param_names=param_names,
@@ -676,7 +695,9 @@ class Emulator:
             name=name,
             factors=factors,
             block_diagonal=block_diagonal,
-            strict_weight_fit=strict_weight_fit
+            strict_weight_fit=strict_weight_fit,
+            _param_min=_param_min,
+            _param_range=_param_range,
         )
         emulator._trained = trained
         
@@ -714,7 +735,9 @@ class Emulator:
             "variances": self.variances,
             "lengthscales": self.lengthscales,
             "block_diagonal": self.block_diagonal,
-            "strict_weight_fit": self.strict_weight_fit
+            "strict_weight_fit": self.strict_weight_fit,
+            "_param_min": self._param_min,
+            "_param_range": self._param_range,
         }
         
         if self.name is not None:
@@ -912,6 +935,9 @@ class Emulator:
         if np.any(params < self.min_params) or np.any(params > self.max_params):
             raise ValueError("Querying emulator outside of original parameter range.", params, self.min_params)
         
+        # Normalize query params to [0,1] to match the normalized kernel space
+        params = (params - self._param_min) / self._param_range
+        
         # Try GPU path if requested and available
         if use_gpu and PYTORCH_AVAILABLE and torch.cuda.is_available() and self._v11_gpu is not None:
             try:
@@ -945,7 +971,7 @@ class Emulator:
             )
             kernel_cpu = np.zeros((self.ncomps, M, M))
             for i in range(self.ncomps):
-                kernel_cpu[i] = rbf_kernel(self.grid_points, self.grid_points, self.variances[i], self.lengthscales[i])
+                kernel_cpu[i] = rbf_kernel(self._grid_points_norm, self._grid_points_norm, self.variances[i], self.lengthscales[i])
             if self.strict_weight_fit:
                 self._v11 = kernel_cpu + 1e-5 * np.eye(M)
             else:
@@ -978,7 +1004,7 @@ class Emulator:
             v12_list = []
             v22_list = []
             for i in range(self.ncomps):
-                v12_list.append(rbf_kernel(self.grid_points, params, self.variances[i], self.lengthscales[i]))
+                v12_list.append(rbf_kernel(self._grid_points_norm, params, self.variances[i], self.lengthscales[i]))
                 v22_list.append(rbf_kernel(params, params, self.variances[i], self.lengthscales[i]))
             
             v12_stacked = np.stack(v12_list) # (n_comp, M, n_query)
@@ -1016,7 +1042,7 @@ class Emulator:
                 
         else:
             # Recalculate V12, V21, and V22.
-            v12 = batch_kernel_auto(self.grid_points, params, self.variances, self.lengthscales)
+            v12 = batch_kernel_auto(self._grid_points_norm, params, self.variances, self.lengthscales)
             v22 = batch_kernel_auto(params, params, self.variances, self.lengthscales)
             v21 = v12.T
 
@@ -1055,7 +1081,7 @@ class Emulator:
         
         # Ensure cached GPU tensors exist
         if self._grid_points_gpu is None:
-            self._grid_points_gpu = torch.from_numpy(self.grid_points).to(device, TORCH_FLOAT64)
+            self._grid_points_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)
         if self._w_hat_gpu is None:
             self._w_hat_gpu = torch.from_numpy(self.w_hat).to(device, TORCH_FLOAT64)
         if self._variances_gpu is None:
@@ -1184,7 +1210,7 @@ class Emulator:
         
         # Ensure cached GPU tensors exist
         if self._grid_points_gpu is None:
-            self._grid_points_gpu = torch.from_numpy(self.grid_points).to(device, TORCH_FLOAT64)
+            self._grid_points_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)
         if self._w_hat_gpu is None:
             self._w_hat_gpu = torch.from_numpy(self.w_hat).to(device, TORCH_FLOAT64)
         if self._variances_gpu is None:
@@ -1613,7 +1639,7 @@ class Emulator:
 
         # Ensure cached GPU tensors exist
         if self._grid_points_gpu is None:
-            self._grid_points_gpu = torch.from_numpy(self.grid_points).to(device, dtype)
+            self._grid_points_gpu = torch.from_numpy(self._grid_points_norm).to(device, dtype)
         if self._variances_gpu is None:
             self._variances_gpu = torch.from_numpy(self.variances).to(device, dtype)
         if self._lengthscales_gpu is None:
@@ -1831,7 +1857,7 @@ class Emulator:
             self.set_param_vector(P)
             
             # Check lengthscales
-            if np.any(self.lengthscales < 2 * self._grid_sep):
+            if np.any(self.lengthscales < 0.5 * self._grid_sep):
                 return np.inf
                 
             # Check variances (prevent runaway)
@@ -2245,7 +2271,7 @@ class Emulator:
             device = torch.device('cuda')
             
             if self._grid_points_gpu is None:
-                self._grid_points_gpu = torch.from_numpy(self.grid_points).to(device, TORCH_FLOAT64)
+                self._grid_points_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)
             if self._w_hat_gpu is None:
                 self._w_hat_gpu = torch.from_numpy(self.w_hat).to(device, TORCH_FLOAT64)
             
@@ -2313,8 +2339,8 @@ class Emulator:
                 
                 for i in range(self.ncomps):
                     kernel_cpu[i] = rbf_kernel(
-                        self.grid_points, 
-                        self.grid_points, 
+                        self._grid_points_norm, 
+                        self._grid_points_norm, 
                         self.variances[i], 
                         self.lengthscales[i]
                     )
@@ -2343,7 +2369,7 @@ class Emulator:
                             self.v11[i] += 1e-5 * eye_M
             else:
                 kernel_auto = batch_kernel_auto(
-                    self.grid_points, self.grid_points, self.variances, self.lengthscales
+                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales
                 )
                 if self.strict_weight_fit:
                     self.v11 = kernel_auto + (1e-5 * np.eye(kernel_auto.shape[0]))
