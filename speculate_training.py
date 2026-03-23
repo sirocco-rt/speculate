@@ -174,6 +174,7 @@ def _(mo):
     import logging
     import pandas as pd
     import altair as alt
+    alt.data_transformers.enable("vegafusion")
     import time
 
     # Import Starfish and Speculate modules
