@@ -147,12 +147,6 @@ def _(mo):
 def _(mo):
     mo.md("""
     ---
-    ## ⚠️ Emulator Training Configuration Requirements
-
-    - Run a Local Installation of Speculate
-    - GPU recommended for large grids (2500+ grid points or 6+ parameters)
-    - RAM/VRAM requirements scales by an order of magnitude with each added parameters.
-
     ## 💻 Emulator Specification:
     """)
     return
@@ -187,10 +181,10 @@ def _(mo):
     class MarimoHDF5Creator(HDF5Creator):
         """Override the grid-processing loop to surface a marimo progress bar
         instead of a plain tqdm counter.  The resulting NPZ contains:
-          wl            – common wavelength grid
-          grid_points   – (N, n_params) array of parameter coordinates
-          flux_data     – dict mapping key_name → {flux, header}
-          param_names   – list of "paramN" strings
+          wl            - common wavelength grid
+          grid_points   - (N, n_params) array of parameter coordinates
+          flux_data     - dict mapping key_name → {flux, header}
+          param_names   - list of "paramN" strings
         """
         def process_grid(self):
             """
