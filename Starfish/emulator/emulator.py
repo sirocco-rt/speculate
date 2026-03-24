@@ -54,7 +54,7 @@ try:
     def _memory_efficient_log_likelihood_gpu(
         grid_points_gpu, variances_gpu, lengthscales_gpu,
         dots_inv_diag_gpu, lambda_xi, w_hat_gpu, n_comp,
-        strict_weight_fit=False
+        strict_weight_fit=False, kernel_type="rbf"
     ):
         """Memory-efficient log likelihood: builds and factors V11 one block at a time.
         
@@ -89,13 +89,10 @@ try:
         
         for i in range(n_comp):
             # --- Build V11 block for component i ---
-            # Kernel: var_i * exp(-0.5 * ||x/ls - x'/ls||^2)
+            # Kernel: compute distance then apply kernel function
             X_scaled = grid_points_gpu / lengthscales_gpu[i]
             dist = torch.cdist(X_scaled, X_scaled, p=2.0)
-            dist.pow_(2)
-            dist.mul_(-0.5)
-            torch.exp(dist, out=dist)
-            dist.mul_(variances_gpu[i])
+            _apply_kernel_gpu_inplace(dist, variances_gpu[i], kernel_type)
             # dist is now K_i (M, M)
             
             # Add diagonal: iPhiPhi/lambda_xi + jitter
@@ -199,7 +196,7 @@ except ImportError:
 from Starfish.grid_tools import NPZInterface
 from Starfish.grid_tools.utils import determine_chunk_log
 from Starfish.utils import calculate_dv
-from .kernels import batch_kernel, batch_kernel_cached, batch_kernel_auto, batch_kernel_pytorch_gpu_only, clear_kernel_cache, get_cache_size, rbf_kernel
+from .kernels import batch_kernel, batch_kernel_cached, batch_kernel_auto, batch_kernel_pytorch_gpu_only, clear_kernel_cache, get_cache_size, rbf_kernel, get_cpu_kernel_func, _apply_kernel_gpu_inplace
 from ._utils import get_phi_squared_optimized, get_phi_squared_pytorch, get_w_hat, PYTORCH_AVAILABLE as UTILS_PYTORCH_AVAILABLE
 log = logging.getLogger(__name__)
 
@@ -341,6 +338,7 @@ class Emulator:
         block_diagonal: bool = False,
         strict_weight_fit: bool = False,
         per_component: bool = False,
+        kernel: str = "rbf",
         _param_min: Optional[np.ndarray] = None,
         _param_range: Optional[np.ndarray] = None,
         ):
@@ -357,6 +355,7 @@ class Emulator:
         self.block_diagonal = block_diagonal
         self.strict_weight_fit = strict_weight_fit
         self.per_component = per_component
+        self.kernel = kernel
         
         # Parameter normalization: scale grid_points to [0,1] for GP kernel operations
         if _param_min is not None and _param_range is not None:
@@ -444,7 +443,7 @@ class Emulator:
                     # Add kernel to v11_gpu in-place
                     batch_kernel_pytorch_gpu_only(
                         self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, 
-                        device='cuda', return_stacked=True, out=v11_gpu, add_to_out=True
+                        device='cuda', return_stacked=True, out=v11_gpu, add_to_out=True, kernel_type=self.kernel
                     )
             else:
                 self.log.info("Using Full Dense Matrix (Standard)")
@@ -452,7 +451,7 @@ class Emulator:
                 iPhiPhi_gpu = torch.kron(dots_inv.contiguous(), eye_M.contiguous())
                 
                 kernel_gpu = batch_kernel_pytorch_gpu_only(
-                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, device='cuda'
+                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, device='cuda', kernel_type=self.kernel
                 )
                 
                 if self.strict_weight_fit:
@@ -497,9 +496,9 @@ class Emulator:
                 # or modify batch_kernel_auto. 
                 # Let's construct it manually to be safe and explicit.
                 kernel_cpu = np.zeros((self.ncomps, M, M))
-                from .kernels import rbf_kernel
+                _kfunc = get_cpu_kernel_func(self.kernel)
                 for i in range(self.ncomps):
-                    kernel_cpu[i] = rbf_kernel(
+                    kernel_cpu[i] = _kfunc(
                         self._grid_points_norm, 
                         self._grid_points_norm, 
                         self.variances[i], 
@@ -523,7 +522,7 @@ class Emulator:
                 phi_squared = get_phi_squared_optimized(eigenspectra_matrix, M)
                 self._iPhiPhi = np.linalg.inv(phi_squared)
                 kernel_auto = batch_kernel_auto(
-                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales
+                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, kernel_type=self.kernel
                 )
                 if self.strict_weight_fit:
                     self._v11 = kernel_auto + (1e-5 * np.eye(M * self.ncomps))
@@ -684,6 +683,9 @@ class Emulator:
         # Load per_component flag if present (backward compatibility)
         per_component = bool(data["per_component"]) if "per_component" in data else False
         
+        # Load kernel type if present (backward compatibility: default to "rbf")
+        kernel = str(data["kernel"]) if "kernel" in data else "rbf"
+        
         if "name" in data:
             name = str(data["name"])
         else:
@@ -710,6 +712,7 @@ class Emulator:
             block_diagonal=block_diagonal,
             strict_weight_fit=strict_weight_fit,
             per_component=per_component,
+            kernel=kernel,
             _param_min=_param_min,
             _param_range=_param_range,
         )
@@ -751,6 +754,7 @@ class Emulator:
             "block_diagonal": self.block_diagonal,
             "strict_weight_fit": self.strict_weight_fit,
             "per_component": self.per_component,
+            "kernel": self.kernel,
             "_param_min": self._param_min,
             "_param_range": self._param_range,
         }
@@ -813,7 +817,7 @@ class Emulator:
         return exp_var, pca.n_components_
 
     @classmethod
-    def from_grid(cls, grid, block_diagonal=False, strict_weight_fit=False, per_component=False, **pca_kwargs):
+    def from_grid(cls, grid, block_diagonal=False, strict_weight_fit=False, per_component=False, kernel="rbf", **pca_kwargs):
         """
         Create an Emulator using PCA decomposition from a GridInterface.
 
@@ -886,6 +890,7 @@ class Emulator:
             block_diagonal=block_diagonal,
             strict_weight_fit=strict_weight_fit,
             per_component=per_component,
+            kernel=kernel,
         )
         # profiler.stop()
         # profiler.print()
@@ -986,8 +991,9 @@ class Emulator:
                 RuntimeWarning, stacklevel=2
             )
             kernel_cpu = np.zeros((self.ncomps, M, M))
+            _kfunc = get_cpu_kernel_func(self.kernel)
             for i in range(self.ncomps):
-                kernel_cpu[i] = rbf_kernel(self._grid_points_norm, self._grid_points_norm, self.variances[i], self.lengthscales[i])
+                kernel_cpu[i] = _kfunc(self._grid_points_norm, self._grid_points_norm, self.variances[i], self.lengthscales[i])
             if self.strict_weight_fit:
                 self._v11 = kernel_cpu + 1e-5 * np.eye(M)
             else:
@@ -1017,11 +1023,12 @@ class Emulator:
             
             # 1. Compute stacked kernels
             # We loop because we don't have a stacked CPU kernel function yet
+            _kfunc = get_cpu_kernel_func(self.kernel)
             v12_list = []
             v22_list = []
             for i in range(self.ncomps):
-                v12_list.append(rbf_kernel(self._grid_points_norm, params, self.variances[i], self.lengthscales[i]))
-                v22_list.append(rbf_kernel(params, params, self.variances[i], self.lengthscales[i]))
+                v12_list.append(_kfunc(self._grid_points_norm, params, self.variances[i], self.lengthscales[i]))
+                v22_list.append(_kfunc(params, params, self.variances[i], self.lengthscales[i]))
             
             v12_stacked = np.stack(v12_list) # (n_comp, M, n_query)
             v22_stacked = np.stack(v22_list) # (n_comp, n_query, n_query)
@@ -1058,8 +1065,8 @@ class Emulator:
                 
         else:
             # Recalculate V12, V21, and V22.
-            v12 = batch_kernel_auto(self._grid_points_norm, params, self.variances, self.lengthscales)
-            v22 = batch_kernel_auto(params, params, self.variances, self.lengthscales)
+            v12 = batch_kernel_auto(self._grid_points_norm, params, self.variances, self.lengthscales, kernel_type=self.kernel)
+            v22 = batch_kernel_auto(params, params, self.variances, self.lengthscales, kernel_type=self.kernel)
             v21 = v12.T
 
             # Recalculate the covariance
@@ -1126,10 +1133,7 @@ class Emulator:
                 # Build V11 block for component i
                 X_scaled = self._grid_points_gpu / self._lengthscales_gpu[i]
                 dist = torch.cdist(X_scaled, X_scaled, p=2.0)
-                dist.pow_(2)
-                dist.mul_(-0.5)
-                torch.exp(dist, out=dist)
-                dist.mul_(self._variances_gpu[i])
+                _apply_kernel_gpu_inplace(dist, self._variances_gpu[i], self.kernel)
                 
                 # Add diagonal (match training: dots_inv_diag/lambda_xi + 1e-5 jitter)
                 if self.strict_weight_fit:
@@ -1162,13 +1166,13 @@ class Emulator:
         v12_gpu = batch_kernel_pytorch_gpu_only(
             self._grid_points_gpu, params_gpu, 
             self._variances_gpu, self._lengthscales_gpu,
-            device='cuda', return_stacked=True
+            device='cuda', return_stacked=True, kernel_type=self.kernel
         )  # (n_comp, M, n_query)
         
         v22_gpu = batch_kernel_pytorch_gpu_only(
             params_gpu, params_gpu, 
             self._variances_gpu, self._lengthscales_gpu,
-            device='cuda', return_stacked=True
+            device='cuda', return_stacked=True, kernel_type=self.kernel
         )  # (n_comp, n_query, n_query)
         
         v21_gpu = v12_gpu.transpose(-2, -1)  # (n_comp, n_query, M)
@@ -1253,7 +1257,8 @@ class Emulator:
                 self._variances_gpu, 
                 self._lengthscales_gpu,
                 device='cuda',
-                return_stacked=True
+                return_stacked=True,
+                kernel_type=self.kernel
             ) # (n_comp, M, n_query)
             
             v22_gpu = batch_kernel_pytorch_gpu_only(
@@ -1262,7 +1267,8 @@ class Emulator:
                 self._variances_gpu, 
                 self._lengthscales_gpu,
                 device='cuda',
-                return_stacked=True
+                return_stacked=True,
+                kernel_type=self.kernel
             ) # (n_comp, n_query, n_query)
             
             v21_gpu = v12_gpu.transpose(-2, -1) # (n_comp, n_query, M)
@@ -1343,14 +1349,16 @@ class Emulator:
                 params_gpu, 
                 self._variances_gpu, 
                 self._lengthscales_gpu,
-                device='cuda'
+                device='cuda',
+                kernel_type=self.kernel
             )
             v22_gpu = batch_kernel_pytorch_gpu_only(
                 params_gpu, 
                 params_gpu, 
                 self._variances_gpu, 
                 self._lengthscales_gpu,
-                device='cuda'
+                device='cuda',
+                kernel_type=self.kernel
             )
             v21_gpu = v12_gpu.T
             
@@ -1677,10 +1685,7 @@ class Emulator:
             X_scaled = self._grid_points_gpu / self._lengthscales_gpu[k]
             K_k = torch.cdist(X_scaled, X_scaled, p=2.0)
             del X_scaled
-            K_k.pow_(2)
-            K_k.mul_(-0.5)
-            torch.exp(K_k, out=K_k)
-            K_k.mul_(self._variances_gpu[k])
+            _apply_kernel_gpu_inplace(K_k, self._variances_gpu[k], self.kernel)
 
             # Add diagonal (match training: dots_inv_diag/lambda_xi + jitter)
             # Variance-scaled jitter keeps condition number ~1e6
@@ -2144,9 +2149,7 @@ class Emulator:
 
                     X_scaled = grid_gpu / ls_t
                     dist = torch.cdist(X_scaled, X_scaled, p=2.0)
-                    dist.pow_(2).mul_(-0.5)
-                    torch.exp(dist, out=dist)
-                    dist.mul_(var_t)
+                    _apply_kernel_gpu_inplace(dist, var_t, self.kernel)
 
                     if self.strict_weight_fit:
                         dist.diagonal().add_(jitter)
@@ -2175,7 +2178,8 @@ class Emulator:
                     del solved, z
                 else:
                     # CPU path
-                    K = rbf_kernel(
+                    _kfunc = get_cpu_kernel_func(self.kernel)
+                    K = _kfunc(
                         self._grid_points_norm, self._grid_points_norm,
                         var_k, ls_k,
                     )
@@ -2589,7 +2593,8 @@ class Emulator:
                         device='cuda',
                         return_stacked=True,
                         out=v11_gpu,
-                        add_to_out=True
+                        add_to_out=True,
+                        kernel_type=self.kernel
                     )
                     self._v11_gpu = v11_gpu
                 
@@ -2604,7 +2609,8 @@ class Emulator:
                     self._variances_gpu, 
                     self._lengthscales_gpu,
                     device='cuda',
-                    return_stacked=False
+                    return_stacked=False,
+                    kernel_type=self.kernel
                 )
                 
                 if self.strict_weight_fit:
@@ -2620,8 +2626,9 @@ class Emulator:
                 M = self.grid_points.shape[0]
                 kernel_cpu = np.zeros((self.ncomps, M, M))
                 
+                _kfunc = get_cpu_kernel_func(self.kernel)
                 for i in range(self.ncomps):
-                    kernel_cpu[i] = rbf_kernel(
+                    kernel_cpu[i] = _kfunc(
                         self._grid_points_norm, 
                         self._grid_points_norm, 
                         self.variances[i], 
@@ -2654,7 +2661,7 @@ class Emulator:
                             self.v11[i] += 1e-5 * eye_M
             else:
                 kernel_auto = batch_kernel_auto(
-                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales
+                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, kernel_type=self.kernel
                 )
                 if self.strict_weight_fit:
                     self.v11 = kernel_auto + (1e-5 * np.eye(kernel_auto.shape[0]))
@@ -2729,7 +2736,8 @@ class Emulator:
                         self.lambda_xi,
                         self._w_hat_gpu,
                         self.ncomps,
-                        strict_weight_fit=self.strict_weight_fit
+                        strict_weight_fit=self.strict_weight_fit,
+                        kernel_type=self.kernel
                     )
                     return result
                 except Exception as e:

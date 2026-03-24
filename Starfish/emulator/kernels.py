@@ -1,5 +1,6 @@
 import scipy as sp
 import numpy as np
+import math
 from functools import lru_cache
 
 # Try to import PyTorch for GPU acceleration
@@ -12,6 +13,9 @@ try:
 except ImportError:
     PYTORCH_AVAILABLE = False
     DTYPE = None
+
+_SQRT3 = math.sqrt(3)
+_SQRT5 = math.sqrt(5)
 
 
 def rbf_kernel(X, Z, variance, lengthscale):
@@ -35,6 +39,64 @@ def rbf_kernel(X, Z, variance, lengthscale):
     """
     sq_dist = sp.spatial.distance.cdist(X / lengthscale, Z / lengthscale, "sqeuclidean")
     return variance * np.exp(-0.5 * sq_dist)
+
+
+def matern32_kernel(X, Z, variance, lengthscale):
+    """
+    Matérn-3/2 covariance kernel (C¹ smooth — once differentiable).
+
+    .. math::
+        k(r) = \\sigma^2 (1 + \\sqrt{3} r) \\exp(-\\sqrt{3} r)
+
+    where r = ||X/ℓ - Z/ℓ|| (Euclidean distance in scaled space).
+
+    Parameters
+    ----------
+    X, Z : np.ndarray
+        Input point sets. Z must have same second dimension as X.
+    variance : double
+        Kernel amplitude σ².
+    lengthscale : np.ndarray or double
+        Per-dimension lengthscale ℓ.
+    """
+    r = sp.spatial.distance.cdist(X / lengthscale, Z / lengthscale, "euclidean")
+    sqrt3_r = _SQRT3 * r
+    return variance * (1.0 + sqrt3_r) * np.exp(-sqrt3_r)
+
+
+def matern52_kernel(X, Z, variance, lengthscale):
+    """
+    Matérn-5/2 covariance kernel (C² smooth — twice differentiable).
+
+    .. math::
+        k(r) = \\sigma^2 \\left(1 + \\sqrt{5} r + \\frac{5}{3} r^2\\right) \\exp(-\\sqrt{5} r)
+
+    where r = ||X/ℓ - Z/ℓ|| (Euclidean distance in scaled space).
+
+    Parameters
+    ----------
+    X, Z : np.ndarray
+        Input point sets. Z must have same second dimension as X.
+    variance : double
+        Kernel amplitude σ².
+    lengthscale : np.ndarray or double
+        Per-dimension lengthscale ℓ.
+    """
+    r = sp.spatial.distance.cdist(X / lengthscale, Z / lengthscale, "euclidean")
+    sqrt5_r = _SQRT5 * r
+    return variance * (1.0 + sqrt5_r + (5.0 / 3.0) * r * r) * np.exp(-sqrt5_r)
+
+
+def get_cpu_kernel_func(kernel_type="rbf"):
+    """Return the CPU kernel function for the given kernel type."""
+    if kernel_type == "rbf":
+        return rbf_kernel
+    elif kernel_type == "matern32":
+        return matern32_kernel
+    elif kernel_type == "matern52":
+        return matern52_kernel
+    else:
+        raise ValueError(f"Unknown kernel type: {kernel_type!r}. Choose from 'rbf', 'matern32', 'matern52'.")
 
 
 def batch_kernel(X, Z, variances, lengthscales):
@@ -323,9 +385,54 @@ def batch_kernel_pytorch(X, Z, variances, lengthscales, device='cuda'):
     return result.cpu().numpy()
 
 
-def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', return_stacked=False, out=None, add_to_out=False):
+def _apply_kernel_gpu_inplace(dist, var, kernel_type="rbf"):
+    """Transform a Euclidean distance matrix into a kernel matrix, in-place on GPU.
+
+    Parameters
+    ----------
+    dist : torch.Tensor
+        Euclidean distance matrix ||x/ℓ - z/ℓ|| (from torch.cdist with p=2.0).
+        Modified in-place and returned.
+    var : torch.Tensor (scalar)
+        Kernel amplitude σ².
+    kernel_type : str
+        One of "rbf", "matern32", "matern52".
+
+    Returns
+    -------
+    torch.Tensor
+        The kernel matrix (same object as dist, modified in-place).
     """
-    PyTorch GPU-accelerated batched RBF kernel that returns GPU tensor (NO CPU TRANSFER!)
+    if kernel_type == "rbf":
+        dist.pow_(2).mul_(-0.5)
+        torch.exp(dist, out=dist)
+        dist.mul_(var)
+    elif kernel_type == "matern32":
+        dist.mul_(_SQRT3)           # sqrt(3)*r
+        exp_neg = torch.exp(-dist)   # exp(-sqrt(3)*r)
+        dist.add_(1.0)              # 1 + sqrt(3)*r
+        dist.mul_(exp_neg)           # (1 + sqrt(3)*r) * exp(-sqrt(3)*r)
+        dist.mul_(var)
+        del exp_neg
+    elif kernel_type == "matern52":
+        r_sq = dist.pow(2)           # r² (new tensor)
+        dist.mul_(_SQRT5)           # sqrt(5)*r
+        exp_neg = torch.exp(-dist)   # exp(-sqrt(5)*r)
+        dist.add_(1.0)              # 1 + sqrt(5)*r
+        dist.add_(r_sq, alpha=5.0 / 3.0)  # 1 + sqrt(5)*r + (5/3)*r²
+        dist.mul_(exp_neg)           # (...) * exp(-sqrt(5)*r)
+        dist.mul_(var)
+        del r_sq, exp_neg
+    else:
+        raise ValueError(f"Unknown kernel_type: {kernel_type!r}")
+    return dist
+
+
+def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', return_stacked=False, out=None, add_to_out=False, kernel_type="rbf"):
+    """
+    PyTorch GPU-accelerated batched kernel that returns GPU tensor (NO CPU TRANSFER!)
+    
+    Supports RBF, Matérn-3/2, and Matérn-5/2 kernels via the kernel_type parameter.
     
     This version keeps the result on GPU for use in training pipelines where
     the result is immediately used in subsequent GPU operations (like log_likelihood).
@@ -339,9 +446,9 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', 
     Z : np.ndarray or torch.Tensor
         The second set of points (n_Z, n_features)
     variances : np.ndarray or torch.Tensor
-        The amplitude for each RBF kernel (n_components,)
+        The amplitude for each kernel (n_components,)
     lengthscales : np.ndarray or torch.Tensor
-        The lengthscale for each RBF kernel (n_components, n_features)
+        The lengthscale for each kernel (n_components, n_features)
     device : str
         'cuda' for GPU or 'cpu' for CPU
     return_stacked : bool
@@ -352,6 +459,8 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', 
     add_to_out : bool, optional
         If True and out is provided, adds the kernel result to out instead of overwriting.
         Useful for constructing v11 = iPhiPhi + kernel in-place.
+    kernel_type : str
+        Kernel function to use: "rbf", "matern32", or "matern52". Default is "rbf".
     
     Returns
     -------
@@ -407,14 +516,11 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', 
         X_scaled = X_torch / ls
         Z_scaled = Z_torch / ls
         
-        # Compute squared Euclidean distances via cdist
+        # Compute Euclidean distances via cdist
         dist = torch.cdist(X_scaled, Z_scaled, p=2.0)
         
-        # Apply RBF kernel in-place: variance * exp(-0.5 * dist²)
-        dist.pow_(2)
-        dist.mul_(-0.5)
-        torch.exp(dist, out=dist)
-        dist.mul_(var)
+        # Apply kernel in-place
+        _apply_kernel_gpu_inplace(dist, var, kernel_type)
         
         if return_stacked:
             if add_to_out:
@@ -440,7 +546,7 @@ def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', 
     return result
 
 
-def batch_kernel_auto(X, Z, variances, lengthscales):
+def batch_kernel_auto(X, Z, variances, lengthscales, kernel_type="rbf"):
     """
     Automatically select fastest batch_kernel implementation
     
@@ -465,15 +571,23 @@ def batch_kernel_auto(X, Z, variances, lengthscales):
     Z : np.ndarray
         The second set of points (n_Z, n_features)
     variances : np.ndarray
-        The amplitude for each RBF kernel (n_components,)
+        The amplitude for each kernel (n_components,)
     lengthscales : np.ndarray
-        The lengthscale for each RBF kernel (n_components, n_features)
+        The lengthscale for each kernel (n_components, n_features)
+    kernel_type : str
+        Kernel function: "rbf", "matern32", or "matern52". Default is "rbf".
     
     Returns
     -------
     np.ndarray
         Block diagonal kernel matrix
     """
+    # For non-RBF kernels, use the generic CPU path
+    if kernel_type != "rbf":
+        kfunc = get_cpu_kernel_func(kernel_type)
+        blocks = [kfunc(X, Z, var, ls) for var, ls in zip(variances, lengthscales)]
+        return sp.linalg.block_diag(*blocks)
+
     # Try PyTorch GPU first (fastest)
     if PYTORCH_AVAILABLE and torch.cuda.is_available():
         try:

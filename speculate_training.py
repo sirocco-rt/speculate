@@ -570,6 +570,12 @@ def _(mo):
         label="Per-Component Training (optimize each PCA component independently)"
     )
 
+    kernel_selector = mo.ui.dropdown(
+        options={"RBF (Squared Exponential)": "rbf", "Matérn-5/2": "matern52", "Matérn-3/2": "matern32"},
+        value="RBF (Squared Exponential)",
+        label="GP Kernel:"
+    )
+
     # λ_ξ (lambda_xi) is the Czekala et al. (2015) truncation noise matrix that
     # inflates the effective measurement noise used during GP weight training.
     # Bypassing it ("strict") minimises the GP loss on the raw PCA weights at
@@ -577,6 +583,12 @@ def _(mo):
     mo.vstack([
         method,
         max_iter,
+        kernel_selector,
+        mo.md(
+            "_**RBF** (C∞ smooth) is the classic choice. **Matérn-5/2** (C² smooth) "
+            "and **Matérn-3/2** (C¹ smooth) allow sharper transitions — useful if "
+            "spectral lines show 'ghosting' artefacts from over-smoothing._"
+        ),
         strict_weight_fit,
         mo.md(
             "_When enabled, the GP is trained to fit the PCA weights directly "
@@ -591,7 +603,7 @@ def _(mo):
             "optimization. Requires block-diagonal mode._"
         )
     ])
-    return max_iter, method, per_component, strict_weight_fit
+    return kernel_selector, max_iter, method, per_component, strict_weight_fit
 
 
 @app.cell
@@ -785,6 +797,7 @@ def _(
     MarimoHDF5Creator,
     grid_configs,
     grid_selector,
+    kernel_selector,
     logging,
     max_iter,
     method,
@@ -856,6 +869,7 @@ def _(
         - **Max Iterations:** {max_iter.value}
         - **Strict Weight Fit:** {'Yes (λ_ξ penalty bypassed)' if strict_weight_fit.value else 'No (standard Czekala+2015)'}
         - **Per-Component Training:** {'Yes' if per_component.value else 'No'}
+        - **GP Kernel:** {kernel_selector.value}
         - **Process Grid:** {'Auto (File not found, creating new)' if process_grid_auto else 'Auto (File found, loading existing)'}
         - **Grid File:** `{grid_file_name}.npz`
         - **Emulator File:** `{emu_file_name}.npz`
@@ -973,6 +987,7 @@ def _(
     get_console_logs,
     get_training_status,
     grid_file_name,
+    kernel_selector,
     max_iter,
     method,
     mo,
@@ -1096,7 +1111,8 @@ def _(
                     svd_solver="full",
                     block_diagonal=True,
                     strict_weight_fit=strict_weight_fit.value,
-                    per_component=per_component.value
+                    per_component=per_component.value,
+                    kernel=kernel_selector.value
                 )
 
                 print(f"Grid loaded. Initialized {emu.ncomps} PCA components.")
