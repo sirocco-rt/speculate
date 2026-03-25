@@ -858,8 +858,10 @@ class Emulator:
         # Center and whiten
         flux_mean = fluxes.mean(0)
         fluxes -= flux_mean
-        flux_std = fluxes.std(0) 
-        fluxes /= flux_std 
+        flux_std = fluxes.std(0)
+        flux_std[flux_std == 0] = 1.0
+        fluxes /= flux_std
+        fluxes = np.nan_to_num(fluxes)
 
         # Perform PCA using sklearn
         default_pca_kwargs = dict(n_components=0.99, svd_solver="full") # PCA
@@ -1475,6 +1477,10 @@ class Emulator:
             'loo_std_resid'   : (ncomps, M) standardised residuals
             'loo_mse_per_comp': (ncomps,) MSE per component
             'loo_rmse_per_comp': (ncomps,) RMSE per component
+            'q2_per_comp'     : (ncomps,) per-component Q² (LOO R²)
+            'nlpd_per_comp'   : (ncomps,) LOO neg. log predictive density
+            'std_resid_mean'  : float, mean of all standardised residuals
+            'std_resid_var'   : float, variance of all standardised residuals
 
             If *grid* is supplied, extra keys:
             'pca_recon_rmse'  : (M,) per-spectrum PCA reconstruction RMSE
@@ -1484,6 +1490,9 @@ class Emulator:
             'loo_flux_rmse_median'  : float
             'loo_flux_rmse_95'      : float
             'max_fractional_resid'  : float
+            'pca_max_fractional_resid' : float, PCA-only worst-case
+            'pca_per_wl_rmse' : (P,) per-wavelength PCA RMSE
+            'loo_per_wl_rmse' : (P,) per-wavelength LOO RMSE
         """
         if not self._trained:
             warnings.warn(
@@ -1528,6 +1537,23 @@ class Emulator:
         loo_mse = np.mean(loo_residuals ** 2, axis=1)
         loo_rmse = np.sqrt(loo_mse)
 
+        # Per-component Q²_k (LOO R² per PCA component)
+        _w_var = np.var(w_hat_all, axis=1)  # (ncomps,)
+        q2_per_comp = 1.0 - loo_mse / np.maximum(_w_var, 1e-30)
+
+        # LOO Negative Log Predictive Density — proper scoring rule
+        # (Bastos & O'Hagan 2009; Gneiting & Raftery 2007)
+        _nlpd_pointwise = 0.5 * (
+            np.log(2.0 * np.pi * np.maximum(loo_var, 1e-30))
+            + loo_residuals ** 2 / np.maximum(loo_var, 1e-30)
+        )  # (ncomps, M)
+        nlpd_per_comp = np.mean(_nlpd_pointwise, axis=1)  # (ncomps,)
+
+        # Standardized residual summary statistics
+        _std_flat = loo_std_resid.ravel()
+        std_resid_mean = float(np.mean(_std_flat))
+        std_resid_var = float(np.var(_std_flat))
+
         results = {
             'loo_mu': loo_mu,
             'loo_var': loo_var,
@@ -1535,6 +1561,10 @@ class Emulator:
             'loo_std_resid': loo_std_resid,
             'loo_mse_per_comp': loo_mse,
             'loo_rmse_per_comp': loo_rmse,
+            'q2_per_comp': q2_per_comp,
+            'nlpd_per_comp': nlpd_per_comp,
+            'std_resid_mean': std_resid_mean,
+            'std_resid_var': std_resid_var,
         }
 
         # -----------------------------------------------------------
@@ -1568,8 +1598,14 @@ class Emulator:
 
             # Max fractional residual across all spectra and wavelengths
             with np.errstate(divide='ignore', invalid='ignore'):
-                fractional = np.abs(loo_flux_err) / (np.abs(original) + 1e-30)
-            max_frac = float(np.nanmax(fractional))
+                loo_fractional = np.abs(loo_flux_err) / (np.abs(original) + 1e-30)
+                pca_fractional = np.abs(pca_recon_err) / (np.abs(original) + 1e-30)
+            max_frac = float(np.nanmax(loo_fractional))
+            pca_max_frac = float(np.nanmax(pca_fractional))
+
+            # Per-wavelength RMSE: aggregate over spectra (axis 0)
+            pca_per_wl_rmse = np.sqrt(np.mean(pca_recon_err ** 2, axis=0))  # (P,)
+            loo_per_wl_rmse = np.sqrt(np.mean(loo_flux_err ** 2, axis=0))    # (P,)
 
             results.update({
                 'original_flux': original,          # (M, P) normalised grid spectra
@@ -1583,6 +1619,9 @@ class Emulator:
                 'loo_flux_rmse_median': float(np.median(loo_flux_rmse)),
                 'loo_flux_rmse_95': float(np.percentile(loo_flux_rmse, 95)),
                 'max_fractional_resid': max_frac,
+                'pca_max_fractional_resid': pca_max_frac,
+                'pca_per_wl_rmse': pca_per_wl_rmse,   # (P,)
+                'loo_per_wl_rmse': loo_per_wl_rmse,    # (P,)
             })
 
         return results
@@ -1712,7 +1751,17 @@ class Emulator:
                 K_inv = torch.cholesky_solve(eye_M, L)
                 del L
             except torch.linalg.LinAlgError:
-                K_k += jitter * eye_M
+                # Rebuild K_k from scratch with 10x jitter for a clean retry
+                del K_k
+                X_scaled = self._grid_points_gpu / self._lengthscales_gpu[k]
+                K_k = torch.cdist(X_scaled, X_scaled, p=2.0)
+                del X_scaled
+                _apply_kernel_gpu_inplace(K_k, self._variances_gpu[k], self.kernel)
+                retry_jitter = 10.0 * jitter
+                if self.strict_weight_fit:
+                    K_k.diagonal().add_(retry_jitter)
+                else:
+                    K_k.diagonal().add_(self._dots_inv_diag_gpu[k].item() / self.lambda_xi + retry_jitter)
                 L = torch.linalg.cholesky(K_k)
                 del K_k
                 K_inv = torch.cholesky_solve(eye_M, L)

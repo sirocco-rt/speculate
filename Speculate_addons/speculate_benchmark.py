@@ -128,15 +128,6 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     t0 = time.time()
     results = emu.loo_cv(grid=grid_path)
 
-    # GP weight-space R²: measures how well the GP predicts PCA weights at
-    # held-out grid points via leave-one-out.  This depends on the trained GP
-    # (optimizer, kernel, hyperparameters) and DIFFERS from the true PCA
-    # explained variance which is a fixed property of the PCA decomposition.
-    results["gp_weight_r2"] = float(
-        1.0 - np.sum(results["loo_mse_per_comp"])
-        / np.sum(np.var(emu.weights, axis=0))
-    )
-
     # True PCA explained variance: fraction of flux variance captured by the
     # PCA components.  This is a fixed property of the grid + n_components
     # and does NOT depend on the GP training.
@@ -150,6 +141,21 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     results["n_grid_points"] = emu.grid_points.shape[0]
     results["n_params"] = emu.grid_points.shape[1]
     results["tier1_time_s"] = time.time() - t0
+
+    # Aggregate Q² across all components (LOO R²).
+    # Uses the same safeguard as per-component Q² in loo_cv().
+    _q2 = results.get("q2_per_comp")
+    if _q2 is not None:
+        _total_mse = np.sum(results["loo_mse_per_comp"])
+        _total_var = np.sum(np.var(emu.weights, axis=0))
+        results["q2_aggregate"] = float(
+            1.0 - _total_mse / max(_total_var, 1e-30)
+        )
+
+    # LOO NLPD: proper scoring rule (Bastos & O’Hagan 2009).
+    _nlpd = results.get("nlpd_per_comp")
+    if _nlpd is not None:
+        results["nlpd_mean"] = float(np.mean(_nlpd))
 
     # Emulator Accuracy Score (EAS): single 0–100% summary metric.
     # Combines true PCA explained variance (how well n_components capture the
@@ -168,7 +174,10 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
         results["emulator_accuracy_score"] = None
 
     # Separate large flux arrays (kept in-memory, never serialised)
-    _ARRAY_KEYS = {"original_flux", "pca_recon_flux", "loo_recon_flux", "wavelength"}
+    _ARRAY_KEYS = {
+        "original_flux", "pca_recon_flux", "loo_recon_flux", "wavelength",
+        "pca_per_wl_rmse", "loo_per_wl_rmse",
+    }
     arrays = {}
     for k in _ARRAY_KEYS:
         if k in results:

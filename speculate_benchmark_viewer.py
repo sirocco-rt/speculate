@@ -207,7 +207,7 @@ def _(
 
 
 @app.cell(hide_code=True)
-def _(get_report, mo, np, plt):
+def _(get_report, get_tier1_arrays, mo, np, plt):
     # ── Tier result tabs ──
     # Render the active report as a set of tabs, one per benchmark tier.
     # Each tab is self-contained: Tier 1 shows EAS + LOO diagnostics,
@@ -241,14 +241,14 @@ def _(get_report, mo, np, plt):
             )
             _pca_ev_raw = _t1.get("pca_explained_variance")
             _loo_rmse_raw = _t1.get("loo_flux_rmse_median")
-            _gp_r2_raw = _t1.get("gp_weight_r2")
+            _q2_raw = _t1.get("q2_aggregate")
             _pca_str = f"{_pca_ev_raw*100:.1f}%" if _pca_ev_raw is not None else "n/a"
             _loo_str = f"{_loo_rmse_raw:.4f}" if _loo_rmse_raw is not None else "n/a"
-            _gp_r2_str = f"{_gp_r2_raw*100:.1f}%" if _gp_r2_raw is not None else "n/a"
+            _q2_str = f"{_q2_raw*100:.1f}%" if _q2_raw is not None else "n/a"
             # Warn when a component drags EAS down
-            _pca_warn = " ⚠ PCA EV < 0" if (_pca_ev_raw is not None and _pca_ev_raw < 0) else ""
-            _loo_warn = " ⚠ RMSE > normalised flux scale" if (_loo_rmse_raw is not None and _loo_rmse_raw > 1.0) else ""
-            _gp_r2_warn = " ⚠ GP worse than mean predictor" if (_gp_r2_raw is not None and _gp_r2_raw < 0) else ""
+            _pca_warn = " \u26a0 PCA EV low \u2014 consider more components" if (_pca_ev_raw is not None and _pca_ev_raw < 0.95) else ""
+            _loo_warn = " \u26a0 RMSE > normalised flux scale" if (_loo_rmse_raw is not None and _loo_rmse_raw > 1.0) else ""
+            _q2_warn = " \u26a0 GP worse than mean predictor" if (_q2_raw is not None and _q2_raw < 0) else ""
             _t1_items.append(mo.md(
                 f'<div style="border:2px solid {_eas_color}; border-radius:8px; '
                 f'padding:12px 20px; display:inline-block; margin-bottom:8px;">'
@@ -256,11 +256,11 @@ def _(get_report, mo, np, plt):
                 f'<span style="font-size:2.4em; font-weight:bold; color:{_eas_color};">{_eas:.2f}%</span><br>'
                 f'<span style="font-size:0.85em; color:#aaa;">'
                 f'PCA explained variance: <b>{_pca_str}</b>{_pca_warn} &nbsp;|&nbsp; '
-                f'GP weight R\u00b2: <b>{_gp_r2_str}</b>{_gp_r2_warn} &nbsp;|&nbsp; '
+                f'Q\u00b2 aggregate: <b>{_q2_str}</b>{_q2_warn} &nbsp;|&nbsp; '
                 f'LOO flux RMSE (median): <b>{_loo_str}</b>{_loo_warn}</span><br>'
                 f'<span style="font-size:0.75em; color:#888;">'
                 f'EAS = clamp(PCA EV, 0\u20131) &times; max(0, 1 &minus; LOO RMSE) &times; 100 '
-                f'&mdash; PCA EV is fixed for a given grid; GP R\u00b2 and LOO RMSE depend on training</span>'
+                f'&mdash; PCA EV is fixed for a given grid; Q\u00b2 and LOO RMSE depend on training</span>'
                 f'</div>'
             ))
         else:
@@ -271,46 +271,287 @@ def _(get_report, mo, np, plt):
 
         # Keep the raw Tier 1 metrics visible even when EAS is present so the
         # user can see which component of the score is limiting performance.
+        _metric_info = {
+            "n_components": ("PCA Components", ""),
+            "n_grid_points": ("Grid Points", ""),
+            "n_params": ("Parameters", ""),
+            "tier1_time_s": ("Runtime (s)", ""),
+            "pca_explained_variance": ("PCA Explained Variance", "higher is better; \u22650.999 typical"),
+            "q2_aggregate": ("Aggregate Q\u00b2 (LOO R\u00b2)", "higher is better; \u22650.99 ideal"),
+            "nlpd_mean": ("Mean NLPD", "lower is better; compare across configs"),
+            "std_resid_mean": ("Std. Residual Mean", "\u22480 ideal; bias if far from 0"),
+            "std_resid_var": ("Std. Residual Variance", "\u22481 ideal; >1 \u2192 under-confident"),
+            "pca_recon_rmse_median": ("PCA RMSE (median)", "lower is better; PCA truncation floor"),
+            "pca_recon_rmse_95": ("PCA RMSE (95th pctl)", "lower is better; worst-case PCA error"),
+            "pca_max_fractional_resid": ("PCA Max Frac. Residual", "lower is better; worst PCA pixel error"),
+            "loo_flux_rmse_median": ("LOO Flux RMSE (median)", "lower is better; total emulator error"),
+            "loo_flux_rmse_95": ("LOO Flux RMSE (95th pctl)", "lower is better; worst-case emulator error"),
+            "max_fractional_resid": ("Max Frac. Residual", "lower is better; worst pixel error overall"),
+        }
         _summary_rows = []
-        for _key in ["n_components", "n_grid_points", "n_params", "tier1_time_s",
-                      "pca_explained_variance", "gp_weight_r2",
-                      "loo_flux_rmse_median",
-                      "loo_flux_rmse_95", "max_fractional_resid"]:
+        for _key in _metric_info:
             if _key in _t1:
+                _name, _notes = _metric_info[_key]
                 _val = _t1[_key]
-                if isinstance(_val, float):
-                    _summary_rows.append({"Metric": _key, "Value": f"{_val:.6g}"})
-                else:
-                    _summary_rows.append({"Metric": _key, "Value": str(_val)})
+                _formatted = f"{_val:.6g}" if isinstance(_val, float) else str(_val)
+                _summary_rows.append({"Name": _name, "Metric": _key, "Value": _formatted, "Notes": _notes})
 
         if _summary_rows:
             _t1_items.append(mo.ui.table(_summary_rows, label="Summary"))
 
-        # The left panel shows which PCA components are hardest for the GP to
-        # reconstruct, while the right panel checks whether residuals resemble a
-        # well-calibrated unit normal.
+        # --- LOO RMSE per component ---
         _rmses = _t1.get("loo_rmse_per_comp", [])
+        _q2s = _t1.get("q2_per_comp", [])
+        _nlpds = _t1.get("nlpd_per_comp", [])
+
         if _rmses:
-            _fig, _axes = plt.subplots(1, 2, figsize=(12, 4))
-            _axes[0].bar(range(len(_rmses)), _rmses, color="steelblue")
-            _axes[0].set_xlabel("PCA Component")
-            _axes[0].set_ylabel("Leave-One-Out RMSE")
-            _axes[0].set_title("Leave-One-Out RMSE by Component")
-
-            # Standardised residuals
-            _std_resid = _t1.get("loo_std_resid", [])
-            if _std_resid:
-                _flat = np.array(_std_resid).flatten()
-                _axes[1].hist(_flat, bins=50, density=True, alpha=0.7, color="steelblue", label="Leave-One-Out")
-                _xgauss = np.linspace(-4, 4, 200)
-                _axes[1].plot(_xgauss, 1.0/(np.sqrt(2*np.pi))*np.exp(-0.5*_xgauss**2), "r-", label="N(0,1)")
-                _axes[1].set_xlabel("Standardised Residual")
-                _axes[1].set_title("Leave-One-Out Residual Distribution")
-                _axes[1].legend()
-
+            _fig_rmse, _ax_rmse = plt.subplots(figsize=(7, 4))
+            _ax_rmse.bar(range(len(_rmses)), _rmses, color="steelblue")
+            _ax_rmse.set_xlabel("PCA Component")
+            _ax_rmse.set_ylabel("LOO RMSE")
+            _ax_rmse.set_title("Leave-One-Out RMSE")
             plt.tight_layout()
-            _t1_items.append(mo.as_html(_fig))
+            _rmse_info = mo.md(
+                "### LOO RMSE per Component\n\n"
+                "**What this shows:** The root-mean-square prediction error for each "
+                "PCA weight when that training point is left out of the GP fit.\n\n"
+                "**Better looks like:** Short bars across all components, with no single "
+                "component dominating the total error.\n\n"
+                "**Watch out for:** A sharp increase in RMSE for higher-order components — "
+                "the GP may struggle to model low-variance PCA modes.\n\n"
+                "**How to improve:** Add more training grid points, or reduce the number of "
+                "PCA components to drop poorly-modelled trailing components."
+            )
+            _t1_items.append(mo.accordion(
+                {"LOO RMSE per Component": mo.hstack([mo.as_html(_fig_rmse), _rmse_info], widths=[3, 1])}
+            ))
             plt.close()
+
+        # --- Q² per component ---
+        if _q2s:
+            _fig_q2, _ax_q2 = plt.subplots(figsize=(7, 4))
+            _colors = ["#2ecc71" if v >= 0.99 else "#f39c12" if v >= 0.9 else "#e74c3c" for v in _q2s]
+            _ax_q2.bar(range(len(_q2s)), _q2s, color=_colors)
+            _ax_q2.set_xlabel("PCA Component")
+            _ax_q2.set_ylabel("Q\u00b2")
+            _ax_q2.set_title("Per-Component Q\u00b2 (LOO R\u00b2)")
+            _ax_q2.axhline(1.0, color="grey", ls="--", lw=0.8)
+            plt.tight_layout()
+            _q2_info = mo.md(
+                "### Per-Component Q\u00b2\n\n"
+                "**What this shows:** The leave-one-out predictive R\u00b2 for each PCA "
+                "component. Bars are colour-coded: green (\u22650.99), amber (\u22650.9), "
+                "red (<0.9).\n\n"
+                "**Better looks like:** All bars green and close to 1.0.\n\n"
+                "**Watch out for:** Red or amber bars, especially on the leading "
+                "components which carry the most spectral variance.\n\n"
+                "**How to improve:** More training points generally raise Q\u00b2. "
+                "If only trailing components are red, consider reducing the PCA rank."
+            )
+            _t1_items.append(mo.accordion(
+                {"Per-Component Q\u00b2": mo.hstack([mo.as_html(_fig_q2), _q2_info], widths=[3, 1])}
+            ))
+            plt.close()
+
+        # --- NLPD per component ---
+        if _nlpds:
+            _fig_nlpd, _ax_nlpd = plt.subplots(figsize=(7, 4))
+            _ax_nlpd.bar(range(len(_nlpds)), _nlpds, color="darkorange")
+            _ax_nlpd.set_xlabel("PCA Component")
+            _ax_nlpd.set_ylabel("NLPD")
+            _ax_nlpd.set_title("LOO Neg. Log Predictive Density")
+            plt.tight_layout()
+            _nlpd_info = mo.md(
+                "### LOO Negative Log Predictive Density\n\n"
+                "**What this shows:** A proper scoring rule that penalises both inaccurate "
+                "predictions and miscalibrated uncertainties. Lower is better.\n\n"
+                "**Better looks like:** Low, roughly uniform bars across components.\n\n"
+                "**Watch out for:** Spikes on specific components — the GP is confidently "
+                "wrong there (high error + tight variance).\n\n"
+                "**How to improve:** NLPD spikes often respond to a different GP optimiser "
+                "or to adding training points near the problematic region of parameter space."
+            )
+            _t1_items.append(mo.accordion(
+                {"NLPD per Component": mo.hstack([mo.as_html(_fig_nlpd), _nlpd_info], widths=[3, 1])}
+            ))
+            plt.close()
+
+        # --- LOO residual distribution ---
+        _std_resid = _t1.get("loo_std_resid", [])
+        if _std_resid:
+            _flat = np.array(_std_resid).flatten()
+            _fig_hist, _ax_hist = plt.subplots(figsize=(7, 4))
+            _ax_hist.hist(_flat, bins=50, density=True, alpha=0.7, color="steelblue", label="Leave-One-Out")
+            _xgauss = np.linspace(-4, 4, 200)
+            _ax_hist.plot(_xgauss, 1.0/(np.sqrt(2*np.pi))*np.exp(-0.5*_xgauss**2), "r-", label="N(0,1)")
+            _ax_hist.set_xlabel("Standardised Residual")
+            _ax_hist.set_title("LOO Residual Distribution")
+            _ax_hist.legend()
+            plt.tight_layout()
+            _hist_info = mo.md(
+                "### Residual Distribution\n\n"
+                "**What this shows:** Histogram of standardised LOO residuals across all "
+                "components, overlaid with the expected N(0,1) Gaussian (red curve).\n\n"
+                "**Better looks like:** The histogram closely tracks the red curve — "
+                "symmetric, centred on zero, with the same width.\n\n"
+                "**Watch out for:** Heavy tails (the GP underestimates uncertainty), "
+                "a shifted centre (systematic bias), or a narrower/wider peak than N(0,1) "
+                "(over/under-confident variances).\n\n"
+                "**How to improve:** Bias \u2192 check for a bug in the mean function. "
+                "Heavy tails \u2192 add training points or try a different optimiser."
+            )
+            _t1_items.append(mo.accordion(
+                {"LOO Residual Distribution": mo.hstack([mo.as_html(_fig_hist), _hist_info], widths=[3, 1])}
+            ))
+            plt.close()
+
+        # --- Q-Q plot of standardised residuals ---
+        _std_resid = _t1.get("loo_std_resid", [])
+        if _std_resid:
+            from scipy import stats as _sp_stats
+            _flat = np.sort(np.array(_std_resid).flatten())
+            _n_pts = len(_flat)
+            _theoretical = _sp_stats.norm.ppf(
+                (np.arange(1, _n_pts + 1) - 0.5) / _n_pts
+            )
+            _fig_qq, _ax_qq = plt.subplots(figsize=(5, 5))
+            _ax_qq.scatter(_theoretical, _flat, s=1, alpha=0.4, color="steelblue")
+            _qq_lim = max(abs(_theoretical[0]), abs(_theoretical[-1]), abs(_flat[0]), abs(_flat[-1]))
+            _ax_qq.plot([-_qq_lim, _qq_lim], [-_qq_lim, _qq_lim], "r-", lw=1.0)
+            _ax_qq.set_xlabel("Theoretical Quantiles (N(0,1))")
+            _ax_qq.set_ylabel("Sample Quantiles")
+            _ax_qq.set_title("Q\u2013Q Plot of Standardised LOO Residuals")
+            _ax_qq.set_aspect("equal")
+            plt.tight_layout()
+            _qq_info = mo.md(
+                "### Q\u2013Q Plot\n\n"
+                "**What this shows:** Compares the quantiles of the standardised LOO residuals "
+                "against a standard normal distribution. If the GP uncertainty estimates are "
+                "well-calibrated the points should lie on the red diagonal.\n\n"
+                "**Better looks like:** All points hugging the 1:1 red line with minimal scatter.\n\n"
+                "**Watch out for:** An S-shape (heavy tails \u2014 under-confident or outlier-prone), "
+                "a banana curve (skew), or systematic departure from the diagonal.\n\n"
+                "**How to improve:** Heavy tails suggest the GP variance is too small for some "
+                "predictions \u2014 try adding training points or a different kernel/optimiser."
+            )
+            _t1_items.append(mo.accordion(
+                {"Q\u2013Q Plot": mo.hstack([mo.as_html(_fig_qq), _qq_info], widths=[2, 1])}
+            ))
+            plt.close()
+
+        # --- Per-wavelength RMSE envelope ---
+        _arrays = get_tier1_arrays() or {}
+        _pca_wl = _arrays.get("pca_per_wl_rmse")
+        _loo_wl = _arrays.get("loo_per_wl_rmse")
+        _wl = _arrays.get("wavelength")
+        if _pca_wl is not None and _wl is not None:
+            _fig_wl, _ax_wl = plt.subplots(figsize=(12, 4))
+            _ax_wl.plot(_wl, _pca_wl, label="PCA truncation only", color="#3498db", lw=1.0)
+            if _loo_wl is not None:
+                _ax_wl.plot(_wl, _loo_wl, label="LOO (PCA + GP)", color="#e74c3c", lw=1.0, alpha=0.8)
+            _ax_wl.set_xlabel("Wavelength (\u00c5)")
+            _ax_wl.set_ylabel("RMSE (normalised flux)")
+            _ax_wl.set_title("Per-Wavelength Reconstruction Error")
+            _ax_wl.legend()
+            _ax_wl.set_xlim(_wl[0], _wl[-1])
+            plt.tight_layout()
+            _wl_info = mo.md(
+                "### Per-Wavelength RMSE\n\n"
+                "**What this shows:** Reconstruction error at every wavelength bin. The blue "
+                "curve is the irreducible PCA truncation error; the red curve adds the GP "
+                "prediction error on top.\n\n"
+                "**Better looks like:** Both curves low and close together. The PCA curve "
+                "sets a floor that the GP cannot beat.\n\n"
+                "**Watch out for:** A large gap between the two curves (GP struggling); "
+                "localised spikes at specific wavelengths (e.g. strong spectral lines "
+                "that are hard to capture in few PCA components).\n\n"
+                "**How to improve:** High PCA error \u2192 increase the number of PCA components. "
+                "High GP error above the PCA floor \u2192 add more training grid points or "
+                "try a different optimiser."
+            )
+            _t1_items.append(mo.accordion(
+                {"Per-Wavelength RMSE Envelope": mo.hstack([mo.as_html(_fig_wl), _wl_info], widths=[3, 1])}
+            ))
+            plt.close()
+
+        # --- Worst-case spectra overlay ---
+        _orig = _arrays.get("original_flux")
+        _pca_rec = _arrays.get("pca_recon_flux")
+        _loo_rec = _arrays.get("loo_recon_flux")
+        if _orig is not None and _loo_rec is not None and _wl is not None:
+            _loo_rmse_arr = _t1.get("loo_flux_rmse", [])
+            if len(_loo_rmse_arr) > 0:
+                _sorted_idx = np.argsort(_loo_rmse_arr)
+                _worst_idx = _sorted_idx[-3:][::-1]
+                _fig_worst, _axes_worst = plt.subplots(len(_worst_idx), 1, figsize=(12, 3 * len(_worst_idx)), sharex=True)
+                if len(_worst_idx) == 1:
+                    _axes_worst = [_axes_worst]
+                for _wi, _idx in enumerate(_worst_idx):
+                    _ax = _axes_worst[_wi]
+                    _ax.plot(_wl, _orig[_idx], label="Original", color="#f1c40f", lw=0.8)
+                    if _pca_rec is not None:
+                        _ax.plot(_wl, _pca_rec[_idx], label="PCA recon", color="#3498db", lw=0.8, ls="--")
+                    _ax.plot(_wl, _loo_rec[_idx], label="LOO recon", color="#e74c3c", lw=0.8, ls="--")
+                    _ax.set_ylabel("Normalised Flux")
+                    _rmse_val = _loo_rmse_arr[_idx] if hasattr(_loo_rmse_arr, '__getitem__') else "?"
+                    _ax.set_title(f"Spectrum #{_idx} (LOO RMSE = {_rmse_val:.5f})")
+                    if _wi == 0:
+                        _ax.legend(fontsize=8)
+                _axes_worst[-1].set_xlabel("Wavelength (\u00c5)")
+                plt.tight_layout()
+                _worst_info = mo.md(
+                    "### Worst-Case Spectra\n\n"
+                    "**What this shows:** The three grid-point spectra with the largest "
+                    "LOO reconstruction error, overlaid with the PCA-only and full "
+                    "LOO reconstructions.\n\n"
+                    "**Better looks like:** Dashed reconstructions closely tracking the "
+                    "yellow original, with residuals invisible at this scale.\n\n"
+                    "**Watch out for:** Systematic offsets in the continuum, poor fits "
+                    "around strong absorption lines, or large discrepancies concentrated "
+                    "at the edges of the wavelength range.\n\n"
+                    "**How to improve:** Worst cases often sit at the edges of parameter "
+                    "space. Ensure the training grid has adequate coverage there. If the "
+                    "PCA reconstruction (blue) is already poor, more PCA components are needed."
+                )
+                _t1_items.append(mo.accordion(
+                    {"Worst-Case Spectra Overlay": mo.hstack([mo.as_html(_fig_worst), _worst_info], widths=[3, 1])}
+                ))
+                plt.close()
+
+                # --- Best-case spectra overlay ---
+                _best_idx = _sorted_idx[:3]
+                _fig_best, _axes_best = plt.subplots(len(_best_idx), 1, figsize=(12, 3 * len(_best_idx)), sharex=True)
+                if len(_best_idx) == 1:
+                    _axes_best = [_axes_best]
+                for _bi, _idx in enumerate(_best_idx):
+                    _ax = _axes_best[_bi]
+                    _ax.plot(_wl, _orig[_idx], label="Original", color="#f1c40f", lw=0.8)
+                    if _pca_rec is not None:
+                        _ax.plot(_wl, _pca_rec[_idx], label="PCA recon", color="#3498db", lw=0.8, ls="--")
+                    _ax.plot(_wl, _loo_rec[_idx], label="LOO recon", color="#e74c3c", lw=0.8, ls="--")
+                    _ax.set_ylabel("Normalised Flux")
+                    _rmse_val = _loo_rmse_arr[_idx] if hasattr(_loo_rmse_arr, '__getitem__') else "?"
+                    _ax.set_title(f"Spectrum #{_idx} (LOO RMSE = {_rmse_val:.5f})")
+                    if _bi == 0:
+                        _ax.legend(fontsize=8)
+                _axes_best[-1].set_xlabel("Wavelength (\u00c5)")
+                plt.tight_layout()
+                _best_info = mo.md(
+                    "### Best-Case Spectra\n\n"
+                    "**What this shows:** The three grid-point spectra with the smallest "
+                    "LOO reconstruction error. These represent the emulator at its best.\n\n"
+                    "**Better looks like:** All three reconstructions virtually "
+                    "indistinguishable from the original.\n\n"
+                    "**Watch out for:** Even in the best cases, check for systematic "
+                    "offsets at specific wavelengths \u2014 these hint at features the PCA "
+                    "basis cannot capture regardless of the GP fit.\n\n"
+                    "**How to improve:** If even the best cases show visible residuals, "
+                    "the PCA truncation is too aggressive \u2014 increase the number of components."
+                )
+                _t1_items.append(mo.accordion(
+                    {"Best-Case Spectra Overlay": mo.hstack([mo.as_html(_fig_best), _best_info], widths=[3, 1])}
+                ))
+                plt.close()
 
         _tabs["Tier 1"] = mo.vstack(_t1_items)
 
@@ -677,25 +918,27 @@ def _(get_comparison_reports, mo, np, plt):
             "eas": _t1.get("emulator_accuracy_score"),
             "loo_rmse": _t1.get("loo_flux_rmse_median"),
             "pca_ev": _t1.get("pca_explained_variance"),
-            "gp_r2": _t1.get("gp_weight_r2"),
+            "nlpd": _t1.get("nlpd_mean"),
+            "q2": _t1.get("q2_aggregate"),
         }
 
     if _t1_data:
         _rows = [
             {
                 "Report": _k,
-                "EAS (%)": f"{_v['eas']:.2f}" if _v["eas"] is not None else "—",
-                "LOO Flux RMSE (med)": f"{_v['loo_rmse']:.6g}" if _v["loo_rmse"] is not None else "—",
-                "PCA Expl. Var.": f"{_v['pca_ev']:.6g}" if _v["pca_ev"] is not None else "—",
-                "GP Weight R²": f"{_v['gp_r2']:.6g}" if _v["gp_r2"] is not None else "—",
+                "EAS (%)": f"{_v['eas']:.2f}" if _v["eas"] is not None else "\u2014",
+                "Q\u00b2": f"{_v['q2']:.6g}" if _v["q2"] is not None else "\u2014",
+                "NLPD": f"{_v['nlpd']:.4f}" if _v["nlpd"] is not None else "\u2014",
+                "LOO RMSE (med)": f"{_v['loo_rmse']:.6g}" if _v["loo_rmse"] is not None else "\u2014",
+                "PCA Expl. Var.": f"{_v['pca_ev']:.6g}" if _v["pca_ev"] is not None else "\u2014",
             }
             for _k, _v in _t1_data.items()
         ]
         _comp_items.append(mo.md("### Tier 1 Comparison"))
         _comp_items.append(mo.md(
-            "**EAS** = PCA explained variance × (1 − LOO flux RMSE) × 100. "
-            "PCA EV is fixed for a given grid setup; GP R² and LOO RMSE reflect training quality. "
-            "Higher is better; 100% is perfect."
+            "**Q\u00b2** (LOO R\u00b2) and **NLPD** (Neg. Log Predictive Density) are publishable metrics. "
+            "**EAS** is a convenience score: PCA EV \u00d7 (1 \u2212 LOO RMSE) \u00d7 100. "
+            "Lower NLPD is better; higher Q\u00b2 and EAS are better."
         ))
         _comp_items.append(mo.ui.table(_rows))
 
