@@ -29,6 +29,9 @@ cuml-cu12; sys_platform == 'linux'
 torch
 torchvision
 
+# Optional optimizers
+cma
+
 # Debugging and Profiling
 pyinstrument
 

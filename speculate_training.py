@@ -553,7 +553,7 @@ def _(mo):
     mo.md("### 4. Training Options")
 
     method = mo.ui.dropdown(
-        options=["Nelder-Mead"],
+        options=["Nelder-Mead", "L-BFGS-B", "CMA-ES"],
         value="Nelder-Mead",
         label="Optimization Method:"
     )
@@ -566,8 +566,13 @@ def _(mo):
     )
 
     per_component = mo.ui.checkbox(
-        value=False,
+        value=True,
         label="Per-Component Training (optimize each PCA component independently)"
+    )
+
+    refine_lambda_xi = mo.ui.checkbox(
+        value=False,
+        label="Refine λ_ξ after training (1-D bounded optimisation of truncation noise)"
     )
 
     kernel_selector = mo.ui.dropdown(
@@ -576,34 +581,54 @@ def _(mo):
         label="GP Kernel:"
     )
 
-    # λ_ξ (lambda_xi) is the Czekala et al. (2015) truncation noise matrix that
-    # inflates the effective measurement noise used during GP weight training.
-    # Bypassing it ("strict") minimises the GP loss on the raw PCA weights at
-    # the cost of losing formal flux-space equivalence.
     mo.vstack([
         method,
         max_iter,
-        kernel_selector,
-        mo.md(
-            "_**RBF** (C∞ smooth) is the classic choice. **Matérn-5/2** (C² smooth) "
-            "and **Matérn-3/2** (C¹ smooth) allow sharper transitions — useful if "
-            "spectral lines show 'ghosting' artefacts from over-smoothing._"
-        ),
-        strict_weight_fit,
-        mo.md(
-            "_When enabled, the GP is trained to fit the PCA weights directly "
-            "without the Czekala et al. (2015) truncation noise matrix. "
-            "This can produce tighter fits at the cost of losing the formal "
-            "flux-space equivalence._"
-        ),
-        per_component,
-        mo.md(
-            "_Per-component training runs a separate low-dimensional Nelder-Mead "
-            "optimization for each PCA component instead of one large joint "
-            "optimization. Requires block-diagonal mode._"
-        )
+        mo.hstack([
+            kernel_selector,
+            mo.accordion({
+                "ℹ️ Kernel info": mo.md(
+                    "**RBF** (C∞ smooth) is the classic choice. **Matérn-5/2** (C² smooth) "
+                    "and **Matérn-3/2** (C¹ smooth) allow sharper transitions — literature has" 
+                    "shown matern kernel tend to outperform other kernels, particularly if the"
+                    "weight space have non-smooth features that the RBF can't capture."
+                ),
+            }),
+        ], align="center", gap=0.5),
+        mo.hstack([
+            strict_weight_fit,
+            mo.accordion({
+                "ℹ️ Strict weight fit": mo.md(
+                    "When enabled, the GP is trained to fit the PCA weights directly "
+                    "without the Czekala et al. (2015) truncation noise matrix (λ_ξ). "
+                    "This can produce tighter fits at the cost of losing the formal "
+                    "flux-space equivalence."
+                ),
+            }),
+        ], align="center", gap=0.5),
+        mo.hstack([
+            per_component,
+            mo.accordion({
+                "ℹ️ Per-component training": mo.md(
+                    "When enabled, runs a separate low-dimensional optimisation for each PCA component "
+                    "instead of one large joint optimisation. Default is enabled as per "
+                    "component is a lower dimensional problem, making it easier for the optimizer"
+                    "to find minima and leads to faster training overall."
+                ),
+            }),
+        ], align="center", gap=0.5),
+        mo.hstack([
+            refine_lambda_xi,
+            mo.accordion({
+                "ℹ️ λ_ξ refinement": mo.md(
+                    "After per-component training, run a 1-D bounded optimisation to "
+                    "refine the shared λ_ξ (truncation noise) parameter. Only applies "
+                    "when strict weight fit is disabled (unticked)."
+                ),
+            }),
+        ], align="center", gap=0.5),
     ])
-    return kernel_selector, max_iter, method, per_component, strict_weight_fit
+    return kernel_selector, max_iter, method, per_component, refine_lambda_xi, strict_weight_fit
 
 
 @app.cell
@@ -807,6 +832,7 @@ def _(
     os,
     params,
     per_component,
+    refine_lambda_xi,
     scale_selector,
     sirocco_grids_path,
     strict_weight_fit,
@@ -869,6 +895,7 @@ def _(
         - **Max Iterations:** {max_iter.value}
         - **Strict Weight Fit:** {'Yes (λ_ξ penalty bypassed)' if strict_weight_fit.value else 'No (standard Czekala+2015)'}
         - **Per-Component Training:** {'Yes' if per_component.value else 'No'}
+        - **Refine λ_ξ:** {'Yes' if refine_lambda_xi.value else 'No'}
         - **GP Kernel:** {kernel_selector.value}
         - **Process Grid:** {'Auto (File not found, creating new)' if process_grid_auto else 'Auto (File found, loading existing)'}
         - **Grid File:** `{grid_file_name}.npz`
@@ -996,6 +1023,7 @@ def _(
     os,
     pd,
     per_component,
+    refine_lambda_xi,
     set_console_logs,
     set_loss_history,
     set_trained_emu,
@@ -1170,11 +1198,12 @@ def _(
 
                 # Train emulator with callback
                 # Note: disp=False preferred to avoid cluttered output interfering with graph
-                if method.value == "Nelder-Mead":
-                    # Use ftol for relative tolerance as discussed previously
-                    emu.train(method="Nelder-Mead", options=dict(maxiter=max_iter.value, disp=False), callback=training_callback)
-                else:
-                    emu.train_bfgs(options=dict(maxiter=max_iter.value, disp=False), callback=training_callback)
+                emu.train(
+                    optimizer=method.value.lower(),
+                    refine_lambda_xi=refine_lambda_xi.value,
+                    options=dict(maxiter=max_iter.value, disp=False),
+                    callback=training_callback,
+                )
 
                 print("--- Training Finished ---")
 

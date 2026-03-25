@@ -6,7 +6,7 @@ from typing import Sequence, Optional, Union, Tuple
 import numpy as np
 from scipy.interpolate import LinearNDInterpolator, RegularGridInterpolator
 from scipy.linalg import cho_factor, cho_solve
-from scipy.optimize import minimize
+from scipy.optimize import minimize, minimize_scalar
 
 # from pyinstrument import Profiler
 
@@ -377,6 +377,7 @@ class Emulator:
 
         self.dv = calculate_dv(wavelength)
         self.ncomps = eigenspectra.shape[0]
+        self.pca_explained_variance = None  # Set by from_grid(), persisted in save/load
 
         self.hyperparams = {}
         self.name = name
@@ -721,6 +722,10 @@ class Emulator:
         # Load loss history if available
         if "loss_history" in data:
             emulator.loss_history = list(data["loss_history"])
+
+        # Load true PCA explained variance if available
+        if "pca_explained_variance" in data:
+            emulator.pca_explained_variance = float(data["pca_explained_variance"])
             
         return emulator
 
@@ -765,6 +770,10 @@ class Emulator:
         # Save loss history if available (for plotting later)
         if hasattr(self, 'loss_history'):
             save_data["loss_history"] = self.loss_history
+
+        # Save true PCA explained variance if available
+        if self.pca_explained_variance is not None:
+            save_data["pca_explained_variance"] = self.pca_explained_variance
             
         np.savez_compressed(filename, **save_data)
         self.log.info("Saved file at {}".format(filename))
@@ -892,6 +901,7 @@ class Emulator:
             per_component=per_component,
             kernel=kernel,
         )
+        emulator.pca_explained_variance = float(exp_var)
         # profiler.stop()
         # profiler.print()
 
@@ -1816,15 +1826,21 @@ class Emulator:
         self.wl = trunc_wavelength
         self.eigenspectra = self.eigenspectra[:, ind]
 
-    def train(self, **opt_kwargs):
+    def train(self, optimizer="nelder-mead", refine_lambda_xi=False, **opt_kwargs):
         """
-        Trains the emulator's hyperparameters using gradient descent. This is a light wrapper around `scipy.optimize.minimize`. If you are experiencing problems optimizing the emulator, consider implementing your own training loop, using this function as a template.
+        Trains the emulator's hyperparameters.
 
         Parameters
         ----------
+        optimizer : str
+            Optimization method. One of ``"nelder-mead"`` (default),
+            ``"l-bfgs-b"``, or ``"cma-es"``.
+        refine_lambda_xi : bool
+            If True and ``strict_weight_fit`` is False, run a 1-D bounded
+            refinement of lambda_xi after per-component training.
         **opt_kwargs
-            Any arguments to pass to the optimizer. By default, `method='Nelder-Mead'`
-            and `maxiter=10000`. Use train_fast() for L-BFGS-B.
+            Any arguments to pass to the optimizer. By default,
+            ``method='Nelder-Mead'`` and ``maxiter=10000``.
 
         See Also
         --------
@@ -1832,10 +1848,25 @@ class Emulator:
 
         """
         import time
-        
+
+        optimizer = optimizer.lower()
+        valid_optimizers = {"nelder-mead", "l-bfgs-b", "cma-es"}
+        if optimizer not in valid_optimizers:
+            raise ValueError(
+                f"Unknown optimizer '{optimizer}'. Must be one of {valid_optimizers}"
+            )
+        if optimizer == "cma-es":
+            try:
+                import cma  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "CMA-ES optimizer requires the 'cma' package. "
+                    "Install it with: pip install cma"
+                )
+
         # Per-component training: optimize each PCA component independently
         if self.per_component and self.block_diagonal:
-            self._train_per_component(**opt_kwargs)
+            self._train_per_component(optimizer=optimizer, refine_lambda_xi=refine_lambda_xi, **opt_kwargs)
             return
         
         if PYTORCH_AVAILABLE and torch.cuda.is_available():
@@ -1869,7 +1900,7 @@ class Emulator:
         self._last_progress_time = time.time()
         
         training_mode_str = "memory-efficient" if self._memory_efficient_training else "standard"
-        print(f"Started training (Nelder-Mead, {training_mode_str})")
+        print(f"Started training ({optimizer.upper()}, {training_mode_str})")
         print(f"Optimizing {len(self.get_param_vector())} hyperparameters")
         
         # Calculate maximum allowed variance based on data variance
@@ -1881,14 +1912,16 @@ class Emulator:
         
         def nll(P, apply_penalty=True):
             if np.any(~np.isfinite(P)):
-                return np.inf
+                return 1e20
             self.set_param_vector(P)
             
-            # Check lengthscales
+            # Check lengthscales — return large finite penalty (not inf)
+            # so gradient-based optimizers can still compute useful gradients
             if np.any(self.lengthscales < 0.5 * self._grid_sep):
-                return np.inf
+                violation = np.sum(np.maximum(0, 0.5 * self._grid_sep - self.lengthscales))
+                return 1e15 + 1e6 * violation
                 
-            # Check variances (prevent runaway)
+            # Check variances (prevent runaway) — only for unbounded optimizers
             current_variances = self.variances
             if apply_penalty and np.any(current_variances > max_variances):
                  # Soft penalty instead of hard cutoff for better optimization behavior
@@ -1920,74 +1953,125 @@ class Emulator:
         initial_loss = nll(P0.copy())
         print(f"Initial loss: {initial_loss:.2f}")
 
-        default_kwargs = {"method": "Nelder-Mead", "options": {"maxiter": 10000, "disp": True}}
+        default_kwargs = {"options": {"maxiter": 10000, "disp": True}}
         default_kwargs.update(opt_kwargs)
-        
-        # Auto-scale fatol if using Nelder-Mead (simulated relative tolerance)
-        if default_kwargs["method"] == "Nelder-Mead":
+        total_max_iter = default_kwargs.get("options", {}).get("maxiter", 10000)
+
+        # ── Build log-space bounds for the full param vector ──
+        # Layout matches get_param_vector() / hyperparams dict order:
+        #   [(log_lambda_xi),]  <-- first, only when not strict_weight_fit
+        #   log_var:0, ..., log_var:K-1,
+        #   log_ls:0:0, ..., log_ls:K-1:d-1
+        d = self._grid_points_norm.shape[1]
+        K = self.ncomps
+        ls_floor = 0.5 * self._grid_sep      # (d,)
+        ls_ceil  = 5.0 * np.ones(d)
+
+        var_lo  = np.full(K, -30.0)
+        var_hi  = np.full(K, np.log(1e4))
+        ls_lo   = np.tile(np.log(ls_floor), K)
+        ls_hi   = np.tile(np.log(ls_ceil),  K)
+        if self.strict_weight_fit:
+            joint_lo = np.concatenate([var_lo, ls_lo])
+            joint_hi = np.concatenate([var_hi, ls_hi])
+        else:
+            joint_lo = np.concatenate([[-30.0], var_lo, ls_lo])
+            joint_hi = np.concatenate([[ 30.0], var_hi, ls_hi])
+
+        if optimizer == "nelder-mead":
+            # ── Nelder-Mead path (with burn-in + auto-scaled fatol) ──
+            default_kwargs["method"] = "Nelder-Mead"
             options = default_kwargs.get("options", {})
             if "fatol" not in options:
-                # Check for a user-provided relative tolerance 'ftol' or default to 1e-4
-                # This makes the convergence criteria independent of the absolute loss value
-                rel_tol = options.pop("ftol", 1e-6) 
-                
-                # Problem: Initial loss can be orders of magnitude larger than the working regime 
-                # (e.g., 1e10 vs 1e5), making calculated fatol too large and causing early stopping.
-                # Solution: Run a short "burn-in" optimization to find a realistic loss baseline.
-                max_iter_total = options.get("maxiter", 1000)
-                
-                # Burn-in must be large enough to initialize simplex (N+1 evals) and take steps
-                # 99 params -> 100 evals just to start. Safe buffer: 200 + 100 steps.
-                n_params = len(P0)
-                # Burn-in: Short run to initialize simplex and find non-penalized region
+                rel_tol = options.pop("ftol", 1e-6)
                 burn_in_iter = 50
-                
+                max_iter_total = options.get("maxiter", 1000)
+
                 if max_iter_total > (burn_in_iter * 2):
                     self.log.info(f"Running burn-in phase ({burn_in_iter} iters) to calibrate convergence tolerance...")
                     print(f"Burn-in phase: {burn_in_iter} iterations")
-                    
-                    # Run burn-in with bare settings (REMOVE tolerances to prevent early stop)
+
                     burn_in_options = options.copy()
                     burn_in_options["maxiter"] = burn_in_iter
                     burn_in_options.pop("xatol", None)
                     burn_in_options.pop("fatol", None)
-                    burn_in_options.pop("ftol", None) 
-                    
+                    burn_in_options.pop("ftol", None)
+
                     burn_in_kwargs = default_kwargs.copy()
                     burn_in_kwargs["options"] = burn_in_options
-                    
-                    # Run minimization
-                    # Disable penalty during burn-in to find valid function range
+
                     burn_in_soln = minimize(nll, P0, args=(False,), **burn_in_kwargs)
-                    
-                    # Update parameters for main run
                     P0 = burn_in_soln.x.copy()
                     current_loss = burn_in_soln.fun
-                    
+
                     print(f"Burn-in complete: Loss {initial_loss:.2e} -> {current_loss:.2e}")
-                    
-                    # Reset iteration count and history
                     self._iteration_count = 0
                     self.loss_history = []
-                    
-                    # Since burn-in was unpenalized, we trust its loss value for tolerance
-                    # even if it's high (though it should be ~3e5).
-                    # If P0 is still technically in penalty region, main run will handle it.
                     initial_loss = current_loss
-                    
-                    # Reduce remaining iterations? No, just let it run full amount to be safe.
-                    # options["maxiter"] = max_iter_total - burn_in_soln.nit
                     print(f"Main run max_iter: {options.get('maxiter')} (full allowance)")
 
-                # fatol = initial_loss * rel_tol
-                # Ensure fatol is at least 1e-8 to prevent issues if loss is near zero
                 calculated_fatol = max(1e-8, abs(initial_loss) * rel_tol)
                 options["fatol"] = calculated_fatol
                 print(f"Auto-scaled fatol: {calculated_fatol:.4f} (relative tolerance: {rel_tol})")
                 default_kwargs["options"] = options
-        
-        # Main run (with penalty enabled by default)
-        soln = minimize(nll, P0, args=(True,), **default_kwargs)
+
+            soln = minimize(nll, P0, args=(True,), **default_kwargs)
+
+        elif optimizer == "l-bfgs-b":
+            # ── L-BFGS-B with box constraints ──
+            # Box bounds enforce constraints directly, so skip the soft penalty
+            # (apply_penalty=False) to avoid early-return before loss computation.
+            bounds_list = list(zip(joint_lo, joint_hi))
+            callback = default_kwargs.pop("callback", None)
+            soln = minimize(
+                nll, P0, args=(False,),
+                method="L-BFGS-B",
+                bounds=bounds_list,
+                callback=callback,
+                options={
+                    "maxiter": total_max_iter,
+                    "ftol": 1e-15,
+                    "gtol": 1e-12,
+                    "eps": 1e-5,
+                    "disp": False,
+                },
+            )
+
+        elif optimizer == "cma-es":
+            # ── CMA-ES (derivative-free, population-based) ──
+            # Box bounds enforce constraints; skip soft penalty (apply_penalty=False).
+            # Use maxfevals (not maxiter/generations) so the user's max_iter
+            # maps to total function evaluations as expected.
+            import cma
+            sigma0 = 0.5
+            callback = default_kwargs.pop("callback", None)
+            cma_bounds = [joint_lo.tolist(), joint_hi.tolist()]
+            es = cma.CMAEvolutionStrategy(
+                P0.tolist(), sigma0,
+                {
+                    "bounds": cma_bounds,
+                    "maxfevals": total_max_iter,
+                    "verbose": -9,
+                    "tolfun": 1e-8,
+                },
+            )
+            best_x, best_f = P0.copy(), initial_loss
+            while not es.stop():
+                solutions = es.ask()
+                fits = [nll(np.array(s), False) for s in solutions]
+                es.tell(solutions, fits)
+                gen_best = min(fits)
+                if gen_best < best_f:
+                    best_f = gen_best
+                    best_x = np.array(solutions[fits.index(gen_best)])
+                if callback is not None:
+                    callback(best_x)
+            # Wrap into a scipy-like result for the downstream code
+            from types import SimpleNamespace
+            soln = SimpleNamespace(
+                x=best_x, fun=best_f, success=True,
+                message="CMA-ES terminated", nit=es.result.iterations,
+            )
         
         if self._gpu_training_mode:
             was_memory_efficient = self._memory_efficient_training
@@ -2050,7 +2134,7 @@ class Emulator:
         delattr(self, '_best_loss')
         delattr(self, '_last_progress_time')
 
-    def _train_per_component(self, **opt_kwargs):
+    def _train_per_component(self, optimizer="nelder-mead", refine_lambda_xi=False, **opt_kwargs):
         """Train each PCA component's GP independently.
 
         In block_diagonal mode the negative log-likelihood decomposes into
@@ -2059,10 +2143,35 @@ class Emulator:
         high-dimensional space), we run K separate low-dimensional
         optimizations (1 variance + d lengthscales each).
 
-        lambda_xi is frozen — it only appears as a scalar shift on the
-        diagonal and is shared across components.
+        Parameters
+        ----------
+        optimizer : str
+            One of ``"nelder-mead"`` (default), ``"l-bfgs-b"``, or
+            ``"cma-es"``.
+        refine_lambda_xi : bool
+            If True and ``strict_weight_fit`` is False, run a 1-D
+            bounded refinement of lambda_xi after all components.
+        **opt_kwargs
+            Forwarded to the underlying minimizer.  ``maxiter`` is read
+            from ``options`` dict and used as the per-component budget.
         """
         import time
+
+        optimizer = optimizer.lower()
+        valid_optimizers = {"nelder-mead", "l-bfgs-b", "cma-es"}
+        if optimizer not in valid_optimizers:
+            raise ValueError(
+                f"Unknown optimizer '{optimizer}'. Must be one of {valid_optimizers}"
+            )
+
+        if optimizer == "cma-es":
+            try:
+                import cma  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "CMA-ES optimizer requires the 'cma' package. "
+                    "Install it with: pip install cma"
+                )
 
         self.loss_history = []
         self._training_start_time = time.time()
@@ -2077,6 +2186,12 @@ class Emulator:
         ls_floor = 0.5 * self._grid_sep      # (d,) — minimum useful resolution
         ls_ceil  = 5.0 * np.ones(d)           # (d,) — beyond this the GP is ~constant
 
+        # Log-space bounds for bounded optimizers (L-BFGS-B, CMA-ES)
+        # variance (index 0): unbounded below, capped at log(1e4)
+        # lengthscales (indices 1..d): [log(ls_floor), log(ls_ceil)]
+        log_bounds_lower = np.concatenate([[-30.0], np.log(ls_floor)])
+        log_bounds_upper = np.concatenate([[np.log(1e4)], np.log(ls_ceil)])
+
         # Parse user options
         default_kwargs = {
             "method": "Nelder-Mead",
@@ -2084,11 +2199,10 @@ class Emulator:
         }
         default_kwargs.update(opt_kwargs)
         total_max_iter = default_kwargs.get("options", {}).get("maxiter", 10000)
-        # Each component gets the FULL iteration budget — 5D Nelder-Mead
-        # is cheap (~6 function evals per iteration vs 76 in the joint 75D case)
+        # Each component gets the FULL iteration budget
         per_comp_max_iter = total_max_iter
 
-        print(f"Per-component training: {self.ncomps} components × {1+d} params each")
+        print(f"Per-component training ({optimizer}): {self.ncomps} components × {1+d} params each")
         print(f"  Per-component max_iter: {per_comp_max_iter}")
         print(f"  Lengthscale bounds: floor={ls_floor}, ceil={ls_ceil}")
 
@@ -2226,34 +2340,72 @@ class Emulator:
 
                 return loss
 
-            # --- Burn-in for fatol calibration ---
-            # Short run to reach the working-regime loss, then calibrate fatol
-            # from that instead of the (often huge) initial loss.
-            # Same loss function throughout — no penalty switching.
-            burn_in_iter = 50
-            burn_in_opts = {"maxiter": burn_in_iter, "disp": False}
-            burn_soln = minimize(
-                nll_k, p0,
-                method="Nelder-Mead", options=burn_in_opts,
-                callback=callback,
-            )
-            p0 = burn_soln.x.copy()
-            baseline_loss = burn_soln.fun if np.isfinite(burn_soln.fun) else comp_best_loss
-            fatol = max(1e-8, abs(baseline_loss) * 1e-6)
+            # --- Optimizer dispatch per component ---
+            if optimizer == "nelder-mead":
+                # Burn-in for fatol calibration
+                burn_in_iter = 50
+                burn_in_opts = {"maxiter": burn_in_iter, "disp": False}
+                burn_soln = minimize(
+                    nll_k, p0,
+                    method="Nelder-Mead", options=burn_in_opts,
+                    callback=callback,
+                )
+                p0 = burn_soln.x.copy()
+                baseline_loss = burn_soln.fun if np.isfinite(burn_soln.fun) else comp_best_loss
+                fatol = max(1e-8, abs(baseline_loss) * 1e-6)
+                print(f"  Comp {k+1:2d}/{self.ncomps} | Burn-in done: loss {baseline_loss:.2f} → fatol={fatol:.2e}")
 
-            print(f"  Comp {k+1:2d}/{self.ncomps} | Burn-in done: loss {baseline_loss:.2f} → fatol={fatol:.2e}")
+                comp_opts = {
+                    "maxiter": per_comp_max_iter,
+                    "fatol": fatol,
+                    "disp": False,
+                }
+                soln = minimize(
+                    nll_k, p0,
+                    method="Nelder-Mead", options=comp_opts,
+                    callback=callback,
+                )
 
-            # --- Main optimisation for this component ---
-            comp_opts = {
-                "maxiter": per_comp_max_iter,
-                "fatol": fatol,
-                "disp": False,
-            }
-            soln = minimize(
-                nll_k, p0,
-                method="Nelder-Mead", options=comp_opts,
-                callback=callback,
-            )
+            elif optimizer == "l-bfgs-b":
+                # L-BFGS-B with box constraints in log-space
+                bounds_list = list(zip(log_bounds_lower, log_bounds_upper))
+                soln = minimize(
+                    nll_k, p0,
+                    method="L-BFGS-B",
+                    bounds=bounds_list,
+                    callback=callback,
+                    options={
+                        "maxiter": per_comp_max_iter,
+                        "ftol": 1e-15,
+                        "gtol": 1e-12,
+                        "eps": 1e-5,
+                        "disp": False,
+                    },
+                )
+
+            elif optimizer == "cma-es":
+                import cma
+                # CMA-ES: population-based evolutionary strategy
+                sigma0 = 0.5  # initial step size in log-space
+                cma_opts = {
+                    "bounds": [log_bounds_lower.tolist(), log_bounds_upper.tolist()],
+                    "maxfevals": per_comp_max_iter,
+                    "verbose": -9,  # suppress CMA-ES internal output
+                    "tolfun": 1e-8,
+                }
+                es = cma.CMAEvolutionStrategy(p0, sigma0, cma_opts)
+                while not es.stop():
+                    solutions = es.ask()
+                    fitnesses = [nll_k(x) for x in solutions]
+                    es.tell(solutions, fitnesses)
+                    if callback is not None:
+                        callback(None)
+                # Build a minimal result-like object for uniform handling
+                soln = type("CMAResult", (), {
+                    "x": es.result.xbest,
+                    "fun": es.result.fbest,
+                })()
+                print(f"  Comp {k+1:2d}/{self.ncomps} | CMA-ES: {es.result.evaluations} fevals, sigma={es.sigma:.4f}")
 
             # Restore best-ever parameters (soln.x is usually the best, but
             # this guards against Nelder-Mead returning a non-optimal final simplex vertex)
@@ -2268,6 +2420,78 @@ class Emulator:
                 f"Best loss: {comp_best_loss:.2f} | Time: {comp_elapsed:.1f}s | "
                 f"var={np.exp(best_P[0]):.4f} ls={np.exp(best_P[1:])}"
             )
+
+        # --- lambda_xi refinement (non-strict mode only) ---
+        # After per-component training, optimize the shared lambda_xi scalar
+        # via 1D bounded minimization over the total NLL across all components.
+        if refine_lambda_xi and not self.strict_weight_fit:
+            print("\nRefining λ_ξ (1D Brent optimization)...")
+            log_lam_init = np.log(self.lambda_xi)
+
+            def _total_nll_lambda(log_lam):
+                lam = np.exp(log_lam)
+                total = 0.0
+                for kk in range(self.ncomps):
+                    var_kk = np.exp(self.hyperparams[f"log_variance:{kk}"])
+                    ls_kk = np.array([np.exp(self.hyperparams[f"log_lengthscale:{kk}:{j}"]) for j in range(d)])
+                    jitter_kk = max(1e-5, 1e-6 * var_kk) if self.strict_weight_fit else 1e-5
+                    shift_kk = dots_inv_diag_val[kk] / lam + jitter_kk
+
+                    if use_gpu:
+                        var_t = torch.tensor(var_kk, device=device, dtype=TORCH_FLOAT64)
+                        ls_t = torch.from_numpy(ls_kk).to(device, TORCH_FLOAT64)
+                        X_sc = grid_gpu / ls_t
+                        dist_m = torch.cdist(X_sc, X_sc, p=2.0)
+                        _apply_kernel_gpu_inplace(dist_m, var_t, self.kernel)
+                        dist_m.diagonal().add_(shift_kk)
+                        try:
+                            Lm = torch.linalg.cholesky(dist_m)
+                        except torch.linalg.LinAlgError:
+                            return 1e30
+                        logdet = 2.0 * torch.sum(torch.log(Lm.diagonal())).item()
+                        z = torch.linalg.solve_triangular(Lm, w_hat_reshaped[kk].unsqueeze(-1), upper=False)
+                        solved = torch.linalg.solve_triangular(Lm.T, z, upper=True).squeeze(-1)
+                        sqmah = torch.dot(w_hat_reshaped[kk], solved).item()
+                        del dist_m, Lm, z, solved
+                    else:
+                        _kfunc = get_cpu_kernel_func(self.kernel)
+                        K = _kfunc(self._grid_points_norm, self._grid_points_norm, var_kk, ls_kk)
+                        K[np.diag_indices_from(K)] += shift_kk
+                        try:
+                            Lc, flag = cho_factor(K)
+                        except np.linalg.LinAlgError:
+                            return 1e30
+                        logdet = 2 * np.sum(np.log(Lc.diagonal()))
+                        solved = cho_solve((Lc, flag), w_hat_reshaped_np[kk])
+                        sqmah = np.dot(w_hat_reshaped_np[kk], solved)
+
+                    total += (logdet + sqmah) / 2.0
+                return total
+
+            # Precompute dots_inv_diag values for all components
+            if use_gpu:
+                if hasattr(self, "_dots_inv_diag_gpu") and self._dots_inv_diag_gpu is not None:
+                    dots_inv_diag_val = [self._dots_inv_diag_gpu[kk].item() for kk in range(self.ncomps)]
+                else:
+                    dots = self.eigenspectra @ self.eigenspectra.T
+                    dots_inv_diag_val = list(np.diag(np.linalg.inv(dots)))
+            else:
+                dots = self.eigenspectra @ self.eigenspectra.T
+                dots_inv_diag_val = list(np.diag(np.linalg.inv(dots)))
+
+            nll_before = _total_nll_lambda(log_lam_init)
+            lam_result = minimize_scalar(
+                _total_nll_lambda,
+                bounds=(log_lam_init - 5.0, log_lam_init + 5.0),
+                method="bounded",
+                options={"xatol": 1e-6},
+            )
+            nll_after = lam_result.fun
+            if nll_after < nll_before:
+                self.hyperparams["log_lambda_xi"] = lam_result.x
+                print(f"  λ_ξ: {np.exp(log_lam_init):.6f} → {np.exp(lam_result.x):.6f} | NLL: {nll_before:.2f} → {nll_after:.2f}")
+            else:
+                print(f"  λ_ξ refinement did not improve NLL ({nll_before:.2f} → {nll_after:.2f}), keeping original value.")
 
         # --- Post-training housekeeping ---
         # Check if V11 fits in memory; if so rebuild, otherwise leave for
@@ -2308,179 +2532,6 @@ class Emulator:
         delattr(self, "_best_loss")
         delattr(self, "_last_progress_time")
 
-    # def train_fast(self, **opt_kwargs):
-    #     """
-    #     Fast training using L-BFGS-B
-        
-    #     Parameters
-    #     ----------
-    #     **opt_kwargs
-    #         Any arguments to pass to the optimizer. By default, `method='L-BFGS-B'`
-    #         with tighter tolerances.
-    #     """
-    #     import time
-        
-    #     if PYTORCH_AVAILABLE and torch.cuda.is_available():
-    #         self._gpu_training_mode = True
-        
-    #     self._training_start_time = time.time()
-    #     self._iteration_count = 0
-    #     self._best_loss = np.inf
-    #     self._last_progress_time = time.time()
-        
-    #     print("Started training (L-BFGS-B)")
-    #     print(f"Optimizing {len(self.get_param_vector())} hyperparameters")
-        
-    #     def nll(P):
-    #         if np.any(~np.isfinite(P)):
-    #             return np.inf
-    #         self.set_param_vector(P)
-    #         if np.any(self.lengthscales < 2 * self._grid_sep):
-    #             return np.inf
-    #         loss = -self.log_likelihood()
-    #         self.log.debug(f"loss: {loss}")
-            
-    #         # Progress tracking
-    #         self._iteration_count += 1
-    #         current_time = time.time()
-            
-    #         # Update best loss
-    #         if loss < self._best_loss:
-    #             self._best_loss = loss
-            
-    #         # Show progress every 10 iterations or every 30 seconds
-    #         if (self._iteration_count % 10 == 0) or (current_time - self._last_progress_time > 30):
-    #             elapsed = current_time - self._training_start_time
-    #             print(f"  Iter {self._iteration_count:4d} | Loss: {loss:8.2f} | Best: {self._best_loss:8.2f} | Time: {elapsed:6.1f}s")
-    #             self._last_progress_time = current_time
-            
-    #         return loss
-
-    #     # Do the optimization
-    #     P0 = self.get_param_vector()
-    #     initial_loss = nll(P0.copy())
-    #     print(f"Initial loss: {initial_loss:.2f}")
-
-    #     default_kwargs = {
-    #         "method": "L-BFGS-B", 
-    #         "options": {
-    #             "maxiter": 2000,        # More iterations
-    #             "ftol": 1e-12,          # Tighter function tolerance  
-    #             "gtol": 1e-10,          # Tighter gradient tolerance
-    #             "eps": 1e-10,           # Smaller step for finite differences
-    #             "disp": True            # Show progress
-    #         }
-    #     }
-    #     default_kwargs.update(opt_kwargs)
-        
-    #     print(f"Starting L-BFGS-B optimization with {default_kwargs['options']['maxiter']} max iterations...")
-    #     soln = minimize(nll, P0, **default_kwargs)
-        
-    #     if self._gpu_training_mode:
-    #         self._gpu_training_mode = False
-    #         self.set_param_dict(self.get_param_dict())
-        
-    #     final_time = time.time()
-    #     total_elapsed = final_time - self._training_start_time
-    #     print(f"\nOptimization complete")
-    #     print(f"Total time: {total_elapsed:.1f}s | Iterations: {self._iteration_count} | Final loss: {self._best_loss:.2f}")
-
-    #     if not soln.success:
-    #         self.log.warning("Fast optimization did not succeed.")
-    #         self.log.info(soln.message)
-    #     else:
-    #         self.set_param_vector(soln.x)
-    #         self._trained = True
-    #         self.log.info("Finished fast optimization")
-    #         self.log.info(self)
-            
-    #     # Clean up progress tracking variables
-    #     delattr(self, '_training_start_time')
-    #     delattr(self, '_iteration_count')
-    #     delattr(self, '_best_loss')
-    #     delattr(self, '_last_progress_time')
-            
-    # def train_bfgs(self, **opt_kwargs):
-    #     """
-    #     Alternative training using BFGS
-        
-    #     Parameters
-    #     ----------
-    #     **opt_kwargs
-    #         Any arguments to pass to the optimizer. By default, `method='BFGS'`.
-    #     """
-    #     import time
-        
-    #     self._training_start_time = time.time()
-    #     self._iteration_count = 0
-    #     self._best_loss = np.inf
-    #     self._last_progress_time = time.time()
-        
-    #     print("Started training (BFGS)")
-    #     print(f"Optimizing {len(self.get_param_vector())} hyperparameters")
-        
-    #     def nll(P):
-    #         if np.any(~np.isfinite(P)):
-    #             return np.inf
-    #         self.set_param_vector(P)
-    #         if np.any(self.lengthscales < 2 * self._grid_sep):
-    #             return np.inf
-    #         loss = -self.log_likelihood()
-    #         self.log.debug(f"loss: {loss}")
-            
-    #         # Progress tracking
-    #         self._iteration_count += 1
-    #         current_time = time.time()
-            
-    #         # Update best loss
-    #         if loss < self._best_loss:
-    #             self._best_loss = loss
-            
-    #         # Show progress every 10 iterations or every 30 seconds
-    #         if (self._iteration_count % 10 == 0) or (current_time - self._last_progress_time > 30):
-    #             elapsed = current_time - self._training_start_time
-    #             print(f"  Iter {self._iteration_count:4d} | Loss: {loss:8.2f} | Best: {self._best_loss:8.2f} | Time: {elapsed:6.1f}s")
-    #             self._last_progress_time = current_time
-            
-    #         return loss
-
-    #     P0 = self.get_param_vector()
-    #     initial_loss = nll(P0.copy())
-    #     print(f"Initial loss: {initial_loss:.2f}")
-
-    #     default_kwargs = {
-    #         "method": "BFGS", 
-    #         "options": {
-    #             "maxiter": 2000,
-    #             "gtol": 1e-10,
-    #             "eps": 1e-10,
-    #             "disp": True
-    #         }
-    #     }
-    #     default_kwargs.update(opt_kwargs)
-        
-    #     soln = minimize(nll, P0, **default_kwargs)
-        
-    #     final_time = time.time()
-    #     total_elapsed = final_time - self._training_start_time
-    #     print(f"\nOptimization complete")
-    #     print(f"Total time: {total_elapsed:.1f}s | Iterations: {self._iteration_count} | Final loss: {self._best_loss:.2f}")
-
-    #     if not soln.success:
-    #         self.log.warning("BFGS optimization did not succeed.")
-    #         self.log.info(soln.message)
-    #     else:
-    #         self.set_param_vector(soln.x)
-    #         self._trained = True
-    #         self.log.info("Finished BFGS optimization")
-    #         self.log.info(self)
-            
-    #     # Clean up progress tracking variables
-    #     delattr(self, '_training_start_time')
-    #     delattr(self, '_iteration_count')
-    #     delattr(self, '_best_loss')
-    #     delattr(self, '_last_progress_time')
-            
     def train_original(self, **opt_kwargs):
         """Original training method using Nelder-Mead"""
         print("Started training (Nelder-Mead)")

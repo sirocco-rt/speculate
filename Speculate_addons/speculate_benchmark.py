@@ -127,23 +127,35 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     """
     t0 = time.time()
     results = emu.loo_cv(grid=grid_path)
-    results["pca_explained_variance"] = float(
+
+    # GP weight-space R²: measures how well the GP predicts PCA weights at
+    # held-out grid points via leave-one-out.  This depends on the trained GP
+    # (optimizer, kernel, hyperparameters) and DIFFERS from the true PCA
+    # explained variance which is a fixed property of the PCA decomposition.
+    results["gp_weight_r2"] = float(
         1.0 - np.sum(results["loo_mse_per_comp"])
         / np.sum(np.var(emu.weights, axis=0))
     )
+
+    # True PCA explained variance: fraction of flux variance captured by the
+    # PCA components.  This is a fixed property of the grid + n_components
+    # and does NOT depend on the GP training.
+    results["pca_explained_variance"] = (
+        float(emu.pca_explained_variance)
+        if emu.pca_explained_variance is not None
+        else None
+    )
+
     results["n_components"] = emu.ncomps
     results["n_grid_points"] = emu.grid_points.shape[0]
     results["n_params"] = emu.grid_points.shape[1]
     results["tier1_time_s"] = time.time() - t0
 
     # Emulator Accuracy Score (EAS): single 0–100% summary metric.
-    # Combines PCA explained variance (how well n_components capture the grid
-    # variance) with Leave-One-Out flux reconstruction accuracy (how well the GP
-    # interpolates unseen training points in flux space).  100% = perfect.
-    # Both components are clamped to [0, 1]: a negative pca_explained_variance
-    # (Leave-One-Out weight-MSE > weight variance — GP worse than mean) scores 0, not
-    # a negative EAS which would be misleading.
-    # Only computable when grid_path is provided (flux-space metrics present).
+    # Combines true PCA explained variance (how well n_components capture the
+    # grid variance — fixed for a given setup) with Leave-One-Out flux
+    # reconstruction accuracy (how well the GP interpolates unseen training
+    # points in flux space — depends on training).  100% = perfect.
     _pca_ev = results["pca_explained_variance"]
     _loo_rmse_med = results.get("loo_flux_rmse_median")
     if _loo_rmse_med is not None:
