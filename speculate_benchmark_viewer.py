@@ -241,11 +241,14 @@ def _(get_report, mo, np, plt):
             )
             _pca_ev_raw = _t1.get("pca_explained_variance")
             _loo_rmse_raw = _t1.get("loo_flux_rmse_median")
+            _gp_r2_raw = _t1.get("gp_weight_r2")
             _pca_str = f"{_pca_ev_raw*100:.1f}%" if _pca_ev_raw is not None else "n/a"
             _loo_str = f"{_loo_rmse_raw:.4f}" if _loo_rmse_raw is not None else "n/a"
+            _gp_r2_str = f"{_gp_r2_raw*100:.1f}%" if _gp_r2_raw is not None else "n/a"
             # Warn when a component drags EAS down
-            _pca_warn = " ⚠ GP worse than mean predictor" if (_pca_ev_raw is not None and _pca_ev_raw < 0) else ""
+            _pca_warn = " ⚠ PCA EV < 0" if (_pca_ev_raw is not None and _pca_ev_raw < 0) else ""
             _loo_warn = " ⚠ RMSE > normalised flux scale" if (_loo_rmse_raw is not None and _loo_rmse_raw > 1.0) else ""
+            _gp_r2_warn = " ⚠ GP worse than mean predictor" if (_gp_r2_raw is not None and _gp_r2_raw < 0) else ""
             _t1_items.append(mo.md(
                 f'<div style="border:2px solid {_eas_color}; border-radius:8px; '
                 f'padding:12px 20px; display:inline-block; margin-bottom:8px;">'
@@ -253,10 +256,11 @@ def _(get_report, mo, np, plt):
                 f'<span style="font-size:2.4em; font-weight:bold; color:{_eas_color};">{_eas:.2f}%</span><br>'
                 f'<span style="font-size:0.85em; color:#aaa;">'
                 f'PCA explained variance: <b>{_pca_str}</b>{_pca_warn} &nbsp;|&nbsp; '
-                f'Leave-One-Out flux RMSE (median): <b>{_loo_str}</b>{_loo_warn}</span><br>'
+                f'GP weight R\u00b2: <b>{_gp_r2_str}</b>{_gp_r2_warn} &nbsp;|&nbsp; '
+                f'LOO flux RMSE (median): <b>{_loo_str}</b>{_loo_warn}</span><br>'
                 f'<span style="font-size:0.75em; color:#888;">'
-                f'EAS = clamp(PCA EV, 0\u20131) &times; max(0, 1 &minus; Leave-One-Out RMSE) &times; 100 '
-                f'&mdash; 100% is perfect, both components must be high</span>'
+                f'EAS = clamp(PCA EV, 0\u20131) &times; max(0, 1 &minus; LOO RMSE) &times; 100 '
+                f'&mdash; PCA EV is fixed for a given grid; GP R\u00b2 and LOO RMSE depend on training</span>'
                 f'</div>'
             ))
         else:
@@ -269,7 +273,8 @@ def _(get_report, mo, np, plt):
         # user can see which component of the score is limiting performance.
         _summary_rows = []
         for _key in ["n_components", "n_grid_points", "n_params", "tier1_time_s",
-                      "pca_explained_variance", "loo_flux_rmse_median",
+                      "pca_explained_variance", "gp_weight_r2",
+                      "loo_flux_rmse_median",
                       "loo_flux_rmse_95", "max_fractional_resid"]:
             if _key in _t1:
                 _val = _t1[_key]
@@ -485,7 +490,7 @@ def _(get_tier1_arrays, mo):
     # Tier 1 run cached the reconstruction arrays in notebook state.
     spectrum_slider = mo.ui.slider(
         start=0, stop=_M - 1, value=0, step=1, show_value=True,
-        label="Grid point index",
+        label="Grid point index", full_width=True
     )
     recon_n_grid = _M
     recon_param_names = _pnames
@@ -672,6 +677,7 @@ def _(get_comparison_reports, mo, np, plt):
             "eas": _t1.get("emulator_accuracy_score"),
             "loo_rmse": _t1.get("loo_flux_rmse_median"),
             "pca_ev": _t1.get("pca_explained_variance"),
+            "gp_r2": _t1.get("gp_weight_r2"),
         }
 
     if _t1_data:
@@ -679,14 +685,16 @@ def _(get_comparison_reports, mo, np, plt):
             {
                 "Report": _k,
                 "EAS (%)": f"{_v['eas']:.2f}" if _v["eas"] is not None else "—",
-                "Leave-One-Out Flux RMSE (median)": f"{_v['loo_rmse']:.6g}" if _v["loo_rmse"] is not None else "—",
-                "PCA Explained Var.": f"{_v['pca_ev']:.6g}" if _v["pca_ev"] is not None else "—",
+                "LOO Flux RMSE (med)": f"{_v['loo_rmse']:.6g}" if _v["loo_rmse"] is not None else "—",
+                "PCA Expl. Var.": f"{_v['pca_ev']:.6g}" if _v["pca_ev"] is not None else "—",
+                "GP Weight R²": f"{_v['gp_r2']:.6g}" if _v["gp_r2"] is not None else "—",
             }
             for _k, _v in _t1_data.items()
         ]
         _comp_items.append(mo.md("### Tier 1 Comparison"))
         _comp_items.append(mo.md(
-            "**EAS** (Emulator Accuracy Score) = PCA explained variance × (1 − Leave-One-Out flux RMSE) × 100. "
+            "**EAS** = PCA explained variance × (1 − LOO flux RMSE) × 100. "
+            "PCA EV is fixed for a given grid setup; GP R² and LOO RMSE reflect training quality. "
             "Higher is better; 100% is perfect."
         ))
         _comp_items.append(mo.ui.table(_rows))
@@ -783,8 +791,12 @@ def _(emu_picker, glob, mo, os, re):
         # Extract the parameter-scale tag from the emulator filename so the
         # lookup lands on the matching processed grid NPZ.
         _after_emu = _emu_base.split("_emu_")[1]  # 1234_linear_55inc_850-...
-        # The inclination segment is the first reliable delimiter in these names.
+        # Try several delimiters in order of specificity:
+        #   1. Inclination segment:  _XXinc_
+        #   2. Wavelength range:     _NNNN-NNNNAA_  (always present)
         _tag_match = re.match(r"(.+?)_\d+inc_", _after_emu)
+        if not _tag_match:
+            _tag_match = re.match(r"(.+?)_\d+-\d+AA_", _after_emu)
         if _tag_match:
             _param_tag = _tag_match.group(1)
         else:
