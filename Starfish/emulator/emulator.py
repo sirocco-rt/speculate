@@ -419,14 +419,16 @@ class Emulator:
                 dots_inv_diag = torch.diagonal(dots_inv) # (n_comp,)
                 self._dots_inv_diag_gpu = dots_inv_diag # Store for training updates
                 
-                # Check if full V11 tensor would exceed GPU VRAM
+                # Check if full V11 tensor would fit in currently FREE GPU VRAM.
+                # Use free memory, not total, so other processes' allocations are respected.
                 v11_bytes = self.ncomps * M * M * 8  # float64
-                gpu_vram = torch.cuda.get_device_properties(0).total_memory
+                gpu_vram_free, gpu_vram_total = torch.cuda.mem_get_info(0)
                 # Need ~3× V11 for construction + kernel intermediates
-                if v11_bytes * 3 > gpu_vram:
+                if v11_bytes * 3 > gpu_vram_free:
                     # V11 won't fit — defer construction to memory-efficient training
-                    self.log.info(f"V11 ({v11_bytes / 1024**3:.1f} GB) exceeds GPU VRAM "
-                                  f"({gpu_vram / 1024**3:.1f} GB). Deferring V11 construction.")
+                    self.log.info(f"V11 ({v11_bytes / 1024**3:.1f} GB) exceeds free GPU VRAM "
+                                  f"({gpu_vram_free / 1024**3:.1f} GB free of {gpu_vram_total / 1024**3:.1f} GB). "
+                                  f"Deferring V11 construction.")
                     v11_gpu = None  # Will be built on-the-fly during training
                 else:
                     # V11 fits — build it now
@@ -448,6 +450,19 @@ class Emulator:
                     )
             else:
                 self.log.info("Using Full Dense Matrix (Standard)")
+                # Guard against OOM when other processes are using GPU memory.
+                v11_bytes = self.ncomps * M * M * 8  # float64 (dense is ncomps*M × ncomps*M)
+                gpu_vram_free, gpu_vram_total = torch.cuda.mem_get_info(0)
+                if v11_bytes * 3 > gpu_vram_free:
+                    self.log.warning(
+                        f"Full V11 ({v11_bytes / 1024**3:.1f} GB est.) exceeds free GPU VRAM "
+                        f"({gpu_vram_free / 1024**3:.1f} GB free of {gpu_vram_total / 1024**3:.1f} GB). "
+                        f"Falling back to CPU for V11 construction."
+                    )
+                    raise torch.cuda.OutOfMemoryError(
+                        f"Insufficient free GPU VRAM for full V11 "
+                        f"({v11_bytes / 1024**3:.1f} GB needed, {gpu_vram_free / 1024**3:.1f} GB free)."
+                    )
                 eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
                 iPhiPhi_gpu = torch.kron(dots_inv.contiguous(), eye_M.contiguous())
                 
@@ -1607,10 +1622,21 @@ class Emulator:
             pca_per_wl_rmse = np.sqrt(np.mean(pca_recon_err ** 2, axis=0))  # (P,)
             loo_per_wl_rmse = np.sqrt(np.mean(loo_flux_err ** 2, axis=0))    # (P,)
 
+            # c) LOO flux-space variance (propagate per-component GP
+            #    uncertainty through the PCA inverse transform).
+            #    flux_var[i, p] = sum_k  X[k,p]^2 * loo_var[k, i]
+            #    where X = eigenspectra * flux_std.  Each component is
+            #    independent so total variance is additive.
+            X2 = X ** 2                                     # (K, P)
+            loo_recon_var = loo_var.T @ X2                   # (M, P)
+
             results.update({
                 'original_flux': original,          # (M, P) normalised grid spectra
                 'pca_recon_flux': pca_recon,         # (M, P) PCA truncation recon
                 'loo_recon_flux': loo_recon,          # (M, P) LOO GP recon
+                'loo_recon_var': loo_recon_var,       # (M, P) LOO flux-space variance
+                'loo_mu': loo_mu,                    # (K, M) LOO predicted weights
+                'loo_var': loo_var,                   # (K, M) LOO predictive variances
                 'wavelength': self.wl,               # (P,)
                 'pca_recon_rmse': pca_recon_rmse,
                 'loo_flux_rmse': loo_flux_rmse,

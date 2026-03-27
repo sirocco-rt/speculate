@@ -428,11 +428,16 @@ def _(mo, n_components, params):
             estimated_total_bytes = v11_bytes * 3
             estimated_gb = estimated_total_bytes / (1024**3)
 
-            # Detect actual GPU VRAM
-            gpu_vram_gb = None
+            # Detect actual GPU VRAM — both total and currently free.
+            # Threshold decisions use free memory so other processes' allocations
+            # are accounted for (mirrors the fix in emulator.py __init__).
+            gpu_vram_total_gb = None
+            gpu_vram_free_gb = None
             try:
                 if torch.cuda.is_available():
-                    gpu_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                    gpu_vram_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                    free_bytes, _ = torch.cuda.mem_get_info(0)
+                    gpu_vram_free_gb = free_bytes / (1024**3)
             except Exception:
                 pass
 
@@ -441,41 +446,48 @@ def _(mo, n_components, params):
             v11_display = f"{v11_mb:.0f} MB" if v11_mb < 1024 else f"{v11_mb/1024:.1f} GB"
             total_display = f"{estimated_gb:.1f} GB"
 
-            if gpu_vram_gb is not None:
-                usage_pct = (estimated_gb / gpu_vram_gb) * 100
-                vram_info = f"GPU VRAM: **{gpu_vram_gb:.1f} GB** &nbsp;|&nbsp; Est. usage: **{total_display}** ({usage_pct:.0f}%)"
+            if gpu_vram_total_gb is not None and gpu_vram_free_gb is not None:
+                # All percentage comparisons are against free VRAM so the
+                # callout reflects what is actually available right now.
+                usage_pct = (estimated_gb / gpu_vram_free_gb) * 100
+                vram_info = (
+                    f"GPU VRAM: **{gpu_vram_total_gb:.1f} GB** total "
+                    f"&nbsp;|&nbsp; **{gpu_vram_free_gb:.1f} GB** free"
+                )
 
-                if estimated_gb > gpu_vram_gb:
+                if estimated_gb > gpu_vram_free_gb:
                     # Memory-efficient mode never materializes the full V11 tensor;
                     # it only needs a couple of MxM working blocks at a time.
                     efficient_bytes = 2 * total_points * total_points * elem_bytes
                     efficient_gb = efficient_bytes / (1024**3)
                     efficient_display = f"{efficient_gb:.1f} GB"
-                    
-                    if efficient_gb > gpu_vram_gb:
+                    efficient_pct = (efficient_gb / gpu_vram_free_gb) * 100
+
+                    if efficient_gb > gpu_vram_free_gb:
                         # Even a single block won't fit — truly too large
                         high_vram = mo.callout(
                             mo.md(f"🛑 **Grid too large for this GPU (~{total_points:,} grid points)**\n\n"
-                                  f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Standard mode: ~{total_display}\n\n"
+                                  f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Memory-efficient est. usage: **~{efficient_display}** ({efficient_pct:.0f}% of free)\n\n"
                                   f"{vram_info}\n\n"
-                                  f"Memory-efficient peak: ~{efficient_display} — even a single M×M block exceeds GPU VRAM. "
+                                  f"Memory-efficient peak for a single M×M block is too large for this GPU — "
                                   f"Reduce parameters."),
                             kind="alert"
                         )
                     else:
-                        # Memory-efficient mode can handle it
+                        # Memory-efficient mode can handle it — report its peak as
+                        # the effective usage, not the unachievable standard-mode value.
                         high_vram = mo.callout(
                             mo.md(f"⚠️ **Training will use memory-efficient mode (~{total_points:,} grid points)**\n\n"
-                                  f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Standard mode: ~{total_display}\n\n"
+                                  f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. usage: **~{efficient_display}** ({efficient_pct:.0f}% of free)\n\n"
                                   f"{vram_info}\n\n"
-                                  f"Memory-efficient peak: ~{efficient_display} — builds V11 blocks on-the-fly instead of storing the full tensor. "
-                                  f"Mathematically identical results, training may be slightly slower. Ensure high performance is used."),
+                                  f"Standard mode would require ~{total_display} — Memory-efficient mode builds V11 blocks on-the-fly instead of "
+                                  f"storing the full tensor. Mathematically identical results, training may be slightly slower. "),
                             kind="warn"
                         )
                 elif usage_pct > 70:
                     high_vram = mo.callout(
                         mo.md(f"⚠️ **Warning: High VRAM usage (~{total_points:,} grid points)**\n\n"
-                              f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Total estimated: ~{total_display}\n\n"
+                              f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. usage: **~{total_display}** ({usage_pct:.0f}% of free)\n\n"
                               f"{vram_info}\n\n"
                               f"Training should fit but memory will be tight. A high performance GPU is recommended."),
                         kind="warn"
@@ -483,7 +495,7 @@ def _(mo, n_components, params):
                 else:
                     high_vram = mo.callout(
                         mo.md(f"✅ **Estimated Grid Size: ~{total_points:,} grid points**\n\n"
-                              f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Total estimated: ~{total_display}\n\n"
+                              f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. usage: **~{total_display}** ({usage_pct:.0f}% of free)\n\n"
                               f"{vram_info}"),
                         kind="success"
                     )

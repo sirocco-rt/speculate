@@ -488,7 +488,7 @@ def _(Emulator, emulator_selector, mo):
             stop_computation = True
 
     if stop_computation:
-        mo.stop()
+        mo.stop(True)
     return (emu,)
 
 
