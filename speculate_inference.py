@@ -843,6 +843,235 @@ def _(mo):
 
 
 @app.cell
+def _(emu, mo, np):
+    # ── Nuisance Parameter Playground ──
+    # Interactive sliders for the four nuisance/inference parameters so the user
+    # can visually explore how they shift the emulated spectrum before committing
+    # to prior bounds.  Physical (grid) parameters are held at the midpoint of
+    # the emulator training range.
+
+    _playground_ui = mo.md("*Load an emulator and observation data to use the playground.*")
+
+    if emu is not None:
+        # Nuisance slider ranges (wider than the defaults to let users explore)
+        pg_av_slider = mo.ui.slider(
+            start=0.0, stop=5.0, value=0.0, step=0.01,
+            label="Av (Extinction)", show_value=True, full_width=True,
+        )
+        pg_logscale_slider = mo.ui.slider(
+            start=-35.0, stop=-10.0, value=-25.0, step=0.1,
+            label="log_scale (ln flux scaling)", show_value=True, full_width=True,
+        )
+        pg_logamp_slider = mo.ui.slider(
+            start=-70.0, stop=-40.0, value=-55.0, step=0.5,
+            label="log_amp (ln GP amplitude)", show_value=True, full_width=True,
+        )
+        pg_logls_slider = mo.ui.slider(
+            start=0.0, stop=15.0, value=4.5, step=0.1,
+            label="log_ls (ln GP length scale)", show_value=True, full_width=True,
+        )
+
+        # Midpoint physical parameters for preview
+        if hasattr(emu, 'min_params') and hasattr(emu, 'max_params'):
+            pg_mid_params = (np.array(emu.min_params) + np.array(emu.max_params)) / 2.0
+        else:
+            pg_mid_params = np.zeros(len(emu.param_names))
+
+        _playground_ui = mo.md("")
+    else:
+        pg_av_slider = None
+        pg_logscale_slider = None
+        pg_logamp_slider = None
+        pg_logls_slider = None
+        pg_mid_params = None
+
+    _playground_ui
+    return pg_av_slider, pg_logamp_slider, pg_logls_slider, pg_logscale_slider, pg_mid_params
+
+
+@app.cell
+def _(
+    alt,
+    emu,
+    mo,
+    np,
+    obs_data,
+    obs_flux_scale,
+    pd,
+    pg_av_slider,
+    pg_logamp_slider,
+    pg_logls_slider,
+    pg_logscale_slider,
+    pg_mid_params,
+    wl_range_slider,
+):
+    # ── Playground: Reactive Emulated vs Observed Spectrum Chart ──
+    # Generates the emulated spectrum at physical-parameter midpoints with
+    # the current nuisance-slider values, then overlays it with the
+    # observation inside an interactive Altair chart.
+
+    _playground_chart = None
+
+    if (emu is not None and obs_data is not None
+            and pg_av_slider is not None and pg_mid_params is not None):
+        try:
+            from Starfish.transforms import extinct, resample
+
+            _wl_min = wl_range_slider.value[0]
+            _wl_max = wl_range_slider.value[1]
+
+            # --- Emulated spectrum reconstruction ---
+            weights, cov = emu(pg_mid_params)
+            X = emu.eigenspectra * emu.flux_std
+            emu_flux = (weights @ X) + emu.flux_mean
+            emu_wl = np.array(emu.wl)
+
+            # Crop to wavelength range
+            _emu_mask = (emu_wl >= _wl_min) & (emu_wl <= _wl_max)
+            emu_wl_crop = emu_wl[_emu_mask]
+            emu_flux_crop = emu_flux[_emu_mask]
+
+            # Apply extinction (Av)
+            _av = pg_av_slider.value
+            if _av > 0:
+                emu_flux_crop = extinct(emu_wl_crop, emu_flux_crop, Av=_av)
+
+            # Apply flux scaling (log_scale -> natural log -> exp)
+            _log_scale = pg_logscale_slider.value
+            emu_flux_crop = emu_flux_crop * np.exp(_log_scale)
+
+            # GP uncertainty envelope (±1σ from GP amplitude)
+            _log_amp = pg_logamp_slider.value
+            _gp_sigma = np.sqrt(np.exp(_log_amp))
+            emu_upper = emu_flux_crop + _gp_sigma
+            emu_lower = emu_flux_crop - _gp_sigma
+
+            # --- Observation data ---
+            _obs_mask = (
+                (obs_data['wavelength'] >= _wl_min)
+                & (obs_data['wavelength'] <= _wl_max)
+            )
+            _obs_sub = obs_data[_obs_mask].copy()
+
+            # Apply the same flux transform to both spectra
+            _scale_label = obs_flux_scale.value
+            _obs_flux = np.array(_obs_sub['flux'])
+            if _scale_label == 'log':
+                _obs_flux = np.where(
+                    _obs_flux > 0,
+                    np.log10(_obs_flux),
+                    np.log10(np.abs(_obs_flux) + 1e-30),
+                )
+                emu_flux_crop = np.where(
+                    emu_flux_crop > 0,
+                    np.log10(emu_flux_crop),
+                    np.log10(np.abs(emu_flux_crop) + 1e-30),
+                )
+                emu_upper = np.where(emu_upper > 0, np.log10(emu_upper), np.log10(np.abs(emu_upper) + 1e-30))
+                emu_lower = np.where(emu_lower > 0, np.log10(emu_lower), np.log10(np.abs(emu_lower) + 1e-30))
+            elif _scale_label == 'scaled':
+                _obs_mean = np.mean(_obs_flux)
+                if _obs_mean != 0:
+                    _obs_flux = _obs_flux / _obs_mean
+                    emu_flux_crop = emu_flux_crop / _obs_mean
+                    emu_upper = emu_upper / _obs_mean
+                    emu_lower = emu_lower / _obs_mean
+
+            # --- Build Altair chart ---
+            _obs_df = pd.DataFrame({
+                'Wavelength': np.array(_obs_sub['wavelength']),
+                'Flux': _obs_flux,
+                'Type': 'Observation',
+            })
+            _emu_df = pd.DataFrame({
+                'Wavelength': emu_wl_crop,
+                'Flux': emu_flux_crop,
+                'Type': 'Emulated (midpoint)',
+            })
+            _band_df = pd.DataFrame({
+                'Wavelength': emu_wl_crop,
+                'Upper': emu_upper,
+                'Lower': emu_lower,
+            })
+
+            # Downsample for responsiveness
+            if len(_obs_df) > 5000:
+                _obs_df = _obs_df.iloc[::max(1, len(_obs_df) // 5000)]
+            if len(_emu_df) > 5000:
+                _emu_df = _emu_df.iloc[::max(1, len(_emu_df) // 5000)]
+                _band_df = _band_df.iloc[::max(1, len(_band_df) // 5000)]
+
+            _combined = pd.concat([_obs_df, _emu_df], ignore_index=True)
+
+            _y_title = f'Flux ({_scale_label})'
+            _y_format = '.1e' if _scale_label == 'linear' else '.2f'
+
+            _color_scale = alt.Scale(
+                domain=['Observation', 'Emulated (midpoint)'],
+                range=['cyan', 'orange'],
+            )
+
+            _lines = alt.Chart(_combined).mark_line(opacity=0.9).encode(
+                x=alt.X('Wavelength:Q', title='Wavelength (Å)'),
+                y=alt.Y('Flux:Q', title=_y_title, axis=alt.Axis(format=_y_format)),
+                color=alt.Color('Type:N', scale=_color_scale, legend=alt.Legend(title="Spectrum")),
+                tooltip=['Wavelength:Q', 'Flux:Q', 'Type:N'],
+            )
+
+            _band = alt.Chart(_band_df).mark_area(
+                opacity=0.15, color='orange',
+            ).encode(
+                x=alt.X('Wavelength:Q'),
+                y=alt.Y('Lower:Q'),
+                y2=alt.Y2('Upper:Q'),
+            )
+
+            _playground_chart = (_band + _lines).properties(
+                width="container",
+                height=400,
+                title=f"Playground: Emulated (midpoint params) vs Observation [{_scale_label}]",
+            ).interactive()
+
+        except Exception as _e:
+            _playground_chart = mo.callout(
+                mo.md(f"Playground error: {_e}"), kind="danger"
+            )
+
+    # Assemble everything inside the accordion: callout, sliders, then chart
+    if (pg_av_slider is not None and _playground_chart is not None):
+        _pg_content = mo.vstack([
+            mo.callout(mo.md(
+                "**Nuisance Parameter Playground - Find sensible prior settings**\n\n"
+                "Adjust the sliders below to see how nuisance parameters affect "
+                "the emulated spectrum compared to your observation. Physical grid "
+                "parameters are held at the midpoint of each parameter's range. The shape of the emulated"
+                " spectrum does not matter here. Instead, just focus on making the spectra look like they are at"
+                " a similar scale to each other and the uncertainty is reasonable.\n\n"
+                "- **Av** — Interstellar dust extinction (magnitudes). Reddens and dims the spectrum.\n"
+                "- **log_scale** — Natural log of the flux scaling factor. Shifts the spectrum up/down.\n"
+                "- **log_amp** — GP covariance amplitude (affects uncertainty envelope, not the mean spectrum).\n"
+                "- **log_ls** — GP covariance length scale (affects uncertainty smoothness, not the mean spectrum)."
+            ), kind="neutral"),
+            pg_av_slider,
+            pg_logscale_slider,
+            pg_logamp_slider,
+            pg_logls_slider,
+            _playground_chart,
+        ])
+    elif _playground_chart is not None:
+        _pg_content = _playground_chart
+    else:
+        _pg_content = mo.md(
+            "*Load an emulator and observation to see the playground chart.*"
+        )
+
+    mo.accordion({
+        "Nuisance Parameter Playground - Aid to find optimal prior settings": _pg_content
+    })
+    return
+
+
+@app.cell
 def _(emu, grid_indices, mo, param_map_db, re):
     # ── Stage 2: Prior & Parameter Setup ──
     # Build per-parameter UI widgets (fixed/free toggle, value, min, max) that
@@ -1971,23 +2200,24 @@ def _(
     mo,
     np,
     os,
-    time,
 ):
     _samples = get_mcmc_samples()
     _labels = get_mcmc_labels()
     _summary_df = get_mcmc_summary_df()
     _model = get_mle_model()
 
-    # Gate export behind a completed MCMC run so the buttons only appear when the
-    # notebook already has the posterior samples needed to write files.
+    # Widgets must be defined unconditionally so the downstream export cell never
+    # receives an undefined reference — mo.stop() would prevent their creation if
+    # they were placed after it.
+    export_pf_btn = mo.ui.run_button(label="📄 Export .pf Template", kind="success")
+    export_csv_btn = mo.ui.run_button(label="📊 Export Posterior CSV", kind="success")
+    export_dir_input = mo.ui.text(value="benchmark_results/exports", label="Output directory")
+
+    # Gate the display (not the widget creation) behind a completed MCMC run.
     mo.stop(
         _samples is None or _model is None,
         mo.callout(mo.md("Run MCMC first to enable export."), kind="neutral"),
     )
-
-    export_pf_btn = mo.ui.run_button(label="📄 Export .pf Template", kind="success")
-    export_csv_btn = mo.ui.run_button(label="📊 Export Posterior CSV", kind="success")
-    export_dir_input = mo.ui.text(value="benchmark_results/exports", label="Output directory")
 
     mo.vstack([
         mo.hstack([export_dir_input], gap=1),
@@ -2009,14 +2239,14 @@ def _(
     mo,
     np,
     os,
-    time,
 ):
+    import time as _time
     _samples = get_mcmc_samples()
     _labels = get_mcmc_labels()
     _summary_df = get_mcmc_summary_df()
     _model = get_mle_model()
     _out_dir = export_dir_input.value or "benchmark_results/exports"
-    _ts = time.strftime("%Y%m%d_%H%M%S")
+    _ts = _time.strftime("%Y%m%d_%H%M%S")
 
     _msg = ""
 
