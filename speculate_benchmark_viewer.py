@@ -113,12 +113,15 @@ def _(mo):
     get_tier1_arrays, set_tier1_arrays = mo.state(None)
     get_comparison_reports, set_comparison_reports = mo.state([])
     get_status_msg, set_status_msg = mo.state("")
+    get_emulator, set_emulator = mo.state(None)
     return (
         get_comparison_reports,
+        get_emulator,
         get_report,
         get_status_msg,
         get_tier1_arrays,
         set_comparison_reports,
+        set_emulator,
         set_report,
         set_status_msg,
         set_tier1_arrays,
@@ -252,7 +255,7 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
             _t1_items.append(mo.md(
                 f'<div style="border:2px solid {_eas_color}; border-radius:8px; '
                 f'padding:12px 20px; display:inline-block; margin-bottom:8px;">'
-                f'<span style="font-size:1.1em; color:#aaa;">Emulator Accuracy Score</span><br>'
+                f'<span style="font-size:1.1em; color:#aaa;">Emulator Accuracy Score (Napkin Math)</span><br>'
                 f'<span style="font-size:2.4em; font-weight:bold; color:{_eas_color};">{_eas:.2f}%</span><br>'
                 f'<span style="font-size:0.85em; color:#aaa;">'
                 f'PCA explained variance: <b>{_pca_str}</b>{_pca_warn} &nbsp;|&nbsp; '
@@ -479,8 +482,10 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
         _pca_rec = _arrays.get("pca_recon_flux")
         _loo_rec = _arrays.get("loo_recon_flux")
         if _orig is not None and _loo_rec is not None and _wl is not None:
-            _loo_rmse_arr = _t1.get("loo_flux_rmse", [])
-            if len(_loo_rmse_arr) > 0:
+            _loo_rmse_arr = _arrays.get("loo_flux_rmse")
+            if _loo_rmse_arr is None:
+                _loo_rmse_arr = _t1.get("loo_flux_rmse", [])
+            if hasattr(_loo_rmse_arr, '__len__') and len(_loo_rmse_arr) > 0:
                 _sorted_idx = np.argsort(_loo_rmse_arr)
                 _worst_idx = _sorted_idx[-3:][::-1]
                 _fig_worst, _axes_worst = plt.subplots(len(_worst_idx), 1, figsize=(12, 3 * len(_worst_idx)), sharex=True)
@@ -733,6 +738,9 @@ def _(get_tier1_arrays, mo):
         start=0, stop=_M - 1, value=0, step=1, show_value=True,
         label="Grid point index", full_width=True
     )
+    add_mean_switch = mo.ui.switch(
+        value=False, label="Add mean spectrum to individual components"
+    )
     recon_n_grid = _M
     recon_param_names = _pnames
 
@@ -742,7 +750,7 @@ def _(get_tier1_arrays, mo):
                "Overlay original grid spectrum, PCA reconstruction, and Leave-One-Out GP reconstruction."),
         spectrum_slider,
     ])
-    return recon_param_names, spectrum_slider
+    return add_mean_switch, recon_param_names, spectrum_slider
 
 
 @app.cell(hide_code=True)
@@ -794,16 +802,41 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
         range=[[0, 0], [6, 4], [4, 2]],
     )
 
-    _spec_chart = (
+    # LOO GP confidence band (±2σ) — propagated from per-component LOO
+    # predictive variance through the PCA inverse transform.
+    _loo_recon_var = _arrs.get("loo_recon_var")
+    _ci_chart = alt.LayerChart()
+    if _loo_recon_var is not None:
+        _sigma = np.sqrt(np.maximum(_loo_recon_var[_idx], 0.0))
+        _df_ci = pd.DataFrame({
+            "Wavelength": _wl,
+            "Lower (2σ)": _loo - 2 * _sigma,
+            "Upper (2σ)": _loo + 2 * _sigma,
+        })
+        _ci_chart = (
+            alt.Chart(_df_ci)
+            .mark_area(opacity=0.18, color="#54a24b")
+            .encode(
+                x=alt.X("Wavelength:Q"),
+                y=alt.Y("Lower (2σ):Q"),
+                y2=alt.Y2("Upper (2σ):Q"),
+            )
+        )
+
+    _spec_lines = (
         alt.Chart(_df_spec)
         .mark_line(strokeWidth=1.5, opacity=0.85)
         .encode(
-            x=alt.X("Wavelength:Q", title="Wavelength (AA)"),
+            x=alt.X("Wavelength:Q", title="Wavelength (Å)"),
             y=alt.Y("Flux:Q", title="Normalised Flux"),
             color=alt.Color("Series:N", scale=_color_scale, legend=alt.Legend(title="Series")),
             strokeDash=alt.StrokeDash("Series:N", scale=_dash_scale, legend=None),
             tooltip=["Wavelength:Q", "Flux:Q", "Series:N"],
         )
+    )
+
+    _spec_chart = (
+        (_ci_chart + _spec_lines)
         .properties(width="container", height=350, title=f"Spectrum #{_idx}")
         .interactive()
     )
@@ -833,7 +866,7 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
         alt.Chart(_df_resid)
         .mark_line(strokeWidth=1, opacity=0.7)
         .encode(
-            x=alt.X("Wavelength:Q", title="Wavelength (AA)"),
+            x=alt.X("Wavelength:Q", title="Wavelength (Å)"),
             y=alt.Y("Residual:Q", title="Residual (Original - Recon)"),
             color=alt.Color("Series:N", scale=_resid_color, legend=alt.Legend(title="")),
             tooltip=["Wavelength:Q", "Residual:Q", "Series:N"],
@@ -852,7 +885,6 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
     ])
     display
     return
-
 
 @app.cell(hide_code=True)
 def _(get_tier1_arrays, mo, np):
@@ -896,6 +928,188 @@ def _(get_tier1_arrays, mo, np):
         mo.ui.table(_rows, label="All spectra", page_size=15),
     ])
     return
+
+@app.cell(hide_code=True)
+def _(add_mean_switch, get_emulator, get_tier1_arrays, mo, np, pd, plt, spectrum_slider):
+    # ── Cumulative PCA Component Reconstruction Diagnostic ──
+    # Builds up the spectrum component-by-component to reveal exactly which
+    # eigenspectrum introduces "ghosting" artifacts in the LOO GP reconstruction.
+    _emu = get_emulator()
+    _arrs = get_tier1_arrays()
+    if _emu is None or _arrs is None:
+        mo.stop(True)
+
+    _loo_mu = _arrs.get("loo_mu")     # (K, M)
+    _loo_var = _arrs.get("loo_var")    # (K, M)
+    if _loo_mu is None or _loo_var is None:
+        mo.stop(True)
+
+    _idx = spectrum_slider.value
+    _wl = _arrs["wavelength"]
+    _orig = _arrs["original_flux"][_idx]
+    _ncomps = _emu.ncomps
+    _X = _emu.eigenspectra * _emu.flux_std         # (K, P)
+    _w_true = _emu.weights[_idx]                   # (K,)  PCA true weights
+    _w_loo = _loo_mu[:, _idx]                      # (K,)  LOO predicted weights
+    _flux_mean = _emu.flux_mean                    # (P,)
+
+    # ── Per-component weight error table ──
+    _delta_w = _w_loo - _w_true
+    _loo_sigma = np.sqrt(np.maximum(_loo_var[:, _idx], 0.0))
+    _df_table = pd.DataFrame({
+        "Component": list(range(_ncomps)),
+        "w_true": [f"{v:.4e}" for v in _w_true],
+        "w_LOO": [f"{v:.4e}" for v in _w_loo],
+        "|Δw|": [f"{abs(v):.4e}" for v in _delta_w],
+        "LOO σ": [f"{v:.4e}" for v in _loo_sigma],
+        "|Δw|/σ": [f"{abs(d)/max(s, 1e-30):.2f}" for d, s in zip(_delta_w, _loo_sigma)],
+    })
+
+    # ── Matplotlib multi-subplot: cumulative reconstruction ──
+    _ncols = min(3, _ncomps)
+    _nrows = int(np.ceil(_ncomps / _ncols))
+    _fig, _axes = plt.subplots(
+        _nrows, _ncols,
+        figsize=(6 * _ncols, 4 * _nrows),
+        sharex=True, sharey=True,
+        squeeze=False,
+    )
+    _fig.patch.set_facecolor("black")
+
+    for _j in range(_ncomps):
+        _ax = _axes[_j // _ncols][_j % _ncols]
+        _ax.set_facecolor("black")
+
+        # Cumulative reconstruction: sum of components 0..j
+        _pca_cum = _w_true[:_j + 1] @ _X[:_j + 1] + _flux_mean
+        _loo_cum = _w_loo[:_j + 1] @ _X[:_j + 1] + _flux_mean
+
+        _ax.plot(_wl, _orig, color="#f0c75e", lw=0.8, alpha=0.7, label="Original")
+        _ax.plot(_wl, _pca_cum, color="#4c78a8", lw=0.9, ls="--", alpha=0.9, label="PCA cumul.")
+        _ax.plot(_wl, _loo_cum, color="#e74c3c", lw=0.9, ls="--", alpha=0.9, label="LOO cumul.")
+
+        _dw = _delta_w[_j]
+        _ax.set_title(
+            f"0–{_j}  |  Δw$_{_j}$ = {_dw:+.3e}",
+            fontsize=8, color="white",
+        )
+        _ax.tick_params(colors="white", labelsize=7)
+        for _spine in _ax.spines.values():
+            _spine.set_color("white")
+
+    # Turn off unused subplots
+    for _k in range(_ncomps, _nrows * _ncols):
+        _axes[_k // _ncols][_k % _ncols].set_visible(False)
+
+    # Legend + labels only on first subplot
+    _axes[0][0].legend(fontsize=7, loc="upper right",
+                       facecolor="black", edgecolor="white",
+                       labelcolor="white")
+    _fig.supxlabel("Wavelength (Å)", color="white", fontsize=9)
+    _fig.supylabel("Normalised Flux", color="white", fontsize=9)
+    _fig.suptitle(
+        f"Cumulative PCA Component Reconstruction — Spectrum #{_idx}",
+        color="white", fontsize=11, y=1.01,
+    )
+    _fig.tight_layout()
+
+    # ── Matplotlib multi-subplot: individual component contribution ──
+    # Each subplot shows only component j's contribution (w_j * X_j),
+    # optionally offset by the mean spectrum, isolating each eigenspectrum's effect.
+    _add_mean = add_mean_switch.value
+    _offset = _flux_mean if _add_mean else np.zeros_like(_flux_mean)
+
+    _fig2, _axes2 = plt.subplots(
+        _nrows, _ncols,
+        figsize=(5 * _ncols, 2.8 * _nrows),
+        sharex=True,
+        squeeze=False,
+    )
+    _fig2.patch.set_facecolor("black")
+
+    for _j in range(_ncomps):
+        _ax2 = _axes2[_j // _ncols][_j % _ncols]
+        _ax2.set_facecolor("black")
+
+        # Individual component: w_j * X_j (+ mean if toggled on)
+        _pca_ind = _w_true[_j] * _X[_j] + _offset
+        _loo_ind = _w_loo[_j] * _X[_j] + _offset
+
+        if _add_mean:
+            _ax2.plot(_wl, _orig, color="#f0c75e", lw=0.8, alpha=0.7, label="Original")
+        _ax2.plot(_wl, _pca_ind, color="#4c78a8", lw=0.9, ls="--", alpha=0.9, label="PCA")
+        _ax2.plot(_wl, _loo_ind, color="#e74c3c", lw=0.9, ls="--", alpha=0.9, label="LOO")
+
+        _dw = _delta_w[_j]
+        _ax2.set_title(
+            f"Comp {_j}  |  Δw$_{_j}$ = {_dw:+.3e}",
+            fontsize=8, color="white",
+        )
+        _ax2.tick_params(colors="white", labelsize=7)
+        for _spine in _ax2.spines.values():
+            _spine.set_color("white")
+
+    for _k in range(_ncomps, _nrows * _ncols):
+        _axes2[_k // _ncols][_k % _ncols].set_visible(False)
+
+    _axes2[0][0].legend(fontsize=7, loc="upper right",
+                        facecolor="black", edgecolor="white",
+                        labelcolor="white")
+    _fig2.supxlabel("Wavelength (Å)", color="white", fontsize=9)
+    _fig2.supylabel("Normalised Flux", color="white", fontsize=9)
+    _fig2.suptitle(
+        f"Individual PCA Component Contribution — Spectrum #{_idx}",
+        color="white", fontsize=11, y=1.01,
+    )
+    _fig2.tight_layout()
+
+    # ── Accordion summaries ──
+    _table_info = mo.md(
+        "### Per-Component Weight Table\n\n"
+        "**What this shows:** For the selected spectrum, compares the true PCA "
+        "weights against the LOO GP-predicted weights for each component. "
+        "The |Δw|/σ column measures deviation in units of the GP's own "
+        "uncertainty — values > 2 indicate the GP is confidently wrong.\n\n"
+        "**Watch out for:** Large |Δw|/σ on a specific component — that "
+        "component's eigenspectrum likely drives any visible ghosting artifact."
+    )
+    _cum_info = mo.md(
+        "### Cumulative Component Reconstruction\n\n"
+        "**What this shows:** Builds the reconstructed spectrum one PCA "
+        "component at a time (0, 0–1, 0–2, …). The yellow line is the original "
+        "spectrum; blue dashed is the PCA reconstruction using true weights; red "
+        "dashed is the LOO GP reconstruction.\n\n"
+        "**Better looks like:** Blue and red lines converging onto yellow with "
+        "each added component, with no sudden divergence.\n\n"
+        "**Watch out for:** A subplot where the red line suddenly deviates from "
+        "blue — that component is where the GP weight error enters the spectrum."
+    )
+    _ind_info = mo.md(
+        "### Individual Component Contribution\n\n"
+        "**What this shows:** Each subplot isolates a single eigenspectrum's "
+        "contribution: $w_j \\times X_j$. Blue = PCA (true weight), Red = LOO "
+        "(GP prediction). Toggle the switch above to add the mean spectrum as "
+        "an offset for context.\n\n"
+        "**Better looks like:** Blue and red overlapping closely in every subplot.\n\n"
+        "**Watch out for:** A subplot where blue and red diverge sharply — that "
+        "eigenspectrum encodes the spectral feature the GP is failing to predict."
+    )
+
+    _table_panel = mo.vstack([
+        mo.md("##### Per-Component Weight Comparison"),
+        mo.ui.table(_df_table, selection=None, page_size=_ncomps),
+    ])
+    _ind_panel = mo.vstack([
+        add_mean_switch,
+        mo.hstack([_fig2, _ind_info], widths=[3, 1]),
+    ])
+    mo.accordion({
+        "Per-Component Weight Table": mo.hstack([_table_panel, _table_info], widths=[3, 1]),
+        "Cumulative Component Reconstruction": mo.hstack([_fig, _cum_info], widths=[3, 1]),
+        "Individual Component Contribution": _ind_panel,
+    })
+    return
+
 
 
 @app.cell(hide_code=True)
@@ -1116,6 +1330,7 @@ def _(
     obs_picker,
     os,
     run_btn,
+    set_emulator,
     set_report,
     set_status_msg,
     set_tier1_arrays,
@@ -1164,6 +1379,11 @@ def _(
             remove_on_exit=True,
         ):
             _emu = _Emulator.load(_emu_path)
+
+        # Persist the emulator in reactive state so downstream diagnostic
+        # cells (e.g. cumulative component analysis) can access eigenspectra,
+        # weights, flux scaling, etc. without reloading from disk.
+        set_emulator(_emu)
 
         # The picker stores numeric tier ids; keep the selected run isolated to
         # this execution so later reactive reruns do not reuse stale results.

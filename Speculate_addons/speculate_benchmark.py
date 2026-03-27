@@ -177,6 +177,8 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     _ARRAY_KEYS = {
         "original_flux", "pca_recon_flux", "loo_recon_flux", "wavelength",
         "pca_per_wl_rmse", "loo_per_wl_rmse",
+        "loo_flux_rmse", "pca_recon_rmse",
+        "loo_recon_var", "loo_mu", "loo_var",
     }
     arrays = {}
     for k in _ARRAY_KEYS:
