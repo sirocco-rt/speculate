@@ -73,7 +73,7 @@ def _(mo):
     # Static sidebar - always shows all options
     mo.sidebar(
         mo.vstack([
-            mo.md("# 🔭 Speculate"),
+            mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
             mo.md(" "),
             mo.md(" "),
             mo.md("---"),
@@ -110,15 +110,15 @@ def _(mo):
         gpu_name = torch.cuda.get_device_name(0)
         try:
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            gpu_text = f"**🟢 GPU Active:** {gpu_name} ({vram_gb:.1f} GB VRAM)"
+            gpu_text = f"**{mo.icon('lucide:cpu')} GPU Active:** {gpu_name} ({vram_gb:.1f} GB VRAM)"
         except:
-            gpu_text = f"**🟢 GPU Active:** {gpu_name}"
+            gpu_text = f"**{mo.icon('lucide:cpu')} GPU Active:** {gpu_name}"
 
         status_widget = mo.callout(mo.md(gpu_text), kind="success")
 
     else:
         status_widget = mo.callout(
-            mo.md("## 🟠 No NVIDIA GPU Detected\n*Performance will be slower on CPU.*"), 
+            mo.md(f"## {mo.icon('lucide:cpu')} No NVIDIA GPU Detected\n*Performance will be slower on CPU.*"), 
             kind="warn"
         )
 
@@ -284,7 +284,7 @@ def _(grid_selector, mo, os, param_map_db, re):
         _param_lookup_info.append("No parameters detected from filenames.")
 
     param_info_accordion = mo.accordion({
-        "🔑 Parameter Key": mo.md("\n".join([f"- {s}" for s in _param_lookup_info]))
+        f"{mo.icon('lucide:key-round')} Parameter Key": mo.md("\n".join([f"- {s}" for s in _param_lookup_info]))
     })
     return emulator_selector, grid_indices, param_info_accordion
 
@@ -300,8 +300,8 @@ def _(mo):
 
     # Source Type Selector: Observation vs Test Grid
     data_source_selector = mo.ui.dropdown(
-        options=["📁 Observation File", "🧪 Test Grid (Validation)"],
-        value="📁 Observation File",
+        options=["Observation File", "Test Grid (Validation)"],
+        value="Observation File",
         label="Data Source:",
         full_width=True
     )
@@ -346,9 +346,9 @@ def _(mo, obs_file_uploader, os, set_obs_refresh):
             # Force refresh of the file list
             set_obs_refresh(lambda v: v + 1)
 
-            mo.status.toast(f"✅ Uploaded {uploaded_file.name}")
+            mo.status.toast(f"{mo.icon('lucide:check-circle')} Uploaded {uploaded_file.name}")
         except Exception as e:
-             mo.status.toast(f"❌ Upload failed: {str(e)}")
+             mo.status.toast(f"{mo.icon('lucide:x-circle')} Upload failed: {str(e)}")
     return
 
 
@@ -444,12 +444,12 @@ def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
                 if os.path.exists(file_path):
                     os.remove(file_path)
                     set_obs_refresh(lambda v: v + 1)
-                    mo.status.toast(f"🗑️ Deleted {obs_file_selector.value}")
+                    mo.status.toast(f"{mo.icon('lucide:trash-2')} Deleted {obs_file_selector.value}")
             except Exception as e:
                 mo.status.toast(f"Error deleting file: {e}")
 
     delete_obs_btn = mo.ui.button(
-        label="🗑️",
+        label=f"{mo.icon('lucide:trash-2')}",
         kind="danger",
         tooltip="Delete selected file",
         on_click=lambda _: delete_selected_file()
@@ -484,7 +484,7 @@ def _(Emulator, emulator_selector, mo):
                 emu_path = f"Grid-Emulator_Files/{emulator_selector.value}"
                 emu = Emulator.load(emu_path)
         except Exception as e:
-            mo.output.replace(mo.callout(mo.md(f"❌ Error loading emulator: {e}"), kind="danger"))
+            mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Error loading emulator: {e}"), kind="danger"))
             stop_computation = True
 
     if stop_computation:
@@ -572,7 +572,7 @@ def _(
             data_source_info = f"Test Grid: {test_run_selector.value} @ {inc_val}°"
 
         except Exception as e:
-            mo.output.replace(mo.callout(mo.md(f"❌ Error loading test grid: {e}"), kind="danger"))
+            mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Error loading test grid: {e}"), kind="danger"))
 
     elif obs_file_selector.value:
         # Observation mode accepts user-uploaded tabular data as long as it has
@@ -592,10 +592,10 @@ def _(
                 obs_data = df
                 data_source_info = f"Observation: {obs_file_selector.value}"
             else:
-                 mo.output.replace(mo.callout(mo.md("❌ Invalid file format. Metadata columns 'Wavelength' and 'Flux' not found."), kind="danger"))
+                 mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Invalid file format. Metadata columns 'Wavelength' and 'Flux' not found."), kind="danger"))
 
         except Exception as e:
-             mo.output.replace(mo.callout(mo.md(f"❌ Error reading file: {e}"), kind="danger"))
+             mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Error reading file: {e}"), kind="danger"))
 
     # Infer the most likely flux transform from the emulator filename so the UI
     # starts on the training scale, while still letting the user override it.
@@ -705,7 +705,7 @@ def _(alt, data_source_info, mo, np, obs_data, obs_flux_scale, pd, wl_range_slid
          ).interactive()
 
     obs_plot_accordion = mo.accordion({
-        "📈 View Selected Spectrum": obs_chart if obs_chart else mo.md("No data loaded.")
+        f"{mo.icon('lucide:trending-up')} View Selected Spectrum": obs_chart if obs_chart else mo.md("No data loaded.")
     })
     return (obs_plot_accordion,)
 
@@ -1234,7 +1234,7 @@ def _(bounds, mo, param_names, w_fix, w_max, w_min, w_val):
                 # FIXED: show value input + locked indicator
                 _prior_col = mo.hstack([
                     _val_elements[_name],
-                    mo.md(f"<span style='color: orange;'>🔒 Fixed</span>"),
+                    mo.md(f"<span style='color: orange;'>{mo.icon('lucide:lock')} Fixed</span>"),
                 ], widths=[3, 2], align="center")
             else:
                 # FREE: show prior distribution controls
@@ -1328,10 +1328,10 @@ def _(mo):
         start=100, stop=100000, value=10000, step=100,
         label="Max Iterations:",
     )
-    run_mle_btn = mo.ui.run_button(label="🚀 Run MLE", kind="success")
+    run_mle_btn = mo.ui.run_button(label=f"{mo.icon('lucide:rocket')} Run MLE", kind="success")
 
     _method_info = mo.accordion({
-        "ℹ️ Optimizer Details": mo.md("""
+        f"{mo.icon('lucide:info')} Optimizer Details": mo.md("""
         | Method | Type | Best For |
         |--------|------|----------|
         | **Nelder-Mead** | Derivative-free simplex | General use; robust default for low-to-moderate dimensions |
@@ -1667,7 +1667,7 @@ def _(
                         _elapsed = _time.time() - _start_time
                         _best_nll = min(_nll_history) if _nll_history else nll
                         _spinner.update(
-                            f"{_opt_method} Iteration {_iter_count[0]}/{_max_iter} | "
+                            f"{_opt_method} Eval {_iter_count[0]} | "
                             f"Best NLL: {_best_nll:.2f} | "
                             f"Time: {_elapsed:.1f}s"
                         )
@@ -1747,7 +1747,7 @@ def _(
 
                 _elapsed_total = _time.time() - _start_time
                 fit_status = mo.callout(
-                    mo.md(f"✅ MLE Complete via {_opt_method}! ({_iter_count[0]} iterations, {_elapsed_total:.1f}s)"),
+                    mo.md(f"{mo.icon('lucide:check-circle')} MLE Complete via {_opt_method}! ({_iter_count[0]} iterations, {_elapsed_total:.1f}s)"),
                     kind="success"
                 )
 
@@ -1843,7 +1843,7 @@ def _(
             except Exception as _e:
                 import traceback as _traceback
                 _tb = _traceback.format_exc()
-                fit_status = mo.callout(mo.md(f"❌ MLE Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
+                fit_status = mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} MLE Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
                 fit_results = fit_status
                 set_mle_model(None)
                 set_mle_priors(None)
@@ -1879,7 +1879,7 @@ def _(emu, get_mle_model, mo, param_names, re):
     mcmc_burnin = mo.ui.number(value=200, label="Burn-in", step=50, start=0)
 
     run_mcmc_btn = mo.ui.run_button(
-        label="🎲 Run MCMC", 
+        label=f"{mo.icon('lucide:shuffle')} Run MCMC", 
         kind="warn",
     )
 
@@ -1907,14 +1907,14 @@ def _(emu, get_mle_model, mo, param_names, re):
     mcmc_freeze = mo.ui.dictionary(_freeze_dict) if _freeze_dict else mo.ui.dictionary({})
 
     if _model is None:
-        mcmc_config_ui = mo.callout(mo.md("⚠️ Run MLE first before MCMC"), kind="warn")
+        mcmc_config_ui = mo.callout(mo.md(f"{mo.icon('lucide:triangle-alert')} Run MLE first before MCMC"), kind="warn")
     else:
         # Show friendly names in the active params list
         _friendly_labels = [mcmc_label_map.get(l, l) for l in _model.labels]
         mcmc_config_ui = mo.vstack([
             mo.md(f"**Active Parameters:** {', '.join(_friendly_labels)}"),
             mo.hstack([mcmc_nwalkers, mcmc_nsteps, mcmc_burnin], justify="start"),
-            mo.md("### 🔒 Freeze Parameters for MCMC"),
+            mo.md(f"### {mo.icon('lucide:lock')} Freeze Parameters for MCMC"),
             mo.callout(mo.md(
                 "Tick parameters to **freeze** them at their MLE best-fit values. "
                 "Frozen parameters will not be sampled by MCMC. "
@@ -2220,7 +2220,7 @@ def _(
                 _frozen_info = f", frozen: {', '.join(_frozen_list)}" if _frozen_list else ""
                 _status_callout = mo.callout(
                     mo.md(
-                        f"✅ MCMC Complete! ({_nsteps} steps, "
+                        f"{mo.icon('lucide:check-circle')} MCMC Complete! ({_nsteps} steps, "
                         f"{_nwalkers} walkers, burn-in {_burnin_used}, thin {_thin_used}"
                         f"{_frozen_info})"
                     ),
@@ -2228,18 +2228,18 @@ def _(
                 )
 
                 _chain_accordion = mo.accordion({
-                    "🔗 Raw MCMC Chains (Full)": mo.vstack([
+                    f"{mo.icon('lucide:link')} Raw MCMC Chains (Full)": mo.vstack([
                         mo.md("Walker traces for all parameters before burn-in removal."),
                         _fig_full_chain
                     ]),
-                    "🔥 Burnt MCMC Chains (Post Burn-in)": mo.vstack([
+                    f"{mo.icon('lucide:flame')} Burnt MCMC Chains (Post Burn-in)": mo.vstack([
                         mo.md(_burnin_info),
                         _fig_burn_chain
                     ]),
-                    "📊 Posterior Distributions": mo.vstack([
+                    f"{mo.icon('lucide:chart-bar')} Posterior Distributions": mo.vstack([
                         _fig_post
                     ]),
-                    "📋 Arviz Summary Statistics": mo.vstack([
+                    f"{mo.icon('lucide:clipboard-list')} Arviz Summary Statistics": mo.vstack([
                         mo.md(_summary_md)
                     ]),
                 })
@@ -2257,7 +2257,7 @@ def _(
             except Exception as _e:
                 import traceback as _traceback
                 _tb = _traceback.format_exc()
-                mcmc_results = mo.callout(mo.md(f"❌ MCMC Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
+                mcmc_results = mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} MCMC Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
 
     mcmc_results if mcmc_results else mo.md("*Configure and run MCMC after MLE*")
     return
@@ -2296,8 +2296,8 @@ def _(
     # Widgets must be defined unconditionally so the downstream export cell never
     # receives an undefined reference — mo.stop() would prevent their creation if
     # they were placed after it.
-    export_pf_btn = mo.ui.run_button(label="📄 Export .pf Template", kind="success")
-    export_csv_btn = mo.ui.run_button(label="📊 Export Posterior CSV", kind="success")
+    export_pf_btn = mo.ui.run_button(label=f"{mo.icon('lucide:file-text')} Export .pf Template", kind="success")
+    export_csv_btn = mo.ui.run_button(label=f"{mo.icon('lucide:chart-bar')} Export Posterior CSV", kind="success")
     export_dir_input = mo.ui.text(value="benchmark_results/exports", label="Output directory")
 
     # Gate the display (not the widget creation) behind a completed MCMC run.
@@ -2368,9 +2368,9 @@ def _(
                 uncertainties=_uncertainties,
                 global_params=_global,
             )
-            _msg += f"✅ .pf template exported to `{_pf_path}`\n\n"
+            _msg += f"{mo.icon('lucide:check-circle')} .pf template exported to `{_pf_path}`\n\n"
         except Exception as _e:
-            _msg += f"❌ .pf export failed: {_e}\n\n"
+            _msg += f"{mo.icon('lucide:x-circle')} .pf export failed: {_e}\n\n"
 
     if export_csv_btn.value and _samples is not None:
         try:
@@ -2391,9 +2391,9 @@ def _(
 
             _csv_path = os.path.join(_out_dir, f"speculate_posterior_{_ts}.csv")
             export_posterior_csv(_samples, _labels, _csv_path, summary=_summary_dict)
-            _msg += f"✅ Posterior CSV exported to `{_csv_path}`\n\n"
+            _msg += f"{mo.icon('lucide:check-circle')} Posterior CSV exported to `{_csv_path}`\n\n"
         except Exception as _e:
-            _msg += f"❌ CSV export failed: {_e}\n\n"
+            _msg += f"{mo.icon('lucide:x-circle')} CSV export failed: {_e}\n\n"
 
     if _msg:
         mo.output.replace(mo.callout(mo.md(_msg), kind="success"))

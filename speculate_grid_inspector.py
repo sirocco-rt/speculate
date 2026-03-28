@@ -59,7 +59,7 @@ def _(mo):
     # Static sidebar - always shows all options
     mo.sidebar(
         mo.vstack([
-            mo.md("# 🔭 Speculate"),
+            mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
             mo.md(" "),
             mo.md(" "),
             mo.md("---"),
@@ -133,9 +133,9 @@ def _(mo):
 def _(IS_HUGGINGFACE_SPACE, mo):
     # Environment mode display
     if IS_HUGGINGFACE_SPACE:
-        env_badge = mo.md("🌐 **Running on HuggingFace Space** - Streaming data from cloud")
+        env_badge = mo.md(f"{mo.icon('lucide:globe')} **Running on HuggingFace Space** - Streaming data from cloud")
     else:
-        env_badge = mo.md("💻 **Running Locally** - Using pre-downloaded grid files")
+        env_badge = mo.md(f"{mo.icon('lucide:monitor')} **Running Locally** - Using pre-downloaded grid files")
 
     env_badge
     return
@@ -178,7 +178,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, mo):
             )
         else:
             grid_selector = None
-            mo.md("⚠️ **No grids found in `sirocco_grids/` directory**\n\nPlease download grids using the Grid Downloader tool first.")
+            mo.md(f"{mo.icon('lucide:triangle-alert')} **No grids found in `sirocco_grids/` directory**\n\nPlease download grids using the Grid Downloader tool first.")
 
     grid_selector
     return (grid_selector,)
@@ -214,7 +214,7 @@ def _(IS_HUGGINGFACE_SPACE, cache_tracker_state, grid_selector, mo):
             set_cache_check(set())
 
             if cleared > 0:
-                mo.md(f"🧹 Cleared {cleared} cached spectra from previous grid")
+                mo.md(f"{mo.icon('lucide:trash')} Cleared {cleared} cached spectra from previous grid")
 
         # Remember the active dataset for the next rerun.
         if current_grid:
@@ -299,7 +299,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
                 grid_mode = "huggingface"
 
             except Exception as e:
-                mo.md(f"❌ Error loading grid from HuggingFace: {e}")
+                mo.md(f"{mo.icon('lucide:x-circle')} Error loading grid from HuggingFace: {e}")
                 mo.stop()
 
         else:
@@ -307,14 +307,14 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
             grid_path = Path("sirocco_grids") / selected_grid
 
             if not grid_path.exists():
-                mo.md(f"❌ Grid directory not found: {grid_path}")
+                mo.md(f"{mo.icon('lucide:x-circle')} Grid directory not found: {grid_path}")
                 mo.stop()
 
             # Find all .spec files
             spec_files = sorted(grid_path.glob("run*.spec"))
 
             if not spec_files:
-                mo.md(f"❌ No .spec files found in {grid_path}")
+                mo.md(f"{mo.icon('lucide:x-circle')} No .spec files found in {grid_path}")
                 mo.stop()
 
             # Try to load lookup table - download from HuggingFace if not present
@@ -327,7 +327,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
                     ORG_ID = "sirocco-rt"
                     local_repo_id = f"{ORG_ID}/{selected_grid}"
 
-                    mo.md("📥 Lookup table not found locally. Downloading from HuggingFace...")
+                    mo.md(f"{mo.icon('lucide:download')} Lookup table not found locally. Downloading from HuggingFace...")
 
                     downloaded_path = local_hf_download(
                         repo_id=local_repo_id,
@@ -338,7 +338,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
                     )
                     lookup_path = Path(downloaded_path)
                 except Exception as e:
-                    mo.md(f"⚠️ No lookup table found locally and failed to download from HuggingFace: {e}")
+                    mo.md(f"{mo.icon('lucide:triangle-alert')} No lookup table found locally and failed to download from HuggingFace: {e}")
                     mo.stop()
 
             # Load lookup table
@@ -384,7 +384,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
         num_inclinations = len(inclination_angles)
 
     mo.md(f"""
-    ✅ **Grid loaded successfully**
+    {mo.icon('lucide:check-circle')} **Grid loaded successfully**
     - **Grid**: `{selected_grid}`
     - **Mode**: `{grid_mode}`
     - **Run Files**: {num_runs:,}
@@ -544,12 +544,12 @@ def _(
 
     # Create buttons with on_click callbacks
     add_spectrum_btn = mo.ui.button(
-        label="➕ Pin Grid Spectrum", 
+        label=f"{mo.icon('lucide:plus-circle')} Pin Grid Spectrum", 
         kind="success",
         on_click=lambda _: add_current_spectrum()
     )
     clear_spectra_btn = mo.ui.button(
-        label="🗑️ Clear All", 
+        label=f"{mo.icon('lucide:trash-2')} Clear All", 
         kind="danger",
         on_click=lambda _: clear_all_spectra()
     )
@@ -567,7 +567,7 @@ def _(get_pinned_spectra, mo):
     # Display status message
     if num_pinned > 0:
         pinned_labels = [f"run{run}@{inc}°" for run, inc in pinned_spectra_indices]
-        status_msg = mo.md(f"📌 **Pinned Spectra**: {num_pinned} ({', '.join(pinned_labels)})")
+        status_msg = mo.md(f"{mo.icon('lucide:pin')} **Pinned Spectra**: {num_pinned} ({', '.join(pinned_labels)})")
     else:
         status_msg = mo.md("_No pinned spectra_")
 
@@ -979,7 +979,7 @@ def _(
     dropdown_list = list(param_dropdowns.values())
 
     mo.vstack([
-        mo.md("⚠️ **Warning**: All grid values shown but not all combinations are available."),
+        mo.md(f"{mo.icon('lucide:triangle-alert')} **Warning**: All grid values shown but not all combinations are available."),
         *dropdown_list
     ])
     return
@@ -994,8 +994,8 @@ def _(mo):
     ### Navigation
     - **Slider**: Drag to browse through spectra sequentially
     - **Index Input**: Jump directly to a specific spectrum by index
-    - **➕ Add Spectrum**: Pin the current spectrum for comparison
-    - **🗑️ Clear All**: Remove all pinned spectra
+    - **Pin Spectrum**: Pin the current spectrum for comparison
+    - **Clear All**: Remove all pinned spectra
 
     ### Display Options
     - **Show Current Spectrum**: Toggle visibility of the active spectrum
@@ -1049,7 +1049,7 @@ def _(mo, obs_file_uploader, os, set_obs_refresh):
             save_path = os.path.join(save_dir, file.name)
             with open(save_path, "wb") as file_handle:
                 file_handle.write(file.contents)
-            mo.md(f"✅ Uploaded `{file.name}` to `{save_dir}`")
+            mo.md(f"{mo.icon('lucide:check-circle')} Uploaded `{file.name}` to `{save_dir}`")
 
         # Trigger refresh of the file list
         set_obs_refresh(lambda v: v + 1)
@@ -1110,7 +1110,7 @@ def _(mo, obs_file_selector, os, set_obs_refresh):
                     pass
 
     delete_obs_btn = mo.ui.button(
-        label="🗑️ Delete Selected",
+        label=f"{mo.icon('lucide:trash-2')} Delete Selected",
         kind="danger",
         on_click=lambda _: delete_selected_file()
     )

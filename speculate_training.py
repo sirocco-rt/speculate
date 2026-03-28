@@ -90,7 +90,7 @@ def _(mo):
     # Static sidebar - always shows all options
     mo.sidebar(
         mo.vstack([
-                    mo.md("# 🔭 Speculate"),
+                    mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
                     mo.md(" "),
                     mo.md(" "),
                     mo.md("---"),
@@ -127,15 +127,15 @@ def _(mo):
         gpu_name = torch.cuda.get_device_name(0)
         try:
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            gpu_text = f"## 🟢 GPU Active: **{gpu_name}** ({vram_gb:.1f} GB VRAM)"
+            gpu_text = f"**{mo.icon('lucide:cpu')} GPU Active:** {gpu_name} ({vram_gb:.1f} GB VRAM)"
         except:
-            gpu_text = f"## 🟢 GPU Active: **{gpu_name}**"
+            gpu_text = f"**{mo.icon('lucide:cpu')} GPU Active:** {gpu_name}"
 
         status_widget = mo.callout(mo.md(gpu_text), kind="success")
 
     else:
         status_widget = mo.callout(
-            mo.md("## 🟠 No NVIDIA GPU Detected - Large grids will train slower."), 
+            mo.md(f"## {mo.icon('lucide:cpu')} No NVIDIA GPU Detected - Large grids will train slower."), 
             kind="warn"
         )
 
@@ -145,9 +145,9 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md("""
+    mo.md(f"""
     ---
-    ## 💻 Emulator Specification:
+    ## {mo.icon('lucide:monitor')} Emulator Specification:
     """)
     return
 
@@ -313,12 +313,12 @@ def _(available_grids, mo):
         )
         mo.vstack([
             grid_selector,
-            mo.md(f"✓ Found **{len(available_grids)}** grid(s) in `sirocco_grids/`")
+            mo.md(f"{mo.icon('lucide:check-circle')} Found **{len(available_grids)}** grid(s) in `sirocco_grids/`")
         ])
     else:
         mo.callout(
-            mo.md("""
-            ⚠️ **No grids found in `sirocco_grids/` folder**
+            mo.md(f"""
+            {mo.icon('lucide:triangle-alert')} **No grids found in `sirocco_grids/` folder**
 
             Please use the **Grid Downloader** tool first:
             """),
@@ -466,7 +466,7 @@ def _(mo, n_components, params):
                     if efficient_gb > gpu_vram_free_gb:
                         # Even a single block won't fit — truly too large
                         high_vram = mo.callout(
-                            mo.md(f"🛑 **Grid too large for this GPU (~{total_points:,} grid points)**\n\n"
+                            mo.md(f"{mo.icon('lucide:ban')} **Grid too large for this GPU (~{total_points:,} grid points)**\n\n"
                                   f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Memory-efficient est. usage: **~{efficient_display}** ({efficient_pct:.0f}% of free)\n\n"
                                   f"{vram_info}\n\n"
                                   f"Memory-efficient peak for a single M×M block is too large for this GPU — "
@@ -477,7 +477,7 @@ def _(mo, n_components, params):
                         # Memory-efficient mode can handle it — report its peak as
                         # the effective usage, not the unachievable standard-mode value.
                         high_vram = mo.callout(
-                            mo.md(f"⚠️ **Training will use memory-efficient mode (~{total_points:,} grid points)**\n\n"
+                            mo.md(f"{mo.icon('lucide:triangle-alert')} **Training will use memory-efficient mode (~{total_points:,} grid points)**\n\n"
                                   f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. usage: **~{efficient_display}** ({efficient_pct:.0f}% of free)\n\n"
                                   f"{vram_info}\n\n"
                                   f"Standard mode would require ~{total_display} — Memory-efficient mode builds V11 blocks on-the-fly instead of "
@@ -486,7 +486,7 @@ def _(mo, n_components, params):
                         )
                 elif usage_pct > 70:
                     high_vram = mo.callout(
-                        mo.md(f"⚠️ **Warning: High VRAM usage (~{total_points:,} grid points)**\n\n"
+                        mo.md(f"{mo.icon('lucide:triangle-alert')} **Warning: High VRAM usage (~{total_points:,} grid points)**\n\n"
                               f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. usage: **~{total_display}** ({usage_pct:.0f}% of free)\n\n"
                               f"{vram_info}\n\n"
                               f"Training should fit but memory will be tight. A high performance GPU is recommended."),
@@ -494,7 +494,7 @@ def _(mo, n_components, params):
                     )
                 else:
                     high_vram = mo.callout(
-                        mo.md(f"✅ **Estimated Grid Size: ~{total_points:,} grid points**\n\n"
+                        mo.md(f"{mo.icon('lucide:check-circle')} **Estimated Grid Size: ~{total_points:,} grid points**\n\n"
                               f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. usage: **~{total_display}** ({usage_pct:.0f}% of free)\n\n"
                               f"{vram_info}"),
                         kind="success"
@@ -502,7 +502,7 @@ def _(mo, n_components, params):
             else:
                 # No GPU detected — show estimate without comparison
                 high_vram = mo.callout(
-                    mo.md(f"ℹ️ **Estimated Grid Size: ~{total_points:,} grid points**\n\n"
+                    mo.md(f"{mo.icon('lucide:info')} **Estimated Grid Size: ~{total_points:,} grid points**\n\n"
                           f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Total estimated: ~{total_display}\n\n"
                           f"No GPU detected. CPU training will be used. Likely very slow for moderate grids."),
                     kind="info"
@@ -599,7 +599,7 @@ def _(mo):
         mo.hstack([
             kernel_selector,
             mo.accordion({
-                "ℹ️ Kernel info": mo.md(
+                f"{mo.icon('lucide:info')} Kernel info": mo.md(
                     "**RBF** (C∞ smooth) is the classic choice. **Matérn-5/2** (C² smooth) "
                     "and **Matérn-3/2** (C¹ smooth) allow sharper transitions — literature has" 
                     "shown matern kernel tend to outperform other kernels, particularly if the"
@@ -610,7 +610,7 @@ def _(mo):
         mo.hstack([
             strict_weight_fit,
             mo.accordion({
-                "ℹ️ Strict weight fit": mo.md(
+                f"{mo.icon('lucide:info')} Strict weight fit": mo.md(
                     "When enabled, the GP is trained to fit the PCA weights directly "
                     "without the Czekala et al. (2015) truncation noise matrix (λ_ξ). "
                     "This can produce tighter fits at the cost of losing the formal "
@@ -621,7 +621,7 @@ def _(mo):
         mo.hstack([
             per_component,
             mo.accordion({
-                "ℹ️ Per-component training": mo.md(
+                f"{mo.icon('lucide:info')} Per-component training": mo.md(
                     "When enabled, runs a separate low-dimensional optimisation for each PCA component "
                     "instead of one large joint optimisation. Default is enabled as per "
                     "component is a lower dimensional problem, making it easier for the optimizer"
@@ -632,7 +632,7 @@ def _(mo):
         mo.hstack([
             refine_lambda_xi,
             mo.accordion({
-                "ℹ️ λ_ξ refinement": mo.md(
+                f"{mo.icon('lucide:info')} λ_ξ refinement": mo.md(
                     "After per-component training, run a 1-D bounded optimisation to "
                     "refine the shared λ_ξ (truncation noise) parameter. Only applies "
                     "when strict weight fit is disabled (unticked)."
@@ -762,7 +762,7 @@ def _(
 
         # Recompute the expected emulator filename reactively so the UI can warn when
         # the current configuration would overwrite an existing trained model.
-    _emu_btn_label = "🚀 Train Emulator"
+    _emu_btn_label = f"{mo.icon('lucide:rocket')} Train Emulator"
     _emu_btn_kind = "success"
     _emu_info_text = "Click to begin training. This may take several minutes to hours depending on grid size and hardware."
 
@@ -789,7 +789,7 @@ def _(
              _chk_name = f'{_base_name}emu_{_model_params_str}_{_scale}{_smooth_tag}_{_fixed_inc}inc_{_wl_range[0]}-{_wl_range[1]}AA_{n_components.value}PCA'
 
         if os.path.exists(f'Grid-Emulator_Files/{_chk_name}.npz'):
-            _emu_btn_label = "♻️ Re-train (An Emulator Already Exists)"
+            _emu_btn_label = f"{mo.icon('lucide:refresh-cw')} Re-train (An Emulator Already Exists)"
             _emu_btn_kind = "warn"
             _emu_info_text = f"**Emulator found:** `{_chk_name}.npz`\n\nClick to **re-train** (overwrites existing)."
 
@@ -894,7 +894,7 @@ def _(
 
         # Display configuration
         config_md = mo.md(f"""
-        ## 📊 Training Configuration
+        ## {mo.icon('lucide:chart-bar')} Training Configuration
 
         - **Grid:** `{grid_name}`
         - **Grid Path:** `{grid_path}`
@@ -930,7 +930,7 @@ def _(
                 smoothing=smoothing
             )
         else:
-            error_md = mo.md(f"⚠️ **Error:** Unknown grid configuration for `{grid_name}`")
+            error_md = mo.md(f"{mo.icon('lucide:triangle-alert')} **Error:** Unknown grid configuration for `{grid_name}`")
             mo.vstack([config_md, error_md])
 
         # Grid processing is the expensive preprocessing step that converts the raw
@@ -948,7 +948,7 @@ def _(
                 force=True
             )
 
-            status_md = mo.md("🔧 **Processing grid...** (logging to `logs/grid_processing.log`)")
+            status_md = mo.md(f"{mo.icon('lucide:wrench')} **Processing grid...** (logging to `logs/grid_processing.log`)")
 
             # key_name reproduces the parameter ordering inside each flux-data entry
             # of the processed NPZ so later code can decode the stored spectra.
@@ -970,7 +970,7 @@ def _(
             grid_points = data['grid_points']
 
             grid_info = f"""
-            ✅ **Grid processed successfully!**
+            {mo.icon('lucide:check-circle')} **Grid processed successfully!**
 
             - **Grid shape:** {grid_points.shape}
             - **Unique values per parameter:**
@@ -988,20 +988,20 @@ def _(
                 grid_points = data['grid_points']
 
                 grid_info = f"""
-                ✅ **Using existing grid file**
+                {mo.icon('lucide:check-circle')} **Using existing grid file**
 
                 - **Grid shape:** {grid_points.shape}
                 """
                 results_md = mo.md(grid_info)
             else:
-                results_md = mo.md(f"⚠️ **Error:** Grid file `{grid_file_name}.npz` not found. Enable 'Process grid' to create it.")
+                results_md = mo.md(f"{mo.icon('lucide:triangle-alert')} **Error:** Grid file `{grid_file_name}.npz` not found. Enable 'Process grid' to create it.")
 
         # Check if emulator exists
         if os.path.isfile(f'Grid-Emulator_Files/{emu_file_name}.npz'):
-            emu_status = mo.md(f"ℹ️ **Emulator `{emu_file_name}.npz` already exists.** Uncheck 'Process grid' to use it or continue to retrain.")
+            emu_status = mo.md(f"{mo.icon('lucide:info')} **Emulator `{emu_file_name}.npz` already exists.** Uncheck 'Process grid' to use it or continue to retrain.")
             emu_exists = True
         else:
-            emu_status = mo.md(f"📝 **Emulator `{emu_file_name}.npz` does not exist.** Ready to train.")
+            emu_status = mo.md(f"{mo.icon('lucide:file-text')} **Emulator `{emu_file_name}.npz` does not exist.** Ready to train.")
             emu_exists = False
 
         mo.vstack([config_md, results_md, emu_status])
@@ -1060,7 +1060,7 @@ def _(
         set_training_status(None)
 
         # Train new emulator (Always re-train if button is clicked)
-        status_box = mo.md("🚀 **Training emulator...** Check the console below for progress.")
+        status_box = mo.md(f"{mo.icon('lucide:rocket')} **Training emulator...** Check the console below for progress.")
 
         # Live Logger setup
         log_buffer = []
@@ -1084,7 +1084,7 @@ def _(
             accordion_content = []
             if current_chart[0]:
                  # Add chart to accordion
-                accordion_content.append(mo.md("### 📈 Live Training Loss"))
+                accordion_content.append(mo.md(f"### {mo.icon('lucide:trending-up')} Live Training Loss"))
                 # Use chart directly instead of ui wrapper to reduce flashing
                 accordion_content.append(current_chart[0])
                 accordion_content.append(mo.md("---"))
@@ -1238,7 +1238,7 @@ def _(
 
             # Create result display
             train_result = mo.md(f"""
-            ✅ **Training complete!**
+            {mo.icon('lucide:check-circle')} **Training complete!**
             """)
 
             set_training_status(train_result)
@@ -1247,7 +1247,7 @@ def _(
 
         except Exception as e:
             error_result = mo.md(f"""
-            ❌ **Training failed!**
+            {mo.icon('lucide:x-circle')} **Training failed!**
 
             **Error:** {str(e)}
 
@@ -1568,7 +1568,7 @@ def _(alt, get_loss_history, gp_figure, mo, pd):
 
     # Always display the chart container with GP diagnostics below
     mo.vstack([
-        mo.md("### 📈 Trained Emulator Loss Curve"),
+        mo.md(f"### {mo.icon('lucide:trending-up')} Trained Emulator Loss Curve"),
         mo.ui.altair_chart(chart),
         gp_figure
     ])

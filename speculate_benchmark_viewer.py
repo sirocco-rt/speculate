@@ -54,7 +54,7 @@ def _(mo):
     # Static sidebar - always shows all options
     mo.sidebar(
         mo.vstack([
-                    mo.md("# 🔭 Speculate"),
+                    mo.md(f"# Speculate {mo.icon('lucide:telescope')}"),
                     mo.md(" "),
                     mo.md(" "),
                     mo.md("---"),

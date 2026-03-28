@@ -113,13 +113,13 @@ def _(ORG_ID, list_datasets, mo):
         grid_datasets = [d for d in dataset_ids if "grid" in d.lower()]
 
         if grid_datasets:
-            dataset_status = mo.md(f"✓ Found **{len(grid_datasets)}** grid datasets")
+            dataset_status = mo.md(f"{mo.icon('lucide:check-circle')} Found **{len(grid_datasets)}** grid datasets")
         else:
-            dataset_status = mo.md("⚠️ No grid datasets found")
+            dataset_status = mo.md(f"{mo.icon('lucide:triangle-alert')} No grid datasets found")
 
     except Exception as e:
         grid_datasets = []
-        dataset_status = mo.md(f"❌ Error fetching datasets: {e}")
+        dataset_status = mo.md(f"{mo.icon('lucide:x-circle')} Error fetching datasets: {e}")
 
     dataset_status
     return (grid_datasets,)
@@ -193,9 +193,9 @@ def _(ORG_ID, REPO_TYPE, dataset_dropdown, list_repo_files, mo):
         except Exception as e:
             spec_files = []
             aux_files = []
-            file_info = mo.md(f"❌ Error fetching files: {e}")
+            file_info = mo.md(f"{mo.icon('lucide:x-circle')} Error fetching files: {e}")
     else:
-        file_info = mo.md("⚠️ Please select a dataset first")
+        file_info = mo.md(f"{mo.icon('lucide:triangle-alert')} Please select a dataset first")
 
     file_info
     return aux_files, repo_id, spec_files
@@ -241,7 +241,7 @@ def _(download_mode, mo, specific_file_dropdown):
         if specific_file_dropdown is not None:
             _display = specific_file_dropdown
         else:
-            _display = mo.md("⚠️ No files available")
+            _display = mo.md(f"{mo.icon('lucide:triangle-alert')} No files available")
 
     _display
     return
@@ -276,10 +276,10 @@ def _(ORG_ID, REPO_TYPE, dataset_dropdown, mo):
             # This table powers the per-run parameter preview in "Specific file"
             # mode and mirrors the metadata bundled with the dataset.
             lookup_df = pd.read_parquet(file_url)
-            lookup_status = mo.md(f"✓ Loaded parameter lookup table with **{len(lookup_df)}** runs")
+            lookup_status = mo.md(f"{mo.icon('lucide:check-circle')} Loaded parameter lookup table with **{len(lookup_df)}** runs")
 
         except Exception as e:
-            lookup_status = mo.md(f"⚠️ Could not load parameter lookup table: {e}")
+            lookup_status = mo.md(f"{mo.icon('lucide:triangle-alert')} Could not load parameter lookup table: {e}")
 
     lookup_status
     return (lookup_df,)
@@ -315,10 +315,10 @@ def _(download_mode, lookup_df, mo, specific_file_dropdown):
 
                     _param_display = mo.md(params_text)
                 else:
-                    _param_display = mo.md(f"⚠️ No parameters found for run {run_number}")
+                    _param_display = mo.md(f"{mo.icon('lucide:triangle-alert')} No parameters found for run {run_number}")
 
             except Exception as e:
-                _param_display = mo.md(f"⚠️ Error displaying parameters: {e}")
+                _param_display = mo.md(f"{mo.icon('lucide:triangle-alert')} Error displaying parameters: {e}")
 
     _param_display
     return
@@ -348,25 +348,25 @@ def _(
     if spec_files:
         if download_mode.value == "All files":
             files_to_download = spec_files
-            download_summary = mo.md(f"📦 Ready to download **{len(files_to_download)}** files")
+            download_summary = mo.md(f"{mo.icon('lucide:package')} Ready to download **{len(files_to_download)}** files")
         else:
             # "Specific file" mode keeps the workflow identical but collapses the
             # target list to a single selected run.
             if specific_file_dropdown is not None and specific_file_dropdown.value:
                 files_to_download = [specific_file_dropdown.value]
-                download_summary = mo.md(f"📦 Ready to download: `{specific_file_dropdown.value}`")
+                download_summary = mo.md(f"{mo.icon('lucide:package')} Ready to download: `{specific_file_dropdown.value}`")
             else:
                 files_to_download = []
-                download_summary = mo.md("⚠️ Please select a file")
+                download_summary = mo.md(f"{mo.icon('lucide:triangle-alert')} Please select a file")
     else:
-        download_summary = mo.md("⚠️ No files available")
+        download_summary = mo.md(f"{mo.icon('lucide:triangle-alert')} No files available")
 
     # The extracted files always land under a dataset-named local directory so
     # other tools can find them with the same naming convention.
     _summary_display = download_summary
     if files_to_download and dataset_dropdown is not None and dataset_dropdown.value:
         save_location = os.path.abspath(f"sirocco_grids/{dataset_dropdown.value}/")
-        location_info = mo.md(f"📁 Files will be saved to: `{save_location}`")
+        location_info = mo.md(f"{mo.icon('lucide:folder')} Files will be saved to: `{save_location}`")
         _summary_display = mo.vstack([download_summary, location_info])
 
     _summary_display
@@ -387,7 +387,7 @@ def _(mo):
     # "Download & Decompress" is the typical workflow (cache + extract).
     # The split buttons let the user decouple downloading from extraction,
     # useful when re-extracting from a populated HuggingFace cache.
-    download_and_decompress_button = mo.ui.run_button(label="📥 Download & Decompress")
+    download_and_decompress_button = mo.ui.run_button(label=f"{mo.icon('lucide:download')} Download & Decompress")
     download_only_button = mo.ui.run_button(label="Download Only")
     decompress_only_button = mo.ui.run_button(label="Decompress Downloaded Files")
 
@@ -440,7 +440,7 @@ def _(
                     download_results.append((filename, local_path, None))
                 except Exception as e:
                     download_results.append((filename, None, str(e)))
-                    mo.output.append(mo.md(f"❌ Failed to download `{filename}`: {e}"))
+                    mo.output.append(mo.md(f"{mo.icon('lucide:x-circle')} Failed to download `{filename}`: {e}"))
                 bar.update()
 
         # Always stage auxiliary files into the extraction directory so the grid
@@ -457,7 +457,7 @@ def _(
                 _dest = os.path.join(extraction_dir, _aux)
                 shutil.copy2(_aux_local, _dest)
             except Exception as e:
-                mo.output.append(mo.md(f"⚠️ Could not fetch auxiliary file `{_aux}`: {e}"))
+                mo.output.append(mo.md(f"{mo.icon('lucide:triangle-alert')} Could not fetch auxiliary file `{_aux}`: {e}"))
 
         # In the combined mode, immediately expand each .xz archive into its raw
         # .spec file under the dataset directory.
@@ -474,12 +474,12 @@ def _(
                                     shutil.copyfileobj(f_in, f_out)
 
                         except Exception as e:
-                            mo.output.append(mo.md(f"❌ Failed to decompress `{filename}`: {e}"))
+                            mo.output.append(mo.md(f"{mo.icon('lucide:x-circle')} Failed to decompress `{filename}`: {e}"))
                     bar.update()
 
-            mo.md(f"### ✅ Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
+            mo.md(f"### {mo.icon('lucide:check-circle')} Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
         else:
-            mo.md("### ✅ Download complete!\n\nFiles cached by HuggingFace (use 'Decompress' to extract)")
+            mo.md(f"### {mo.icon('lucide:check-circle')} Download complete!\n\nFiles cached by HuggingFace (use 'Decompress' to extract)")
 
     elif decompress_only_button.value and files_to_download:
         # Rehydrate raw .spec files from archives that should already exist in the
@@ -521,10 +521,10 @@ def _(
                             shutil.copyfileobj(f_in, f_out)
 
                 except Exception as e:
-                    mo.output.append(mo.md(f"❌ Failed to decompress `{filename}`: {e}"))
+                    mo.output.append(mo.md(f"{mo.icon('lucide:x-circle')} Failed to decompress `{filename}`: {e}"))
                 bar.update()
 
-        mo.md(f"### ✅ Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
+        mo.md(f"### {mo.icon('lucide:check-circle')} Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
     return
 
 
@@ -533,7 +533,7 @@ def _(mo):
     # Static sidebar - always shows all options
     mo.sidebar(
         mo.vstack([
-            mo.md("# 🔭 Speculate"),
+            mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
             mo.md(" "),
             mo.md(" "),
             mo.md("---"),

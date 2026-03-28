@@ -66,8 +66,8 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md("""
-    ## 🚀 Please select your correct working environment:
+    mo.md(f"""
+    ## {mo.icon('lucide:rocket')} Please select your correct working environment:
     """)
     return
 
@@ -113,13 +113,13 @@ def _(environment_mode, mo):
             - **Grid Inspector**
             - **Inference Tool**
 
-            ⚠️ **Note:** For full features, install Speculate locally and select "Local Machine".
+            {mo.icon('lucide:triangle-alert')} **Note:** For full features, install Speculate locally and select "Local Machine".
             """),
             kind="warn"
         )
     else:
         mode_warning = mo.callout(
-            mo.md("""**💻 Local Mode Active** 
+            mo.md(f"""**{mo.icon('lucide:monitor')} Local Mode Active** 
 
             All tools available! Please ensure you have adequate local CPU and GPU provisions."""),
             kind="success"
@@ -135,7 +135,7 @@ def _(current_mode, mo):
     if current_mode == "HuggingFace Space":
         # Show all items but mark unavailable ones
         menu = mo.vstack([
-            mo.md("# 🔭 Speculate"),
+            mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
             mo.md(" "),
             mo.md(" "),
             mo.md("---"),
@@ -149,7 +149,7 @@ def _(current_mode, mo):
             }, orientation="vertical"),
             mo.md(" "),
             mo.md("---"),
-            mo.md("### 🔒 Locked Tools:"),
+            mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
             mo.md("Install Speculate Locally"),
             mo.md(" "),
             mo.md(f"###{mo.icon('lucide:download')} Grid Downloader"),
@@ -173,7 +173,7 @@ def _(current_mode, mo):
     else: 
         # Show all items as available
         menu = mo.vstack([
-            mo.md("# 🔭 Speculate"),
+            mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
             mo.md(" "),
             mo.md(" "),
             mo.md("---"),
