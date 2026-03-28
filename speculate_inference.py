@@ -1319,13 +1319,38 @@ def _(mo):
 @app.cell
 def _(mo):
     # Inference Control
+    mle_method = mo.ui.dropdown(
+        options=["Nelder-Mead", "L-BFGS-B", "CMA-ES"],
+        value="Nelder-Mead",
+        label="Optimization Method:",
+    )
+    mle_max_iter = mo.ui.number(
+        start=100, stop=100000, value=10000, step=100,
+        label="Max Iterations:",
+    )
     run_mle_btn = mo.ui.run_button(label="🚀 Run MLE", kind="success")
+
+    _method_info = mo.accordion({
+        "ℹ️ Optimizer Details": mo.md("""
+        | Method | Type | Best For |
+        |--------|------|----------|
+        | **Nelder-Mead** | Derivative-free simplex | General use; robust default for low-to-moderate dimensions |
+        | **L-BFGS-B** | Quasi-Newton (gradient) | Fast convergence when the likelihood surface is smooth |
+        | **CMA-ES** | Evolutionary strategy | Complex, multi-modal landscapes; slower but very robust |
+
+        **Nelder-Mead** uses an adaptive simplex spanning the prior volume.
+        **L-BFGS-B** uses box constraints derived from your priors and finite-difference gradients.
+        **CMA-ES** is population-based and requires the `cma` package.
+        """)
+    })
 
     mo.vstack([
         mo.md("Run Maximum Likelihood Estimation (MLE) to find the best fit parameters."),
-        run_mle_btn
+        mo.hstack([mle_method, mle_max_iter], justify="start", gap=1),
+        _method_info,
+        run_mle_btn,
     ])
-    return (run_mle_btn,)
+    return (mle_max_iter, mle_method, run_mle_btn,)
 
 
 @app.cell
@@ -1334,6 +1359,8 @@ def _(
     SpectrumModel,
     emu,
     ground_truth_params,
+    mle_max_iter,
+    mle_method,
     mo,
     np,
     obs_data,
@@ -1350,20 +1377,7 @@ def _(
     wl_range_slider,
 ):
     # ── Stage 3: Maximum Likelihood Estimation (MLE) ──
-    # Workflow:
-    #  1. Crop observation to the wavelength window and apply the emulator’s
-    #     flux transform (linear / log10 / mean-scaled).
-    #  2. Build a SpectrumModel from the emulator + transformed observation.
-    #  3. Translate Stage 2 UI state into frozen scipy prior objects; freeze
-    #     any parameters the user locked.
-    #  4. Construct an initial simplex that spans the full prior volume so
-    #     Nelder-Mead starts from a sensible region (not a single point).
-    #  5. Bootstrap log_scale at each simplex vertex via one model evaluation.
-    #  6. Run adaptive Nelder-Mead on the negative log-posterior with a live
-    #     spinner reporting iteration count, best NLL, and elapsed time.
-    #  7. Store the fitted model + priors in reactive state for Stage 4.
-    #  8. Render the best-fit overlay, NLL convergence curve, and a result
-    #     table with optional ground-truth comparison.
+    # Supports Nelder-Mead, L-BFGS-B, and CMA-ES optimizers.
     fit_status = None
     fit_results = None
 
@@ -1528,10 +1542,9 @@ def _(
                         and w_fix.value['log_amp'] and w_fix.value['log_ls']):
                     _model.freeze('global_cov')
 
-                # 4. Build Initial Simplex
-                # Spans the prior space for ALL active parameters (grid + hyperparams)
-                # so Nelder-Mead starts from a sensible region instead of a single point.
-                _spinner.update("Building initial simplex...")
+                # 4. Build Initial Simplex / Bounds
+                _spinner.update("Preparing optimizer...")
+                _opt_method = mle_method.value
 
                 _active_labels = list(_model.labels)
                 _N = len(_active_labels)
@@ -1548,108 +1561,182 @@ def _(
                     else:
                         return kwds.get('loc', 0.0), kwds.get('scale', 1.0)
 
-                def _simplex_column_uniform(loc, scale, N):
-                    """Evenly spaced points across a truncated uniform range."""
-                    mn = loc
-                    mx = loc + scale
-                    rng = mx - mn
-                    margin = rng / 20  # 5% inset on each end
-                    t_mn, t_mx = mn + margin, mx - margin
-                    interval = (t_mx - t_mn) / N
-                    return [t_mn + interval * k for k in range(N + 1)]
-
-                def _simplex_column_norm(mean, std, N):
-                    """Evenly spaced points across ±2σ of a normal prior."""
-                    mn = mean - 2 * std
-                    mx = mean + 2 * std
-                    interval = (mx - mn) / N
-                    return [mn + interval * k for k in range(N + 1)]
-
-                _simplex = np.zeros((_N + 1, _N))
-                _simplex_info = []
-
-                for _col_idx, _label in enumerate(_active_labels):
+                # Derive per-parameter bounds from the priors (used by all methods).
+                _lo_bounds = []
+                _hi_bounds = []
+                for _label in _active_labels:
                     if _label in _priors:
                         _dist = _priors[_label]
                         _loc, _sc = _get_loc_scale(_dist)
                         if _dist.dist.name == 'uniform':
-                            _col = _simplex_column_uniform(_loc, _sc, _N)
+                            _lo_bounds.append(_loc)
+                            _hi_bounds.append(_loc + _sc)
                         elif _dist.dist.name == 'norm':
-                            _col = _simplex_column_norm(_loc, _sc, _N)
+                            _lo_bounds.append(_loc - 4 * _sc)
+                            _hi_bounds.append(_loc + 4 * _sc)
                         else:
-                            # Fallback: small perturbation around current value
-                            _cv = _model.get_param_vector()[_col_idx]
-                            _col = [_cv + (_cv * 0.01 * k) for k in range(_N + 1)]
+                            _cv = _model.get_param_vector()[_active_labels.index(_label)]
+                            _lo_bounds.append(_cv - abs(_cv) * 0.5)
+                            _hi_bounds.append(_cv + abs(_cv) * 0.5)
                     else:
-                        # Parameter is active but has no explicit prior — use current value
-                        _cv = _model.get_param_vector()[_col_idx]
-                        _col = [_cv] * (_N + 1)
+                        _cv = _model.get_param_vector()[_active_labels.index(_label)]
+                        _lo_bounds.append(_cv - abs(_cv) * 0.5 - 1e-6)
+                        _hi_bounds.append(_cv + abs(_cv) * 0.5 + 1e-6)
 
-                    _simplex[:, _col_idx] = _col
-                    _simplex_info.append(
-                        f"  {_label}: [{min(_col):.4f} .. {max(_col):.4f}]")
+                _simplex = None
+                if _opt_method == "Nelder-Mead":
+                    # Build an initial simplex spanning the prior volume.
+                    def _simplex_column_uniform(loc, scale, N):
+                        mn = loc
+                        mx = loc + scale
+                        rng = mx - mn
+                        margin = rng / 20
+                        t_mn, t_mx = mn + margin, mx - margin
+                        interval = (t_mx - t_mn) / N
+                        return [t_mn + interval * k for k in range(N + 1)]
 
-                    # Roll each column by its index so rows are offset from each other
-                    _simplex[:, _col_idx] = np.roll(
-                        _simplex[:, _col_idx], _col_idx)
+                    def _simplex_column_norm(mean, std, N):
+                        mn = mean - 2 * std
+                        mx = mean + 2 * std
+                        interval = (mx - mn) / N
+                        return [mn + interval * k for k in range(N + 1)]
 
-                # --- Bootstrap log_scale into the simplex ---
-                # Evaluate the model at each simplex vertex to auto-calculate
-                # the appropriate log_scale, giving the optimizer a head start.
-                if 'log_scale' in _active_labels:
-                    _ls_idx = _active_labels.index('log_scale')
-                    for _row in range(_N + 1):
+                    _simplex = np.zeros((_N + 1, _N))
+                    _simplex_info = []
+
+                    for _col_idx, _label in enumerate(_active_labels):
+                        if _label in _priors:
+                            _dist = _priors[_label]
+                            _loc, _sc = _get_loc_scale(_dist)
+                            if _dist.dist.name == 'uniform':
+                                _col = _simplex_column_uniform(_loc, _sc, _N)
+                            elif _dist.dist.name == 'norm':
+                                _col = _simplex_column_norm(_loc, _sc, _N)
+                            else:
+                                _cv = _model.get_param_vector()[_col_idx]
+                                _col = [_cv + (_cv * 0.01 * k) for k in range(_N + 1)]
+                        else:
+                            _cv = _model.get_param_vector()[_col_idx]
+                            _col = [_cv] * (_N + 1)
+
+                        _simplex[:, _col_idx] = _col
+                        _simplex_info.append(
+                            f"  {_label}: [{min(_col):.4f} .. {max(_col):.4f}]")
+                        _simplex[:, _col_idx] = np.roll(
+                            _simplex[:, _col_idx], _col_idx)
+
+                    # Bootstrap log_scale into the simplex
+                    if 'log_scale' in _active_labels:
+                        _ls_idx = _active_labels.index('log_scale')
+                        for _row in range(_N + 1):
+                            try:
+                                _model.set_param_vector(_simplex[_row])
+                                _ = _model()
+                                if (_model._log_scale is not None
+                                        and np.isfinite(_model._log_scale)):
+                                    _simplex[_row, _ls_idx] = _model._log_scale
+                            except Exception:
+                                pass
+
+                    _centroid = _simplex.mean(axis=0)
+                    _model.set_param_vector(_centroid)
+                else:
+                    # L-BFGS-B / CMA-ES: bootstrap log_scale at the starting point
+                    if 'log_scale' in _active_labels:
                         try:
-                            _model.set_param_vector(_simplex[_row])
-                            _ = _model()  # triggers auto log_scale calc
-                            if (_model._log_scale is not None
-                                    and np.isfinite(_model._log_scale)):
-                                _simplex[_row, _ls_idx] = _model._log_scale
+                            _ = _model()
+                            if _model._log_scale is not None and np.isfinite(_model._log_scale):
+                                _model.params['log_scale'] = _model._log_scale
                         except Exception:
-                            pass  # keep the prior-based value
+                            pass
 
-                # Restore model to the centroid of the simplex
-                _centroid = _simplex.mean(axis=0)
-                _model.set_param_vector(_centroid)
+                # 5. Run MLE Optimization
+                _spinner.update(f"Running {_opt_method} optimisation...")
 
-                # 5. Run Training (MLE) with Progress Tracking
-                _spinner.update("Running MLE Optimization...")
-
-                # Track optimization progress
                 _nll_history = []
                 _iter_count = [0]
                 _start_time = _time.time()
-                _max_iter = 10000
+                _max_iter = int(mle_max_iter.value)
 
                 def _nll_with_callback(P):
                     _model.set_param_vector(P)
                     nll = -_model.log_likelihood(_priors)
                     _nll_history.append(nll)
                     _iter_count[0] += 1
-
-                    # Update spinner every 50 iterations
                     if _iter_count[0] % 50 == 0:
                         _elapsed = _time.time() - _start_time
                         _best_nll = min(_nll_history) if _nll_history else nll
                         _spinner.update(
-                            f"MLE Iteration {_iter_count[0]}/{_max_iter} | "
+                            f"{_opt_method} Iteration {_iter_count[0]}/{_max_iter} | "
                             f"Best NLL: {_best_nll:.2f} | "
                             f"Time: {_elapsed:.1f}s"
                         )
                     return nll
 
                 _p0 = _model.get_param_vector()
-                _soln = scipy_minimize(
-                    _nll_with_callback, 
-                    _p0, 
-                    method="Nelder-Mead",
-                    options=dict(
-                        maxiter=_max_iter,
-                        disp=False,
-                        adaptive=True,
-                        initial_simplex=_simplex,
+
+                if _opt_method == "Nelder-Mead":
+                    _soln = scipy_minimize(
+                        _nll_with_callback,
+                        _p0,
+                        method="Nelder-Mead",
+                        options=dict(
+                            maxiter=_max_iter,
+                            disp=False,
+                            adaptive=True,
+                            initial_simplex=_simplex,
+                        )
                     )
-                )
+
+                elif _opt_method == "L-BFGS-B":
+                    _bounds_list = list(zip(_lo_bounds, _hi_bounds))
+                    _soln = scipy_minimize(
+                        _nll_with_callback,
+                        _p0,
+                        method="L-BFGS-B",
+                        bounds=_bounds_list,
+                        options=dict(
+                            maxiter=_max_iter,
+                            ftol=1e-15,
+                            gtol=1e-12,
+                            eps=1e-5,
+                        ),
+                    )
+
+                elif _opt_method == "CMA-ES":
+                    try:
+                        import cma
+                    except ImportError:
+                        raise ImportError(
+                            "CMA-ES requires the 'cma' package. "
+                            "Install it with: pip install cma"
+                        )
+                    _sigma0 = 0.5
+                    _cma_bounds = [_lo_bounds, _hi_bounds]
+                    _es = cma.CMAEvolutionStrategy(
+                        _p0.tolist(), _sigma0,
+                        {
+                            "bounds": _cma_bounds,
+                            "maxfevals": _max_iter,
+                            "verbose": -9,
+                            "tolfun": 1e-8,
+                        },
+                    )
+                    _best_x, _best_f = _p0.copy(), float("inf")
+                    while not _es.stop():
+                        _solutions = _es.ask()
+                        _fits = [_nll_with_callback(np.array(s)) for s in _solutions]
+                        _es.tell(_solutions, _fits)
+                        _gen_best = min(_fits)
+                        if _gen_best < _best_f:
+                            _best_f = _gen_best
+                            _best_x = np.array(_solutions[_fits.index(_gen_best)])
+                    from types import SimpleNamespace
+                    _soln = SimpleNamespace(
+                        x=_best_x, fun=_best_f, success=True,
+                        message="CMA-ES terminated",
+                        nit=_es.result.iterations,
+                    )
 
                 if _soln.success:
                     _model.set_param_vector(_soln.x)
@@ -1660,7 +1747,7 @@ def _(
 
                 _elapsed_total = _time.time() - _start_time
                 fit_status = mo.callout(
-                    mo.md(f"✅ MLE Complete! ({_iter_count[0]} iterations, {_elapsed_total:.1f}s)"),
+                    mo.md(f"✅ MLE Complete via {_opt_method}! ({_iter_count[0]} iterations, {_elapsed_total:.1f}s)"),
                     kind="success"
                 )
 
@@ -1782,13 +1869,13 @@ def _(emu, get_mle_model, mo, param_names, re):
     # optionally freezes select parameters at their MLE values so the
     # sampler explores a reduced subspace.  Defaults were chosen for a
     # reasonable balance of speed vs. posterior quality:
-    #   32 walkers  – twice the typical active-parameter count
-    #   1000 steps  – gives ~30 000 post-burn samples at thin=1
+    #   64 walkers  – twice the typical active-parameter count
+    #   2500 steps  – gives ~30 000 post-burn samples at thin=1
     #   200 burn-in – conservative; the auto-burn heuristic may override
     _model = get_mle_model()
 
-    mcmc_nwalkers = mo.ui.number(value=32, label="Walkers", step=4, start=8)
-    mcmc_nsteps = mo.ui.number(value=1000, label="Steps", step=100, start=100)
+    mcmc_nwalkers = mo.ui.number(value=64, label="Walkers", step=4, start=8)
+    mcmc_nsteps = mo.ui.number(value=2500, label="Steps", step=100, start=100)
     mcmc_burnin = mo.ui.number(value=200, label="Burn-in", step=50, start=0)
 
     run_mcmc_btn = mo.ui.run_button(
