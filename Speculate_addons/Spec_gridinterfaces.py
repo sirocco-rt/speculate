@@ -2,7 +2,8 @@ import os
 import fnmatch
 import numpy as np
 from Starfish.grid_tools import GridInterface
-import sigfig        
+import sigfig
+from Speculate_addons.Spec_functions import fit_power_law_continuum        
         
 class Speculate_cv_bl_grid_v87f(GridInterface):
     """
@@ -280,6 +281,14 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             flux = np.log10(flux) # logged 10 
         if self.scale == 'scaled': # to values near order of magnitude 10^0. 
             flux = flux/np.mean(flux)
+        if self.scale == 'continuum-subtracted':
+            wl_sel = self.wl_full[:len(flux)][self.ind]
+            continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])
+            flux[self.ind] = flux[self.ind] - continuum
+        if self.scale == 'continuum-normalised':
+            wl_sel = self.wl_full[:len(flux)][self.ind]
+            continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])
+            flux[self.ind] = flux[self.ind] / np.where(continuum > 0, continuum, 1.0)
         
         # TODO: Implement header if doing to use
         hdr = {'inclination_column': inclination_column} # Header constructed 
@@ -556,6 +565,14 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             flux = np.log10(flux) # logged 10 
         if self.scale == 'scaled': # to values near order of magnitude 10^0. 
             flux = flux/np.mean(flux)
+        if self.scale == 'continuum-subtracted':
+            wl_sel = self.wl_full[:len(flux)][self.ind]
+            continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])
+            flux[self.ind] = flux[self.ind] - continuum
+        if self.scale == 'continuum-normalised':
+            wl_sel = self.wl_full[:len(flux)][self.ind]
+            continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])
+            flux[self.ind] = flux[self.ind] / np.where(continuum > 0, continuum, 1.0)
         
         # TODO: Implement header if doing to use
         hdr = {'inclination_column': inclination_column} # Header constructed 

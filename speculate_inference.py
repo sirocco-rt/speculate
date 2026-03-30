@@ -43,6 +43,7 @@ def _():
     from Starfish.models import SpectrumModel
     import pathlib
     import scipy.stats as stats
+    from Speculate_addons.Spec_functions import fit_power_law_continuum
     logo_path = "assets/logos/Speculate_logo2.png"
 
 
@@ -65,7 +66,7 @@ def _():
 
     # Combine in horizontal stack
     mo.hstack([title_col, logo_col], justify="space-between", align="center")
-    return Emulator, Spectrum, SpectrumModel, alt, mo, np, os, pd, re, stats
+    return Emulator, Spectrum, SpectrumModel, alt, fit_power_law_continuum, mo, np, os, pd, re, stats
 
 
 @app.cell
@@ -606,9 +607,13 @@ def _(
             _detected_scale = "log"
         elif '_scaled_' in _emu_name:
             _detected_scale = "scaled"
+        elif '_continuum-subtracted_' in _emu_name:
+            _detected_scale = "continuum-subtracted"
+        elif '_continuum-normalised_' in _emu_name:
+            _detected_scale = "continuum-normalised"
 
     obs_flux_scale = mo.ui.dropdown(
-        options=["linear", "log", "scaled"],
+        options=["linear", "log", "scaled", "continuum-subtracted"],
         value=_detected_scale,
         label="Observation Flux Transform:",
         full_width=True,
@@ -893,6 +898,7 @@ def _(emu, mo, np):
 def _(
     alt,
     emu,
+    fit_power_law_continuum,
     mo,
     np,
     obs_data,
@@ -976,6 +982,21 @@ def _(
                     emu_flux_crop = emu_flux_crop / _obs_mean
                     emu_upper = emu_upper / _obs_mean
                     emu_lower = emu_lower / _obs_mean
+            elif _scale_label == 'continuum-subtracted':
+                _obs_cont, _ = fit_power_law_continuum(
+                    np.array(_obs_sub['wavelength']), _obs_flux
+                )
+                _obs_flux = _obs_flux - _obs_cont
+                # Emulator output is already in subtracted space — no transform needed
+            elif _scale_label == 'continuum-normalised':
+                _obs_cont, _ = fit_power_law_continuum(
+                    np.array(_obs_sub['wavelength']), _obs_flux
+                )
+                _obs_cont_safe = np.where(_obs_cont > 0, _obs_cont, 1.0)
+                _obs_flux = _obs_flux / _obs_cont_safe
+                emu_flux_crop = emu_flux_crop / _obs_cont_safe
+                emu_upper = emu_upper / _obs_cont_safe
+                emu_lower = emu_lower / _obs_cont_safe
 
             # --- Build Altair chart ---
             _obs_df = pd.DataFrame({
@@ -1358,6 +1379,7 @@ def _(
     Spectrum,
     SpectrumModel,
     emu,
+    fit_power_law_continuum,
     ground_truth_params,
     mle_max_iter,
     mle_method,
@@ -1410,6 +1432,17 @@ def _(
                     _flux_mean = np.mean(_raw_flux)
                     if _flux_mean != 0:
                         _raw_flux = _raw_flux / _flux_mean
+                elif _flux_scale == 'continuum-subtracted':
+                    _cont, _ = fit_power_law_continuum(
+                        np.array(_data_subset['wavelength']), _raw_flux
+                    )
+                    _raw_flux = _raw_flux - _cont
+                elif _flux_scale == 'continuum-normalised':
+                    _cont, _ = fit_power_law_continuum(
+                        np.array(_data_subset['wavelength']), _raw_flux
+                    )
+                    _cont_safe = np.where(_cont > 0, _cont, 1.0)
+                    _raw_flux = _raw_flux / _cont_safe
                 # else: linear (no transform)
                 _data_subset['flux'] = _raw_flux
 
@@ -1424,6 +1457,11 @@ def _(
                         _sigma = _sigma / (np.abs(_orig_flux) * np.log(10) + 1e-30)
                     elif _flux_scale == 'scaled':
                         _sigma = _sigma / _flux_mean if _flux_mean != 0 else _sigma
+                    # continuum-subtracted: sigma unchanged (deterministic subtraction)
+                    elif _flux_scale == 'continuum-normalised':
+                        _sigma = _sigma / _cont_safe
+                    elif _flux_scale == 'continuum-normalised':
+                        _sigma = _sigma / _cont_safe
                 else:
                     _sigma = np.abs(_raw_flux) * 0.05
 

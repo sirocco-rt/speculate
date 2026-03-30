@@ -110,6 +110,7 @@ def _():
     import pandas as pd
     from pathlib import Path
     import altair as alt
+    from Speculate_addons.Spec_functions import fit_power_law_continuum
 
     # Enable VegaFusion for large datasets
     alt.data_transformers.enable("vegafusion")
@@ -118,7 +119,7 @@ def _():
     # When running on HuggingFace Spaces the grid files are fetched over
     # HTTP; locally they are read straight from the filesystem.
     IS_HUGGINGFACE_SPACE = os.environ.get("SPACE_ID") is not None
-    return IS_HUGGINGFACE_SPACE, Path, alt, np, os, pd
+    return IS_HUGGINGFACE_SPACE, Path, alt, fit_power_law_continuum, np, os, pd
 
 
 @app.cell
@@ -696,8 +697,11 @@ def _(
     alt,
     current_flux,
     current_run_index,
+    fit_power_law_continuum,
+    flux_scale_selector,
     inclination_selector,
     load_spectrum,
+    np,
     obs_file_selector,
     os,
     pd,
@@ -726,6 +730,23 @@ def _(
             return pd.Series(flux_array).rolling(window=5, center=True, min_periods=1).mean().values
         return flux_array
 
+    # Apply the selected flux-scale transformation to an already-smoothed spectrum.
+    _scale_mode = flux_scale_selector.value
+    def apply_scale(flux_array, wl_array):
+        if _scale_mode == 'log':
+            safe = np.where(flux_array > 0, flux_array, 1e-30)
+            return np.log10(safe)
+        elif _scale_mode == 'scaled':
+            mean_val = np.mean(flux_array)
+            return flux_array / mean_val if mean_val != 0 else flux_array
+        elif _scale_mode == 'continuum-subtracted':
+            continuum, _ = fit_power_law_continuum(wl_array, flux_array)
+            return flux_array - continuum
+        elif _scale_mode == 'continuum-normalised':
+            continuum, _ = fit_power_law_continuum(wl_array, flux_array)
+            return flux_array / np.where(continuum > 0, continuum, 1.0)
+        return flux_array  # linear
+
     # Collect each visible series as a dataframe and concatenate them into the
     # long-form layout Altair expects for layered categorical plotting.
     plot_data_list = []
@@ -740,6 +761,12 @@ def _(
                 # Apply smoothing
                 pinned_flux_plot = smooth_flux(pinned_flux)
 
+                # Crop to selected wavelength range BEFORE continuum fitting
+                pinned_flux_plot = pinned_flux_plot[wl_mask]
+
+                # Apply flux scale transform on the cropped range
+                pinned_flux_plot = apply_scale(pinned_flux_plot, filtered_wavelengths)
+
                 # Dimensionless mode removes absolute scaling so pinned spectra can
                 # be compared by shape rather than by flux level.
                 if use_dimensionless.value:
@@ -749,7 +776,7 @@ def _(
 
                 pinned_df = pd.DataFrame({
                     'Wavelength': filtered_wavelengths,
-                    'Flux': pinned_flux_plot[wl_mask],
+                    'Flux': pinned_flux_plot,
                     'Spectrum': f'run{run_idx}@{inclination}°',
                     'Type': 'Pinned'
                 })
@@ -764,6 +791,12 @@ def _(
         # Apply smoothing
         current_flux_plot = smooth_flux(current_flux_plot)
 
+        # Crop to selected wavelength range BEFORE continuum fitting
+        current_flux_plot = current_flux_plot[wl_mask]
+
+        # Apply flux scale transform on the cropped range
+        current_flux_plot = apply_scale(current_flux_plot, filtered_wavelengths)
+
         # Apply the same shape-only normalization as the pinned spectra so the
         # current run remains directly comparable when that mode is active.
         if use_dimensionless.value:
@@ -773,7 +806,7 @@ def _(
 
         current_df = pd.DataFrame({
             'Wavelength': filtered_wavelengths,
-            'Flux': current_flux_plot[wl_mask],
+            'Flux': current_flux_plot,
             'Spectrum': f'run{current_run_index}@{inclination_selector.value}°',
             'Type': 'Current'
         })
@@ -801,6 +834,9 @@ def _(
 
                 if not obs_data.empty:
                     obs_flux = obs_data['FLUX'].values
+
+                    # Apply the same flux-scale transform as model spectra
+                    obs_flux = apply_scale(obs_flux, obs_data['WAVELENGTH'].values)
 
                     # Use the same normalization rule here so observations can be
                     # overplotted directly against model spectra by shape.
@@ -832,7 +868,11 @@ def _(
                    scale=alt.Scale(zero=False),
                    axis=alt.Axis(grid=show_grid.value)),
             y=alt.Y('Flux:Q', 
-                    title='Flux' if not use_dimensionless.value else 'Normalized Flux',
+                    title=('Flux' if _scale_mode == 'linear'
+                           else 'log₁₀(Flux)' if _scale_mode == 'log'
+                           else 'Scaled Flux' if _scale_mode == 'scaled'
+                           else 'Flux − Continuum' if _scale_mode == 'continuum-subtracted'
+                           else 'Flux / Continuum') if not use_dimensionless.value else 'Normalized Flux',
                     scale=alt.Scale(zero=False),
                     axis=alt.Axis(format='~e', grid=show_grid.value)),
             color=alt.condition(
@@ -1127,6 +1167,17 @@ def _(delete_obs_btn, mo, obs_file_selector, obs_file_uploader):
         mo.md("Data must be in CSV format with 'Wavelength', then 'Flux' columns.")
     ])
     return
+
+
+@app.cell
+def _(mo):
+    flux_scale_selector = mo.ui.dropdown(
+        options=["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"],
+        value="linear",
+        label="Flux Scale:"
+    )
+    flux_scale_selector
+    return (flux_scale_selector,)
 
 
 if __name__ == "__main__":

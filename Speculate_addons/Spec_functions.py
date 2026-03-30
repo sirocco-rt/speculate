@@ -14,6 +14,80 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Slider, CheckButtons, Button
 from Starfish.transforms import rescale, _get_renorm_factor
 
+
+def fit_power_law_continuum(wl, flux, sigma_clip=3.0, max_iter=5, poly_deg=2):
+    """Fit a smooth continuum to a spectrum using iterative sigma-clipping.
+
+    The fit is a polynomial of degree *poly_deg* in log-log space
+    (log10(λ) vs log10(F)).  A degree-1 polynomial corresponds to a pure
+    power law F = A·λ^α; higher degrees capture curvature in the continuum.
+    Iterative sigma-clipping rejects emission/absorption line outliers so
+    they do not bias the fit.
+
+    Parameters
+    ----------
+    wl : array_like
+        Wavelength array (Å).
+    flux : array_like
+        Flux array (same length as *wl*).
+    sigma_clip : float, optional
+        Number of standard deviations for clipping (default 3.0).
+    max_iter : int, optional
+        Maximum number of clip-and-refit iterations (default 5).
+    poly_deg : int, optional
+        Degree of the polynomial fitted in log-log space (default 2).
+
+    Returns
+    -------
+    continuum : ndarray
+        Smooth continuum evaluated at every wavelength in *wl*
+        (linear-space flux units).
+    params : dict
+        ``{'coeffs': array of polynomial coefficients (highest degree first),
+        'poly_deg': degree used, 'n_masked': number of pixels rejected}``.
+    """
+    wl = np.asarray(wl, dtype=np.float64)
+    flux = np.asarray(flux, dtype=np.float64)
+
+    # Only fit where both wl and flux are strictly positive (required for log)
+    valid = (wl > 0) & (flux > 0) & np.isfinite(flux)
+    log_wl = np.log10(wl[valid])
+    log_flux = np.log10(flux[valid])
+
+    # Ensure we have enough points for the requested degree
+    min_pts = poly_deg + 1
+    mask = np.ones(log_wl.shape, dtype=bool)  # True = included in fit
+
+    for _ in range(max_iter):
+        if mask.sum() < min_pts:
+            break
+        coeffs = np.polyfit(log_wl[mask], log_flux[mask], deg=poly_deg)
+        residuals = log_flux - np.polyval(coeffs, log_wl)
+        std = np.std(residuals[mask])
+        if std < 1e-10:
+            break  # residuals are at numerical noise level — fit has converged
+        new_mask = np.abs(residuals) <= sigma_clip * std
+        if np.array_equal(new_mask, mask):
+            break  # converged
+        mask = new_mask
+
+    # Final fit on converged mask
+    if mask.sum() >= min_pts:
+        coeffs = np.polyfit(log_wl[mask], log_flux[mask], deg=poly_deg)
+
+    # Evaluate continuum over the full (original) wavelength array
+    safe_wl = np.where(wl > 0, wl, 1.0)
+    continuum = 10.0 ** np.polyval(coeffs, np.log10(safe_wl))
+    # Zero the continuum where original wavelength was non-positive
+    continuum = np.where(wl > 0, continuum, 0.0)
+
+    params = {
+        'coeffs': coeffs,
+        'poly_deg': poly_deg,
+        'n_masked': int((~mask).sum()),
+    }
+    return continuum, params
+
 def plot_emulator(emulator, grid, not_fixed, fixed):
     
     """Takes the emulator and given the emulator's inputed model parameters, 

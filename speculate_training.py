@@ -520,7 +520,7 @@ def _(mo):
     wl_max = mo.ui.number(start=800, stop=8000, value=1850, step=10, label="Max Wavelength (Å):")
 
     scale_selector = mo.ui.dropdown(
-        options=["linear", "log", "scaled"],
+        options=["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"],
         value="linear",
         label="Flux Scale:"
     )

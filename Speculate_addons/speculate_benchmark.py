@@ -405,6 +405,16 @@ def run_mle_single(
         if fmean != 0:
             sigma = sigma / fmean
             flux = flux / fmean
+    elif flux_scale == "continuum-subtracted":
+        from Speculate_addons.Spec_functions import fit_power_law_continuum
+        continuum, _ = fit_power_law_continuum(wl, flux)
+        flux = flux - continuum
+    elif flux_scale == "continuum-normalised":
+        from Speculate_addons.Spec_functions import fit_power_law_continuum
+        continuum, _ = fit_power_law_continuum(wl, flux)
+        cont_safe = np.where(continuum > 0, continuum, 1.0)
+        sigma = sigma / cont_safe
+        flux = flux / cont_safe
 
     sigma = np.maximum(sigma, np.abs(flux) * 0.01)
     spec = Spectrum(wl, flux, sigmas=sigma)
