@@ -1,0 +1,78 @@
+System_type(star,cv,bh,agn,previous)                  agn
+
+### Parameters for the Central Object
+Central_object.mass(msol)                       1e8
+Central_object.radius(cm)               9e13
+
+### Parameters for the Disk (if there is one)
+Disk.type(none,flat,vertically.extended,rmin>central.obj.rad)                 flat
+Disk.radiation(yes,no)                          no
+Disk.temperature.profile(standard,readin)             standard
+Disk.mdot(msol/yr)                            1e-08
+Disk.radmax(cm)                           2.657e+15
+
+### Parameters for Boundary Layer or the compact object in an X-ray Binary or AGN
+Central_object.radiation(yes,no)        	yes
+Central_object.rad_type_to_make_wind(bb,models,power,cloudy,brems)	models
+Input_spectra.model_file                	data/seds/qsosed_m9.000_mdot0.150_hispin.ls
+Central_object.luminosity(ergs/s)       	7.730328124426503e+44
+Central_object.geometry_for_source(sphere,lamp_post,bubble,iso)   iso
+
+### Parameters describing the various winds or coronae in the system
+Wind.number_of_components                         1
+Wind.type(SV,star,hydro,corona,kwd,homologous,shell,imported)                  kwd
+Wind.coord_system(spherical,cylindrical,polar,cyl_var)          cylindrical
+Wind.dim.in.x_or_r.direction                     50
+Wind.dim.in.z_or_theta.direction                   50
+
+### Parameters associated with photon number, cycles,ionization and radiative transfer options
+Photons_per_cycle                         10000000
+Ionization_cycles                               30
+Spectrum_cycles                                 12
+Wind.ionization(on.the.spot,ML93,LTE_tr,LTE_te,fixed,matrix_bb,matrix_pow,matrix_est)           matrix_pow
+Line_transfer(pure_abs,pure_scat,sing_scat,escape_prob,thermal_trapping,macro_atoms_escape_prob,macro_atoms_thermal_trapping) macro_atoms_thermal_trapping
+Matom_transition_mode(mc_jumps,matrix)               matrix
+Surface.reflection.or.absorption(reflect,absorb,thermalized.rerad)              reflect
+Wind_heating.extra_processes(none,adiabatic,nonthermal,both)            adiabatic
+Atomic_data                    data/h20_hetop_standard80.dat
+
+### Parameters for Domain 0
+Wind.mdot(msol/yr)                             3e7
+KWD.d(in_units_of_rstar)                       5.5
+KWD.mdot_r_exponent                           0.25
+KWD.v_infinity(in_units_of_vescape)                   2
+KWD.acceleration_length(cm)                   7e+10
+KWD.acceleration_exponent                       1.5
+KWD.v_zero(multiple_of_sound_speed_at_base)                    1
+KWD.rmin(in_units_of_rstar)                       1
+KWD.rmax(in_units_of_rstar)                      30
+Wind.radmax(cm)                         4.42833e+15
+Wind.t.init                                   100000
+Wind.filling_factor(1=smooth,<1=clumped)                 0.1
+
+### Parameters defining the spectra seen by observers
+
+Central_object.rad_type_in_final_spectrum(bb,models,power,cloudy,brems)	models
+Input_spectra.model_file                	data/seds/qsosed_m9.500_mdot0.468.ls
+
+### The minimum and maximum wavelengths in the final spectra and the number of wavelength bins
+Spectrum.nwave                               14400
+Spectrum.wavemin(Angstroms)                    800
+Spectrum.wavemax(Angstroms)                   8000
+
+### The observers and their location relative to the system
+Spectrum.no_observers                           6
+Spectrum.angle(0=pole)                          10
+Spectrum.angle(0=pole)                          25
+Spectrum.angle(0=pole)                          40
+Spectrum.angle(0=pole)                          55
+Spectrum.angle(0=pole)                          70
+Spectrum.angle(0=pole)                          85
+Spectrum.live_or_die(live.or.die,extract)              extract
+Spectrum.type(flambda,fnu,basic)              flambda
+
+### Parameters for Reverberation Modeling (if needed)
+Reverb.type(none,photon,wind,matom)                 none
+
+### Other parameters
+Photon_sampling.approach(T_star,cv,yso,AGN,tde_bb,min_max_freq,user_bands,cloudy_test,wide,logarithmic)                  agn

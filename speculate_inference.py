@@ -2298,7 +2298,7 @@ def _(
     # they were placed after it.
     export_pf_btn = mo.ui.run_button(label=f"{mo.icon('lucide:file-text')} Export .pf Template", kind="success")
     export_csv_btn = mo.ui.run_button(label=f"{mo.icon('lucide:chart-bar')} Export Posterior CSV", kind="success")
-    export_dir_input = mo.ui.text(value="benchmark_results/exports", label="Output directory")
+    export_dir_input = mo.ui.text(value="exports", label="Output directory")
 
     # Gate the display (not the widget creation) behind a completed MCMC run.
     mo.stop(
@@ -2323,6 +2323,7 @@ def _(
     get_mcmc_samples,
     get_mcmc_summary_df,
     get_mle_model,
+    grid_selector,
     mo,
     np,
     os,
@@ -2332,7 +2333,7 @@ def _(
     _labels = get_mcmc_labels()
     _summary_df = get_mcmc_summary_df()
     _model = get_mle_model()
-    _out_dir = export_dir_input.value or "benchmark_results/exports"
+    _out_dir = export_dir_input.value or "exports"
     _ts = _time.strftime("%Y%m%d_%H%M%S")
 
     _msg = ""
@@ -2367,6 +2368,7 @@ def _(
                 emu, _grid_means, _pf_path,
                 uncertainties=_uncertainties,
                 global_params=_global,
+                grid_name=grid_selector.value,
             )
             _msg += f"{mo.icon('lucide:check-circle')} .pf template exported to `{_pf_path}`\n\n"
         except Exception as _e:

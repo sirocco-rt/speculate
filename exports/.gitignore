@@ -1,0 +1,9 @@
+# Ignore everything in this directory (generated .pf, .dat, .ls exports, etc.)
+*
+# Except this file
+!.gitignore
+# Except the templates directory and all its contents (scripts, template .pf files)
+!templates/
+!templates/**
+
+templates/__pycache__/

@@ -1602,6 +1602,13 @@ def _(
                 show_eta=True,
                 remove_on_exit=True,
             ) as _t3_bar:
+                # Derive the grid name from the emulator filename so Tier 3
+                # can export a valid Sirocco .pf for each observation.
+                _emu_base = os.path.basename(emu_picker.value or "")
+                _grid_stem = None
+                if "_emu_" in _emu_base:
+                    _grid_stem = _emu_base.split("_emu_")[0]
+
                 for _obs_path in _obs_list:
                     # Tier 3 reports are independent, so the loop only needs to append
                     # each completed result and advance the progress bar.
@@ -1612,11 +1619,16 @@ def _(
                     _r = _run_tier3_single(
                         _emu, _obs_path,
                         mcmc_steps=mcmc_steps_slider.value,
+                        grid_name=_grid_stem,
+                        output_dir="exports",
                     )
                     _tier3_results.append(_r)
+                    _pf_status = ""
+                    if "pf_path" in _r:
+                        _pf_status = f" → {os.path.basename(_r['pf_path'])}"
                     _t3_bar.update(
                         increment=1,
-                        subtitle=f"✓ {os.path.basename(_obs_path)} complete",
+                        subtitle=f"✓ {os.path.basename(_obs_path)} complete{_pf_status}",
                     )
 
         # Store the execution settings alongside the benchmark outputs so a saved
