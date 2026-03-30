@@ -39,13 +39,13 @@ log = logging.getLogger(__name__)
 # grids labelled "bl").  Indices 9-11 encode the observer inclination
 # at progressively finer angular resolution (sparse / mid / full).
 #
-# In emulator space, parameters 1 and 5 are stored in log10; parameter 2
+# In emulator space, parameters 1, 3, and 5 are stored in log10; parameter 2
 # is the wind-to-disk mass-loss *ratio* rather than the absolute value.
 
 PARAM_MAP = {
     1: ("disk.mdot", "Disk.mdot(msol/yr)"),          # log10(Msol/yr)
     2: ("wind.mdot", "Wind.mdot(msol/yr)"),          # ratio: wind/disk
-    3: ("KWD.d", "KWD.d(in_units_of_rstar)"),        # wind launch radius
+    3: ("KWD.d", "KWD.d(in_units_of_rstar)"),        # log10(wind launch radius)
     4: ("KWD.mdot_r_exponent", "KWD.mdot_r_exponent"),  # radial mdot power law
     5: ("KWD.acceleration_length", "KWD.acceleration_length(cm)"),  # log10(cm)
     6: ("KWD.acceleration_exponent", "KWD.acceleration_exponent"),  # velocity law exponent
@@ -86,6 +86,8 @@ def emulator_to_physical(param_names: Sequence[str], values: np.ndarray) -> dict
             # Wind mass loss is inferred as a fraction of disk.mdot and becomes
             # an absolute quantity only after disk.mdot has been converted.
             physical[sirocco_key] = v
+        elif idx == 3:
+            physical[sirocco_key] = 10 ** v  # log10(R_star) -> R_star
         elif idx == 5:
             physical[sirocco_key] = 10 ** v  # log10(cm) -> cm
         else:
@@ -262,7 +264,7 @@ def _extract_ground_truth(
     The lookup table (a parquet file co-located with the .spec files) records the
     Sirocco simulation inputs for every run.  This function reads the raw physical
     values, then applies the same forward transforms used during emulator training
-    (log10 for params 1 and 5; wind/disk ratio for param 2) so the returned dict
+    (log10 for params 1, 3, and 5; wind/disk ratio for param 2) so the returned dict
     lives in emulator space and is directly comparable to inference outputs.
     """
     df = pd.read_parquet(parquet_path)
@@ -304,6 +306,8 @@ def _extract_ground_truth(
                             disk_mdot = row[dc]
                             break
                     value = raw / disk_mdot if disk_mdot and disk_mdot > 0 else raw
+                elif idx == 3:
+                    value = np.log10(raw) if raw > 0 else raw
                 elif idx == 5:
                     value = np.log10(raw) if raw > 0 else raw
                 elif idx in (9, 10, 11):

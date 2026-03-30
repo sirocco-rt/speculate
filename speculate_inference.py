@@ -146,7 +146,7 @@ def _():
     # Indices 7-8  : Boundary-layer emission (only in "bl" grids).
     # Indices 9-11 : Observer inclination at increasing angular resolution.
     #
-    # In emulator space param1 and param5 are stored in log10.
+    # In emulator space param1, param3, and param5 are stored in log10.
     # param2 (wind.mdot) is stored as the ratio wind/disk mass-loss rate.
     param_map_db = {
         1: ("disk.mdot", 0.0, 1.0),              # log10(Msol/yr)
@@ -562,7 +562,7 @@ def _(
                     ground_truth_params = {
                         'disk.mdot': np.log10(gt_row['Disk.mdot(msol/yr)'].values[0]),
                         'wind.mdot': gt_row['Wind.mdot(msol/yr)'].values[0] / gt_row['Disk.mdot(msol/yr)'].values[0],  # Ratio
-                        'KWD.d': gt_row['KWD.d(in_units_of_rstar)'].values[0],
+                        'KWD.d': np.log10(gt_row['KWD.d(in_units_of_rstar)'].values[0]),
                         'KWD.mdot_r_exponent': gt_row['KWD.mdot_r_exponent'].values[0],
                         'KWD.acceleration_length': np.log10(gt_row['KWD.acceleration_length(cm)'].values[0]),
                         'KWD.acceleration_exponent': gt_row['KWD.acceleration_exponent'].values[0],

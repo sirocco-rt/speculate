@@ -1478,6 +1478,10 @@ def _(
         _param_name = _emu.param_names[_not_fixed_col]
         _p_idx = int(_param_name.replace("param", ""))
         _xlabel = _desc_map.get(_p_idx, _param_name)
+        # Parameters 1 (Disk.mdot), 3 (KWD.d) and 5 (KWD.accel_length) are
+        # stored in log10 space; all others are linear.
+        _logged_params = {1, 3, 5}
+        _xlabel_axis = f'log\u2081\u2080({_xlabel})' if _p_idx in _logged_params else _xlabel
 
         # Build Altair charts for selected components
         _charts = []
@@ -1504,7 +1508,7 @@ def _(
             })
 
             _scatter = alt.Chart(_scatter_df).mark_circle(size=60, color='#3b82f6').encode(
-                x=alt.X('x:Q', title=f'log\u2081\u2080({_xlabel})'),
+                x=alt.X('x:Q', title=_xlabel_axis),
                 y=alt.Y('weight:Q', title=f'Weight {_comp}'),
                 tooltip=[alt.Tooltip('x:Q', title=_xlabel, format='.4f'),
                          alt.Tooltip('weight:Q', title='Weight', format='.4e')]

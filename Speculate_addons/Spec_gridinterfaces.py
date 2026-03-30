@@ -66,7 +66,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             param_points_2 = np.array([0.03, 0.1, 0.3])
             points.append(param_points_2)
         if 3 in model_parameters:
-            param_points_3 = np.array([0.55, 5.5, 55.0])
+            param_points_3 = np.log10(np.array([0.55, 5.5, 55.0]))
             points.append(param_points_3)
         if 4 in model_parameters:
             param_points_4 = np.array([0.0, 0.25, 1.0])
@@ -142,7 +142,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         # Parameter definitions for both file lookup (1-8) and full space (1-10)
         param1_name = np.log10([3e-9, 1e-08, 3e-08]) # Disk.mdot
         param2_name = [0.03, 0.1, 0.3] # wind.mdot (Disk.mdot)
-        param3_name = [0.55, 5.5, 55.0] # KWD.d
+        param3_name = np.log10([0.55, 5.5, 55.0]) # KWD.d
         param4_name = [0.0, 0.25, 1.0] # KWD.mdot_r_exponent
         param5_name = np.log10([7.25182e+08, 7.25182e+09, 7.25182e+10]) # KWD.acceleration_length (cm)
         param6_name = [0.5, 1.5, 4.5] # KWD.acceleration_exponent
@@ -351,7 +351,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             param_points_2 = np.array([0.03, 0.1, 0.3])
             points.append(param_points_2)
         if 3 in model_parameters:
-            param_points_3 = np.array([0.55, 5.5, 55.0])
+            param_points_3 = np.log10(np.array([0.55, 5.5, 55.0]))
             points.append(param_points_3)
         if 4 in model_parameters:
             param_points_4 = np.array([0.0, 0.25, 1.0])
@@ -421,7 +421,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         # Parameter definitions for both file lookup (1-8) and full space (1-10)
         param1_name = np.log10([3e-9, 1e-08, 3e-08]) # Disk.mdot
         param2_name = [0.03, 0.1, 0.3] # wind.mdot (Disk.mdot)
-        param3_name = [0.55, 5.5, 55.0] # KWD.d
+        param3_name = np.log10([0.55, 5.5, 55.0]) # KWD.d
         param4_name = [0.0, 0.25, 1.0] # KWD.mdot_r_exponent
         param5_name = np.log10([7.25182e+08, 7.25182e+09, 7.25182e+10]) # KWD.acceleration_length (cm)
         param6_name = [0.5, 1.5, 4.5] # KWD.acceleration_exponent
