@@ -791,7 +791,7 @@ def _(
         if os.path.exists(f'Grid-Emulator_Files/{_chk_name}.npz'):
             _emu_btn_label = f"{mo.icon('lucide:refresh-cw')} Re-train (An Emulator Already Exists)"
             _emu_btn_kind = "warn"
-            _emu_info_text = f"**Emulator found:** `{_chk_name}.npz`\n\nClick to **re-train** (overwrites existing)."
+            _emu_info_text = f"**Emulator found:** `{_chk_name}.npz`\n\nClicking **re-train** overwrites existing. Clicking **continue training** will resume from the existing model's state."
 
             # If a prior training run saved loss_history, hydrate it now so the
             # diagnostics panel shows something useful before retraining starts.
@@ -819,19 +819,30 @@ def _(
              set_trained_emu(None)
 
     train_button = mo.ui.run_button(label=_emu_btn_label, kind=_emu_btn_kind)
+    continue_train_button = mo.ui.run_button(
+        label=f"{mo.icon('lucide:fast-forward')} Continue Training",
+        kind="neutral"
+    )
 
-    mo.callout(
+    _callout = mo.callout(
         mo.md(_emu_info_text),
         kind="info" if _emu_btn_kind == "success" else "warn"
     )
 
-    train_button
-    return (train_button,)
+    if _emu_btn_kind == "warn":
+        # Emulator exists: show both retrain and continue training buttons
+        _buttons = mo.hstack([train_button, continue_train_button], justify="start", gap=1)
+    else:
+        _buttons = train_button
+
+    mo.vstack([_callout, _buttons])
+    return continue_train_button, train_button
 
 
 @app.cell
 def _(
     MarimoHDF5Creator,
+    continue_train_button,
     grid_configs,
     grid_selector,
     kernel_selector,
@@ -859,7 +870,7 @@ def _(
     emu_file_name = ""
     grid_file_name = ""
 
-    if train_button.value and grid_selector is not None and params is not None:
+    if (train_button.value or continue_train_button.value) and grid_selector is not None and params is not None:
         # Normalize the selected UI controls into the exact identifiers used by the
         # downstream grid-processing and emulator-training code.
         model_parameters = tuple(sorted([int(p) for p in params.value]))
@@ -1022,6 +1033,7 @@ def _(mo):
 def _(
     Emulator,
     alt,
+    continue_train_button,
     emu_file_name,
     get_console_logs,
     get_training_status,
@@ -1050,17 +1062,22 @@ def _(
 
     training_complete = False
     emu = None
+    is_continue = continue_train_button.value and not train_button.value
 
-    if train_button.value and grid_file_name:
+    if (train_button.value or continue_train_button.value) and grid_file_name:
         import contextlib
 
-        # Clear previous history
-        set_loss_history([])
+        # Clear previous history only for fresh training (not continue)
+        if not is_continue:
+            set_loss_history([])
         set_console_logs("")
         set_training_status(None)
 
-        # Train new emulator (Always re-train if button is clicked)
-        status_box = mo.md(f"{mo.icon('lucide:rocket')} **Training emulator...** Check the console below for progress.")
+        # Choose status text based on mode
+        if is_continue:
+            status_box = mo.md(f"{mo.icon('lucide:fast-forward')} **Continuing emulator training...** Check the console below for progress.")
+        else:
+            status_box = mo.md(f"{mo.icon('lucide:rocket')} **Training emulator...** Check the console below for progress.")
 
         # Live Logger setup
         log_buffer = []
@@ -1139,26 +1156,43 @@ def _(
 
                 sys.stdout.flush()
 
-                # Create emulator
-                # Matching arguments from Speculate_dev.py
-                # block_diagonal=True and svd_solver="full" are used there
-                print("Initializing Emulator (running PCA/SVD)...")
-                sys.stdout.flush()
+                # Create or load emulator depending on mode
+                if is_continue:
+                    # Continue training: load existing emulator
+                    emu_path = f'Grid-Emulator_Files/{emu_file_name}.npz'
+                    print(f"Loading existing emulator for continued training: {emu_path}")
+                    sys.stdout.flush()
 
-                emu = Emulator.from_grid(
-                    grid_path_npz,
-                    n_components=n_components.value,
-                    svd_solver="full",
-                    block_diagonal=True,
-                    strict_weight_fit=strict_weight_fit.value,
-                    per_component=per_component.value,
-                    kernel=kernel_selector.value
-                )
+                    emu = Emulator.load(emu_path)
 
-                print(f"Grid loaded. Initialized {emu.ncomps} PCA components.")
-                print(f"Starting optimization using {method.value} (max_iter={max_iter.value})...")
-                print("Optimization output:")
-                sys.stdout.flush()
+                    # Preserve existing loss history so the plot is cumulative
+                    prev_history = list(emu.loss_history) if hasattr(emu, 'loss_history') and emu.loss_history else []
+                    set_loss_history(prev_history)
+
+                    print(f"Emulator loaded. {emu.ncomps} PCA components.")
+                    print(f"Previous training iterations: {len(prev_history)}")
+                    print(f"Continuing optimization using {method.value} for {max_iter.value} more iterations...")
+                    sys.stdout.flush()
+                else:
+                    # Fresh training: create emulator from grid
+                    # Matching arguments from Speculate_dev.py
+                    # block_diagonal=True and svd_solver="full" are used there
+                    print("Initializing Emulator (running PCA/SVD)...")
+                    sys.stdout.flush()
+
+                    emu = Emulator.from_grid(
+                        grid_path_npz,
+                        n_components=n_components.value,
+                        svd_solver="full",
+                        block_diagonal=True,
+                        strict_weight_fit=strict_weight_fit.value,
+                        per_component=per_component.value,
+                        kernel=kernel_selector.value
+                    )
+
+                    print(f"Grid loaded. Initialized {emu.ncomps} PCA components.")
+                    print(f"Starting optimization using {method.value} (max_iter={max_iter.value})...")
+                    sys.stdout.flush()
 
                 # --- Live Plotting Setup ---
 
