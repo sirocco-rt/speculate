@@ -1165,11 +1165,20 @@ def _(
 
                     emu = Emulator.load(emu_path)
 
+                    # Guard: warn if the UI kernel selector differs from the
+                    # kernel baked into the saved emulator.  Training always
+                    # uses the kernel stored in the .npz, so a mismatch would
+                    # silently ignore the user's dropdown selection.
+                    if emu.kernel != kernel_selector.value:
+                        print(f"⚠️  Kernel mismatch — loaded emulator uses '{emu.kernel}', "
+                              f"but UI has '{kernel_selector.value}' selected. "
+                              f"Continuing with the emulator's original kernel ('{emu.kernel}').")
+
                     # Preserve existing loss history so the plot is cumulative
                     prev_history = list(emu.loss_history) if hasattr(emu, 'loss_history') and emu.loss_history else []
                     set_loss_history(prev_history)
 
-                    print(f"Emulator loaded. {emu.ncomps} PCA components.")
+                    print(f"Emulator loaded. {emu.ncomps} PCA components, kernel='{emu.kernel}'.")
                     print(f"Previous training iterations: {len(prev_history)}")
                     print(f"Continuing optimization using {method.value} for {max_iter.value} more iterations...")
                     sys.stdout.flush()
