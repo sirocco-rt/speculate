@@ -867,6 +867,10 @@ def _(emu, mo, np):
             start=-35.0, stop=-10.0, value=-25.0, step=0.1,
             label="log_scale (ln flux scaling)", show_value=True, full_width=True,
         )
+        pg_cheb1_slider = mo.ui.slider(
+            start=-0.5, stop=0.5, value=0.0, step=0.01,
+            label="cheb_1 (continuum tilt)", show_value=True, full_width=True,
+        )
         pg_logamp_slider = mo.ui.slider(
             start=-70.0, stop=-40.0, value=-55.0, step=0.5,
             label="log_amp (ln GP amplitude)", show_value=True, full_width=True,
@@ -886,12 +890,13 @@ def _(emu, mo, np):
     else:
         pg_av_slider = None
         pg_logscale_slider = None
+        pg_cheb1_slider = None
         pg_logamp_slider = None
         pg_logls_slider = None
         pg_mid_params = None
 
     _playground_ui
-    return pg_av_slider, pg_logamp_slider, pg_logls_slider, pg_logscale_slider, pg_mid_params
+    return pg_av_slider, pg_cheb1_slider, pg_logamp_slider, pg_logls_slider, pg_logscale_slider, pg_mid_params
 
 
 @app.cell
@@ -905,6 +910,7 @@ def _(
     obs_flux_scale,
     pd,
     pg_av_slider,
+    pg_cheb1_slider,
     pg_logamp_slider,
     pg_logls_slider,
     pg_logscale_slider,
@@ -941,6 +947,14 @@ def _(
             _av = pg_av_slider.value
             if _av > 0:
                 emu_flux_crop = extinct(emu_wl_crop, emu_flux_crop, Av=_av)
+
+            # Apply Chebyshev continuum tilt (c0=1, c1=slider value)
+            _cheb1 = pg_cheb1_slider.value
+            if _cheb1 != 0.0:
+                from numpy.polynomial.chebyshev import chebval
+                _scale_wl = emu_wl_crop / emu_wl_crop.max()
+                _cheb_poly = chebval(_scale_wl, [1.0, _cheb1])
+                emu_flux_crop = emu_flux_crop * _cheb_poly
 
             # Apply flux scaling (log_scale -> natural log -> exp)
             _log_scale = pg_logscale_slider.value
@@ -1070,11 +1084,13 @@ def _(
                 " a similar scale to each other and the uncertainty is reasonable.\n\n"
                 "- **Av** — Interstellar dust extinction (magnitudes). Reddens and dims the spectrum.\n"
                 "- **log_scale** — Natural log of the flux scaling factor. Shifts the spectrum up/down.\n"
+                "- **cheb_1** — Chebyshev c₁ coefficient. Applies a linear tilt to the continuum gradient.\n"
                 "- **log_amp** — GP covariance amplitude (affects uncertainty envelope, not the mean spectrum).\n"
                 "- **log_ls** — GP covariance length scale (affects uncertainty smoothness, not the mean spectrum)."
             ), kind="neutral"),
             pg_av_slider,
             pg_logscale_slider,
+            pg_cheb1_slider,
             pg_logamp_slider,
             pg_logls_slider,
             _playground_chart,
@@ -1167,6 +1183,7 @@ def _(emu, grid_indices, mo, param_map_db, re):
     inf_params = [
         'Av',        # Extinction (magnitudes)
         'log_scale', # Log Flux Scaling Factor (natural log)
+        'cheb_1',    # Chebyshev c1 coefficient (continuum tilt)
         'log_amp',   # GP Global Covariance Amplitude (natural log)
         'log_ls'     # GP Global Covariance Length Scale (natural log)
     ] 
@@ -1184,6 +1201,12 @@ def _(emu, grid_indices, mo, param_map_db, re):
         # Tighter range centred on typical linear-scale values
         bounds['log_scale'] = [-30.0, -20.0]
         defaults['log_scale'] = -25.0
+
+        # cheb_1: Chebyshev c1 coefficient – linear continuum tilt
+        # Multiplies the model by a Chebyshev polynomial; c0 is fixed to 1.
+        # Small values nudge the continuum gradient without changing lines.
+        bounds['cheb_1'] = [-0.5, 0.5]
+        defaults['cheb_1'] = 0.0
 
         # log_amp: GP global covariance amplitude (natural log)
         # Normal prior: center ± 2σ defines the bounds displayed in the UI
@@ -1229,6 +1252,7 @@ def _(bounds, mo, param_names, w_fix, w_max, w_min, w_val):
         # Friendly display names
         _label_map = {
             'log_scale': 'Log Scale (ln)',
+            'cheb_1': 'Continuum Tilt (c₁)',
             'log_amp': 'GP Log Amp (ln)',
             'log_ls': 'GP Log Length (ln)',
         }
@@ -1246,7 +1270,7 @@ def _(bounds, mo, param_names, w_fix, w_max, w_min, w_val):
             is_fixed = _fix_values.get(_name, False)
             display_name = _label_map.get(_name, _name)
             _mn, _mx = bounds.get(_name, [0.0, 1.0])
-            is_global = _name in ('Av', 'log_scale', 'log_amp', 'log_ls')
+            is_global = _name in ('Av', 'log_scale', 'cheb_1', 'log_amp', 'log_ls')
 
             # Fix toggle — access the individual checkbox widget from w_fix
             _fix_widget = w_fix.elements[_name]
@@ -1494,6 +1518,11 @@ def _(
                         'log_ls': w_val.value['log_ls']
                     }
 
+                # Handle Chebyshev continuum tilt (cheb_1)
+                # SpectrumModel expects cheb=[c1, c2, ...] (c0=1 is enforced internally)
+                if 'cheb_1' in param_names:
+                    global_params['cheb'] = [w_val.value['cheb_1']]
+
                 # Handle log_scale (flux scaling)
                 # If user has fixed log_scale, use their value
                 # If free, let Starfish auto-calculate initially, then optimize
@@ -1577,6 +1606,16 @@ def _(
                 if ('log_amp' in param_names and 'log_ls' in param_names 
                         and w_fix.value['log_amp'] and w_fix.value['log_ls']):
                     _model.freeze('global_cov')
+
+                # E. Chebyshev continuum tilt (cheb_1 -> internal key cheb:1)
+                if 'cheb_1' in param_names:
+                    if w_fix.value['cheb_1']:
+                        _model['cheb:1'] = w_val.value['cheb_1']
+                        _model.freeze('cheb')
+                    else:
+                        _mn = w_min['cheb_1'].value
+                        _mx = w_max['cheb_1'].value
+                        _priors['cheb:1'] = stats.uniform(loc=_mn, scale=_mx - _mn)
 
                 # 4. Build Initial Simplex / Bounds
                 _spinner.update("Preparing optimizer...")
@@ -1853,6 +1892,8 @@ def _(
                     _results_md += f"- **log_scale**: {res_global['log_scale']:.4f}\n"
                 elif hasattr(_model, '_log_scale') and _model._log_scale is not None:
                     _results_md += f"- **log_scale (auto)**: {_model._log_scale:.4f}\n"
+                if 'cheb:1' in res_global:
+                    _results_md += f"- **cheb_1** (continuum tilt): {res_global['cheb:1']:.4f}\n"
                 if 'global_cov:log_amp' in res_global:
                     _results_md += f"- **log_amp**: {res_global['global_cov:log_amp']:.4f}\n"
                 if 'global_cov:log_ls' in res_global:
@@ -1930,6 +1971,7 @@ def _(emu, get_mle_model, mo, param_names, re):
         # Map global/nuisance params to friendly names
         mcmc_label_map['Av'] = 'Av'
         mcmc_label_map['log_scale'] = 'log_scale'
+        mcmc_label_map['cheb:1'] = 'cheb_1'
         mcmc_label_map['global_cov:log_amp'] = 'GP log_amp'
         mcmc_label_map['global_cov:log_ls'] = 'GP log_ls'
 
