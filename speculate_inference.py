@@ -848,31 +848,95 @@ def _(mo):
 
 
 @app.cell
-def _(emu, mo, np):
+def _(emu, fit_power_law_continuum, mo, np, obs_data, obs_flux_scale, wl_range_slider):
     # ── Nuisance Parameter Playground ──
     # Interactive sliders for the four nuisance/inference parameters so the user
     # can visually explore how they shift the emulated spectrum before committing
     # to prior bounds.  Physical (grid) parameters are held at the midpoint of
     # the emulator training range.
+    #
+    # Slider ranges for log_scale and log_amp are auto-computed from the ratio
+    # of the emulator's midpoint flux to the (transformed) observation flux, so
+    # they stay sensible regardless of emmulator training transform.
 
     _playground_ui = mo.md("*Load an emulator and observation data to use the playground.*")
 
     if emu is not None:
-        # Nuisance slider ranges (wider than the defaults to let users explore)
+        # Midpoint physical parameters for preview
+        if hasattr(emu, 'min_params') and hasattr(emu, 'max_params'):
+            pg_mid_params = (np.array(emu.min_params) + np.array(emu.max_params)) / 2.0
+        else:
+            pg_mid_params = np.zeros(len(emu.param_names))
+
+        # --- Auto-compute log_scale and log_amp centres from data ---
+        # Reconstruct the emulator flux at the midpoint and compare with the
+        # transformed observation to estimate a sensible log_scale default.
+        _ls_centre = 0.0   # fallback
+        _la_centre = -5.0   # fallback
+        if obs_data is not None:
+            try:
+                _wl_lo, _wl_hi = wl_range_slider.value
+                # Emulator midpoint flux
+                _w, _c = emu(pg_mid_params)
+                _X = emu.eigenspectra * emu.flux_std
+                _emu_fl = (_w @ _X) + emu.flux_mean
+                _emu_wl = np.array(emu.wl)
+                _em = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
+                _emu_mean = np.mean(np.abs(_emu_fl[_em])) if _em.any() else 1.0
+
+                # Observation flux in the emulator's trained space
+                _om = (obs_data['wavelength'] >= _wl_lo) & (obs_data['wavelength'] <= _wl_hi)
+                _obs_fl = np.array(obs_data[_om]['flux'])
+                _obs_wl = np.array(obs_data[_om]['wavelength'])
+                _scale_label = obs_flux_scale.value
+                if _scale_label == 'log':
+                    _obs_fl = np.where(_obs_fl > 0, np.log10(_obs_fl),
+                                       np.log10(np.abs(_obs_fl) + 1e-30))
+                elif _scale_label == 'scaled':
+                    _m = np.mean(_obs_fl)
+                    if _m != 0:
+                        _obs_fl = _obs_fl / _m
+                elif _scale_label == 'continuum-subtracted':
+                    _ct, _ = fit_power_law_continuum(_obs_wl, _obs_fl)
+                    _obs_fl = _obs_fl - _ct
+                elif _scale_label == 'continuum-normalised':
+                    _ct, _ = fit_power_law_continuum(_obs_wl, _obs_fl)
+                    _ct_safe = np.where(_ct > 0, _ct, 1.0)
+                    _obs_fl = _obs_fl / _ct_safe
+
+                _obs_mean = np.mean(np.abs(_obs_fl)) if len(_obs_fl) > 0 else 1.0
+                # log_scale = ln(obs / emu)
+                if _emu_mean > 0 and _obs_mean > 0:
+                    _ls_centre = float(np.log(_obs_mean / _emu_mean))
+                # log_amp centre: residual variance as starting estimate
+                _residual_var = np.mean((_obs_fl[:min(len(_obs_fl), len(_emu_fl[_em]))]
+                                         - _emu_fl[_em][:min(len(_obs_fl), len(_emu_fl[_em]))]
+                                         * np.exp(_ls_centre)) ** 2) if len(_obs_fl) > 0 else 1e-5
+                _la_centre = float(np.log(max(_residual_var, 1e-30)))
+            except Exception:
+                pass  # keep fallback values
+
+        # Round for cleaner slider display
+        _ls_centre = round(_ls_centre, 1)
+        _la_centre = round(_la_centre, 1)
+
+        # Nuisance slider ranges centred on auto-detected values
         pg_av_slider = mo.ui.slider(
             start=0.0, stop=5.0, value=0.0, step=0.01,
             label="Av (Extinction)", show_value=True, full_width=True,
         )
         pg_logscale_slider = mo.ui.slider(
-            start=-35.0, stop=-10.0, value=-25.0, step=0.1,
+            start=_ls_centre - 10.0, stop=_ls_centre + 10.0,
+            value=_ls_centre, step=0.1,
             label="log_scale (ln flux scaling)", show_value=True, full_width=True,
         )
         pg_cheb1_slider = mo.ui.slider(
-            start=-0.5, stop=0.5, value=0.0, step=0.01,
+            start=-2.0, stop=2.0, value=0.0, step=0.01,
             label="cheb_1 (continuum tilt)", show_value=True, full_width=True,
         )
         pg_logamp_slider = mo.ui.slider(
-            start=-70.0, stop=-40.0, value=-55.0, step=0.5,
+            start=_la_centre - 15.0, stop=_la_centre + 15.0,
+            value=_la_centre, step=0.5,
             label="log_amp (ln GP amplitude)", show_value=True, full_width=True,
         )
         pg_logls_slider = mo.ui.slider(
@@ -973,7 +1037,9 @@ def _(
             )
             _obs_sub = obs_data[_obs_mask].copy()
 
-            # Apply the same flux transform to both spectra
+            # Transform observation flux to match the emulator's output space.
+            # The emulator already outputs in the trained space (e.g. continuum-
+            # normalised), so we only transform the observation — NOT the emulator.
             _scale_label = obs_flux_scale.value
             _obs_flux = np.array(_obs_sub['flux'])
             if _scale_label == 'log':
@@ -982,35 +1048,21 @@ def _(
                     np.log10(_obs_flux),
                     np.log10(np.abs(_obs_flux) + 1e-30),
                 )
-                emu_flux_crop = np.where(
-                    emu_flux_crop > 0,
-                    np.log10(emu_flux_crop),
-                    np.log10(np.abs(emu_flux_crop) + 1e-30),
-                )
-                emu_upper = np.where(emu_upper > 0, np.log10(emu_upper), np.log10(np.abs(emu_upper) + 1e-30))
-                emu_lower = np.where(emu_lower > 0, np.log10(emu_lower), np.log10(np.abs(emu_lower) + 1e-30))
             elif _scale_label == 'scaled':
                 _obs_mean = np.mean(_obs_flux)
                 if _obs_mean != 0:
                     _obs_flux = _obs_flux / _obs_mean
-                    emu_flux_crop = emu_flux_crop / _obs_mean
-                    emu_upper = emu_upper / _obs_mean
-                    emu_lower = emu_lower / _obs_mean
             elif _scale_label == 'continuum-subtracted':
                 _obs_cont, _ = fit_power_law_continuum(
                     np.array(_obs_sub['wavelength']), _obs_flux
                 )
                 _obs_flux = _obs_flux - _obs_cont
-                # Emulator output is already in subtracted space — no transform needed
             elif _scale_label == 'continuum-normalised':
                 _obs_cont, _ = fit_power_law_continuum(
                     np.array(_obs_sub['wavelength']), _obs_flux
                 )
                 _obs_cont_safe = np.where(_obs_cont > 0, _obs_cont, 1.0)
                 _obs_flux = _obs_flux / _obs_cont_safe
-                emu_flux_crop = emu_flux_crop / _obs_cont_safe
-                emu_upper = emu_upper / _obs_cont_safe
-                emu_lower = emu_lower / _obs_cont_safe
 
             # --- Build Altair chart ---
             _obs_df = pd.DataFrame({
@@ -1109,7 +1161,7 @@ def _(
 
 
 @app.cell
-def _(emu, grid_indices, mo, param_map_db, re):
+def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_scale, param_map_db, re, wl_range_slider):
     # ── Stage 2: Prior & Parameter Setup ──
     # Build per-parameter UI widgets (fixed/free toggle, value, min, max) that
     # drive the prior construction in Stage 3.  Parameters fall into two groups:
@@ -1197,10 +1249,52 @@ def _(emu, grid_indices, mo, param_map_db, re):
         defaults['Av'] = 0.0
 
         # log_scale: natural log of flux scaling factor
-        # Typically auto-calculated if not set, but can be optimized
-        # Tighter range centred on typical linear-scale values
-        bounds['log_scale'] = [-30.0, -20.0]
-        defaults['log_scale'] = -25.0
+        # Auto-detect sensible centre from emulator/observation flux ratio.
+        _ls_default = 0.0
+        _la_default = -5.0
+        if obs_data is not None:
+            try:
+                _wl_lo, _wl_hi = wl_range_slider.value
+                _w_tmp, _ = emu(np.array([(lo + hi) / 2 for lo, hi in
+                    zip(emu.min_params, emu.max_params)]))
+                _X_tmp = emu.eigenspectra * emu.flux_std
+                _efl = (_w_tmp @ _X_tmp) + emu.flux_mean
+                _ewl = np.array(emu.wl)
+                _em_tmp = (_ewl >= _wl_lo) & (_ewl <= _wl_hi)
+                _emu_avg = np.mean(np.abs(_efl[_em_tmp])) if _em_tmp.any() else 1.0
+
+                _om_tmp = (obs_data['wavelength'] >= _wl_lo) & (obs_data['wavelength'] <= _wl_hi)
+                _ofl = np.array(obs_data[_om_tmp]['flux'])
+                _owl = np.array(obs_data[_om_tmp]['wavelength'])
+                _sc = obs_flux_scale.value
+                if _sc == 'log':
+                    _ofl = np.where(_ofl > 0, np.log10(_ofl),
+                                    np.log10(np.abs(_ofl) + 1e-30))
+                elif _sc == 'scaled':
+                    _mm = np.mean(_ofl)
+                    if _mm != 0:
+                        _ofl = _ofl / _mm
+                elif _sc == 'continuum-subtracted':
+                    _ct2, _ = fit_power_law_continuum(_owl, _ofl)
+                    _ofl = _ofl - _ct2
+                elif _sc == 'continuum-normalised':
+                    _ct2, _ = fit_power_law_continuum(_owl, _ofl)
+                    _ct2s = np.where(_ct2 > 0, _ct2, 1.0)
+                    _ofl = _ofl / _ct2s
+
+                _obs_avg = np.mean(np.abs(_ofl)) if len(_ofl) > 0 else 1.0
+                if _emu_avg > 0 and _obs_avg > 0:
+                    _ls_default = float(np.log(_obs_avg / _emu_avg))
+                _n = min(len(_ofl), int(_em_tmp.sum()))
+                _resid_var = np.mean((_ofl[:_n] - _efl[_em_tmp][:_n] * np.exp(_ls_default)) ** 2) if _n > 0 else 1e-5
+                _la_default = float(np.log(max(_resid_var, 1e-30)))
+            except Exception:
+                pass
+        _ls_default = round(_ls_default, 1)
+        _la_default = round(_la_default, 1)
+
+        bounds['log_scale'] = [_ls_default - 5.0, _ls_default + 5.0]
+        defaults['log_scale'] = _ls_default
 
         # cheb_1: Chebyshev c1 coefficient – linear continuum tilt
         # Multiplies the model by a Chebyshev polynomial; c0 is fixed to 1.
@@ -1210,8 +1304,8 @@ def _(emu, grid_indices, mo, param_map_db, re):
 
         # log_amp: GP global covariance amplitude (natural log)
         # Normal prior: center ± 2σ defines the bounds displayed in the UI
-        bounds['log_amp'] = [-60.0, -50.0]
-        defaults['log_amp'] = -55.0
+        bounds['log_amp'] = [_la_default - 5.0, _la_default + 5.0]
+        defaults['log_amp'] = _la_default
 
         # log_ls: GP global covariance length scale (natural log)
         bounds['log_ls'] = [1.0, 8.0]
@@ -1788,8 +1882,10 @@ def _(
                         )
                     _sigma0 = 0.5
                     _cma_bounds = [_lo_bounds, _hi_bounds]
+                    # CMA-ES requires x0 strictly inside bounds; use midpoint
+                    _p0_cma = 0.5 * (np.array(_lo_bounds) + np.array(_hi_bounds))
                     _es = cma.CMAEvolutionStrategy(
-                        _p0.tolist(), _sigma0,
+                        _p0_cma.tolist(), _sigma0,
                         {
                             "bounds": _cma_bounds,
                             "maxfevals": _max_iter,
