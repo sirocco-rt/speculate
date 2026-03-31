@@ -613,7 +613,7 @@ def _(
             _detected_scale = "continuum-normalised"
 
     obs_flux_scale = mo.ui.dropdown(
-        options=["linear", "log", "scaled", "continuum-subtracted"],
+        options=["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"],
         value=_detected_scale,
         label="Observation Flux Transform:",
         full_width=True,
@@ -1458,8 +1458,6 @@ def _(
                     elif _flux_scale == 'scaled':
                         _sigma = _sigma / _flux_mean if _flux_mean != 0 else _sigma
                     # continuum-subtracted: sigma unchanged (deterministic subtraction)
-                    elif _flux_scale == 'continuum-normalised':
-                        _sigma = _sigma / _cont_safe
                     elif _flux_scale == 'continuum-normalised':
                         _sigma = _sigma / _cont_safe
                 else:
