@@ -41,14 +41,20 @@ def _(mo):
     get_training_status, set_training_status = mo.state(None)
     get_pca_result, set_pca_result = mo.state("Click test to see variance")
     get_trained_emu, set_trained_emu = mo.state(None)
+    get_loaded_emu_config, set_loaded_emu_config = mo.state(None)
+    get_loaded_emu_display, set_loaded_emu_display = mo.state(None)
     return (
         get_console_logs,
+        get_loaded_emu_config,
+        get_loaded_emu_display,
         get_loss_history,
         get_pca_result,
         get_trained_emu,
         get_training_status,
         get_training_trigger,
         set_console_logs,
+        set_loaded_emu_config,
+        set_loaded_emu_display,
         set_loss_history,
         set_pca_result,
         set_trained_emu,
@@ -302,14 +308,157 @@ def _(mo):
 
 
 @app.cell
-def _(available_grids, mo):
+def _(get_loaded_emu_display, get_training_trigger, set_loaded_emu_config, set_loaded_emu_display, mo, np):
+    import re as _re
+    from pathlib import Path as _Path
+
+    # Rescan after training completes so newly created emulators appear
+    _ = get_training_trigger()
+
+    def _parse_emu_filename(name):
+        """Parse emulator NPZ filename into a configuration dict.
+
+        Right-to-left parsing of the naming convention:
+          {grid}_emu_{params}_{scale}[_smooth][_{inc}inc]_{wlmin}-{wlmax}AA_{n}PCA
+        """
+        name = name.replace('.npz', '')
+        result = {}
+
+        # 1. PCA components
+        m = _re.search(r'_(\d+)PCA$', name)
+        if not m:
+            return None
+        result['n_components'] = int(m.group(1))
+        name = name[:m.start()]
+
+        # 2. Wavelength range
+        m = _re.search(r'_(\d+)-(\d+)AA$', name)
+        if not m:
+            return None
+        result['wl_min'] = int(m.group(1))
+        result['wl_max'] = int(m.group(2))
+        name = name[:m.start()]
+
+        # 3. Optional inclination tag (present when no inclination param)
+        m = _re.search(r'_(\d+)inc$', name)
+        if m:
+            name = name[:m.start()]
+
+        # 4. Smooth tag
+        if name.endswith('_smooth'):
+            result['smoothing'] = True
+            name = name[:-len('_smooth')]
+        else:
+            result['smoothing'] = False
+
+        # 5. Grid name, params string, scale
+        m = _re.match(r'^(.+?)_emu_(\d+)_(.+)$', name)
+        if not m:
+            return None
+        result['grid_name'] = m.group(1)
+        result['scale'] = m.group(3)
+
+        # Parse param digits — single digits 1-9, multi-digit 10/11
+        params = []
+        i = 0
+        s = m.group(2)
+        while i < len(s):
+            if i + 1 < len(s) and s[i:i+2] in ('10', '11'):
+                params.append(int(s[i:i+2]))
+                i += 2
+            else:
+                params.append(int(s[i]))
+                i += 1
+        result['params'] = params
+
+        return result
+
+    def _read_kernel_from_npz(stem):
+        """Try to read the kernel type from a saved emulator NPZ."""
+        try:
+            with np.load(f'Grid-Emulator_Files/{stem}.npz', allow_pickle=True) as data:
+                if 'kernel' in data:
+                    return str(data['kernel'])
+        except Exception:
+            pass
+        return None
+
+    # Scan for emulator files
+    _emu_dir = _Path("Grid-Emulator_Files")
+    _emu_options = {"-- No Emulator Selected --": ""}
+    if _emu_dir.exists():
+        for _f in sorted(_emu_dir.glob("*_emu_*.npz")):
+            _emu_options[_f.stem] = _f.stem
+
+    # Sync dropdown visual state with loaded_emu_display
+    _display = get_loaded_emu_display()
+    _initial = "-- No Emulator Selected --"
+    if _display and _display in _emu_options:
+        _initial = _display
+
+    def _on_load_select(value):
+        if value:
+            config = _parse_emu_filename(value)
+            if config:
+                # Also attach kernel from NPZ
+                kernel = _read_kernel_from_npz(value)
+                if kernel:
+                    config['kernel'] = kernel
+                set_loaded_emu_config(config)
+                set_loaded_emu_display(value)
+            else:
+                set_loaded_emu_config(None)
+                set_loaded_emu_display(None)
+        else:
+            set_loaded_emu_config(None)
+            set_loaded_emu_display(None)
+
+    load_emu_dropdown = mo.ui.dropdown(
+        options=_emu_options,
+        value=_initial,
+        label=f"{mo.icon('lucide:folder-open')} Load Existing Emulator:",
+        on_change=_on_load_select
+    )
+
+    _status = ""
+    if _display:
+        _parsed = _parse_emu_filename(_display)
+        if _parsed:
+            _kernel = _read_kernel_from_npz(_display)
+            _kernel_str = f" | Kernel: `{_kernel}`" if _kernel else ""
+            _status = (f"{mo.icon('lucide:check-circle')} **Loaded:** params={_parsed['params']}, "
+                       f"scale=`{_parsed['scale']}`, "
+                       f"{'smoothed, ' if _parsed['smoothing'] else ''}"
+                       f"{_parsed['wl_min']}-{_parsed['wl_max']}Å, "
+                       f"{_parsed['n_components']} PCA{_kernel_str}")
+
+    mo.vstack([
+        load_emu_dropdown,
+        mo.md(_status) if _status else mo.md("")
+    ])
+    return
+
+
+@app.cell
+def _(available_grids, get_loaded_emu_config, set_loaded_emu_display, mo):
     mo.md("### 1. Grid Selection")
 
+    _cfg = get_loaded_emu_config()
+
     if available_grids:
+        # Find the label for the loaded grid, or fall back to first available
+        _default_label = list(available_grids.keys())[0]
+        if _cfg and _cfg.get('grid_name'):
+            for _label, _name in available_grids.items():
+                if _name == _cfg['grid_name']:
+                    _default_label = _label
+                    break
+
         grid_selector = mo.ui.dropdown(
             options=available_grids,
-            value=list(available_grids.keys())[0] if available_grids else None,
-            label="Select Grid:"
+            value=_default_label,
+            label="Select Grid:",
+            on_change=lambda _: set_loaded_emu_display(None)
         )
         mo.vstack([
             grid_selector,
@@ -330,11 +479,12 @@ def _(available_grids, mo):
 
 
 @app.cell
-def _(grid_configs, grid_selector, mo, sirocco_grids_path):
+def _(grid_configs, grid_selector, get_loaded_emu_config, set_loaded_emu_display, mo, sirocco_grids_path):
     # Introspect the selected grid interface so the Stage 1 multiselect shows the
     # parameters that grid actually exposes, using the interface's own metadata
     # when possible.
     param_names = {}
+    _cfg = get_loaded_emu_config()
 
     if grid_selector is not None and grid_selector.value:
         selected_grid = grid_selector.value
@@ -370,15 +520,18 @@ def _(grid_configs, grid_selector, mo, sirocco_grids_path):
                 # Fallback if interface fails (e.g. files missing)
                 param_names = {i: f"Parameter {i}" for i in max_params}
 
-            # Default to the "standard" physical axes plus the sparse inclination
-            # variant; the denser inclination encodings are optional expansions.
-            default_params = [p for p in max_params if p <= 9]
+            # Use loaded params when the loaded grid matches, otherwise standard defaults
+            if _cfg and _cfg.get('params') and selected_grid == _cfg.get('grid_name'):
+                default_params = [p for p in _cfg['params'] if p in max_params]
+            else:
+                default_params = [p for p in max_params if p <= 9]
 
             # Create options
             params = mo.ui.multiselect(
                 options={param_names.get(i, f"Parameter {i}"): str(i) for i in max_params},
                 value=[param_names.get(p, f"Parameter {p}") for p in default_params if p in max_params],
-                label="Select parameters to include:"
+                label="Select parameters to include:",
+                on_change=lambda _: set_loaded_emu_display(None)
             )
         else:
             params = mo.ui.multiselect(
@@ -515,19 +668,23 @@ def _(mo, n_components, params):
 
 
 @app.cell
-def _(mo):
-    wl_min = mo.ui.number(start=800, stop=8000, value=850, step=10, label="Min Wavelength (Å):")
-    wl_max = mo.ui.number(start=800, stop=8000, value=1850, step=10, label="Max Wavelength (Å):")
+def _(get_loaded_emu_config, set_loaded_emu_display, mo):
+    _cfg = get_loaded_emu_config()
+    _scales = ["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"]
+
+    wl_min = mo.ui.number(start=800, stop=8000, value=_cfg['wl_min'] if _cfg and 'wl_min' in _cfg else 850, step=10, label="Min Wavelength (Å):", on_change=lambda _: set_loaded_emu_display(None))
+    wl_max = mo.ui.number(start=800, stop=8000, value=_cfg['wl_max'] if _cfg and 'wl_max' in _cfg else 1850, step=10, label="Max Wavelength (Å):", on_change=lambda _: set_loaded_emu_display(None))
 
     scale_selector = mo.ui.dropdown(
-        options=["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"],
-        value="linear",
-        label="Flux Scale:"
+        options=_scales,
+        value=_cfg['scale'] if _cfg and _cfg.get('scale') in _scales else "linear",
+        label="Flux Scale:",
+        on_change=lambda _: set_loaded_emu_display(None)
     )
 
-    use_smoothing = mo.ui.checkbox(value=False, label="Smooth Spectra (Boxcar=5)")
+    use_smoothing = mo.ui.checkbox(value=_cfg['smoothing'] if _cfg and 'smoothing' in _cfg else False, label="Smooth Spectra (Boxcar=5)", on_change=lambda _: set_loaded_emu_display(None))
 
-    n_components = mo.ui.slider(start=2, stop=30, value=10, step=1, label="PCA Components:",show_value=True,)
+    n_components = mo.ui.slider(start=2, stop=30, value=max(2, min(30, _cfg['n_components'])) if _cfg and 'n_components' in _cfg else 10, step=1, label="PCA Components:",show_value=True, on_change=lambda _: set_loaded_emu_display(None))
 
     test_pca_btn = mo.ui.run_button(label="Test PCA Reconstruction", kind="neutral")
     return (
@@ -556,13 +713,46 @@ def _(
     # Display result using state
     pca_result_display = mo.md(f"_{get_pca_result()}_")
 
-    mo.vstack([wl_min, wl_max, mo.hstack([scale_selector, use_smoothing], justify="start", align="center"), mo.hstack([n_components, test_pca_btn, pca_result_display], justify="start", align="start")])
+    mo.vstack([
+        mo.hstack([
+            mo.hstack([wl_min, wl_max], justify="start", align="center"),
+            mo.accordion({
+                f"{mo.icon('lucide:info')} Wavelength range": mo.md(
+                    "Specify the wavelength range to train the emulator on. \n\n The full Sirocco CV grids span 800-8000Å, but choosing a narrower range to focus on "
+                    "specific features can speed up training, improve accuracy and lessen the number of PCA components required."
+                ),
+            }),
+        ], align="center", gap=0.5),
+        mo.hstack([
+            mo.hstack([scale_selector, use_smoothing], justify="start", align="center"),
+            mo.accordion({
+                f"{mo.icon('lucide:info')} Scale & Smoothing": mo.md(
+                    "**Flux Scale**: Possible transformations to the input spectra before PCA may help capture features more efficiently."
+                    "Linear, log and continuum-normalised options are standard choices.\n\n"
+                    "**Smoothing**: Applying a boxcar smoothing (width=5) can help reduce high-frequency noise in the spectra, which may improve PCA reconstruction quality for some grids. However, it also slightly blurs spectral features, so use with caution."
+                ),
+            }),
+        ], align="center", gap=0.5),
+        mo.hstack([
+            mo.hstack([n_components, test_pca_btn, pca_result_display], justify="start", align="center"),
+            mo.accordion({
+                f"{mo.icon('lucide:info')} PCA Components": mo.md(
+                    "The number of PCA components determines the maximum accuracy achievable and the dimensionality of the emulator's latent space.\n\n The more components, the more accurate the emulator can be, but it also increases training time and has diminishing returns beyond a certain point.\n\n"
+                    r"Test the PCA reconstruction quality before training the emulator to see the accuracy.\n\n It is recommended to choose at minimum a 90-95% reconstruction quality, but the optimal number of components depends ones needs. More spectral lines = More components required."
+                ),
+            }),
+        ], align="center", gap=0.5),
+    ])          
     return
 
 
 @app.cell
-def _(mo):
+def _(get_loaded_emu_config, set_loaded_emu_display, mo):
     mo.md("### 4. Training Options")
+
+    _cfg = get_loaded_emu_config()
+    _kernel_labels = {"rbf": "RBF (Squared Exponential)", "matern52": "Matérn-5/2", "matern32": "Matérn-3/2"}
+    _default_kernel = _kernel_labels.get(_cfg.get('kernel', ''), "RBF (Squared Exponential)") if _cfg else "RBF (Squared Exponential)"
 
     method = mo.ui.dropdown(
         options=["Nelder-Mead", "L-BFGS-B", "CMA-ES"],
@@ -589,20 +779,29 @@ def _(mo):
 
     kernel_selector = mo.ui.dropdown(
         options={"RBF (Squared Exponential)": "rbf", "Matérn-5/2": "matern52", "Matérn-3/2": "matern32"},
-        value="RBF (Squared Exponential)",
-        label="GP Kernel:"
+        value=_default_kernel,
+        label="GP Kernel:",
+        on_change=lambda _: set_loaded_emu_display(None)
     )
 
     mo.vstack([
-        method,
-        max_iter,
+        mo.hstack([
+            mo.hstack([method, max_iter], justify="start", align="center"),
+            mo.accordion({
+            f"{mo.icon('lucide:info')} Optimization Settings": mo.md(
+                "**Nelder-Mead** is a robust simplex method that doesn't require gradients but can be slower and struggle with high-dimensional problems.\n\n "
+                "**L-BFGS-B** is a quasi-Newton method that uses gradients for **faster** convergence but may struggle finding good minima in complex landscapes.\n\n"
+                "**CMA-ES** is a population-based evolutionary strategy that can escape local minima but is computationally intensive but fair better in high-dimensional problems.\n\n"
+                "**Max Iterations** sets a hard cap on optimization steps to prevent runaway training times; increase for larger grids / high dimensional problems."
+            ),
+        })], align="center", gap=0.5),
         mo.hstack([
             kernel_selector,
             mo.accordion({
                 f"{mo.icon('lucide:info')} Kernel info": mo.md(
                     "**RBF** (C∞ smooth) is the classic choice. **Matérn-5/2** (C² smooth) "
-                    "and **Matérn-3/2** (C¹ smooth) allow sharper transitions — literature has" 
-                    "shown matern kernel tend to outperform other kernels, particularly if the"
+                    "and **Matérn-3/2** (C¹ smooth) allow sharper transitions — literature has " 
+                    "shown matern kernel tend to outperform other kernels, particularly if the "
                     "weight space have non-smooth features that the RBF can't capture."
                 ),
             }),
@@ -1121,7 +1320,9 @@ def _(
                 log_buffer.append(text)
                 # Update UI with current status (preserves chart)
                 update_ui(status_box)
-            def flush(self): pass
+            def flush(self):
+                # Force UI refresh so status prints appear immediately
+                update_ui(status_box, force=True)
 
         logger = LiveLogger()
         update_ui(status_box, force=True)

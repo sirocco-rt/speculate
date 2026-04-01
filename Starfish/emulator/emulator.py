@@ -2148,6 +2148,7 @@ class Emulator:
                 message="CMA-ES terminated", nit=es.result.iterations,
             )
         
+        print("\nRebuilding covariance matrix (V11)...", flush=True)
         if self._gpu_training_mode:
             was_memory_efficient = self._memory_efficient_training
             self._gpu_training_mode = False
@@ -2166,6 +2167,7 @@ class Emulator:
                 print("(Skipping V11 rebuild — memory-efficient inference will be used)")
             else:
                 self.set_param_dict(self.get_param_dict())  # Rebuild V11 normally
+                print("V11 rebuild complete.", flush=True)
         
         final_time = time.time()
         total_elapsed = final_time - self._training_start_time
@@ -2500,11 +2502,14 @@ class Emulator:
         # After per-component training, optimize the shared lambda_xi scalar
         # via 1D bounded minimization over the total NLL across all components.
         if refine_lambda_xi and not self.strict_weight_fit:
-            print("\nRefining λ_ξ (1D Brent optimization)...")
+            print("\nRefining λ_ξ (1D Brent optimization)...", flush=True)
             log_lam_init = np.log(self.lambda_xi)
+            _lam_eval_counter = [0]
 
             def _total_nll_lambda(log_lam):
+                _lam_eval_counter[0] += 1
                 lam = np.exp(log_lam)
+                print(f"  λ_ξ eval {_lam_eval_counter[0]} | log(λ_ξ)={log_lam:.4f}", end="", flush=True)
                 total = 0.0
                 for kk in range(self.ncomps):
                     var_kk = np.exp(self.hyperparams[f"log_variance:{kk}"])
@@ -2541,6 +2546,7 @@ class Emulator:
                         sqmah = np.dot(w_hat_reshaped_np[kk], solved)
 
                     total += (logdet + sqmah) / 2.0
+                print(f" | NLL={total:.2f}", flush=True)
                 return total
 
             # Precompute dots_inv_diag values for all components
@@ -2571,6 +2577,7 @@ class Emulator:
         # --- Post-training housekeeping ---
         # Check if V11 fits in memory; if so rebuild, otherwise leave for
         # memory-efficient inference.
+        print("\nRebuilding covariance matrix (V11)...", flush=True)
         if use_gpu:
             v11_bytes = self.ncomps * M * M * 8 * 3
             gpu_vram = torch.cuda.get_device_properties(0).total_memory
@@ -2587,8 +2594,10 @@ class Emulator:
                 self._gpu_training_mode = True
                 self.set_param_dict(self.get_param_dict())
                 self._gpu_training_mode = False
+                print("V11 rebuild complete.", flush=True)
         else:
             self.set_param_dict(self.get_param_dict())
+            print("V11 rebuild complete.", flush=True)
 
         total_elapsed = time.time() - self._training_start_time
         print(f"\nPer-component training complete")
