@@ -70,35 +70,59 @@ def _():
 
 
 @app.cell
-def _(mo):
-    # Static sidebar - always shows all options
-    mo.sidebar(
-        mo.vstack([
-            mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
-            mo.md(" "),
+def _(mo, os):
+    _is_hf = os.environ.get("SPACE_ID") is not None
+
+    _items = [mo.md(f"#Speculate {mo.icon('lucide:telescope')}")]
+    _items.extend([mo.md(" "), mo.md("---"), mo.md("---"), mo.md(" ")])
+
+    if _is_hf:
+        _items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+        }, orientation="vertical"))
+        _items.extend([
             mo.md(" "),
             mo.md("---"),
             mo.md("---"),
+            mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
+            mo.md("Install Speculate Locally"),
             mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:download')} Grid Downloader"),
             mo.md(" "),
-            mo.nav_menu({
-                "/": f"###{mo.icon('lucide:home')} Home",
-            }, orientation="vertical"),
+            mo.md(f"###{mo.icon('lucide:brain')} Training Tool"),
             mo.md(" "),
-            mo.md("---"),
-            mo.md("---"),
-            mo.nav_menu({
+            mo.md(f"###{mo.icon('lucide:sparkles')} Inference Tool"),
+            mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:test-tubes')} Benchmark Suite"),
+        ])
+    else:
+        _items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/downloader": f"###{mo.icon('lucide:download')} Grid Downloader",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/training": f"###{mo.icon('lucide:brain')} Training Tool",
+            "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+            "/benchmark": f"###{mo.icon('lucide:test-tubes')} Benchmark Suite",
+        }, orientation="vertical"))
+
+    _items.extend([
+        mo.md(" "), mo.md("---"), mo.md("---"),
+        mo.nav_menu({
             "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
             "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.nav_menu({
+        }, orientation="vertical"),
+        mo.md(" "), mo.md("---"),
+        mo.nav_menu({
             "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
-            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs"
-            }, orientation="vertical")
-        ])
-    )
+            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs",
+        }, orientation="vertical"),
+        mo.md("---"),
+        mo.md("---"),
+    ])
+    mo.sidebar(mo.vstack(_items))
     return
 
 

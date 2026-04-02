@@ -5,17 +5,19 @@
 
 import marimo
 
-__generated_with = "0.19.6"
+__generated_with = "0.19.7"
 app = marimo.App(
     width="full",
     app_title="Speculate - Spectral Emulator Suite",
     layout_file="layouts/speculate.grid.json",
 )
 
+
 @app.cell(hide_code=True)
 def _():
     import marimo as mo
     return (mo,)
+
 
 @app.cell
 def _(mo):
@@ -56,18 +58,13 @@ def _(mo):
     - **Grid Inspector** -- A plotting display interface to browse through our pre-made Sirocco spectra datasets.
     - **Training Tool** -- A training interface for the emulator. This tool requires GPU access, so it should only be run locally.
     - **Inference Tool** -- An analysis interface to uncover the best-matching sirocco emulated spectra to **YOUR** observational spectrum.
+    - **Quick Fit** -- A lightweight fitting interface for quick-look analysis of spectra. This tool is designed to run on HuggingFace Spaces with limited resources.
+    - **Benchmark Suite** -- A collection of benchmark results comparing different emulator models and training configurations.
+    - **Documentation** -- Hosted on Speculate's GitHub repository wiki page. Links to Sirocco's repository and documentation are also available in the sidebar.
 
-    Documentation is hosted on Speculate's GitHub repository wiki page. Links to Sirocco's repository and documentation are also linked in the sidebar.
+    🤗 HuggingFace Spaces are resource-limited and hence, only lightweight tools/models should be used online.
 
-    HuggingFace Spaces are resource-limited and hence, only lightweight tools/models should be used online. For full access, perform a local install on a more powerful local machine or HPC interactive node. GPU access is HIGHLY RECOMMENDED for heavy-weight models.
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(f"""
-    ## {mo.icon('lucide:rocket')} Please select your correct working environment:
+    For full access, perform a local install on a more powerful local machine or HPC interactive node. GPU access is HIGHLY RECOMMENDED.
     """)
     return
 
@@ -76,45 +73,109 @@ def _(mo):
 def _(mo):
     import os
 
-    # Auto-detect if running on HuggingFace Space
+    # Hard-detect if running on a real HuggingFace Space
     is_hf_space = os.environ.get("SPACE_ID") is not None
-    default_mode = "🤗 HuggingFace Space" if is_hf_space else "💻 Local Computer"
 
-    # Environment mode selector
-    environment_mode = mo.ui.dropdown(
-        options={
-            "🤗 HuggingFace Space": "HuggingFace Space",
-            "💻 Local Computer": "Local Machine"
-        },
-        value=default_mode,
-        label="",
-        full_width=True
-    )
-    environment_mode
-    return (environment_mode,)
+    # On a real HF Space: no switch, mode is locked
+    # On local: provide a switch to simulate HF mode for development
+    if is_hf_space:
+        hf_mode_switch = None
+    else:
+        hf_mode_switch = mo.ui.switch(
+            value=False,
+            label="🤗 HuggingFace Space Mode",
+        )
+    return hf_mode_switch, is_hf_space
 
 
 @app.cell
-def _(environment_mode):
-    print(environment_mode.value)
-    return
+def _(hf_mode_switch, is_hf_space, mo):
+    # Resolve the current mode (must be in a separate cell from switch creation)
+    if is_hf_space:
+        current_mode = "HuggingFace Space"
+    elif hf_mode_switch is not None and hf_mode_switch.value:
+        current_mode = "HuggingFace Space"
+    else:
+        current_mode = "Local Machine"
 
-
-@app.cell
-def _(environment_mode, mo):
-    # Show warning about which tools are available based on mode
-    current_mode = environment_mode.value
+    # Build sidebar based on mode
+    sidebar_items = [
+        mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
+        mo.md(" "),
+        mo.md("---"),
+        mo.md("---"),
+        mo.md(" "),
+    ]
 
     if current_mode == "HuggingFace Space":
+        sidebar_items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+        }, orientation="vertical"))
+        sidebar_items.extend([
+            mo.md(" "),
+            mo.md("---"),
+            mo.md("---"),
+            mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
+            mo.md("Install Speculate Locally"),
+            mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:download')} Grid Downloader"),
+            mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:brain')} Training Tool"),
+            mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:sparkles')} Inference Tool"),
+            mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:test-tubes')} Benchmark Suite"),
+        ])
+    else:
+        sidebar_items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/downloader": f"###{mo.icon('lucide:download')} Grid Downloader",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/training": f"###{mo.icon('lucide:brain')} Training Tool",
+            "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+            "/benchmark": f"###{mo.icon('lucide:test-tubes')} Benchmark Suite",
+        }, orientation="vertical"))
+
+    sidebar_items.extend([
+        mo.md(" "),
+        mo.md("---"),
+        mo.md("---"),
+        mo.nav_menu({
+            "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
+            "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
+        }, orientation="vertical"),
+        mo.md(" "),
+        mo.md("---"),
+        mo.nav_menu({
+            "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
+            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs",
+        }, orientation="vertical"),
+        mo.md("---"),
+        mo.md("---"),
+    ])
+
+    # Show the dev-mode switch on local installs (after documentation)
+    if hf_mode_switch is not None:
+        sidebar_items.append(hf_mode_switch)
+
+    mo.sidebar(mo.vstack(sidebar_items))
+    return (current_mode,)
+
+
+@app.cell
+def _(current_mode, mo):
+    if current_mode == "HuggingFace Space":
         mode_warning = mo.callout(
-            mo.md("""**🤗 HuggingFace Space Mode Active** 
+            mo.md(f"""**🤗 HuggingFace Space Mode Active** 
 
             Only the following tools will operate as expected due to resource limitations: 
             - **Grid Inspector**
-            - **Inference Tool**
+            - **Quick Fit**
 
-            {mo.icon('lucide:triangle-alert')} **Note:** For full features, install Speculate locally and select "Local Machine".
-            """),
+            {mo.icon('lucide:triangle-alert')} **Note:** For full features, install Speculate locally."""),
             kind="warn"
         )
     else:
@@ -126,84 +187,6 @@ def _(environment_mode, mo):
         )
 
     mode_warning
-    return (current_mode,)
-
-
-@app.cell
-def _(current_mode, mo):
-    # Side bar menu adjusted based on environment mode
-    if current_mode == "HuggingFace Space":
-        # Show all items but mark unavailable ones
-        menu = mo.vstack([
-            mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
-            mo.md(" "),
-            mo.md(" "),
-            mo.md("---"),
-            mo.md("---"),
-            mo.md(" "),
-            mo.md(" "),
-            mo.nav_menu({
-                "/": f"###{mo.icon('lucide:home')} Home",
-                "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
-                "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
-            mo.md("Install Speculate Locally"),
-            mo.md(" "),
-            mo.md(f"###{mo.icon('lucide:download')} Grid Downloader"),
-            mo.md(" "),
-            mo.md(f"###{mo.icon('lucide:brain')} Training Tool"),
-            mo.md(" "),
-            mo.md(f"###{mo.icon('lucide:test-tubes')} Benchmark Suite"),
-            mo.md("---"),
-            mo.md("---"),
-            mo.nav_menu({
-            "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
-            "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.nav_menu({
-            "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
-            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs"
-            }, orientation="vertical")
-        ])
-    else: 
-        # Show all items as available
-        menu = mo.vstack([
-            mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
-            mo.md(" "),
-            mo.md(" "),
-            mo.md("---"),
-            mo.md("---"),
-            mo.md(" "),
-            mo.md(" "),
-            mo.nav_menu({
-                "/": f"###{mo.icon('lucide:home')} Home",
-                "/downloader": f"###{mo.icon('lucide:download')} Grid Downloader",
-                "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
-                "/training": f"###{mo.icon('lucide:brain')} Training Tool",
-                "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
-                "/benchmark": f"###{mo.icon('lucide:test-tubes')} Benchmark Suite",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.md("---"),
-            mo.nav_menu({
-            "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
-            "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.nav_menu({
-            "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
-            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs"
-            }, orientation="vertical")
-        ])
-
-    mo.sidebar(menu)
     return
 
 

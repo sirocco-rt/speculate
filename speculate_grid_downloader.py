@@ -19,7 +19,7 @@
 
 import marimo
 
-__generated_with = "0.18.1"
+__generated_with = "0.19.7"
 app = marimo.App(
     width="full",
     app_title="Speculate Grid Downloader",
@@ -52,6 +52,63 @@ def _(mo):
     logo = mo.image(src=str(logo_path), width=400, height=95)
     link = mo.md('<p style="text-align: center;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
     mo.vstack([mo.md("---"), logo, link], align="center")
+    return
+
+
+@app.cell
+def _(mo, os):
+    _is_hf = os.environ.get("SPACE_ID") is not None
+
+    _items = [mo.md(f"#Speculate {mo.icon('lucide:telescope')}")]
+    _items.extend([mo.md(" "), mo.md("---"), mo.md("---"), mo.md(" ")])
+
+    if _is_hf:
+        _items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+        }, orientation="vertical"))
+        _items.extend([
+            mo.md(" "),
+            mo.md("---"),
+            mo.md("---"),
+            mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
+            mo.md("Install Speculate Locally"),
+            mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:download')} Grid Downloader"),
+            mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:brain')} Training Tool"),
+            mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:sparkles')} Inference Tool"),
+            mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:test-tubes')} Benchmark Suite"),
+        ])
+    else:
+        _items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/downloader": f"###{mo.icon('lucide:download')} Grid Downloader",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/training": f"###{mo.icon('lucide:brain')} Training Tool",
+            "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+            "/benchmark": f"###{mo.icon('lucide:test-tubes')} Benchmark Suite",
+        }, orientation="vertical"))
+
+    _items.extend([
+        mo.md(" "), mo.md("---"), mo.md("---"),
+        mo.nav_menu({
+            "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
+            "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
+        }, orientation="vertical"),
+        mo.md(" "), mo.md("---"),
+        mo.nav_menu({
+            "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
+            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs",
+        }, orientation="vertical"),
+        mo.md("---"),
+        mo.md("---"),
+    ])
+    mo.sidebar(mo.vstack(_items))
     return
 
 
@@ -165,7 +222,7 @@ def _(ORG_ID, REPO_TYPE, dataset_dropdown, list_repo_files, mo):
     aux_files = []
     repo_id = None
 
-    if dataset_dropdown.value:
+    if dataset_dropdown is not None and dataset_dropdown.value:
         try:
             repo_id = f"{ORG_ID}/{dataset_dropdown.value}"
             all_files = list(list_repo_files(repo_id=repo_id, repo_type=REPO_TYPE))
@@ -525,39 +582,6 @@ def _(
                 bar.update()
 
         mo.md(f"### {mo.icon('lucide:check-circle')} Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
-    return
-
-
-@app.cell
-def _(mo):
-    # Static sidebar - always shows all options
-    mo.sidebar(
-        mo.vstack([
-            mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
-            mo.md(" "),
-            mo.md(" "),
-            mo.md("---"),
-            mo.md("---"),
-            mo.md(" "),
-            mo.md(" "),
-            mo.nav_menu({
-                "/": f"###{mo.icon('lucide:home')} Home",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.md("---"),
-            mo.nav_menu({
-            "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
-            "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.nav_menu({
-            "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
-            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs"
-            }, orientation="vertical")
-        ])
-    )
     return
 
 

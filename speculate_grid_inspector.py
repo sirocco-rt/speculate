@@ -46,65 +46,106 @@ def _():
 
 @app.cell
 def _(mo):
-    mo.md("""
+    title_col = mo.vstack([mo.md(
+    """
     # Grid Inspector
-
+    """), mo.md(
+    """
     Visualize and analyse the sirocco spectral grid data interactively.
-    """)
+    """)])
+
+    mo._runtime.context.get_context().marimo_config["runtime"]["output_max_bytes"] = 10_000_000_000
+    logo_path = "assets/logos/Speculate_logo2.png"
+
+    # Right column: Logo with link
+    # Using flex-end to align it to the right
+    logo_col = mo.vstack([
+        mo.image(src=logo_path, width=400, height=95),
+        mo.md('<p style="text-align: center; font-size: 0.8em;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
+    ], align="center")
+
+    # Combine in horizontal stack
+    mo.hstack([title_col, logo_col], justify="space-between", align="center")
     return
 
 
 @app.cell
 def _(mo):
-    # Static sidebar - always shows all options
-    mo.sidebar(
-        mo.vstack([
-            mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
-            mo.md(" "),
+    _is_hf = __import__('os').environ.get("SPACE_ID") is not None
+    if _is_hf:
+        hf_mode_switch = None
+        is_hf_space_nav = True
+    else:
+        hf_mode_switch = mo.ui.switch(value=False, label="🤗 HuggingFace Space Mode")
+        is_hf_space_nav = False
+    return hf_mode_switch, is_hf_space_nav
+
+
+@app.cell
+def _(hf_mode_switch, is_hf_space_nav, mo):
+    if is_hf_space_nav:
+        _mode = "HuggingFace Space"
+    elif hf_mode_switch is not None and hf_mode_switch.value:
+        _mode = "HuggingFace Space"
+    else:
+        _mode = "Local Machine"
+
+    IS_HUGGINGFACE_SPACE = (_mode == "HuggingFace Space")
+
+    _items = [mo.md(f"#Speculate {mo.icon('lucide:telescope')}")]
+    _items.extend([mo.md(" "), mo.md("---"), mo.md("---"), mo.md(" ")])
+
+    if _mode == "HuggingFace Space":
+        _items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+        }, orientation="vertical"))
+        _items.extend([
             mo.md(" "),
             mo.md("---"),
             mo.md("---"),
-            mo.md(" "),
-            mo.md(" "),
-            mo.nav_menu({
-                "/": f"###{mo.icon('lucide:home')} Home",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.md("---"),
-            mo.nav_menu({
+            mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
+            mo.md("Install Speculate Locally"), mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:download')} Grid Downloader"), mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:brain')} Training Tool"), mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:sparkles')} Inference Tool"), mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:test-tubes')} Benchmark Suite"),
+        ])
+    else:
+        _items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/downloader": f"###{mo.icon('lucide:download')} Grid Downloader",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/training": f"###{mo.icon('lucide:brain')} Training Tool",
+            "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+            "/benchmark": f"###{mo.icon('lucide:test-tubes')} Benchmark Suite",
+        }, orientation="vertical"))
+
+    _items.extend([
+        mo.md(" "), mo.md("---"), mo.md("---"),
+        mo.nav_menu({
             "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
             "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.nav_menu({
+        }, orientation="vertical"),
+        mo.md(" "), mo.md("---"),
+        mo.nav_menu({
             "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
-            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs"
-            }, orientation="vertical")
-        ])
-    )
-    return
+            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs",
+        }, orientation="vertical"),
+        mo.md("---"),
+        mo.md("---"),
+    ])
+    if hf_mode_switch is not None:
+        _items.extend([hf_mode_switch])
 
-
-@app.cell
-def _(mo):
-    # Add logo using marimo's image display
-    import pathlib
-
-    logo_path = pathlib.Path("assets/logos/Speculate_logo2.png")
-
-    logo = mo.image(src=str(logo_path), width=400, height=95)
-    link = mo.md('<p style="text-align: center;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
-    mo.vstack([mo.md("---"), logo, link], align="center")
-    return
+    mo.sidebar(mo.vstack(_items))
+    return (IS_HUGGINGFACE_SPACE,)
 
 
 @app.cell
 def _():
-    # ── Core data-science imports ──
-    # VegaFusion is enabled because a single spectrum can have thousands of
-    # wavelength points and Altair’s default inline limit is 5 000 rows.
     import os
     import numpy as np
     import pandas as pd
@@ -112,14 +153,8 @@ def _():
     import altair as alt
     from Speculate_addons.Spec_functions import fit_power_law_continuum
 
-    # Enable VegaFusion for large datasets
     alt.data_transformers.enable("vegafusion")
-
-    # Detect environment
-    # When running on HuggingFace Spaces the grid files are fetched over
-    # HTTP; locally they are read straight from the filesystem.
-    IS_HUGGINGFACE_SPACE = os.environ.get("SPACE_ID") is not None
-    return IS_HUGGINGFACE_SPACE, Path, alt, fit_power_law_continuum, np, os, pd
+    return Path, alt, fit_power_law_continuum, np, os, pd
 
 
 @app.cell
@@ -419,7 +454,14 @@ def _(mo):
 
 
 @app.cell
-def _(get_run_index, inclination_angles, mo, num_runs, set_run_index):
+def _(
+    get_run_index,
+    inclination_angles,
+    mo,
+    num_runs,
+    set_run_index,
+    wavelengths,
+):
     # Run file selector slider with built-in editable input
     # Synced with shared state
 
@@ -446,22 +488,6 @@ def _(get_run_index, inclination_angles, mo, num_runs, set_run_index):
         label="Inclination Angle:"
     )
 
-    mo.vstack([
-        run_slider,
-        inclination_selector
-    ])
-    return inclination_selector, run_slider
-
-
-@app.cell
-def _(run_slider):
-    # Use slider value directly - the built-in input is already integrated
-    current_run_index = run_slider.value
-    return (current_run_index,)
-
-
-@app.cell
-def _(mo, wavelengths):
     # Wavelength range selector - exclude first and last 10 Å to avoid Sirocco artifacts
     wl_min_limit = float(wavelengths.min() + 10)
     wl_max_limit = float(wavelengths.max() - 10)
@@ -475,8 +501,32 @@ def _(mo, wavelengths):
         show_value=True
     )
 
-    wavelength_range
-    return (wavelength_range,)
+
+    flux_scale_selector = mo.ui.dropdown(
+        options=["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"],
+        value="linear",
+        label="Flux Scale:"
+    )
+
+    mo.hstack([
+        run_slider,
+        wavelength_range,
+        inclination_selector, 
+        flux_scale_selector
+    ], justify='space-between')
+    return (
+        flux_scale_selector,
+        inclination_selector,
+        run_slider,
+        wavelength_range,
+    )
+
+
+@app.cell
+def _(run_slider):
+    # Use slider value directly - the built-in input is already integrated
+    current_run_index = run_slider.value
+    return (current_run_index,)
 
 
 @app.cell
@@ -489,7 +539,7 @@ def _(mo):
     use_smoothing = mo.ui.checkbox(value=True, label="Smooth Data (Boxcar=5)")
     show_grid = mo.ui.checkbox(value=True, label="Show Grid")
 
-    mo.hstack([show_current, show_fixed, show_obs, use_dimensionless, use_smoothing, show_grid], justify="start", gap=0)
+    mo.hstack([show_current, show_fixed, show_obs, use_dimensionless, use_smoothing, show_grid], justify="space-between")
     return (
         show_current,
         show_fixed,
@@ -891,8 +941,8 @@ def _(
                 {"test": alt.datum.Type == 'Observational', "value": 1.0}
             ])
         ).properties(
-            width=1000,
-            height=600,
+            width=850,
+            height=500,
             title=f'Spectral Data Exploration - {selected_grid}',
             background='white'
         ).configure_axis(
@@ -914,8 +964,8 @@ def _(
             x='x:Q',
             y='y:Q'
         ).properties(
-            width=900,
-            height=400,
+            width=850,
+            height=500,
             title='No spectra to display'
         )
 
@@ -1161,23 +1211,12 @@ def _(mo, obs_file_selector, os, set_obs_refresh):
 def _(delete_obs_btn, mo, obs_file_selector, obs_file_uploader):
     # Select observational spectrum - Layout
     mo.vstack([
-        mo.md("### Observational Data"),
+        mo.md("## Observational Data:"),
         mo.hstack([obs_file_selector, delete_obs_btn], align="end"),
         obs_file_uploader,
         mo.md("Data must be in CSV format with 'Wavelength', then 'Flux' columns.")
     ])
     return
-
-
-@app.cell
-def _(mo):
-    flux_scale_selector = mo.ui.dropdown(
-        options=["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"],
-        value="linear",
-        label="Flux Scale:"
-    )
-    flux_scale_selector
-    return (flux_scale_selector,)
 
 
 if __name__ == "__main__":

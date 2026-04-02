@@ -20,42 +20,24 @@
       {
         "position": [
           0,
-          42,
+          45,
           24,
           1
         ]
       },
       {
-        "position": [
-          0,
-          46,
-          24,
-          1
-        ]
+        "position": null
       },
       {
         "position": [
           0,
           21,
           24,
-          21
+          24
         ]
       },
       {
-        "position": [
-          3,
-          43,
-          11,
-          3
-        ]
-      },
-      {
-        "position": [
-          14,
-          43,
-          6,
-          3
-        ]
+        "position": null
       },
       {
         "position": null
@@ -63,13 +45,10 @@
       {
         "position": [
           0,
-          47,
+          46,
           24,
           21
         ]
-      },
-      {
-        "position": null
       }
     ]
   }
