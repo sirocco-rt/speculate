@@ -114,17 +114,23 @@ def _(mo):
     get_comparison_reports, set_comparison_reports = mo.state([])
     get_status_msg, set_status_msg = mo.state("")
     get_emulator, set_emulator = mo.state(None)
+    # tier2_posteriors – list of per-spectrum dicts, each containing MCMC
+    # flat samples, labels, ground-truth values, and summary stats so the
+    # interactive corner-plot explorer can render any spectrum post-run.
+    get_tier2_posteriors, set_tier2_posteriors = mo.state(None)
     return (
         get_comparison_reports,
         get_emulator,
         get_report,
         get_status_msg,
         get_tier1_arrays,
+        get_tier2_posteriors,
         set_comparison_reports,
         set_emulator,
         set_report,
         set_status_msg,
         set_tier1_arrays,
+        set_tier2_posteriors,
     )
 
 
@@ -722,6 +728,99 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
 
 
 @app.cell(hide_code=True)
+def _(get_tier2_posteriors, mo):
+    _posteriors = get_tier2_posteriors()
+    mo.stop(
+        _posteriors is None or len(_posteriors) == 0,
+        mo.md("*Run a Tier 2 benchmark to view per-spectrum corner plots.*"),
+    )
+    _n = len(_posteriors)
+    t2_spectrum_slider = mo.ui.slider(
+        start=0, stop=_n - 1, value=0, step=1, show_value=True,
+        label="Test spectrum index", full_width=True,
+    )
+    mo.vstack([
+        mo.md("## Tier 2 — Per-Spectrum Posterior Explorer"),
+        mo.md(f"Browse **{_n}** completed spectra. "
+               "Each corner plot shows the MCMC posterior with ground-truth values (blue lines)."),
+        t2_spectrum_slider,
+    ])
+    return (t2_spectrum_slider,)
+
+
+@app.cell(hide_code=True)
+def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
+    import corner as _corner
+
+    _posteriors = get_tier2_posteriors()
+    mo.stop(_posteriors is None or len(_posteriors) == 0)
+
+    _idx = t2_spectrum_slider.value
+    _post = _posteriors[_idx]
+    _samples = _post["samples"]       # (N, ndim)
+    _labels = _post["labels"]         # list of friendly labels
+    _summary = _post["summary"]       # dict of {label: {mean, std, median, ...}}
+    _gt = _post["truths"]             # dict of {friendly_name: value}
+    _run = _post["run"]
+    _inc = _post["inclination"]
+    _converged = _post["converged"]
+
+    # Build truth vector aligned to sample columns
+    _truths = []
+    _has_any_truth = False
+    for _lbl in _labels:
+        _gt_key = _lbl
+        # Collapse inclination variants onto a common key
+        if "Inclination" in _lbl:
+            _gt_key = "Inclination"
+        if _gt_key in _gt:
+            _truths.append(_gt[_gt_key])
+            _has_any_truth = True
+        else:
+            _truths.append(None)
+
+    _fig = _corner.corner(
+        _samples,
+        labels=_labels,
+        show_titles=True,
+        quantiles=[0.16, 0.5, 0.84],
+        title_fmt=".4f",
+        truths=_truths if _has_any_truth else None,
+        truth_color="#ff4444",
+        truth_kwargs={"linewidth": 2},
+    )
+
+    _conv_tag = "converged" if _converged else "**not converged**"
+    _summary_rows = []
+    for _lbl in _labels:
+        if _lbl in _summary:
+            _s = _summary[_lbl]
+            _row = {
+                "Parameter": _lbl,
+                "Mean": f"{_s['mean']:.4f}",
+                "Std": f"{_s['std']:.4f}",
+                "Median": f"{_s['median']:.4f}",
+                "HDI 3%": f"{_s['hdi_3']:.4f}",
+                "HDI 97%": f"{_s['hdi_97']:.4f}",
+            }
+            _gt_key = "Inclination" if "Inclination" in _lbl else _lbl
+            if _gt_key in _gt:
+                _row["Truth"] = f"{_gt[_gt_key]:.4f}"
+                _row["Δ/σ"] = f"{(_s['mean'] - _gt[_gt_key]) / max(_s['std'], 1e-10):.2f}"
+            else:
+                _row["Truth"] = "—"
+                _row["Δ/σ"] = "—"
+            _summary_rows.append(_row)
+
+    mo.vstack([
+        mo.md(f"### Run {_run} — inclination {_inc:.0f}° — {_conv_tag}"),
+        mo.ui.table(_summary_rows, label="Posterior Summary", selection=None),
+        _fig,
+    ])
+    return
+
+
+@app.cell(hide_code=True)
 def _(get_tier1_arrays, mo):
     _arrs = get_tier1_arrays()
     mo.stop(
@@ -1218,11 +1317,27 @@ def _(glob, mo, os):
         label="Max test spectra (Tier 2)",
     )
     mcmc_steps_slider = mo.ui.slider(
-        start=100, stop=5000, value=1000, step=100, show_value=True,
+        start=100, stop=5000, value=2500, step=100, show_value=True,
         label="MCMC steps",
     )
+
+    # Inclination selector for Tier 2: which viewing angle column to read from
+    # each .spec file.  "Random" assigns a reproducibly random inclination per
+    # spectrum (seeded by run index).
+    inclination_picker = mo.ui.dropdown(
+        options={
+            "30°": "30", "35°": "35", "40°": "40", "45°": "45",
+            "50°": "50", "55°": "55", "60°": "60", "65°": "65",
+            "70°": "70", "75°": "75", "80°": "80", "85°": "85",
+            "Random": "random",
+        },
+        value="55°",
+        label="Inclination (Tier 2)",
+    )
+
     return (
         emu_picker,
+        inclination_picker,
         max_spectra_slider,
         mcmc_steps_slider,
         obs_picker,
@@ -1235,6 +1350,28 @@ def _(emu_picker, glob, mo, os, re):
     """Auto-populate grid and test-grid paths from the emulator selection."""
     _emu_val = emu_picker.value or ""
     _emu_base = os.path.basename(_emu_val)
+
+    # Flux scale selector for Tier 2/3 — auto-detected from the emulator
+    # filename when possible, but user can override.  Created here (not in
+    # the picker cell) because marimo forbids reading .value in the same
+    # cell that creates a UIElement.
+    _detected_scale = "linear"
+    if _emu_val:
+        _emu_name = _emu_base.lower()
+        if '_log_' in _emu_name:
+            _detected_scale = "log"
+        elif '_scaled_' in _emu_name:
+            _detected_scale = "scaled"
+        elif '_continuum-subtracted_' in _emu_name:
+            _detected_scale = "continuum-subtracted"
+        elif '_continuum-normalised_' in _emu_name:
+            _detected_scale = "continuum-normalised"
+
+    flux_scale_picker = mo.ui.dropdown(
+        options=["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"],
+        value=_detected_scale,
+        label="Flux Transform",
+    )
 
     matched_grid_path = ""
     matched_testgrid_path = ""
@@ -1289,13 +1426,15 @@ def _(emu_picker, glob, mo, os, re):
                    "Expected pattern: `{stem}_emu_{params}_{inc}inc_{wl}_{PCA}PCA.npz`"),
             kind="warn",
         )
-    return emu_grid_info, matched_grid_path, matched_testgrid_path
+    return emu_grid_info, flux_scale_picker, matched_grid_path, matched_testgrid_path
 
 
 @app.cell(hide_code=True)
 def _(
     emu_grid_info,
     emu_picker,
+    flux_scale_picker,
+    inclination_picker,
     max_spectra_slider,
     mcmc_steps_slider,
     mo,
@@ -1304,10 +1443,10 @@ def _(
 ):
     mo.vstack([
         mo.md("### Run Benchmark"),
-        mo.hstack([emu_picker], gap=1),
+        mo.hstack([emu_picker, flux_scale_picker], gap=1),
         emu_grid_info,
         mo.hstack([obs_picker], gap=1),
-        mo.hstack([tier_picker, max_spectra_slider, mcmc_steps_slider], gap=1),
+        mo.hstack([tier_picker, max_spectra_slider, mcmc_steps_slider, inclination_picker], gap=1),
     ])
     return
 
@@ -1322,6 +1461,8 @@ def _(mo):
 @app.cell
 def _(
     emu_picker,
+    flux_scale_picker,
+    inclination_picker,
     matched_grid_path,
     matched_testgrid_path,
     max_spectra_slider,
@@ -1334,6 +1475,7 @@ def _(
     set_report,
     set_status_msg,
     set_tier1_arrays,
+    set_tier2_posteriors,
     tier_picker,
     time,
 ):
@@ -1409,6 +1551,8 @@ def _(
 
         # ---- Tier 2 (progress_bar per spectrum + spinner per stage) ----
         if 2 in _tiers and matched_testgrid_path:
+            import json as _json
+            import random as _random
             _t2_t0 = time.time()
             _test_path = _Path(matched_testgrid_path)
             # Tier 2 works spectrum-by-spectrum from the decompressed test-grid files.
@@ -1417,15 +1561,36 @@ def _(
                 _spec_files = _spec_files[: max_spectra_slider.value]
             _n_t2 = len(_spec_files)
 
+            # Resolve inclination setting from UI
+            _inc_raw = inclination_picker.value
+            _inc_is_random = (_inc_raw == "random")
+            _inc_fixed = float(_inc_raw) if not _inc_is_random else 55.0
+            _VALID_INCS = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85]
+
+            # Resolve flux scale and wavelength range from emulator
+            _flux_scale = flux_scale_picker.value
+            _wl_range = (float(_emu.wl.min()) + 10, float(_emu.wl.max()) - 10)
+
             # The lookup table is optional metadata used to compare recovered
             # parameters against the known test-grid inputs.
             _parquet = _ensure_lookup(_test_path)
             _friendly = _to_friendly(_emu.param_names)
             _n_params = len(_emu.param_names)
 
-            # Accumulate both per-spectrum summaries and the raw posterior draws
-            # needed by the aggregate Tier 2 metrics.
+            # ---- Checkpoint / Resume ----
+            # Each completed spectrum is appended as a JSON line to a partial
+            # results file.  If a matching partial exists from a previous
+            # interrupted run, we load completed results and skip those spectra.
+            _emu_stem = os.path.basename(emu_picker.value or "").replace(".npz", "")
+            _checkpoint_dir = "benchmark_results"
+            os.makedirs(_checkpoint_dir, exist_ok=True)
+            _checkpoint_path = os.path.join(
+                _checkpoint_dir, f"benchmark_partial_{_emu_stem}.jsonl"
+            )
+
+            _completed_runs = set()
             _per_spectrum = []
+            _tier2_posteriors = []  # full MCMC posteriors for corner-plot explorer
             _all_samples = {n: [] for n in _friendly}
             _all_truths = {n: [] for n in _friendly}
             _failures = 0
@@ -1433,25 +1598,110 @@ def _(
             _failure_log = []
             _mcmc_steps_val = mcmc_steps_slider.value
 
+            # Resume: load any previously checkpointed results
+            if os.path.exists(_checkpoint_path):
+                try:
+                    with open(_checkpoint_path, "r") as _cpf:
+                        for _line in _cpf:
+                            _line = _line.strip()
+                            if not _line:
+                                continue
+                            _entry = _json.loads(_line)
+                            _completed_runs.add(_entry["run"])
+                            _per_spectrum.append(_entry["spec_result"])
+                            for _fn in _friendly:
+                                if f"{_fn}_samples" in _entry:
+                                    _all_samples[_fn].append(
+                                        _np.array(_entry[f"{_fn}_samples"])
+                                    )
+                                if f"{_fn}_truth" in _entry:
+                                    _all_truths[_fn].append(_entry[f"{_fn}_truth"])
+                            if not _entry.get("mcmc_converged", True):
+                                _n_not_converged += 1
+                            # Reconstruct posterior entry for corner-plot explorer.
+                            # If the checkpoint has the full ndim samples array,
+                            # use it directly; otherwise fall back to grid-param
+                            # columns only (older checkpoint format).
+                            if "full_samples" in _entry:
+                                _tier2_posteriors.append({
+                                    "run": _entry["run"],
+                                    "inclination": _entry.get("inclination", 55.0),
+                                    "samples": _np.array(_entry["full_samples"]),
+                                    "labels": _entry.get("full_labels", _friendly),
+                                    "summary": _entry.get("full_summary", {}),
+                                    "converged": _entry.get("mcmc_converged", False),
+                                    "truths": _entry.get("truths", {}),
+                                })
+                            else:
+                                # Legacy checkpoint: reconstruct from per-param samples
+                                _cp_cols = []
+                                _cp_labels = []
+                                _cp_summary = {}
+                                for _fn in _friendly:
+                                    if f"{_fn}_samples" in _entry:
+                                        _cp_cols.append(_np.array(_entry[f"{_fn}_samples"]))
+                                        _cp_labels.append(_fn)
+                                        _sr = _entry.get("spec_result", {})
+                                        _cp_summary[_fn] = {
+                                            "mean": _sr.get(f"{_fn}_mean", float("nan")),
+                                            "std": _sr.get(f"{_fn}_std", float("nan")),
+                                            "median": float("nan"),
+                                            "hdi_3": float("nan"),
+                                            "hdi_97": float("nan"),
+                                        }
+                                if _cp_cols:
+                                    _cp_truths = {}
+                                    for _fn in _friendly:
+                                        if f"{_fn}_truth" in _entry:
+                                            _cp_truths[_fn] = _entry[f"{_fn}_truth"]
+                                    _tier2_posteriors.append({
+                                        "run": _entry["run"],
+                                        "inclination": _entry.get("inclination", 55.0),
+                                        "samples": _np.column_stack(_cp_cols),
+                                        "labels": _cp_labels,
+                                        "summary": _cp_summary,
+                                        "converged": _entry.get("mcmc_converged", False),
+                                        "truths": _cp_truths,
+                                    })
+                except Exception:
+                    pass  # corrupted partial — start fresh
+
+            _n_resumed = len(_completed_runs)
+
             with mo.status.progress_bar(
                 total=_n_t2,
                 title="Tier 2 — Parameter Recovery",
-                subtitle="Starting…",
+                subtitle=f"Resuming from {_n_resumed} completed…" if _n_resumed else "Starting…",
                 completion_title="Tier 2 — Parameter Recovery",
                 completion_subtitle="Complete ✓",
                 show_rate=True,
                 show_eta=True,
                 remove_on_exit=True,
             ) as _t2_bar:
+                # Advance the progress bar past already-completed spectra
+                if _n_resumed > 0:
+                    _t2_bar.update(increment=_n_resumed, subtitle=f"Resumed {_n_resumed} spectra")
+
                 for _si, _sf in enumerate(_spec_files):
                     # Spectrum filenames encode the run number used by the lookup table.
                     _run_idx = int(_sf.stem.replace("run", ""))
                     _sname = _sf.name
 
+                    # Skip already-completed spectra (resume mode)
+                    if _run_idx in _completed_runs:
+                        continue
+
+                    # Resolve inclination for this spectrum
+                    if _inc_is_random:
+                        _rng = _random.Random(_run_idx)
+                        _inc = float(_rng.choice(_VALID_INCS))
+                    else:
+                        _inc = _inc_fixed
+
                     # -- Load spectrum --
-                    _t2_bar.update(increment=0, subtitle=f"Loading {_sname}…")
+                    _t2_bar.update(increment=0, subtitle=f"Loading {_sname} (i={_inc:.0f}°)…")
                     try:
-                        _wl, _flux, _sigma = _load_spec(str(_sf), 55.0, (850, 1850))
+                        _wl, _flux, _sigma = _load_spec(str(_sf), _inc, _wl_range)
                     except Exception as _e:
                         _failure_log.append({
                             "run": _sname, "stage": "load",
@@ -1476,8 +1726,6 @@ def _(
                         subtitle=f"Optimising ({_si + 1}/{_n_t2})…",
                         remove_on_exit=True,
                     ) as _mle_spin:
-                        # Forward the optimizer callback into the spinner so long
-                        # runs still expose iteration and NLL progress in the UI.
                         def _mle_cb(it, mx, best_nll, elapsed):
                             _mle_spin.update(
                                 subtitle=(
@@ -1488,7 +1736,7 @@ def _(
                             )
                         try:
                             _mle = _run_mle(
-                                _emu, _wl, _flux, _sigma, flux_scale="linear",
+                                _emu, _wl, _flux, _sigma, flux_scale=_flux_scale,
                                 max_iter=10_000, iteration_callback=_mle_cb,
                             )
                         except Exception as _e:
@@ -1506,8 +1754,6 @@ def _(
                         subtitle=f"Sampling {_mcmc_steps_val} steps ({_si + 1}/{_n_t2})…",
                         remove_on_exit=True,
                     ) as _mcmc_spin:
-                        # Mirror the sampler callback into the spinner for coarse
-                        # step-level progress during the posterior draw phase.
                         def _mcmc_cb(step, total, elapsed):
                             _mcmc_spin.update(
                                 subtitle=(
@@ -1518,10 +1764,11 @@ def _(
                         try:
                             _mcmc = _run_mcmc(
                                 _mle["model"], _mle["priors"],
-                                nwalkers=32,
+                                nwalkers=64,
                                 nsteps=_mcmc_steps_val,
                                 burnin=200,
                                 iteration_callback=_mcmc_cb,
+                                freeze_nuisance=True,
                             )
                         except Exception as _e:
                             _failure_log.append({
@@ -1535,37 +1782,80 @@ def _(
                     if not _mcmc["converged"]:
                         _n_not_converged += 1
 
-                    # Persist the compact per-spectrum summary used by the Tier 2 report.
+                    # Build per-spectrum summary
                     _spec_res = {
                         "run": _run_idx,
+                        "inclination": _inc,
                         "mle_success": _mle["success"],
                         "mcmc_converged": _mcmc["converged"],
                         "n_effective": _mcmc["n_effective"],
                         "mle_grid_params": _mle["grid_params"],
                     }
+
+                    # Checkpoint entry: includes samples for resume
+                    _cp_entry = {
+                        "run": _run_idx,
+                        "inclination": _inc,
+                        "mcmc_converged": _mcmc["converged"],
+                        "spec_result": _spec_res,
+                        # Full posterior for corner-plot explorer on resume
+                        "full_samples": _mcmc["samples"].tolist(),
+                        "full_labels": _mcmc.get("labels", []),
+                        "full_summary": {
+                            k: {sk: sv for sk, sv in v.items()}
+                            for k, v in _mcmc["summary"].items()
+                        },
+                        "truths": dict(_gt),
+                    }
+
+                    # Map friendly names to their column index in the flat
+                    # MCMC samples array. Columns follow model.labels order
+                    # (nuisance params first), so we cannot assume grid param
+                    # i maps to column i.
+                    _mcmc_labels = _mcmc.get("labels", [])
                     for _pi, _fn in enumerate(_friendly):
                         if _fn in _mcmc["summary"]:
-                            # Keep both the scalar posterior summary and the raw draws;
-                            # the aggregate step uses the draws to compute coverage-style
-                            # metrics across all spectra.
                             _spec_res[f"{_fn}_mean"] = _mcmc["summary"][_fn]["mean"]
                             _spec_res[f"{_fn}_std"] = _mcmc["summary"][_fn]["std"]
-                            _all_samples[_fn].append(_mcmc["samples"][:, _pi])
+                            # Find correct column for this parameter
+                            _col = _mcmc_labels.index(_fn) if _fn in _mcmc_labels else _pi
+                            _samples_i = _mcmc["samples"][:, _col]
+                            _all_samples[_fn].append(_samples_i)
+                            _cp_entry[f"{_fn}_samples"] = _samples_i.tolist()
                             if _fn in _gt:
-                                # When ground truth is available, record the truth and the
-                                # offset in posterior standard deviations for later review.
                                 _all_truths[_fn].append(_gt[_fn])
                                 _spec_res[f"{_fn}_truth"] = _gt[_fn]
+                                _cp_entry[f"{_fn}_truth"] = _gt[_fn]
                                 _spec_res[f"{_fn}_delta_sigma"] = (
                                     _mcmc["summary"][_fn]["mean"] - _gt[_fn]
                                 ) / max(_mcmc["summary"][_fn]["std"], 1e-10)
 
+                    # Update the spec_result in the checkpoint entry (it now has _mean/_std keys)
+                    _cp_entry["spec_result"] = _spec_res
                     _per_spectrum.append(_spec_res)
 
+                    # Store full posterior for corner-plot explorer
+                    _tier2_posteriors.append({
+                        "run": _run_idx,
+                        "inclination": _inc,
+                        "samples": _mcmc["samples"],  # (N, ndim) array
+                        "labels": _mcmc_labels,
+                        "summary": _mcmc["summary"],
+                        "converged": _mcmc["converged"],
+                        "truths": dict(_gt),
+                    })
+
+                    # Append checkpoint line (crash-safe: one write per spectrum)
+                    try:
+                        with open(_checkpoint_path, "a") as _cpf:
+                            _cpf.write(_json.dumps(_cp_entry) + "\n")
+                    except Exception:
+                        pass
+
                     _status_lbl = (
-                        f"✓ {_sname} complete"
+                        f"✓ {_sname} (i={_inc:.0f}°) complete"
                         if _mcmc["converged"]
-                        else f"⚠ {_sname} (not converged)"
+                        else f"⚠ {_sname} (i={_inc:.0f}°, not converged)"
                     )
                     _t2_bar.update(increment=1, subtitle=_status_lbl)
 
@@ -1581,12 +1871,23 @@ def _(
                 spec_files_count=_n_t2,
                 failures=_failures,
                 failure_log=_failure_log,
-                mcmc_walkers=32,
+                mcmc_walkers=64,
                 mcmc_steps=_mcmc_steps_val,
                 mcmc_burnin=200,
                 elapsed=time.time() - _t2_t0,
                 n_not_converged=_n_not_converged,
             )
+
+            # Clean up checkpoint file on successful completion
+            if os.path.exists(_checkpoint_path):
+                try:
+                    os.remove(_checkpoint_path)
+                except Exception:
+                    pass
+
+            # Persist the full per-spectrum posteriors so the interactive
+            # corner-plot explorer can render any spectrum after the run.
+            set_tier2_posteriors(_tier2_posteriors if _tier2_posteriors else None)
 
         # ---- Tier 3 (progress bar — one step per observation) ----
         if 3 in _tiers and obs_picker.value:

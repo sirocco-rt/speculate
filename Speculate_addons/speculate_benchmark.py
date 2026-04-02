@@ -430,6 +430,7 @@ def run_mle_single(
         data=spec,
         grid_params=grid_init,
         global_cov={"log_amp": -55.0, "log_ls": 4.5},
+        cheb=[0.0],
     )
 
     # Optionally fix Av = 0 (synthetic test-grid spectra have no dust
@@ -466,8 +467,27 @@ def run_mle_single(
         priors["log_scale"] = stats.uniform(
             loc=_bootstrapped_ls - 5.0, scale=10.0
         )
-        # GP log_amp: normal prior centred on -55 with σ=2.5 (±2σ = [-60, -50])
-        priors["global_cov:log_amp"] = stats.norm(loc=-55.0, scale=2.5)
+        # Chebyshev c1 continuum tilt — small correction for gradient mismatch
+        priors["cheb:1"] = stats.uniform(loc=-0.5, scale=1.0)
+        # GP log_amp: auto-detect centre from residual variance between the
+        # bootstrapped model and the data, so it adapts to any flux scale.
+        _la_centre = -55.0  # fallback for linear-scale raw flux
+        try:
+            model.params["log_scale"] = _bootstrapped_ls
+            _model_result = model()
+            _model_flux = _model_result[0] if isinstance(_model_result, tuple) else _model_result
+            if hasattr(_model_flux, 'detach'):
+                _model_flux = _model_flux.detach().cpu().numpy()
+            _data_flux = np.array(spec.fluxes)
+            _n = min(len(_data_flux), len(_model_flux))
+            _resid = _data_flux[:_n] - _model_flux[:_n]
+            _resid_var = float(np.mean(_resid ** 2))
+            if _resid_var > 0:
+                _la_centre = float(np.log(max(_resid_var, 1e-30)))
+        except Exception:
+            pass
+        _la_centre = round(_la_centre, 1)
+        priors["global_cov:log_amp"] = stats.norm(loc=_la_centre, scale=2.5)
         # GP log_ls: [1, 8] — matches inference tool optimised range
         priors["global_cov:log_ls"] = stats.uniform(loc=1.0, scale=7.0)
 
@@ -582,6 +602,7 @@ def run_mcmc_single(
     nsteps: int = 1000,
     burnin: int = 200,
     iteration_callback=None,
+    freeze_nuisance: bool = False,
 ) -> dict:
     """
     Run MCMC on a SpectrumModel already set to MLE best-fit.
@@ -591,6 +612,12 @@ def run_mcmc_single(
     iteration_callback : callable or None
         If provided, called as ``iteration_callback(step, nsteps, elapsed_s)``
         every 50 steps.
+    freeze_nuisance : bool
+        If True, freeze the nuisance parameters (log_scale, cheb:1,
+        global_cov:log_amp, global_cov:log_ls) at their MLE-optimised
+        values so the MCMC only samples over the physical grid parameters.
+        This follows the Starfish paper recommendation (Czekala+2015,
+        Section 2.5) and significantly speeds up convergence.
 
     Returns
     -------
@@ -603,6 +630,18 @@ def run_mcmc_single(
         'n_effective'  : int
     """
     import emcee
+
+    # Optionally freeze nuisance params at MLE best-fit (Czekala+2015 §2.5):
+    # "one can first optimize the kernel parameters and then proceed with
+    # them fixed, since the stellar parameter posteriors are relatively
+    # insensitive to the precise value of the kernel parameters."
+    _nuisance_labels = {"log_scale", "cheb:1", "global_cov:log_amp", "global_cov:log_ls"}
+    _frozen_nuisance = {}
+    if freeze_nuisance:
+        for _lbl in list(_nuisance_labels):
+            if _lbl in model.labels:
+                _frozen_nuisance[_lbl] = float(model.params[_lbl])
+                model.freeze(_lbl)
 
     ndim = len(model.labels)
 
@@ -710,6 +749,12 @@ def run_mcmc_single(
     # to support posterior summaries.
     converged = all(rh < 1.05 for rh in r_hat_dict.values() if np.isfinite(rh))
     converged = converged and flat.shape[0] >= 100
+
+    # Restore any nuisance params that were frozen for this MCMC run so the
+    # model object is left in a usable state for downstream callers.
+    for _lbl, _val in _frozen_nuisance.items():
+        model.thaw(_lbl)
+        model[_lbl] = _val
 
     return {
         "samples": flat,
@@ -1022,6 +1067,7 @@ def run_tier2(
                 nwalkers=mcmc_walkers,
                 nsteps=mcmc_steps,
                 burnin=mcmc_burnin,
+                freeze_nuisance=True,
             )
         except Exception as e:
             import traceback as _tb
@@ -1047,12 +1093,21 @@ def run_tier2(
             "mle_grid_params": mle_result["grid_params"],
         }
 
+        # Map friendly names to their column index in the flat samples array.
+        # The columns follow model.labels order (nuisance params first, then
+        # grid params), so we cannot assume grid param i maps to column i.
+        _mcmc_labels = mcmc_result.get("labels", [])
         for i, fname in enumerate(friendly_names):
             if fname in mcmc_result["summary"]:
                 spec_result[f"{fname}_mean"] = mcmc_result["summary"][fname]["mean"]
                 spec_result[f"{fname}_std"] = mcmc_result["summary"][fname]["std"]
 
-                samples_i = mcmc_result["samples"][:, i]
+                # Find the correct column for this parameter in the samples array
+                if fname in _mcmc_labels:
+                    _col = _mcmc_labels.index(fname)
+                else:
+                    _col = i  # fallback (legacy behaviour)
+                samples_i = mcmc_result["samples"][:, _col]
                 all_samples[fname].append(samples_i)
 
                 if fname in gt:
@@ -1227,6 +1282,7 @@ def run_tier3_single(
         mcmc = run_mcmc_single(
             model, priors,
             nwalkers=mcmc_walkers, nsteps=mcmc_steps, burnin=mcmc_burnin,
+            freeze_nuisance=True,
         )
     except Exception as e:
         log.warning(f"MCMC failed for {obs_csv}: {e}")
