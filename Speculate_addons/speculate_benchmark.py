@@ -398,8 +398,8 @@ def run_mle_single(
     # Match the observation onto the emulator's training scale before building a
     # SpectrumModel, including consistent propagation of the uncertainties.
     if flux_scale == "log":
-        flux = np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
         sigma = sigma / (np.abs(flux) * np.log(10) + 1e-30)
+        flux = np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
     elif flux_scale == "scaled":
         fmean = np.mean(flux)
         if fmean != 0:
@@ -1250,18 +1250,8 @@ def run_tier3_single(
     mask = (wl >= wl_range[0]) & (wl <= wl_range[1])
     wl, flux, sigma = wl[mask], flux[mask], sigma[mask]
 
-    if flux_scale == "log":
-        sigma = sigma / (np.abs(flux) * np.log(10) + 1e-30)
-        flux = np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
-    elif flux_scale == "scaled":
-        fmean = np.mean(flux)
-        if fmean != 0:
-            sigma = sigma / fmean
-            flux = flux / fmean
-
-    sigma = np.maximum(sigma, np.abs(flux) * 0.01)
-
-    # MLE
+    # MLE — run_mle_single handles flux_scale transforms internally;
+    # applying them here as well would double-scale the data.
     mle = run_mle_single(emu, wl, flux, sigma, flux_scale=flux_scale,
                           max_iter=max_mle_iter, freeze_av=False)
     model = mle["model"]

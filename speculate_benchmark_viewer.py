@@ -1941,6 +1941,7 @@ def _(
                     )
                     _r = _run_tier3_single(
                         _emu, _obs_path,
+                        flux_scale=_flux_scale,
                         mcmc_steps=mcmc_steps_slider.value,
                         grid_name=_grid_stem,
                         output_dir="exports",
