@@ -81,8 +81,27 @@ def _(mo):
     return hf_mode_switch, is_hf_space_nav
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    usage_toggle = mo.ui.switch(value=False, label=f"{mo.icon('lucide:activity')} System Resources")
+    usage_refresh = mo.ui.refresh(default_interval="10s", label="")
+    return usage_refresh, usage_toggle
+
+
+@app.cell(hide_code=True)
+def _(mo, usage_refresh, usage_toggle):
+    from Speculate_addons.speculate_usage_bars import get_usage_html
+    if usage_toggle.value:
+        usage_refresh
+        _html = get_usage_html()
+        usage_bars = mo.vstack([usage_toggle, mo.Html(_html), mo.hstack([usage_refresh], justify="center")])
+    else:
+        usage_bars = usage_toggle
+    return (usage_bars,)
+
+
 @app.cell
-def _(hf_mode_switch, is_hf_space_nav, mo):
+def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
     if is_hf_space_nav:
         _mode = "HuggingFace Space"
     elif hf_mode_switch is not None and hf_mode_switch.value:
@@ -140,6 +159,7 @@ def _(hf_mode_switch, is_hf_space_nav, mo):
     if hf_mode_switch is not None:
         _items.extend([hf_mode_switch])
 
+    _items.extend([mo.md("---"), usage_bars])
     mo.sidebar(mo.vstack(_items))
     return (IS_HUGGINGFACE_SPACE,)
 

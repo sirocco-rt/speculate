@@ -91,8 +91,27 @@ def _():
     return (mo,)
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    usage_toggle = mo.ui.switch(value=False, label=f"{mo.icon('lucide:activity')} System Resources")
+    usage_refresh = mo.ui.refresh(default_interval="10s", label="")
+    return usage_refresh, usage_toggle
+
+
+@app.cell(hide_code=True)
+def _(mo, usage_refresh, usage_toggle):
+    from Speculate_addons.speculate_usage_bars import get_usage_html
+    if usage_toggle.value:
+        usage_refresh
+        _html = get_usage_html()
+        usage_bars = mo.vstack([usage_toggle, mo.Html(_html)])
+    else:
+        usage_bars = usage_toggle
+    return (usage_bars,)
+
+
 @app.cell
-def _(mo, os):
+def _(mo, os, usage_bars):
     _is_hf = os.environ.get("SPACE_ID") is not None
 
     _items = [mo.md(f"#Speculate {mo.icon('lucide:telescope')}")]
@@ -144,6 +163,7 @@ def _(mo, os):
         mo.md("---"),
         mo.md("---"),
     ])
+    _items.extend([mo.md("---"), usage_bars])
     mo.sidebar(mo.vstack(_items))
     return
 
@@ -781,7 +801,7 @@ def _(get_loaded_emu_config, set_loaded_emu_display, mo):
     method = mo.ui.dropdown(
         options=["Nelder-Mead", "L-BFGS-B", "CMA-ES"],
         value="Nelder-Mead",
-        label="Optimization Method:"
+        label="Optimisation Method:"
     )
 
     max_iter = mo.ui.number(start=100, stop=100000, value=10000, step=100, label="Max Iterations:")
@@ -793,7 +813,7 @@ def _(get_loaded_emu_config, set_loaded_emu_display, mo):
 
     per_component = mo.ui.checkbox(
         value=True,
-        label="Per-Component Training (optimize each PCA component independently)"
+        label="Per-Component Training (optimise each PCA component independently)"
     )
 
     refine_lambda_xi = mo.ui.checkbox(
@@ -812,11 +832,11 @@ def _(get_loaded_emu_config, set_loaded_emu_display, mo):
         mo.hstack([
             mo.hstack([method, max_iter], justify="start", align="center"),
             mo.accordion({
-            f"{mo.icon('lucide:info')} Optimization Settings": mo.md(
+            f"{mo.icon('lucide:info')} Optimisation Settings": mo.md(
                 "**Nelder-Mead** is a robust simplex method that doesn't require gradients but can be slower and struggle with high-dimensional problems.\n\n "
                 "**L-BFGS-B** is a quasi-Newton method that uses gradients for **faster** convergence but may struggle finding good minima in complex landscapes.\n\n"
                 "**CMA-ES** is a population-based evolutionary strategy that can escape local minima but is computationally intensive but fair better in high-dimensional problems.\n\n"
-                "**Max Iterations** sets a hard cap on optimization steps to prevent runaway training times; increase for larger grids / high dimensional problems."
+                "**Max Iterations** sets a hard cap on optimisation steps to prevent runaway training times; increase for larger grids / high dimensional problems."
             ),
         })], align="center", gap=0.5),
         mo.hstack([
@@ -847,7 +867,7 @@ def _(get_loaded_emu_config, set_loaded_emu_display, mo):
                 f"{mo.icon('lucide:info')} Per-component training": mo.md(
                     "When enabled, runs a separate low-dimensional optimisation for each PCA component "
                     "instead of one large joint optimisation. Default is enabled as per "
-                    "component is a lower dimensional problem, making it easier for the optimizer"
+                    "component is a lower dimensional problem, making it easier for the optimiser "
                     "to find minima and leads to faster training overall."
                 ),
             }),
@@ -857,7 +877,7 @@ def _(get_loaded_emu_config, set_loaded_emu_display, mo):
             mo.accordion({
                 f"{mo.icon('lucide:info')} λ_ξ refinement": mo.md(
                     "After per-component training, run a 1-D bounded optimisation to "
-                    "refine the shared λ_ξ (truncation noise) parameter. Only applies "
+                    "refine the shared λ_ξ (truncation noise) parameter. Higher values lead to more confident predictions. Only applies "
                     "when strict weight fit is disabled (unticked)."
                 ),
             }),
@@ -1405,7 +1425,7 @@ def _(
 
                     print(f"Emulator loaded. {emu.ncomps} PCA components, kernel='{emu.kernel}'.")
                     print(f"Previous training iterations: {len(prev_history)}")
-                    print(f"Continuing optimization using {method.value} for {max_iter.value} more iterations...")
+                    print(f"Continuing optimisation using {method.value} for {max_iter.value} more iterations...")
                     sys.stdout.flush()
                 else:
                     # Fresh training: create emulator from grid
@@ -1425,7 +1445,7 @@ def _(
                     )
 
                     print(f"Grid loaded. Initialized {emu.ncomps} PCA components.")
-                    print(f"Starting optimization using {method.value} (max_iter={max_iter.value})...")
+                    print(f"Starting optimisation using {method.value} (max_iter={max_iter.value})...")
                     sys.stdout.flush()
 
                 # --- Live Plotting Setup ---
@@ -1584,10 +1604,10 @@ def _(get_trained_emu, mo, np):
             label="Varying Parameter (X-axis):"
         )
 
-        _max_unique = max(len(np.unique(_emu.grid_points[:, _i])) for _i in range(_n_params))
+        _min_unique = min(len(np.unique(_emu.grid_points[:, _i])) for _i in range(_n_params))
         gp_fixed_slider = mo.ui.slider(
-            start=0, stop=_max_unique - 1, value=0, step=1,
-            label="Fixed Parameter Index:", show_value=True
+            start=0, stop=_min_unique - 1, value=0, step=1,
+            label="Fixed Grid Position (low → high):", show_value=True
         )
 
         gp_comp_start = mo.ui.slider(
@@ -1636,15 +1656,18 @@ def _(
         # Get unique values per parameter dimension
         _unique_per_dim = [np.unique(_emu.grid_points[:, _i]) for _i in range(_n_params)]
 
-        # Build parameter combinations: vary _not_fixed_col, fix others at _fixed_idx
+        # Build parameter combinations: vary _not_fixed_col, fix others at _fixed_idx.
+        # Map slider proportionally so 0/1/2 → low/mid/high even for dimensions
+        # with more unique values (e.g. inclination).
+        _slider_max = min(len(v) for v in _unique_per_dim) - 1
         _fixed_values = []
         for _i in range(_n_params):
             _vals = _unique_per_dim[_i]
             if _i == _not_fixed_col:
                 _fixed_values.append(_vals)  # all values for varying param
             else:
-                _idx = min(_fixed_idx, len(_vals) - 1)
-                _fixed_values.append(_vals[_idx])  # single fixed value
+                _idx = round(_fixed_idx * (len(_vals) - 1) / _slider_max) if _slider_max > 0 else 0
+                _fixed_values.append(_vals[_idx])  # proportionally mapped value
 
         # Create grid point combinations for actual weight lookup
         _params_list = []
@@ -1733,8 +1756,8 @@ def _(
             })
 
             _scatter = alt.Chart(_scatter_df).mark_circle(size=60, color='#3b82f6').encode(
-                x=alt.X('x:Q', title=_xlabel_axis),
-                y=alt.Y('weight:Q', title=f'Weight {_comp}'),
+                x=alt.X('x:Q', title=_xlabel_axis, scale=alt.Scale(zero=False)),
+                y=alt.Y('weight:Q', title=f'Weight {_comp}', scale=alt.Scale(zero=False)),
                 tooltip=[alt.Tooltip('x:Q', title=_xlabel, format='.4f'),
                          alt.Tooltip('weight:Q', title='Weight', format='.4e')]
             )
@@ -1775,7 +1798,7 @@ def _(
         for _i in range(_n_params):
             if _i != _not_fixed_col:
                 _vals = _unique_per_dim[_i]
-                _idx = min(_fixed_idx, len(_vals) - 1)
+                _idx = round(_fixed_idx * (len(_vals) - 1) / _slider_max) if _slider_max > 0 else 0
                 _pn = _emu.param_names[_i]
                 _pi = int(_pn.replace("param", ""))
                 _pdesc = _desc_map.get(_pi, _pn)

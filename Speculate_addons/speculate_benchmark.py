@@ -756,8 +756,15 @@ def run_mcmc_single(
         model.thaw(_lbl)
         model[_lbl] = _val
 
+    # Full chain (nsteps, nwalkers, ndim) before burn-in — used for
+    # chain trace plots in the benchmark viewer.
+    full_chain = sampler.get_chain()  # (nsteps, nwalkers, ndim)
+
     return {
         "samples": flat,
+        "full_chain": full_chain,
+        "burnin_used": burnin_used,
+        "thin": thin,
         "summary": summary,
         "r_hat": r_hat_dict,
         "ess_bulk": ess_dict,
@@ -1037,6 +1044,10 @@ def run_tier2(
                 failure_log.append({"run": sf.name, "stage": "ground_truth", "error": _msg,
                                      "traceback": ""})
 
+        # Always record the true inclination so it can be overlaid on corner
+        # plots when inclination is an MCMC-sampled parameter (param9-11).
+        gt.setdefault("Inclination", inclination)
+
         # MLE
         if progress_callback is not None:
             progress_callback(_spec_idx, _n_total, sf.name, "MLE")
@@ -1087,6 +1098,8 @@ def run_tier2(
         # needed for aggregate calibration metrics across the whole test grid.
         spec_result = {
             "run": run_idx,
+            "filename": sf.name,
+            "inclination": inclination,
             "mle_success": mle_result["success"],
             "mcmc_converged": mcmc_result["converged"],
             "n_effective": mcmc_result["n_effective"],
@@ -1471,9 +1484,17 @@ def build_report_card(
     tier2: Optional[dict] = None,
     tier3: Optional[list] = None,
     config: Optional[dict] = None,
+    tier2_posteriors: Optional[list] = None,
 ) -> dict:
     """
     Assemble a JSON-serialisable benchmark report card.
+
+    Parameters
+    ----------
+    tier2_posteriors : list or None
+        Per-spectrum posterior dicts (samples, full_chain, labels, summary,
+        truths, etc.) to embed in the report so corner plots and chain
+        trace plots can be reconstructed when reloading.
     """
     report = {
         "speculate_benchmark_version": "1.0.0",
@@ -1508,6 +1529,31 @@ def build_report_card(
             "mcmc_config": tier2["mcmc_config"],
             "aggregate": tier2["aggregate"],
         }
+        # Embed per-spectrum posteriors so saved reports can reconstruct
+        # corner plots and chain trace plots without re-running the benchmark.
+        if tier2_posteriors:
+            _serialised_posteriors = []
+            for _p in tier2_posteriors:
+                _entry = {
+                    "run": _p["run"],
+                    "filename": _p.get("filename", f"run{_p['run']}.spec"),
+                    "inclination": _p.get("inclination", 55.0),
+                    "labels": _p.get("labels", []),
+                    "summary": _p.get("summary", {}),
+                    "converged": _p.get("converged", False),
+                    "truths": _p.get("truths", {}),
+                }
+                # Convert numpy arrays to lists for JSON serialisation
+                if "samples" in _p:
+                    _s = _p["samples"]
+                    _entry["samples"] = _s.tolist() if hasattr(_s, "tolist") else _s
+                if "full_chain" in _p:
+                    _c = _p["full_chain"]
+                    _entry["full_chain"] = _c.tolist() if hasattr(_c, "tolist") else _c
+                if "burnin_used" in _p:
+                    _entry["burnin_used"] = _p["burnin_used"]
+                _serialised_posteriors.append(_entry)
+            t2_summary["posteriors"] = _serialised_posteriors
         report["tier2"] = t2_summary
 
     if tier3 is not None:

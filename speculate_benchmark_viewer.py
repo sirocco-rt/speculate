@@ -49,8 +49,28 @@ def _(mo):
     mo.hstack([_title_col, _logo_col], justify="space-between", align="center")
     return
 
+
+@app.cell(hide_code=True)
+def _(mo):
+    usage_toggle = mo.ui.switch(value=False, label=f"{mo.icon('lucide:activity')} System Resources")
+    usage_refresh = mo.ui.refresh(default_interval="10s", label="")
+    return usage_refresh, usage_toggle
+
+
+@app.cell(hide_code=True)
+def _(mo, usage_refresh, usage_toggle):
+    from Speculate_addons.speculate_usage_bars import get_usage_html
+    if usage_toggle.value:
+        usage_refresh
+        _html = get_usage_html()
+        usage_bars = mo.vstack([usage_toggle, mo.Html(_html)])
+    else:
+        usage_bars = usage_toggle
+    return (usage_bars,)
+
+
 @app.cell
-def _(mo, os):
+def _(mo, os, usage_bars):
     _is_hf = os.environ.get("SPACE_ID") is not None
 
     _items = [mo.md(f"# Speculate {mo.icon('lucide:telescope')}")]
@@ -100,6 +120,7 @@ def _(mo, os):
             "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs",
         }, orientation="vertical"),
     ])
+    _items.extend([mo.md("---"), usage_bars])
     mo.sidebar(mo.vstack(_items))
     return
 
@@ -199,30 +220,62 @@ def _(
     compare_picker,
     json,
     load_btn,
+    np,
     os,
     report_picker,
     set_comparison_reports,
     set_report,
     set_tier1_arrays,
+    set_tier2_posteriors,
     upload_btn,
 ):
+    def _reconstruct_posteriors(report):
+        """Rebuild tier2_posteriors list from a loaded report's embedded data."""
+        t2 = report.get("tier2", {})
+        posteriors_data = t2.get("posteriors", [])
+        if not posteriors_data:
+            return None
+        posteriors = []
+        for p in posteriors_data:
+            entry = {
+                "run": p["run"],
+                "filename": p.get("filename", f"run{p['run']}.spec"),
+                "inclination": p.get("inclination", 55.0),
+                "labels": p.get("labels", []),
+                "summary": p.get("summary", {}),
+                "converged": p.get("converged", False),
+                "truths": p.get("truths", {}),
+            }
+            if "samples" in p:
+                entry["samples"] = np.array(p["samples"])
+            if "full_chain" in p:
+                entry["full_chain"] = np.array(p["full_chain"])
+                entry["burnin_used"] = p.get("burnin_used", 200)
+            posteriors.append(entry)
+        return posteriors if posteriors else None
+
     # Each button mutates notebook state only when clicked; the returned state is
     # then consumed by the rendering cells below.
     if load_btn.value:
         _path = report_picker.value
         if _path and os.path.isfile(_path):
             with open(_path) as _f:
-                set_report(json.load(_f))
+                _loaded = json.load(_f)
+            set_report(_loaded)
             # Reports loaded from disk contain summaries only, so clear any stale
             # Tier 1 arrays left behind by a previous live benchmark run.
             set_tier1_arrays(None)
+            # Reconstruct posteriors from embedded data (if present)
+            set_tier2_posteriors(_reconstruct_posteriors(_loaded))
 
     if upload_btn.value:
         # Accept the first uploaded JSON file and treat it the same way as a
         # report loaded from the local picker.
         for _f in upload_btn.value:
-            set_report(json.loads(_f.contents.decode()))
+            _loaded = json.loads(_f.contents.decode())
+            set_report(_loaded)
             set_tier1_arrays(None)
+            set_tier2_posteriors(_reconstruct_posteriors(_loaded))
             break
 
     if compare_btn.value:
@@ -786,6 +839,7 @@ def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
     _run = _post["run"]
     _inc = _post["inclination"]
     _converged = _post["converged"]
+    _filename = _post.get("filename", f"run{_run}.spec")
 
     # Build truth vector aligned to sample columns
     _truths = []
@@ -835,8 +889,87 @@ def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
             _summary_rows.append(_row)
 
     mo.vstack([
-        mo.md(f"### Run {_run} — inclination {_inc:.0f}° — {_conv_tag}"),
+        mo.md(f"### {_filename} @ {_inc:.0f}° — {_conv_tag}"),
         mo.ui.table(_summary_rows, label="Posterior Summary", selection=None),
+        _fig,
+    ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
+    # ── Tier 2 Chain Trace Plot ──
+    # Visualises the full MCMC walker chains for the selected spectrum,
+    # mirroring the trace-plot diagnostic from the inference tool.
+    _posteriors = get_tier2_posteriors()
+    mo.stop(_posteriors is None or len(_posteriors) == 0)
+
+    _idx = t2_spectrum_slider.value
+    _post = _posteriors[_idx]
+    _full_chain = _post.get("full_chain")
+    mo.stop(
+        _full_chain is None,
+        mo.md("*Chain data not available for this spectrum (older benchmark run).*"),
+    )
+
+    _full_chain = np.asarray(_full_chain)  # (nsteps, nwalkers, ndim)
+    _labels = _post.get("labels", [])
+    _burnin = _post.get("burnin_used", 0)
+    _gt = _post.get("truths", {})
+    _nsteps, _nwalkers, _ndim = _full_chain.shape
+    _filename = _post.get("filename", f"run{_post['run']}.spec")
+    _inc = _post.get("inclination", 55.0)
+
+    _fig, _axes = plt.subplots(
+        _ndim, 1,
+        figsize=(10, 2.5 * _ndim),
+        sharex=True,
+        squeeze=False,
+    )
+    _fig.patch.set_facecolor("black")
+
+    for _j in range(_ndim):
+        _ax = _axes[_j][0]
+        _ax.set_facecolor("black")
+        for _w in range(_nwalkers):
+            _ax.plot(
+                _full_chain[:, _w, _j],
+                alpha=0.25, linewidth=0.5, color="#4c78a8",
+            )
+        # Mark burn-in boundary
+        if _burnin > 0:
+            _ax.axvline(_burnin, color="#f58518", linestyle="--",
+                        linewidth=1, alpha=0.8, label="burn-in" if _j == 0 else None)
+        # Overlay ground truth
+        _lbl = _labels[_j] if _j < len(_labels) else f"param{_j}"
+        _gt_key = "Inclination" if "Inclination" in _lbl else _lbl
+        if _gt_key in _gt:
+            _ax.axhline(_gt[_gt_key], color="#ff4444", linestyle="-",
+                        linewidth=1.5, alpha=0.8, label="truth" if _j == 0 else None)
+        _ax.set_ylabel(_lbl, color="white", fontsize=9)
+        _ax.tick_params(colors="white", labelsize=8)
+        for _spine in _ax.spines.values():
+            _spine.set_color("white")
+
+    _axes[-1][0].set_xlabel("Step", color="white", fontsize=10)
+    # Show legend if any labelled artists were drawn (burn-in or truth lines)
+    _handles, _leg_labels = _axes[0][0].get_legend_handles_labels()
+    if _handles:
+        _axes[0][0].legend(
+            fontsize=8, loc="upper right",
+            facecolor="black", edgecolor="white", labelcolor="white",
+        )
+    _fig.suptitle(
+        f"MCMC Chains — {_filename} @ {_inc:.0f}°",
+        color="white", fontsize=11, y=1.01,
+    )
+    _fig.tight_layout()
+
+    mo.vstack([
+        mo.md("#### Chain Trace Plot"),
+        mo.md(f"Full walker chains ({_nwalkers} walkers × {_nsteps} steps). "
+               f"Orange dashed line marks burn-in at step {_burnin}. "
+               "Red line marks ground truth."),
         _fig,
     ])
     return
@@ -1645,15 +1778,20 @@ def _(
                             # use it directly; otherwise fall back to grid-param
                             # columns only (older checkpoint format).
                             if "full_samples" in _entry:
-                                _tier2_posteriors.append({
+                                _post_entry = {
                                     "run": _entry["run"],
+                                    "filename": _entry.get("filename", f"run{_entry['run']}.spec"),
                                     "inclination": _entry.get("inclination", 55.0),
                                     "samples": _np.array(_entry["full_samples"]),
                                     "labels": _entry.get("full_labels", _friendly),
                                     "summary": _entry.get("full_summary", {}),
                                     "converged": _entry.get("mcmc_converged", False),
                                     "truths": _entry.get("truths", {}),
-                                })
+                                }
+                                if "full_chain" in _entry:
+                                    _post_entry["full_chain"] = _np.array(_entry["full_chain"])
+                                    _post_entry["burnin_used"] = _entry.get("burnin_used", 200)
+                                _tier2_posteriors.append(_post_entry)
                             else:
                                 # Legacy checkpoint: reconstruct from per-param samples
                                 _cp_cols = []
@@ -1678,6 +1816,7 @@ def _(
                                             _cp_truths[_fn] = _entry[f"{_fn}_truth"]
                                     _tier2_posteriors.append({
                                         "run": _entry["run"],
+                                        "filename": _entry.get("filename", f"run{_entry['run']}.spec"),
                                         "inclination": _entry.get("inclination", 55.0),
                                         "samples": _np.column_stack(_cp_cols),
                                         "labels": _cp_labels,
@@ -1741,6 +1880,12 @@ def _(
                             _gt = _extract_gt(str(_parquet), _run_idx, _emu.param_names)
                         except Exception:
                             pass
+
+                    # Always record the true inclination used to extract this
+                    # spectrum so the corner plot can overlay it.  This matters
+                    # when inclination is an MCMC-sampled parameter (param9-11)
+                    # but the parquet lookup didn't resolve it.
+                    _gt.setdefault("Inclination", _inc)
 
                     # -- MLE (spinner with iteration updates) --
                     with mo.status.spinner(
@@ -1807,6 +1952,7 @@ def _(
                     # Build per-spectrum summary
                     _spec_res = {
                         "run": _run_idx,
+                        "filename": _sf.name,
                         "inclination": _inc,
                         "mle_success": _mle["success"],
                         "mcmc_converged": _mcmc["converged"],
@@ -1817,11 +1963,14 @@ def _(
                     # Checkpoint entry: includes samples for resume
                     _cp_entry = {
                         "run": _run_idx,
+                        "filename": _sf.name,
                         "inclination": _inc,
                         "mcmc_converged": _mcmc["converged"],
                         "spec_result": _spec_res,
                         # Full posterior for corner-plot explorer on resume
                         "full_samples": _mcmc["samples"].tolist(),
+                        "full_chain": _mcmc["full_chain"].tolist(),
+                        "burnin_used": _mcmc.get("burnin_used", 200),
                         "full_labels": _mcmc.get("labels", []),
                         "full_summary": {
                             k: {sk: sv for sk, sv in v.items()}
@@ -1859,8 +2008,11 @@ def _(
                     # Store full posterior for corner-plot explorer
                     _tier2_posteriors.append({
                         "run": _run_idx,
+                        "filename": _sf.name,
                         "inclination": _inc,
-                        "samples": _mcmc["samples"],  # (N, ndim) array
+                        "samples": _mcmc["samples"],  # (N, ndim) burnt+thinned flat samples
+                        "full_chain": _mcmc["full_chain"],  # (nsteps, nwalkers, ndim) full chain
+                        "burnin_used": _mcmc.get("burnin_used", 200),
                         "labels": _mcmc_labels,
                         "summary": _mcmc["summary"],
                         "converged": _mcmc["converged"],
@@ -1965,7 +2117,10 @@ def _(
             "mcmc_steps": mcmc_steps_slider.value,
             "max_spectra": max_spectra_slider.value,
         }
-        _report = _build_report_card(_tier1_result, _tier2_result, _tier3_results, _config)
+        _report = _build_report_card(
+            _tier1_result, _tier2_result, _tier3_results, _config,
+            tier2_posteriors=_tier2_posteriors if 2 in _tiers and matched_testgrid_path else None,
+        )
 
         # Save each live run under a timestamped filename to avoid clobbering earlier reports.
         os.makedirs("benchmark_results", exist_ok=True)

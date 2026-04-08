@@ -88,8 +88,27 @@ def _(mo):
     return hf_mode_switch, is_hf_space
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    usage_toggle = mo.ui.switch(value=False, label=f"{mo.icon('lucide:activity')} System Resources")
+    usage_refresh = mo.ui.refresh(default_interval="10s", label="")
+    return usage_refresh, usage_toggle
+
+
+@app.cell(hide_code=True)
+def _(mo, usage_refresh, usage_toggle):
+    from Speculate_addons.speculate_usage_bars import get_usage_html
+    if usage_toggle.value:
+        usage_refresh
+        _html = get_usage_html()
+        usage_bars = mo.vstack([usage_toggle, mo.Html(_html)])
+    else:
+        usage_bars = usage_toggle
+    return (usage_bars,)
+
+
 @app.cell
-def _(hf_mode_switch, is_hf_space, mo):
+def _(hf_mode_switch, is_hf_space, mo, usage_bars):
     # Resolve the current mode (must be in a separate cell from switch creation)
     if is_hf_space:
         current_mode = "HuggingFace Space"
@@ -160,6 +179,8 @@ def _(hf_mode_switch, is_hf_space, mo):
     # Show the dev-mode switch on local installs (after documentation)
     if hf_mode_switch is not None:
         sidebar_items.append(hf_mode_switch)
+
+    sidebar_items.extend([mo.md("---"), usage_bars])
 
     mo.sidebar(mo.vstack(sidebar_items))
     return (current_mode,)

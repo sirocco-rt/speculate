@@ -55,8 +55,27 @@ def _(mo):
     return
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    usage_toggle = mo.ui.switch(value=False, label=f"{mo.icon('lucide:activity')} System Resources")
+    usage_refresh = mo.ui.refresh(default_interval="10s", label="")
+    return usage_refresh, usage_toggle
+
+
+@app.cell(hide_code=True)
+def _(mo, usage_refresh, usage_toggle):
+    from Speculate_addons.speculate_usage_bars import get_usage_html
+    if usage_toggle.value:
+        usage_refresh
+        _html = get_usage_html()
+        usage_bars = mo.vstack([usage_toggle, mo.Html(_html)])
+    else:
+        usage_bars = usage_toggle
+    return (usage_bars,)
+
+
 @app.cell
-def _(mo, os):
+def _(mo, os, usage_bars):
     _is_hf = os.environ.get("SPACE_ID") is not None
 
     _items = [mo.md(f"#Speculate {mo.icon('lucide:telescope')}")]
@@ -108,6 +127,7 @@ def _(mo, os):
         mo.md("---"),
         mo.md("---"),
     ])
+    _items.extend([mo.md("---"), usage_bars])
     mo.sidebar(mo.vstack(_items))
     return
 
