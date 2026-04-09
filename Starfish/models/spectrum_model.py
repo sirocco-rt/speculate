@@ -141,6 +141,7 @@ class SpectrumModel:
         max_deque_len: int = 100,
         norm=False,
         name: str = "SpectrumModel",
+        flux_scale: str = "linear",
         **params,
     ):
         if isinstance(emulator, str):
@@ -177,6 +178,10 @@ class SpectrumModel:
         self.frozen = []
         self.name = name
         self.norm = norm
+
+        # The flux space the emulator was trained in ("linear", "log", etc.).
+        # When "log", nuisance transforms are applied in linear space.
+        self.flux_scale = flux_scale
 
         # Unpack the grid parameters
         self.n_grid_params = len(grid_params)
@@ -331,10 +336,12 @@ class SpectrumModel:
         else:
             fluxes = self._cached_resampled_fluxes
 
-        if "Av" in self.params:
+        # In log₁₀ space, nuisance transforms are additive offsets applied
+        # AFTER PCA reconstruction, so skip pre-reconstruction bulk ops.
+        if "Av" in self.params and self.flux_scale != "log":
             fluxes = extinct(self.data.wave, fluxes, self.params["Av"])
 
-        if "cheb" in self.params:
+        if "cheb" in self.params and self.flux_scale != "log":
             # force constant term to be 1 to avoid degeneracy with log_scale
             coeffs = [1, *self.cheb]
             fluxes = chebyshev_correct(self.data.wave, fluxes, coeffs)
@@ -373,27 +380,70 @@ class SpectrumModel:
             # Reconstruction
             X = eigenspectra * flux_std
             flux = torch.matmul(weights, X) + flux_mean
-            
-            # optionally scale using absolute flux calibration
-            if self.norm:
-                norm = self.emulator.norm_factor(self.grid_params)
-            else:
-                norm = 1.0
 
-            # Renorm to data flux if no "log_scale" provided
-            if "log_scale" not in self.params:
-                flux_cpu = flux.detach().cpu().numpy()
-                scale = _get_renorm_factor(self.data.wave, flux_cpu * norm, self.data.flux)
-                self._log_scale = np.log(scale)
-                scale *= norm
-                self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
+            if self.flux_scale == "log":
+                # ── Log₁₀-space nuisance transforms (additive) ──────────
+                # In log₁₀ space, multiplicative nuisance ops become
+                # additive offsets and do NOT change the GP covariance.
+                _ln10 = np.log(10.0)
+                if "Av" in self.params:
+                    _av = self.params["Av"]
+                    _Rv = self.params.get("Rv", 3.1)
+                    import extinction as _ext_mod
+                    _a_lambda = _ext_mod.fitzpatrick99(
+                        self.data.wave.astype(np.float64), _av, _Rv
+                    )
+                    flux = flux + torch.from_numpy(
+                        -0.4 * _a_lambda
+                    ).to(flux.device, flux.dtype)
+                if "cheb" in self.params:
+                    coeffs_np = np.array([1, *self.cheb.tolist()])
+                    _sw = self.data.wave / self.data.wave.max()
+                    from numpy.polynomial.chebyshev import chebval as _chebval
+                    _cheb_poly = _chebval(_sw, coeffs_np)
+                    _cheb_poly = np.clip(_cheb_poly, 1e-30, None)
+                    flux = flux + torch.from_numpy(
+                        np.log10(_cheb_poly)
+                    ).to(flux.device, flux.dtype)
+                if "log_scale" in self.params:
+                    self._log_scale = self.params["log_scale"]
+                    flux = flux + self.params["log_scale"] / _ln10
+                else:
+                    # Auto-renorm in log₁₀ space: additive offset that aligns
+                    # integrated emu vs data.  data.flux is already in log₁₀.
+                    from scipy.integrate import trapezoid as _trapz
+                    _flux_np = flux.detach().cpu().numpy()
+                    _data_int = _trapz(self.data.flux, self.data.wave)
+                    _emu_int = _trapz(_flux_np, self.data.wave)
+                    if abs(_emu_int) > 1e-30:
+                        _offset = (_data_int - _emu_int) / len(self.data.wave)
+                    else:
+                        _offset = 0.0
+                    self._log_scale = _offset * _ln10  # store as natural-log equiv
+                    flux = flux + _offset
+                # X is NOT scaled — additive transforms don't change covariance
             else:
-                self._log_scale = self.params["log_scale"]
-                scale = np.exp(self.params["log_scale"]) * norm
-            
-            # Apply scale
-            flux = flux * scale
-            X = X * scale
+                # ── Linear-space nuisance transforms (original path) ─────
+                # optionally scale using absolute flux calibration
+                if self.norm:
+                    norm = self.emulator.norm_factor(self.grid_params)
+                else:
+                    norm = 1.0
+
+                # Renorm to data flux if no "log_scale" provided
+                if "log_scale" not in self.params:
+                    flux_cpu = flux.detach().cpu().numpy()
+                    scale = _get_renorm_factor(self.data.wave, flux_cpu * norm, self.data.flux)
+                    self._log_scale = np.log(scale)
+                    scale *= norm
+                    self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
+                else:
+                    self._log_scale = self.params["log_scale"]
+                    scale = np.exp(self.params["log_scale"]) * norm
+                
+                # Apply scale
+                flux = flux * scale
+                X = X * scale
             
             # Covariance via Cholesky solve
             L_weights = torch.linalg.cholesky(weights_cov)
@@ -476,24 +526,58 @@ class SpectrumModel:
         X = eigenspectra * flux_std
         flux = weights @ X + flux_mean
 
-        # optionally scale using absolute flux calibration
-        if self.norm:
-            norm = self.emulator.norm_factor(self.grid_params)
+        if self.flux_scale == "log":
+            # ── Log₁₀-space nuisance transforms (additive) ──────────
+            _ln10 = np.log(10.0)
+            if "Av" in self.params:
+                _av = self.params["Av"]
+                _Rv = self.params.get("Rv", 3.1)
+                import extinction as _ext_mod
+                _a_lambda = _ext_mod.fitzpatrick99(
+                    self.data.wave.astype(np.float64), _av, _Rv
+                )
+                flux = flux + (-0.4 * _a_lambda)
+            if "cheb" in self.params:
+                coeffs_np = np.array([1, *self.cheb.tolist()])
+                _sw = self.data.wave / self.data.wave.max()
+                from numpy.polynomial.chebyshev import chebval as _chebval
+                _cheb_poly = _chebval(_sw, coeffs_np)
+                _cheb_poly = np.clip(_cheb_poly, 1e-30, None)
+                flux = flux + np.log10(_cheb_poly)
+            if "log_scale" in self.params:
+                self._log_scale = self.params["log_scale"]
+                flux = flux + self.params["log_scale"] / _ln10
+            else:
+                from scipy.integrate import trapezoid as _trapz
+                _data_int = _trapz(self.data.flux, self.data.wave)
+                _emu_int = _trapz(flux, self.data.wave)
+                if abs(_emu_int) > 1e-30:
+                    _offset = (_data_int - _emu_int) / len(self.data.wave)
+                else:
+                    _offset = 0.0
+                self._log_scale = _offset * _ln10
+                flux = flux + _offset
+            # X is NOT scaled — additive transforms don't change covariance
         else:
-            norm = 1
+            # ── Linear-space nuisance transforms (original path) ─────
+            # optionally scale using absolute flux calibration
+            if self.norm:
+                norm = self.emulator.norm_factor(self.grid_params)
+            else:
+                norm = 1
 
-        # Renorm to data flux if no "log_scale" provided
-        if "log_scale" not in self.params:
-            scale = _get_renorm_factor(self.data.wave, flux * norm, self.data.flux)
-            self._log_scale = np.log(scale)
-            scale *= norm
-            self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
-        else:
-            self._log_scale = self.params["log_scale"]
-            scale = np.exp(self.params["log_scale"]) * norm
+            # Renorm to data flux if no "log_scale" provided
+            if "log_scale" not in self.params:
+                scale = _get_renorm_factor(self.data.wave, flux * norm, self.data.flux)
+                self._log_scale = np.log(scale)
+                scale *= norm
+                self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
+            else:
+                self._log_scale = self.params["log_scale"]
+                scale = np.exp(self.params["log_scale"]) * norm
 
-        flux = rescale(flux, scale)
-        X = rescale(X, scale)
+            flux = rescale(flux, scale)
+            X = rescale(X, scale)
 
         L, flag = cho_factor(weights_cov, overwrite_a=True)
         cov = X.T @ cho_solve((L, flag), X)

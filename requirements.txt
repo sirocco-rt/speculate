@@ -31,6 +31,8 @@ torchvision
 
 # Optional optimizers
 cma
+optuna
+scikit-learn
 
 # Debugging and Profiling
 pyinstrument

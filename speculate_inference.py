@@ -649,15 +649,11 @@ def _(
         _emu_name = emulator_selector.value.lower()
         if '_log_' in _emu_name:
             _detected_scale = "log"
-        elif '_scaled_' in _emu_name:
-            _detected_scale = "scaled"
-        elif '_continuum-subtracted_' in _emu_name:
-            _detected_scale = "continuum-subtracted"
         elif '_continuum-normalised_' in _emu_name:
             _detected_scale = "continuum-normalised"
 
     obs_flux_scale = mo.ui.dropdown(
-        options=["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"],
+        options=["linear", "log", "continuum-normalised"],
         value=_detected_scale,
         label="Observation Flux Transform:",
         full_width=True,
@@ -715,11 +711,6 @@ def _(alt, data_source_info, mo, np, obs_data, obs_flux_scale, pd, wl_range_slid
          _scale_label = obs_flux_scale.value
          if _scale_label == 'log':
              _flux_vals = np.where(_flux_vals > 0, np.log10(_flux_vals), np.log10(np.abs(_flux_vals) + 1e-30))
-         elif _scale_label == 'scaled':
-             _flux_mean = np.mean(_flux_vals)
-             if _flux_mean != 0:
-                 _flux_vals = _flux_vals / _flux_mean
-
          _plot_df = pd.DataFrame({
              'Wavelength': _plot_df['wavelength'],
              'Flux': _flux_vals,
@@ -936,26 +927,37 @@ def _(emu, fit_power_law_continuum, mo, np, obs_data, obs_flux_scale, wl_range_s
                 if _scale_label == 'log':
                     _obs_fl = np.where(_obs_fl > 0, np.log10(_obs_fl),
                                        np.log10(np.abs(_obs_fl) + 1e-30))
-                elif _scale_label == 'scaled':
-                    _m = np.mean(_obs_fl)
-                    if _m != 0:
-                        _obs_fl = _obs_fl / _m
-                elif _scale_label == 'continuum-subtracted':
-                    _ct, _ = fit_power_law_continuum(_obs_wl, _obs_fl)
-                    _obs_fl = _obs_fl - _ct
                 elif _scale_label == 'continuum-normalised':
                     _ct, _ = fit_power_law_continuum(_obs_wl, _obs_fl)
                     _ct_safe = np.where(_ct > 0, _ct, 1.0)
                     _obs_fl = _obs_fl / _ct_safe
 
                 _obs_mean = np.mean(np.abs(_obs_fl)) if len(_obs_fl) > 0 else 1.0
-                # log_scale = ln(obs / emu)
-                if _emu_mean > 0 and _obs_mean > 0:
-                    _ls_centre = float(np.log(_obs_mean / _emu_mean))
-                # log_amp centre: residual variance as starting estimate
-                _residual_var = np.mean((_obs_fl[:min(len(_obs_fl), len(_emu_fl[_em]))]
-                                         - _emu_fl[_em][:min(len(_obs_fl), len(_emu_fl[_em]))]
-                                         * np.exp(_ls_centre)) ** 2) if len(_obs_fl) > 0 else 1e-5
+                # log_scale = ln(obs / emu) — but in log₁₀ space the raw
+                # means are negative, so compare linear-space means instead.
+                if _scale_label == 'log':
+                    _emu_mean_lin = np.mean(np.abs(10.0 ** _emu_fl[_em])) if _em.any() else 1.0
+                    _obs_mean_lin = np.mean(np.abs(np.array(obs_data[_om]['flux']))) if len(_obs_fl) > 0 else 1.0
+                    if _emu_mean_lin > 0 and _obs_mean_lin > 0:
+                        _ls_centre = float(np.log(_obs_mean_lin / _emu_mean_lin))
+                else:
+                    if _emu_mean > 0 and _obs_mean > 0:
+                        _ls_centre = float(np.log(_obs_mean / _emu_mean))
+                # log_amp centre: residual variance as starting estimate.
+                # Apply log_scale additively in log₁₀ space, multiplicatively
+                # otherwise.
+                _ln10 = np.log(10.0)
+                _n_cmp = min(len(_obs_fl), int(_em.sum()))
+                if _n_cmp > 0:
+                    if _scale_label == 'log':
+                        _resid = (_obs_fl[:_n_cmp]
+                                  - (_emu_fl[_em][:_n_cmp] + _ls_centre / _ln10))
+                    else:
+                        _resid = (_obs_fl[:_n_cmp]
+                                  - _emu_fl[_em][:_n_cmp] * np.exp(_ls_centre))
+                    _residual_var = float(np.mean(_resid ** 2))
+                else:
+                    _residual_var = 1e-5
                 _la_centre = float(np.log(max(_residual_var, 1e-30)))
             except Exception:
                 pass  # keep fallback values
@@ -1051,22 +1053,43 @@ def _(
             emu_wl_crop = emu_wl[_emu_mask]
             emu_flux_crop = emu_flux[_emu_mask]
 
-            # Apply extinction (Av)
-            _av = pg_av_slider.value
-            if _av > 0:
-                emu_flux_crop = extinct(emu_wl_crop, emu_flux_crop, Av=_av)
+            _is_log = (obs_flux_scale.value == "log")
+            _ln10 = np.log(10.0)
 
-            # Apply Chebyshev continuum tilt (c0=1, c1=slider value)
-            _cheb1 = pg_cheb1_slider.value
-            if _cheb1 != 0.0:
-                from numpy.polynomial.chebyshev import chebval
-                _scale_wl = emu_wl_crop / emu_wl_crop.max()
-                _cheb_poly = chebval(_scale_wl, [1.0, _cheb1])
-                emu_flux_crop = emu_flux_crop * _cheb_poly
+            if _is_log:
+                # ── Log₁₀-space nuisance transforms (additive) ──────
+                _av = pg_av_slider.value
+                if _av > 0:
+                    import extinction as _ext_mod
+                    _a_lambda = _ext_mod.fitzpatrick99(
+                        emu_wl_crop.astype(np.float64), _av, 3.1)
+                    emu_flux_crop = emu_flux_crop + (-0.4 * _a_lambda)
 
-            # Apply flux scaling (log_scale -> natural log -> exp)
-            _log_scale = pg_logscale_slider.value
-            emu_flux_crop = emu_flux_crop * np.exp(_log_scale)
+                _cheb1 = pg_cheb1_slider.value
+                if _cheb1 != 0.0:
+                    from numpy.polynomial.chebyshev import chebval
+                    _scale_wl = emu_wl_crop / emu_wl_crop.max()
+                    _cheb_poly = chebval(_scale_wl, [1.0, _cheb1])
+                    _cheb_poly = np.clip(_cheb_poly, 1e-30, None)
+                    emu_flux_crop = emu_flux_crop + np.log10(_cheb_poly)
+
+                _log_scale = pg_logscale_slider.value
+                emu_flux_crop = emu_flux_crop + _log_scale / _ln10
+            else:
+                # ── Linear-space nuisance transforms (original) ──────
+                _av = pg_av_slider.value
+                if _av > 0:
+                    emu_flux_crop = extinct(emu_wl_crop, emu_flux_crop, Av=_av)
+
+                _cheb1 = pg_cheb1_slider.value
+                if _cheb1 != 0.0:
+                    from numpy.polynomial.chebyshev import chebval
+                    _scale_wl = emu_wl_crop / emu_wl_crop.max()
+                    _cheb_poly = chebval(_scale_wl, [1.0, _cheb1])
+                    emu_flux_crop = emu_flux_crop * _cheb_poly
+
+                _log_scale = pg_logscale_slider.value
+                emu_flux_crop = emu_flux_crop * np.exp(_log_scale)
 
             # GP uncertainty envelope (±1σ from GP amplitude)
             _log_amp = pg_logamp_slider.value
@@ -1092,15 +1115,6 @@ def _(
                     np.log10(_obs_flux),
                     np.log10(np.abs(_obs_flux) + 1e-30),
                 )
-            elif _scale_label == 'scaled':
-                _obs_mean = np.mean(_obs_flux)
-                if _obs_mean != 0:
-                    _obs_flux = _obs_flux / _obs_mean
-            elif _scale_label == 'continuum-subtracted':
-                _obs_cont, _ = fit_power_law_continuum(
-                    np.array(_obs_sub['wavelength']), _obs_flux
-                )
-                _obs_flux = _obs_flux - _obs_cont
             elif _scale_label == 'continuum-normalised':
                 _obs_cont, _ = fit_power_law_continuum(
                     np.array(_obs_sub['wavelength']), _obs_flux
@@ -1314,23 +1328,30 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
                 if _sc == 'log':
                     _ofl = np.where(_ofl > 0, np.log10(_ofl),
                                     np.log10(np.abs(_ofl) + 1e-30))
-                elif _sc == 'scaled':
-                    _mm = np.mean(_ofl)
-                    if _mm != 0:
-                        _ofl = _ofl / _mm
-                elif _sc == 'continuum-subtracted':
-                    _ct2, _ = fit_power_law_continuum(_owl, _ofl)
-                    _ofl = _ofl - _ct2
                 elif _sc == 'continuum-normalised':
                     _ct2, _ = fit_power_law_continuum(_owl, _ofl)
                     _ct2s = np.where(_ct2 > 0, _ct2, 1.0)
                     _ofl = _ofl / _ct2s
 
                 _obs_avg = np.mean(np.abs(_ofl)) if len(_ofl) > 0 else 1.0
-                if _emu_avg > 0 and _obs_avg > 0:
-                    _ls_default = float(np.log(_obs_avg / _emu_avg))
+                if _sc == 'log':
+                    _emu_avg_lin = np.mean(np.abs(10.0 ** _efl[_em_tmp])) if _em_tmp.any() else 1.0
+                    _obs_avg_lin = np.mean(np.abs(np.array(obs_data[_om_tmp]['flux']))) if len(_ofl) > 0 else 1.0
+                    if _emu_avg_lin > 0 and _obs_avg_lin > 0:
+                        _ls_default = float(np.log(_obs_avg_lin / _emu_avg_lin))
+                else:
+                    if _emu_avg > 0 and _obs_avg > 0:
+                        _ls_default = float(np.log(_obs_avg / _emu_avg))
                 _n = min(len(_ofl), int(_em_tmp.sum()))
-                _resid_var = np.mean((_ofl[:_n] - _efl[_em_tmp][:_n] * np.exp(_ls_default)) ** 2) if _n > 0 else 1e-5
+                _ln10 = np.log(10.0)
+                if _n > 0:
+                    if _sc == 'log':
+                        _resid = _ofl[:_n] - (_efl[_em_tmp][:_n] + _ls_default / _ln10)
+                    else:
+                        _resid = _ofl[:_n] - _efl[_em_tmp][:_n] * np.exp(_ls_default)
+                    _resid_var = float(np.mean(_resid ** 2))
+                else:
+                    _resid_var = 1e-5
                 _la_default = float(np.log(max(_resid_var, 1e-30)))
             except Exception:
                 pass
@@ -1590,15 +1611,6 @@ def _(
                 if _flux_scale == 'log':
                     # Guard against non-positive values
                     _raw_flux = np.where(_raw_flux > 0, np.log10(_raw_flux), np.log10(np.abs(_raw_flux) + 1e-30))
-                elif _flux_scale == 'scaled':
-                    _flux_mean = np.mean(_raw_flux)
-                    if _flux_mean != 0:
-                        _raw_flux = _raw_flux / _flux_mean
-                elif _flux_scale == 'continuum-subtracted':
-                    _cont, _ = fit_power_law_continuum(
-                        np.array(_data_subset['wavelength']), _raw_flux
-                    )
-                    _raw_flux = _raw_flux - _cont
                 elif _flux_scale == 'continuum-normalised':
                     _cont, _ = fit_power_law_continuum(
                         np.array(_data_subset['wavelength']), _raw_flux
@@ -1617,9 +1629,6 @@ def _(
                         # Propagate error through log10: sigma_log = sigma / (val * ln(10))
                         _orig_flux = np.array(obs_data[_mask]['flux'])
                         _sigma = _sigma / (np.abs(_orig_flux) * np.log(10) + 1e-30)
-                    elif _flux_scale == 'scaled':
-                        _sigma = _sigma / _flux_mean if _flux_mean != 0 else _sigma
-                    # continuum-subtracted: sigma unchanged (deterministic subtraction)
                     elif _flux_scale == 'continuum-normalised':
                         _sigma = _sigma / _cont_safe
                 else:
@@ -1672,6 +1681,7 @@ def _(
                        emulator=emu, 
                        data=spec_data, 
                        grid_params=grid_params_init,
+                       flux_scale=_flux_scale,
                        **global_params
                 )
 

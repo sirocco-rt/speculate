@@ -714,7 +714,7 @@ def _(mo, n_components, params):
 @app.cell
 def _(get_loaded_emu_config, set_loaded_emu_display, mo):
     _cfg = get_loaded_emu_config()
-    _scales = ["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"]
+    _scales = ["linear", "log", "continuum-normalised"]
 
     wl_min = mo.ui.number(start=800, stop=8000, value=_cfg['wl_min'] if _cfg and 'wl_min' in _cfg else 850, step=10, label="Min Wavelength (Å):", on_change=lambda _: set_loaded_emu_display(None))
     wl_max = mo.ui.number(start=800, stop=8000, value=_cfg['wl_max'] if _cfg and 'wl_max' in _cfg else 1850, step=10, label="Max Wavelength (Å):", on_change=lambda _: set_loaded_emu_display(None))
@@ -915,7 +915,9 @@ def _(
             _smoothing = use_smoothing.value
             _scale = scale_selector.value
             _smooth_suffix = "_smooth" if _smoothing else ""
-            _grid_file_name_pca = f"{_base_name}grid_{_model_params_str}_{_scale}{_smooth_suffix}"
+            _wl_lo = wl_min.value
+            _wl_hi = wl_max.value
+            _grid_file_name_pca = f"{_base_name}grid_{_model_params_str}_{_scale}{_smooth_suffix}_{_wl_lo}-{_wl_hi}AA"
             _grid_file_path_pca = f'Grid-Emulator_Files/{_grid_file_name_pca}.npz'
             _grid_ready = True
 
@@ -1128,9 +1130,11 @@ def _(
         # Standardize base name from grid folder name (e.g. no-bl -> no_bl)
         base_name = grid_name + "_"
 
-        # Include the flux scale and smoothing tag in the grid filename because the
-        # processed spectra themselves differ when either option changes.
-        grid_file_name = f"{base_name}grid_{model_parameters_str}_{scale}{smooth_tag}"
+        # Include the flux scale, smoothing tag, and wavelength range in the grid
+        # filename because the processed spectra themselves differ when any of these
+        # options change.  Without the wavelength range a cached grid from a previous
+        # run with a different range would be silently reused.
+        grid_file_name = f"{base_name}grid_{model_parameters_str}_{scale}{smooth_tag}_{wl_range[0]}-{wl_range[1]}AA"
 
         # Determine emulator file name based on Speculate_dev.py conventions
         # Default fixed inclination is 55 degrees per grid_configs setup

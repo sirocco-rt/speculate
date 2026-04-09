@@ -1515,15 +1515,11 @@ def _(emu_picker, glob, mo, os, re):
         _emu_name = _emu_base.lower()
         if '_log_' in _emu_name:
             _detected_scale = "log"
-        elif '_scaled_' in _emu_name:
-            _detected_scale = "scaled"
-        elif '_continuum-subtracted_' in _emu_name:
-            _detected_scale = "continuum-subtracted"
         elif '_continuum-normalised_' in _emu_name:
             _detected_scale = "continuum-normalised"
 
     flux_scale_picker = mo.ui.dropdown(
-        options=["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"],
+        options=["linear", "log", "continuum-normalised"],
         value=_detected_scale,
         label="Flux Transform",
     )
@@ -1552,9 +1548,14 @@ def _(emu_picker, glob, mo, os, re):
             # Fallback for older filenames that predate the stricter pattern.
             _param_tag = _after_emu.split("_850")[0].split("_1000")[0]
 
+        # Extract the wavelength range tag (e.g. "850-1850AA") from the emulator
+        # filename so we find the grid that was processed with the same range.
+        _wl_tag_match = re.search(r"(\d+-\d+AA)", _after_emu)
+        _wl_tag = _wl_tag_match.group(1) if _wl_tag_match else "*"
+
         # Tier 1 consumes the processed NPZ grid, while Tier 2 consumes the raw
         # test-grid directory that contains individual .spec files.
-        _grid_pattern = f"Grid-Emulator_Files/{_grid_stem}_grid_{_param_tag}.npz"
+        _grid_pattern = f"Grid-Emulator_Files/{_grid_stem}_grid_{_param_tag}_{_wl_tag}.npz"
         _grid_matches = sorted(glob.glob(_grid_pattern))
         if _grid_matches:
             matched_grid_path = _grid_matches[0]

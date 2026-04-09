@@ -523,7 +523,7 @@ def _(
 
 
     flux_scale_selector = mo.ui.dropdown(
-        options=["linear", "log", "scaled", "continuum-subtracted", "continuum-normalised"],
+        options=["linear", "log", "continuum-normalised"],
         value="linear",
         label="Flux Scale:"
     )
@@ -806,12 +806,6 @@ def _(
         if _scale_mode == 'log':
             safe = np.where(flux_array > 0, flux_array, 1e-30)
             return np.log10(safe)
-        elif _scale_mode == 'scaled':
-            mean_val = np.mean(flux_array)
-            return flux_array / mean_val if mean_val != 0 else flux_array
-        elif _scale_mode == 'continuum-subtracted':
-            continuum, _ = fit_power_law_continuum(wl_array, flux_array)
-            return flux_array - continuum
         elif _scale_mode == 'continuum-normalised':
             continuum, _ = fit_power_law_continuum(wl_array, flux_array)
             return flux_array / np.where(continuum > 0, continuum, 1.0)
@@ -940,8 +934,6 @@ def _(
             y=alt.Y('Flux:Q', 
                     title=('Flux' if _scale_mode == 'linear'
                            else 'log₁₀(Flux)' if _scale_mode == 'log'
-                           else 'Scaled Flux' if _scale_mode == 'scaled'
-                           else 'Flux − Continuum' if _scale_mode == 'continuum-subtracted'
                            else 'Flux / Continuum') if not use_dimensionless.value else 'Normalized Flux',
                     scale=alt.Scale(zero=False),
                     axis=alt.Axis(format='~e', grid=show_grid.value)),

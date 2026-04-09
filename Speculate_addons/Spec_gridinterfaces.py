@@ -239,7 +239,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             norm (bool): Whether to normalise the return flux (left unimplemented)
         
             scale (str): Change this default too if changing the flux scale. 
-                Define the scale for your data and emulator grid space. 'linear', 'log' or 'scaled'
+                Define the scale for your data and emulator grid space. 'linear', 'log' or 'continuum-normalised'
                 
         Returns:
             ndarray: List of fluxes in the wavelength range specified on initialisation
@@ -279,12 +279,6 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         if self.scale == 'log':
             flux = np.where(flux > 0, flux, 1e-30)  # Floor non-positive values to avoid log10(0) = -inf
             flux = np.log10(flux) # logged 10 
-        if self.scale == 'scaled': # to values near order of magnitude 10^0. 
-            flux = flux/np.mean(flux)
-        if self.scale == 'continuum-subtracted':
-            wl_sel = self.wl_full[:len(flux)][self.ind]
-            continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])
-            flux[self.ind] = flux[self.ind] - continuum
         if self.scale == 'continuum-normalised':
             wl_sel = self.wl_full[:len(flux)][self.ind]
             continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])
@@ -523,7 +517,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             norm (bool): Whether to normalise the return flux (left unimplemented)
         
             scale (str): Change this default too if changing the flux scale. 
-                Define the scale for your data and emulator grid space. 'linear', 'log' or 'scaled'
+                Define the scale for your data and emulator grid space. 'linear', 'log' or 'continuum-normalised'
                 
         Returns:
             ndarray: List of fluxes in the wavelength range specified on initialisation
@@ -563,12 +557,6 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         if self.scale == 'log':
             flux = np.where(flux > 0, flux, 1e-30)  # Floor non-positive values to avoid log10(0) = -inf
             flux = np.log10(flux) # logged 10 
-        if self.scale == 'scaled': # to values near order of magnitude 10^0. 
-            flux = flux/np.mean(flux)
-        if self.scale == 'continuum-subtracted':
-            wl_sel = self.wl_full[:len(flux)][self.ind]
-            continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])
-            flux[self.ind] = flux[self.ind] - continuum
         if self.scale == 'continuum-normalised':
             wl_sel = self.wl_full[:len(flux)][self.ind]
             continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])

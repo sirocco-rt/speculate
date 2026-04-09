@@ -376,7 +376,7 @@ def run_mle_single(
     priors : dict or None
         Priors dict (internal param names → scipy frozen distributions).
     flux_scale : str
-        'linear', 'log', or 'scaled'.
+        'linear', 'log', or 'continuum-normalised'.
     max_iter : int
         Maximum Nelder-Mead iterations.
     freeze_av : bool
@@ -400,15 +400,6 @@ def run_mle_single(
     if flux_scale == "log":
         sigma = sigma / (np.abs(flux) * np.log(10) + 1e-30)
         flux = np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
-    elif flux_scale == "scaled":
-        fmean = np.mean(flux)
-        if fmean != 0:
-            sigma = sigma / fmean
-            flux = flux / fmean
-    elif flux_scale == "continuum-subtracted":
-        from Speculate_addons.Spec_functions import fit_power_law_continuum
-        continuum, _ = fit_power_law_continuum(wl, flux)
-        flux = flux - continuum
     elif flux_scale == "continuum-normalised":
         from Speculate_addons.Spec_functions import fit_power_law_continuum
         continuum, _ = fit_power_law_continuum(wl, flux)
@@ -431,6 +422,7 @@ def run_mle_single(
         grid_params=grid_init,
         global_cov={"log_amp": -55.0, "log_ls": 4.5},
         cheb=[0.0],
+        flux_scale=flux_scale,
     )
 
     # Optionally fix Av = 0 (synthetic test-grid spectra have no dust
