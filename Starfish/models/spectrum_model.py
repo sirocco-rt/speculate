@@ -373,13 +373,17 @@ class SpectrumModel:
             else:
                 fluxes_gpu = self._cached_fluxes_gpu
 
-            eigenspectra = fluxes_gpu[:-2]
-            flux_mean = fluxes_gpu[-2]
-            flux_std = fluxes_gpu[-1]
+            eigenspectra = fluxes_gpu[:-2]  # (m, N_pix)  — Eq. 26 Ξ^T
+            flux_mean = fluxes_gpu[-2]              # (N_pix,)   — ξ_μ
+            flux_std = fluxes_gpu[-1]               # (N_pix,)   — ξ_σ
             
-            # Reconstruction
-            X = eigenspectra * flux_std
-            flux = torch.matmul(weights, X) + flux_mean
+            # Paper Eq. 26: Ξ = [ξ_1 ... ξ_m] is (N_pix, m) — eigenspectra as columns.
+            # Paper Eq. 53: X = ξ_σ I_{N_pix} Ξ  is (N_pix, m) — Ξ scaled by flux_std.
+            # In code eigenspectra are stored as ROWS (sklearn convention),
+            # so X_code = Ξ^T · diag(ξ_σ) = X_paper^T, shape (m, N_pix).
+            X = eigenspectra * flux_std              # (m, N_pix) = X_paper^T
+            # Paper Eq. 52: M(w) = ξ_μ + X w  →  code: w^T X_code + ξ_μ
+            flux = torch.matmul(weights, X) + flux_mean  # (m,)@(m,N_pix) → (N_pix,)
 
             if self.flux_scale == "log":
                 # ── Log₁₀-space nuisance transforms (additive) ──────────
@@ -445,11 +449,16 @@ class SpectrumModel:
                 flux = flux * scale
                 X = X * scale
             
-            # Covariance via Cholesky solve
-            L_weights = torch.linalg.cholesky(weights_cov)
-            Z = torch.linalg.solve_triangular(L_weights, X, upper=False)
-            Z = torch.linalg.solve_triangular(L_weights.T, Z, upper=True)
-            cov = torch.matmul(X.T, Z)
+            # Paper Eq. 59: C' = X Σ_w X^T + C  where X is (N_pix, m) from Eq. 53.
+            # In code X_code = X_paper^T (m, N_pix), so:
+            #   C' = X_code^T Σ_w X_code + C    (N_pix,m)(m,m)(m,N_pix) → (N_pix,N_pix)
+            # Cholesky for numerical stability: Σ_w = LL^T
+            #   X_code^T Σ_w X_code = (L^T X_code)^T (L^T X_code)
+            # .mT = matrix transpose (last two dims); equivalent to .T for
+            # 2-D tensors but preferred in PyTorch (safe for batched >2-D).
+            L_weights = torch.linalg.cholesky(weights_cov)  # (m, m)
+            Y = torch.matmul(L_weights.mT, X)   # (m,m)@(m,N_pix) → (m, N_pix)
+            cov = torch.matmul(Y.mT, Y)          # (N_pix,m)@(m,N_pix) → (N_pix, N_pix)
             
             # Add trivial covariance — cache sigma on GPU
             if self._cached_data_sigma_gpu is None:
@@ -521,10 +530,14 @@ class SpectrumModel:
         weights, weights_cov = self.emulator(self.grid_params)
 
         # Decompose the bulk_fluxes (see emulator/emulator.py for the ordering)
-        *eigenspectra, flux_mean, flux_std = fluxes
-        # Complete the reconstruction
-        X = eigenspectra * flux_std
-        flux = weights @ X + flux_mean
+        *eigenspectra, flux_mean, flux_std = fluxes  # m arrays (N_pix,), then (N_pix,), (N_pix,)
+        # Paper Eq. 26: Ξ = [ξ_1 ... ξ_m] is (N_pix, m) — eigenspectra as columns.
+        # Paper Eq. 53: X = ξ_σ I_{N_pix} Ξ  is (N_pix, m) — Ξ scaled by flux_std.
+        # In code eigenspectra are stored as ROWS (sklearn convention),
+        # so X_code = Ξ^T · diag(ξ_σ) = X_paper^T, shape (m, N_pix).
+        X = eigenspectra * flux_std   # list→array broadcast → (m, N_pix) = X_paper^T
+        # Paper Eq. 52: M(w) = ξ_μ + X w  →  code: w^T X_code + ξ_μ
+        flux = weights @ X + flux_mean  # (m,)@(m,N_pix) → (N_pix,)
 
         if self.flux_scale == "log":
             # ── Log₁₀-space nuisance transforms (additive) ──────────
@@ -579,8 +592,14 @@ class SpectrumModel:
             flux = rescale(flux, scale)
             X = rescale(X, scale)
 
-        L, flag = cho_factor(weights_cov, overwrite_a=True)
-        cov = X.T @ cho_solve((L, flag), X)
+        # Paper Eq. 59: C' = X Σ_w X^T + C  where X is (N_pix, m) from Eq. 53.
+        # In code X_code = X_paper^T (m, N_pix), so:
+        #   C' = X_code^T Σ_w X_code + C    (N_pix,m)(m,m)(m,N_pix) → (N_pix,N_pix)
+        # Cholesky for numerical stability: Σ_w = LL^T
+        #   X_code^T Σ_w X_code = (L^T X_code)^T (L^T X_code)
+        L_w = np.linalg.cholesky(weights_cov)  # (m, m)
+        Y = L_w.T @ np.array(X)   # (m,m)@(m,N_pix) → (m, N_pix)
+        cov = Y.T @ Y              # (N_pix,m)@(m,N_pix) → (N_pix, N_pix)
 
         # Trivial covariance
         np.fill_diagonal(cov, cov.diagonal() + self.data.sigma**2)
