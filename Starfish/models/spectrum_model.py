@@ -339,7 +339,8 @@ class SpectrumModel:
         # In log₁₀ space, nuisance transforms are additive offsets applied
         # AFTER PCA reconstruction, so skip pre-reconstruction bulk ops.
         if "Av" in self.params and self.flux_scale != "log":
-            fluxes = extinct(self.data.wave, fluxes, self.params["Av"])
+            fluxes = extinct(self.data.wave, fluxes, self.params["Av"],
+                            Rv=self.params.get("Rv", 3.1))
 
         if "cheb" in self.params and self.flux_scale != "log":
             # force constant term to be 1 to avoid degeneracy with log_scale
@@ -391,15 +392,12 @@ class SpectrumModel:
                 # additive offsets and do NOT change the GP covariance.
                 _ln10 = np.log(10.0)
                 if "Av" in self.params:
-                    _av = self.params["Av"]
-                    _Rv = self.params.get("Rv", 3.1)
-                    import extinction as _ext_mod
-                    _a_lambda = _ext_mod.fitzpatrick99(
-                        self.data.wave.astype(np.float64), _av, _Rv
+                    _ext_np = extinct(
+                        self.data.wave, np.zeros_like(self.data.wave),
+                        self.params["Av"], Rv=self.params.get("Rv", 3.1),
+                        flux_scale="log",
                     )
-                    flux = flux + torch.from_numpy(
-                        -0.4 * _a_lambda
-                    ).to(flux.device, flux.dtype)
+                    flux = flux + torch.from_numpy(_ext_np).to(flux.device, flux.dtype)
                 if "cheb" in self.params:
                     coeffs_np = np.array([1, *self.cheb.tolist()])
                     _sw = self.data.wave / self.data.wave.max()
@@ -543,13 +541,10 @@ class SpectrumModel:
             # ── Log₁₀-space nuisance transforms (additive) ──────────
             _ln10 = np.log(10.0)
             if "Av" in self.params:
-                _av = self.params["Av"]
-                _Rv = self.params.get("Rv", 3.1)
-                import extinction as _ext_mod
-                _a_lambda = _ext_mod.fitzpatrick99(
-                    self.data.wave.astype(np.float64), _av, _Rv
+                flux = extinct(
+                    self.data.wave, flux, self.params["Av"],
+                    Rv=self.params.get("Rv", 3.1), flux_scale="log",
                 )
-                flux = flux + (-0.4 * _a_lambda)
             if "cheb" in self.params:
                 coeffs_np = np.array([1, *self.cheb.tolist()])
                 _sw = self.data.wave / self.data.wave.max()
@@ -656,7 +651,8 @@ class SpectrumModel:
         fluxes = resample(wave, fluxes, self.data.wave)
 
         if "Av" in self.params:
-            fluxes = extinct(self.data.wave, fluxes, self.params["Av"])
+            fluxes = extinct(self.data.wave, fluxes, self.params["Av"],
+                            Rv=self.params.get("Rv", 3.1))
 
         if "cheb" in self.params:
             # force constant term to be 1 to avoid degeneracy with log_scale
