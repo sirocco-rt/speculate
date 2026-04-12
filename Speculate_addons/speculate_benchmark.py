@@ -431,6 +431,8 @@ def run_mle_single(
     if freeze_av:
         model.params["Av"] = 0.0
         model.freeze("Av")
+    else:
+        model.params["Av"] = 0.0
 
     # Bootstrap log_scale from auto-calculation *before* building priors
     # so we can centre the log_scale prior on the data-informed value.
@@ -1298,8 +1300,10 @@ def run_tier3_single(
     indices = np.random.choice(mcmc["samples"].shape[0], size=n_ppc, replace=False)
     envelopes = np.zeros((n_ppc, len(flux)))
 
+    _mcmc_labels = mcmc["labels"]
     for j, idx in enumerate(indices):
-        model.set_param_vector(mcmc["samples"][idx])
+        _sample_dict = dict(zip(_mcmc_labels, mcmc["samples"][idx]))
+        model.set_param_dict(_sample_dict)
         try:
             pred, _ = model()
             envelopes[j] = pred
@@ -1316,7 +1320,7 @@ def run_tier3_single(
 
     # Set model back to posterior mean for export
     mcmc_means = {}
-    for i, label in enumerate(model.labels):
+    for i, label in enumerate(mcmc["labels"]):
         mcmc_means[label] = float(np.mean(mcmc["samples"][:, i]))
     model.set_param_dict(mcmc_means)
 
