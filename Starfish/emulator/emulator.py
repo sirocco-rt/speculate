@@ -50,6 +50,18 @@ try:
         GPU_PCA = False
         if PYTORCH_AVAILABLE:
             print('CUDA not available - using CPU for PCA')
+
+    def _get_v11_jitter(variance):
+        """Variance-scaled jitter for V11 diagonal stabilisation.
+
+        Keeps jitter/diagonal ~ 1e-6, giving a condition-number ceiling
+        of ~1e6 regardless of the kernel variance magnitude.  The floor
+        of 1e-5 protects components with very small learned variances.
+
+        Must be used in *every* V11 construction path (training, inference,
+        LOO, set_param_dict) to guarantee train/predict consistency.
+        """
+        return max(1e-5, 1e-6 * float(variance))
             
     def _memory_efficient_log_likelihood_gpu(
         grid_points_gpu, variances_gpu, lengthscales_gpu,
@@ -96,8 +108,8 @@ try:
             # dist is now K_i (M, M)
             
             # Add diagonal: iPhiPhi/lambda_xi + jitter
-            # Variance-scaled jitter keeps condition number ~1e6
-            jitter = max(1e-5, 1e-6 * variances_gpu[i].item()) if strict_weight_fit else 1e-5
+            # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
+            jitter = _get_v11_jitter(variances_gpu[i].item())
             if strict_weight_fit:
                 dist.diagonal().add_(jitter)
             else:
@@ -435,13 +447,16 @@ class Emulator:
                     eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
                     
                     if self.strict_weight_fit:
-                        # Variance-scaled jitter keeps condition number ~1e6
+                        # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
                         variances_t = torch.from_numpy(self.variances).to(device, TORCH_FLOAT64)
-                        jitter_t = torch.clamp(1e-6 * variances_t, min=1e-5)
+                        jitter_t = torch.tensor([_get_v11_jitter(v) for v in self.variances],
+                                                device=device, dtype=TORCH_FLOAT64)
                         v11_gpu = (jitter_t.view(-1, 1, 1) * eye_M.unsqueeze(0)).clone()
                     else:
                         v11_gpu = (dots_inv_diag.view(-1, 1, 1) * eye_M.unsqueeze(0)) / self.lambda_xi
-                        v11_gpu += 1e-5 * eye_M.unsqueeze(0)
+                        jitter_t = torch.tensor([_get_v11_jitter(v) for v in self.variances],
+                                                device=device, dtype=TORCH_FLOAT64)
+                        v11_gpu += jitter_t.view(-1, 1, 1) * eye_M.unsqueeze(0)
                     
                     # Add kernel to v11_gpu in-place
                     batch_kernel_pytorch_gpu_only(
@@ -471,7 +486,9 @@ class Emulator:
                 )
                 
                 if self.strict_weight_fit:
-                    v11_gpu = kernel_gpu + (1e-5 * torch.eye(M * self.ncomps, device=device, dtype=TORCH_FLOAT64))
+                    # Variance-scaled jitter: use max variance as conservative scalar
+                    _jit = _get_v11_jitter(float(self.variances.max()))
+                    v11_gpu = kernel_gpu + (_jit * torch.eye(M * self.ncomps, device=device, dtype=TORCH_FLOAT64))
                 else:
                     v11_gpu = iPhiPhi_gpu / self.lambda_xi + kernel_gpu
                 
@@ -522,12 +539,15 @@ class Emulator:
                     )
                 
                 if self.strict_weight_fit:
-                    # Variance-scaled jitter keeps condition number ~1e6
+                    # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
                     eye_M_arr = np.eye(M)
-                    jitter_arr = np.maximum(1e-6 * self.variances, 1e-5)  # (ncomps,)
+                    jitter_arr = np.array([_get_v11_jitter(v) for v in self.variances])
                     v11_cpu = kernel_cpu + jitter_arr[:, None, None] * eye_M_arr
                 else:
+                    jitter_arr = np.array([_get_v11_jitter(v) for v in self.variances])
                     v11_cpu = iPhiPhi_cpu / self.lambda_xi + kernel_cpu
+                    eye_M_arr = np.eye(M)
+                    v11_cpu += jitter_arr[:, None, None] * eye_M_arr
                 
                 # Store as _v11 but note it is 3D
                 self._iPhiPhi = iPhiPhi_cpu
@@ -541,7 +561,8 @@ class Emulator:
                     self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, kernel_type=self.kernel
                 )
                 if self.strict_weight_fit:
-                    self._v11 = kernel_auto + (1e-5 * np.eye(M * self.ncomps))
+                    _jit = _get_v11_jitter(float(self.variances.max()))
+                    self._v11 = kernel_auto + (_jit * np.eye(M * self.ncomps))
                 else:
                     self._v11 = self._iPhiPhi / self.lambda_xi + kernel_auto
             
@@ -1022,13 +1043,16 @@ class Emulator:
             for i in range(self.ncomps):
                 kernel_cpu[i] = _kfunc(self._grid_points_norm, self._grid_points_norm, self.variances[i], self.lengthscales[i])
             if self.strict_weight_fit:
-                self._v11 = kernel_cpu + 1e-5 * np.eye(M)
+                eye_M = np.eye(M)
+                for i in range(self.ncomps):
+                    kernel_cpu[i] += _get_v11_jitter(self.variances[i]) * eye_M
+                self._v11 = kernel_cpu
             else:
                 dots = self.eigenspectra @ self.eigenspectra.T
                 dots_inv_diag = np.diag(np.linalg.inv(dots))
                 eye_M = np.eye(M)
                 for i in range(self.ncomps):
-                    kernel_cpu[i] += ((dots_inv_diag[i] / self.lambda_xi) + 1e-5) * eye_M
+                    kernel_cpu[i] += ((dots_inv_diag[i] / self.lambda_xi) + _get_v11_jitter(self.variances[i])) * eye_M
                 self._v11 = kernel_cpu
         
         return self._call_cpu(params, full_cov, reinterpret_batch)
@@ -1162,11 +1186,12 @@ class Emulator:
                 dist = torch.cdist(X_scaled, X_scaled, p=2.0)
                 _apply_kernel_gpu_inplace(dist, self._variances_gpu[i], self.kernel)
                 
-                # Add diagonal (match training: dots_inv_diag/lambda_xi + 1e-5 jitter)
+                # Add diagonal (match training: dots_inv_diag/lambda_xi + jitter)
+                jitter = _get_v11_jitter(self._variances_gpu[i].item())
                 if self.strict_weight_fit:
-                    dist.diagonal().add_(1e-5)
+                    dist.diagonal().add_(jitter)
                 else:
-                    dist.diagonal().add_(self._dots_inv_diag_gpu[i].item() / self.lambda_xi + 1e-5)
+                    dist.diagonal().add_(self._dots_inv_diag_gpu[i].item() / self.lambda_xi + jitter)
                 
                 # Cholesky factor — keep L, discard V11
                 L_i = torch.linalg.cholesky(dist)
@@ -1763,8 +1788,8 @@ class Emulator:
             _apply_kernel_gpu_inplace(K_k, self._variances_gpu[k], self.kernel)
 
             # Add diagonal (match training: dots_inv_diag/lambda_xi + jitter)
-            # Variance-scaled jitter keeps condition number ~1e6
-            jitter = max(1e-5, 1e-6 * self._variances_gpu[k].item()) if self.strict_weight_fit else 1e-5
+            # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
+            jitter = _get_v11_jitter(self._variances_gpu[k].item())
             if self.strict_weight_fit:
                 K_k.diagonal().add_(jitter)
             else:
@@ -2330,9 +2355,8 @@ class Emulator:
                 if np.any(ls_k < ls_floor) or np.any(ls_k > ls_ceil):
                     return np.inf
 
-                # Variance-scaled jitter for numerical stability
-                # Keeps condition number bounded at ~1e6 regardless of variance scale
-                jitter = max(1e-5, 1e-6 * var_k) if self.strict_weight_fit else 1e-5
+                # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
+                jitter = _get_v11_jitter(var_k)
 
                 if use_gpu:
                     var_t = torch.tensor(var_k, device=device, dtype=TORCH_FLOAT64)
@@ -2514,7 +2538,7 @@ class Emulator:
                 for kk in range(self.ncomps):
                     var_kk = np.exp(self.hyperparams[f"log_variance:{kk}"])
                     ls_kk = np.array([np.exp(self.hyperparams[f"log_lengthscale:{kk}:{j}"]) for j in range(d)])
-                    jitter_kk = max(1e-5, 1e-6 * var_kk) if self.strict_weight_fit else 1e-5
+                    jitter_kk = _get_v11_jitter(var_kk)
                     shift_kk = dots_inv_diag_val[kk] / lam + jitter_kk
 
                     if use_gpu:
@@ -2712,12 +2736,15 @@ class Emulator:
                     eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
                     
                     if self.strict_weight_fit:
-                        # Variance-scaled jitter keeps condition number ~1e6
-                        jitter_t = torch.clamp(1e-6 * self._variances_gpu, min=1e-5)
+                        # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
+                        jitter_t = torch.tensor([_get_v11_jitter(v) for v in self.variances.tolist()],
+                                                device=device, dtype=TORCH_FLOAT64)
                         v11_gpu = (jitter_t.view(-1, 1, 1) * eye_M.unsqueeze(0)).clone()
                     else:
                         v11_gpu = (self._dots_inv_diag_gpu.view(-1, 1, 1) * eye_M.unsqueeze(0)) / self.lambda_xi
-                        v11_gpu += 1e-5 * eye_M.unsqueeze(0)
+                        jitter_t = torch.tensor([_get_v11_jitter(v) for v in self.variances.tolist()],
+                                                device=device, dtype=TORCH_FLOAT64)
+                        v11_gpu += jitter_t.view(-1, 1, 1) * eye_M.unsqueeze(0)
 
                     # Add kernel in-place
                     batch_kernel_pytorch_gpu_only(
@@ -2750,11 +2777,12 @@ class Emulator:
                 
                 if self.strict_weight_fit:
                     M = kernel_gpu.shape[0]
-                    self._v11_gpu = kernel_gpu + (1e-5 * torch.eye(M, device=device, dtype=TORCH_FLOAT64))
+                    _jit = _get_v11_jitter(float(self.variances.max()))
+                    self._v11_gpu = kernel_gpu + (_jit * torch.eye(M, device=device, dtype=TORCH_FLOAT64))
                 else:
                     self._v11_gpu = self._iPhiPhi_gpu / self.lambda_xi + kernel_gpu
                     M = self._iPhiPhi_gpu.shape[0]
-                    self._v11_gpu += 1e-5 * torch.eye(M, device=device, dtype=TORCH_FLOAT64)
+                    self._v11_gpu += _get_v11_jitter(float(self.variances.max())) * torch.eye(M, device=device, dtype=TORCH_FLOAT64)
         else:
             if self.block_diagonal:
                 # Block-Diagonal CPU Update
@@ -2771,9 +2799,9 @@ class Emulator:
                     )
                 
                 if self.strict_weight_fit:
-                    # Variance-scaled jitter keeps condition number ~1e6
+                    # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
                     eye_M = np.eye(M)
-                    jitter_arr = np.maximum(1e-6 * self.variances, 1e-5)  # (ncomps,)
+                    jitter_arr = np.array([_get_v11_jitter(v) for v in self.variances])
                     self.v11 = kernel_cpu + jitter_arr[:, None, None] * eye_M
                 else:
                     if self.iPhiPhi is None:
@@ -2785,7 +2813,7 @@ class Emulator:
                         # Add (dots_inv_diag / lambda) * I to kernel and Jitter
                         eye_M = np.eye(M)
                         for i in range(self.ncomps):
-                            kernel_cpu[i] += ((dots_inv_diag[i] / self.lambda_xi) + 1e-5) * eye_M
+                            kernel_cpu[i] += ((dots_inv_diag[i] / self.lambda_xi) + _get_v11_jitter(self.variances[i])) * eye_M
                         self.v11 = kernel_cpu
                     else:
                         self.v11 = self.iPhiPhi / self.lambda_xi + kernel_cpu
@@ -2793,16 +2821,17 @@ class Emulator:
                         M = self.v11.shape[-1]
                         eye_M = np.eye(M)
                         for i in range(self.ncomps):
-                            self.v11[i] += 1e-5 * eye_M
+                            self.v11[i] += _get_v11_jitter(self.variances[i]) * eye_M
             else:
                 kernel_auto = batch_kernel_auto(
                     self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, kernel_type=self.kernel
                 )
                 if self.strict_weight_fit:
-                    self.v11 = kernel_auto + (1e-5 * np.eye(kernel_auto.shape[0]))
+                    _jit = _get_v11_jitter(float(self.variances.max()))
+                    self.v11 = kernel_auto + (_jit * np.eye(kernel_auto.shape[0]))
                 else:
                     self.v11 = self.iPhiPhi / self.lambda_xi + kernel_auto
-                    self.v11 += 1e-5 * np.eye(self.v11.shape[0])
+                    self.v11 += _get_v11_jitter(float(self.variances.max())) * np.eye(self.v11.shape[0])
 
 
     def get_param_vector(self) -> np.ndarray:

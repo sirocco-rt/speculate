@@ -731,8 +731,9 @@ class SpectrumModel:
         
         if PYTORCH_AVAILABLE and isinstance(cov, torch.Tensor):
             # GPU Path
-            # Add jitter for stability
-            cov.diagonal().add_(1e-50)
+            # Diagonal-relative jitter for Cholesky stability (~1e-6 × max(diag))
+            _jitter = max(1e-12, 1e-6 * cov.diagonal().max().item())
+            cov.diagonal().add_(_jitter)
             
             try:
                 # Cholesky decomposition
@@ -767,8 +768,12 @@ class SpectrumModel:
                 return -np.inf
         else:
             # CPU Path
-            np.fill_diagonal(cov, cov.diagonal() + 1e-50) # Austen edit 1e-10 -> 1e-30
-            factor, flag = cho_factor(cov, overwrite_a=True)
+            _jitter = max(1e-12, 1e-6 * np.max(cov.diagonal()))
+            np.fill_diagonal(cov, cov.diagonal() + _jitter)
+            try:
+                factor, flag = cho_factor(cov, overwrite_a=True)
+            except np.linalg.LinAlgError:
+                return -np.inf
             logdet = 2 * np.sum(np.log(factor.diagonal()))
             R = flux - self.data.flux
             self.residuals.append(R)
