@@ -2850,6 +2850,10 @@ class Emulator:
         Get the log likelihood of the emulator in its current state as calculated in
         the appendix of Czekala et al. (2015)
 
+        Note: returns the unnormalised log-likelihood (the -n/2 ln(2π) constant
+        is omitted, following standard GP convention). This has no effect on
+        training since the constant is independent of the hyperparameters.
+
         Returns
         -------
         float

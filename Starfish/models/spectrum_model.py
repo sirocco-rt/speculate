@@ -696,6 +696,10 @@ class SpectrumModel:
         """
         Returns the log probability of a multivariate normal distribution
 
+        Note: returns the unnormalised log-likelihood (the -n/2 ln(2π) constant
+        is omitted, following standard GP convention). This has no effect on
+        optimisation or MCMC sampling since n is fixed for a given observation.
+
         Parameters
         ----------
         priors : dict, optional
