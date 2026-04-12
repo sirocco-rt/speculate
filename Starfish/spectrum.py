@@ -180,8 +180,8 @@ class Spectrum:
         """
         np.ndarray: The full 2-dimensional boolean masks
         """
-        waves = [o.wave for o in self.orders]
-        return np.asarray(waves)
+        masks = [o.mask for o in self.orders]
+        return np.asarray(masks)
 
     @property
     def shape(self):
