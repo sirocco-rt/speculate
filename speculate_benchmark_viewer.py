@@ -251,6 +251,8 @@ def _(
             if "full_chain" in p:
                 entry["full_chain"] = np.array(p["full_chain"])
                 entry["burnin_used"] = p.get("burnin_used", 200)
+            if "bestfit_spec" in p:
+                entry["bestfit_spec"] = p["bestfit_spec"]
             posteriors.append(entry)
         return posteriors if posteriors else None
 
@@ -701,6 +703,7 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                     "Shrinkage": f"{_m.get('shrinkage', float('nan')):.2%}",
                     "Cov@68%": f"{_m.get('coverage_68', float('nan')):.3f}",
                     "Cov@95%": f"{_m.get('coverage_95', float('nan')):.3f}",
+                    "Cov@99.7%": f"{_m.get('coverage_997', float('nan')):.3f}",
                 })
             _t2_items.append(mo.ui.table(_agg_rows, label="Aggregate Metrics"))
 
@@ -970,6 +973,82 @@ def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
         mo.md(f"Full walker chains ({_nwalkers} walkers × {_nsteps} steps). "
                f"Orange dashed line marks burn-in at step {_burnin}. "
                "Red line marks ground truth."),
+        _fig,
+    ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
+    # ── Tier 2 Best-Fit Spectrum Plot ──
+    # Reconstructs the Starfish-style 3-panel plot (data vs model, residuals,
+    # relative error) from spectral arrays stored during the benchmark run.
+    _posteriors = get_tier2_posteriors()
+    mo.stop(_posteriors is None or len(_posteriors) == 0)
+
+    _idx = t2_spectrum_slider.value
+    _post = _posteriors[_idx]
+    _bf = _post.get("bestfit_spec")
+    mo.stop(
+        _bf is None or not _bf,
+        mo.md("*Best-fit spectrum data not available for this spectrum (older benchmark run).*"),
+    )
+
+    _wl = np.asarray(_bf["wavelength"])
+    _data_flux = np.asarray(_bf["data_flux"])
+    _model_flux = np.asarray(_bf["model_flux"])
+    _cov_diag = np.asarray(_bf["model_cov_diag"])
+    _std = np.sqrt(np.abs(_cov_diag))
+
+    _filename = _post.get("filename", f"run{_post['run']}.spec")
+    _inc = _post.get("inclination", 55.0)
+    _converged = _post.get("converged", False)
+    _conv_tag = "converged" if _converged else "not converged"
+
+    _fig, _axes = plt.subplots(
+        2, 2, figsize=(14, 7),
+        gridspec_kw={"width_ratios": (1.25, 1)},
+    )
+    # Main panel: data vs model (span both rows in left column)
+    _axes[0, 0].remove()
+    _axes[1, 0].remove()
+    _ax_main = _fig.add_subplot(1, 2, 1)
+    _ax_main.plot(_wl, _data_flux, lw=0.7, label="Data")
+    _ax_main.plot(_wl, _model_flux, lw=0.7, label="Model")
+    _ax_main.set_xlabel(r"$\lambda$ [$\AA$]")
+    _ax_main.set_ylabel(r"$f_\lambda$")
+    _ax_main.legend()
+
+    # Residuals panel (top right)
+    _R = _data_flux - _model_flux
+    _ax_resid = _axes[0, 1]
+    _ax_resid.plot(_wl, _R, c="g", lw=0.3, label="Data − Model")
+    _ax_resid.fill_between(_wl, -_std, _std, color="C2", alpha=0.6, label=r"$1\sigma$")
+    _ax_resid.fill_between(_wl, -2*_std, 2*_std, color="C2", alpha=0.4, label=r"$2\sigma$")
+    _ax_resid.fill_between(_wl, -3*_std, 3*_std, color="C2", alpha=0.2, label=r"$3\sigma$")
+    _ax_resid.set_ylabel(r"$\Delta f_\lambda$")
+    _ax_resid.yaxis.tick_right()
+    _ax_resid.yaxis.set_label_position("right")
+    _ax_resid.legend(fontsize=7)
+    _ax_resid.tick_params(labelbottom=False)
+
+    # Relative error panel (bottom right)
+    _R_frac = _R / np.where(np.abs(_data_flux) > 0, _data_flux, 1.0)
+    _ax_rel = _axes[1, 1]
+    _ax_rel.plot(_wl, _R_frac, c="r", lw=0.3, label="Relative Error")
+    _ax_rel.set_xlabel(r"$\lambda$ [$\AA$]")
+    _ax_rel.set_ylabel(r"$\Delta f_\lambda / f_\lambda$")
+    _ax_rel.yaxis.tick_right()
+    _ax_rel.yaxis.set_label_position("right")
+
+    _fig.suptitle(
+        f"Best-Fit Model — {_filename} @ {_inc:.0f}° ({_conv_tag})",
+        fontsize=11, y=1.01,
+    )
+    _fig.tight_layout()
+
+    mo.vstack([
+        mo.md("#### Best-Fit Spectrum (MCMC Posterior Mean)"),
         _fig,
     ])
     return
@@ -1792,6 +1871,8 @@ def _(
                                 if "full_chain" in _entry:
                                     _post_entry["full_chain"] = _np.array(_entry["full_chain"])
                                     _post_entry["burnin_used"] = _entry.get("burnin_used", 200)
+                                if "bestfit_spec" in _entry:
+                                    _post_entry["bestfit_spec"] = _entry["bestfit_spec"]
                                 _tier2_posteriors.append(_post_entry)
                             else:
                                 # Legacy checkpoint: reconstruct from per-param samples
@@ -1978,6 +2059,7 @@ def _(
                             for k, v in _mcmc["summary"].items()
                         },
                         "truths": dict(_gt),
+                        "bestfit_spec": _mcmc.get("bestfit_spec", {}),
                     }
 
                     # Map friendly names to their column index in the flat
@@ -2018,6 +2100,7 @@ def _(
                         "summary": _mcmc["summary"],
                         "converged": _mcmc["converged"],
                         "truths": dict(_gt),
+                        "bestfit_spec": _mcmc.get("bestfit_spec", {}),
                     })
 
                     # Append checkpoint line (crash-safe: one write per spectrum)

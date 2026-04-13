@@ -781,6 +781,29 @@ def run_mcmc_single(
     # chain trace plots in the benchmark viewer.
     full_chain = sampler.get_chain()  # (nsteps, nwalkers, ndim)
 
+    # Best-fit spectrum at posterior means — set model params, evaluate, and
+    # store the arrays so the viewer can reconstruct the Starfish-style plot
+    # without needing the live model object.
+    bestfit_spec = {}
+    try:
+        _mean_params = {}
+        for i, label in enumerate(model.labels):
+            _mean_params[label] = float(np.mean(flat[:, i]))
+        model.set_param_dict(_mean_params)
+        _bf_flux, _bf_cov = model()
+        if hasattr(_bf_flux, 'detach'):
+            _bf_flux = _bf_flux.detach().cpu().numpy()
+        if hasattr(_bf_cov, 'detach'):
+            _bf_cov = _bf_cov.detach().cpu().numpy()
+        bestfit_spec = {
+            "wavelength": model.data.wave.tolist(),
+            "data_flux": model.data.flux.tolist(),
+            "model_flux": np.asarray(_bf_flux).tolist(),
+            "model_cov_diag": np.diag(np.asarray(_bf_cov)).tolist(),
+        }
+    except Exception:
+        pass  # non-critical — viewer will skip the plot
+
     return {
         "samples": flat,
         "full_chain": full_chain,
@@ -792,6 +815,7 @@ def run_mcmc_single(
         "converged": converged,
         "n_effective": flat.shape[0],
         "labels": all_labels,
+        "bestfit_spec": bestfit_spec,
     }
 
 
@@ -837,7 +861,7 @@ def compute_coverage(
     alphas, coverage : tuple of ndarrays
     """
     if alphas is None:
-        alphas = np.linspace(0.01, 0.99, 50)
+        alphas = np.linspace(0.01, 0.999, 50)
 
     coverage = np.zeros_like(alphas)
     n = len(samples_list)
@@ -942,6 +966,7 @@ def aggregate_tier2_results(
         alphas, cov = compute_coverage(all_samples[fname], all_truths[fname])
         cov_68 = float(np.interp(0.68, alphas, cov))
         cov_95 = float(np.interp(0.95, alphas, cov))
+        cov_997 = float(np.interp(0.997, alphas, cov))
 
         aggregate[fname] = {
             "rmse": rmse,
@@ -950,6 +975,7 @@ def aggregate_tier2_results(
             "shrinkage": shrinkage,
             "coverage_68": cov_68,
             "coverage_95": cov_95,
+            "coverage_997": cov_997,
             "coverage_alphas": alphas.tolist(),
             "coverage_values": cov.tolist(),
         }
@@ -1206,6 +1232,7 @@ def run_tier2(
         # Interpolate to standard reporting levels
         cov_68 = float(np.interp(0.68, alphas, cov))
         cov_95 = float(np.interp(0.95, alphas, cov))
+        cov_997 = float(np.interp(0.997, alphas, cov))
 
         aggregate[fname] = {
             "rmse": rmse,
@@ -1214,6 +1241,7 @@ def run_tier2(
             "shrinkage": shrinkage,
             "coverage_68": cov_68,
             "coverage_95": cov_95,
+            "coverage_997": cov_997,
             "coverage_alphas": alphas.tolist(),
             "coverage_values": cov.tolist(),
         }
