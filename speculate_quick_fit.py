@@ -3163,13 +3163,26 @@ def _(mo):
         label="Optimizer:",
     )
     qf_max_iter = mo.ui.number(
-        value=10000, start=100, stop=50000, step=100,
+        value=20000, start=100, stop=50000, step=100,
         label="Max Iterations:",
+    )
+    qf_restarts = mo.ui.number(
+        value=3, start=1, stop=10, step=1,
+        label="Restarts:",
     )
     qf_run_btn = mo.ui.run_button(label=f"{mo.icon('lucide:play')} Run Quick Fit")
 
-    mo.hstack([qf_opt_method, qf_max_iter, qf_run_btn], justify="start", align="end")
-    return qf_max_iter, qf_opt_method, qf_run_btn
+    mo.vstack([
+        mo.hstack([qf_opt_method, qf_max_iter, qf_restarts, qf_run_btn], justify="start", align="end"),
+        mo.callout(mo.md(
+            "**Restarts** runs the optimiser multiple times from different random "
+            "starting points and keeps the best result. This greatly reduces the "
+            "chance of getting stuck in a local minimum. The first run uses the "
+            "configured initial values; subsequent runs start from random points "
+            "within the parameter bounds."
+        ), kind="neutral"),
+    ])
+    return qf_max_iter, qf_opt_method, qf_restarts, qf_run_btn
 
 
 @app.cell
@@ -3189,6 +3202,7 @@ def _(
     qf_opt_method,
     qf_param_config,
     qf_predict_flux,
+    qf_restarts,
     qf_run_btn,
     qf_transform_observation_data,
     scipy_minimize,
@@ -3301,80 +3315,115 @@ def _(
         _resid = (_model_interp - _obs_fl) / _obs_err
         return float(np.sum(_resid ** 2))
 
+    _n_restarts = max(1, int(qf_restarts.value))
     with mo.status.spinner(title=f"Running {qf_opt_method.value} MLE...") as _spinner:
         _nll_history = []
         _iter_count = [0]
         _t0 = time_mod.time()
 
+        _global_best_f = [float("inf")]  # mutable for callback access
+        _cur_restart = [0]
+
         def _chi2_cb(P):
-            val = _chi2(P)
+            try:
+                val = _chi2(P)
+            except (ValueError, np.linalg.LinAlgError):
+                val = 1e30
             _nll_history.append(val)
             _iter_count[0] += 1
             if _iter_count[0] % 50 == 0:
                 _spinner.update(
-                    f"{qf_opt_method.value} | Eval {_iter_count[0]} | "
-                    f"Best χ² = {min(_nll_history):.2f} | "
+                    f"{qf_opt_method.value} | Restart {_cur_restart[0]}/{_n_restarts} | "
+                    f"Eval {_iter_count[0]} | "
+                    f"Best χ² = {_global_best_f[0]:.4f} | "
                     f"{time_mod.time() - _t0:.1f}s"
                 )
             return val
 
-        if qf_opt_method.value == "Nelder-Mead":
-            _soln = scipy_minimize(
-                _chi2_cb, _p0,
-                method="Nelder-Mead",
-                options=dict(maxiter=int(qf_max_iter.value), adaptive=True),
+        # Generate starting points: first = user guess, rest = random
+        _start_points = [_p0.copy()]
+        if _n_restarts > 1:
+            np.random.seed(None)
+            for _ in range(_n_restarts - 1):
+                _start_points.append(_lo + np.random.rand(len(_lo)) * (_hi - _lo))
+
+        _global_best_x = _p0.copy()
+        _global_best_nit = 0
+
+        for _restart_idx, _x0 in enumerate(_start_points):
+            _cur_restart[0] = _restart_idx + 1
+            _spinner.update(
+                f"{qf_opt_method.value} | Restart {_cur_restart[0]}/{_n_restarts} | "
+                f"Starting... | {time_mod.time() - _t0:.1f}s"
             )
-        elif qf_opt_method.value == "CMA-ES":
-            try:
-                import cma
-            except ImportError:
-                raise ImportError(
-                    "CMA-ES requires the 'cma' package. "
-                    "Install it with: pip install cma"
+
+            if qf_opt_method.value == "Nelder-Mead":
+                _run_soln = scipy_minimize(
+                    _chi2_cb, _x0,
+                    method="Nelder-Mead",
+                    options=dict(maxiter=int(qf_max_iter.value), adaptive=True),
                 )
-            _cma_bounds = [_lo.tolist(), _hi.tolist()]
-            # Start from the user-configured initial guess (clipped to bounds)
-            # rather than the raw bounds midpoint.
-            _p0_cma = np.clip(_p0, _lo + 1e-8, _hi - 1e-8)
-            # Per-coordinate initial σ = 20% of prior range — essential when
-            # parameters span different scales.
-            _cma_stds = [0.2 * float(hi - lo) for lo, hi in zip(_lo, _hi)]
-            _N_cma = len(_p0_cma)
-            _popsize = 2 * (4 + int(3 * np.log(_N_cma)))
-            _es = cma.CMAEvolutionStrategy(
-                _p0_cma.tolist(), 1.0,
-                {
-                    "bounds": _cma_bounds,
-                    "CMA_stds": _cma_stds,
-                    "popsize": _popsize,
-                    "maxfevals": int(qf_max_iter.value),
-                    "verbose": -9,
-                    "tolfun": 1e-10,
-                },
-            )
-            _best_x, _best_f = _p0.copy(), float("inf")
-            while not _es.stop():
-                _solutions = _es.ask()
-                _fits = [_chi2_cb(np.array(s)) for s in _solutions]
-                _es.tell(_solutions, _fits)
-                _gen_best = min(_fits)
-                if _gen_best < _best_f:
-                    _best_f = _gen_best
-                    _best_x = np.array(_solutions[_fits.index(_gen_best)])
-            from types import SimpleNamespace
-            _soln = SimpleNamespace(
-                x=_best_x, fun=_best_f, success=True,
-                message="CMA-ES terminated",
-                nit=_es.result.iterations,
-            )
-        else:
-            _bounds = list(zip(_lo, _hi))
-            _soln = scipy_minimize(
-                _chi2_cb, _p0,
-                method="L-BFGS-B",
-                bounds=_bounds,
-                options=dict(maxiter=int(qf_max_iter.value), ftol=1e-15, gtol=1e-12),
-            )
+            elif qf_opt_method.value == "CMA-ES":
+                try:
+                    import cma
+                except ImportError:
+                    raise ImportError(
+                        "CMA-ES requires the 'cma' package. "
+                        "Install it with: pip install cma"
+                    )
+                _cma_bounds = [_lo.tolist(), _hi.tolist()]
+                _p0_cma = np.clip(_x0, _lo + 1e-8, _hi - 1e-8)
+                _cma_stds = [0.2 * float(hi - lo) for lo, hi in zip(_lo, _hi)]
+                _N_cma = len(_p0_cma)
+                _popsize = 2 * (4 + int(3 * np.log(_N_cma)))
+                _es = cma.CMAEvolutionStrategy(
+                    _p0_cma.tolist(), 1.0,
+                    {
+                        "bounds": _cma_bounds,
+                        "CMA_stds": _cma_stds,
+                        "popsize": _popsize,
+                        "maxfevals": int(qf_max_iter.value),
+                        "verbose": -9,
+                        "tolfun": 1e-10,
+                    },
+                )
+                _run_best_x, _run_best_f = _x0.copy(), float("inf")
+                while not _es.stop():
+                    _solutions = _es.ask()
+                    _fits = [_chi2_cb(np.array(s)) for s in _solutions]
+                    _es.tell(_solutions, _fits)
+                    _gen_best = min(_fits)
+                    if _gen_best < _run_best_f:
+                        _run_best_f = _gen_best
+                        _run_best_x = np.array(_solutions[_fits.index(_gen_best)])
+                    if _run_best_f < _global_best_f[0]:
+                        _global_best_f[0] = _run_best_f
+                from types import SimpleNamespace
+                _run_soln = SimpleNamespace(
+                    x=_run_best_x, fun=_run_best_f, success=True,
+                    message="CMA-ES terminated",
+                    nit=_es.result.iterations,
+                )
+            else:
+                _bounds = list(zip(_lo, _hi))
+                _run_soln = scipy_minimize(
+                    _chi2_cb, np.clip(_x0, _lo, _hi),
+                    method="L-BFGS-B",
+                    bounds=_bounds,
+                    options=dict(maxiter=int(qf_max_iter.value), ftol=1e-15, gtol=1e-12),
+                )
+
+            if _run_soln.fun <= _global_best_f[0]:
+                _global_best_f[0] = _run_soln.fun
+                _global_best_x = _run_soln.x.copy()
+                _global_best_nit = getattr(_run_soln, 'nit', 0)
+
+        from types import SimpleNamespace
+        _soln = SimpleNamespace(
+            x=_global_best_x, fun=_global_best_f[0], success=True,
+            message=f"Best of {_n_restarts} restart(s)",
+            nit=_global_best_nit,
+        )
 
         _elapsed = time_mod.time() - _t0
 
@@ -3461,6 +3510,7 @@ def _(
         "chi2_history": _nll_history,
         "labels": _labels,
         "n_physical": _n_phys,
+        "n_restarts": _n_restarts,
     }
     return (qf_mle_result,)
 
@@ -3617,7 +3667,7 @@ def _(
         mo.md(f"""
         **Quick Fit Complete**
         - **χ²** = {qf_mle_result['chi2']:.2f} | **Reduced χ²** = {qf_mle_result['chi2'] / max(1, len(_obs_wl) - len(qf_mle_result['active_idx'])):.4f}
-        - **Iterations:** {qf_mle_result['nit']} | **Time:** {qf_mle_result['elapsed']:.1f}s
+        - **Iterations:** {qf_mle_result['nit']} | **Restarts:** {qf_mle_result.get('n_restarts', 1)} | **Time:** {qf_mle_result['elapsed']:.1f}s
         - **Converged:** {'Yes' if qf_mle_result['success'] else 'No'}
         """),
         kind="success" if qf_mle_result['success'] else "warn"

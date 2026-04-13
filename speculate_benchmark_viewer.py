@@ -699,8 +699,8 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                     "Bias": f"{_m.get('bias', float('nan')):.4f}",
                     "CRPS": f"{_m.get('crps', float('nan')):.4f}",
                     "Shrinkage": f"{_m.get('shrinkage', float('nan')):.2%}",
-                    "Cov@68%": f"{_m.get('coverage_68', float('nan')):.2f}",
-                    "Cov@95%": f"{_m.get('coverage_95', float('nan')):.2f}",
+                    "Cov@68%": f"{_m.get('coverage_68', float('nan')):.3f}",
+                    "Cov@95%": f"{_m.get('coverage_95', float('nan')):.3f}",
                 })
             _t2_items.append(mo.ui.table(_agg_rows, label="Aggregate Metrics"))
 

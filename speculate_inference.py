@@ -1541,6 +1541,10 @@ def _(mo):
         start=100, stop=100000, value=10000, step=100,
         label="Max Iterations:",
     )
+    mle_restarts = mo.ui.number(
+        start=1, stop=10, value=3, step=1,
+        label="Restarts:",
+    )
     run_mle_btn = mo.ui.run_button(label=f"{mo.icon('lucide:rocket')} Run MLE", kind="success")
 
     _method_info = mo.accordion({
@@ -1554,16 +1558,19 @@ def _(mo):
         **CMA-ES** is population-based and adapts its search covariance — best for 7+ dimensional spectral fitting.
         **Nelder-Mead** uses an adaptive simplex spanning the prior volume.
         **L-BFGS-B** uses box constraints derived from your priors and finite-difference gradients.
+
+        **Restarts** runs the optimiser multiple times from different random starting
+        points and keeps the best result, greatly reducing the chance of local-minimum trapping.
         """)
     })
 
     mo.vstack([
         mo.md("Run Maximum Likelihood Estimation (MLE) to find the best fit parameters."),
-        mo.hstack([mle_method, mle_max_iter], justify="start", gap=1),
+        mo.hstack([mle_method, mle_max_iter, mle_restarts], justify="start", gap=1),
         _method_info,
         run_mle_btn,
     ])
-    return (mle_max_iter, mle_method, run_mle_btn,)
+    return (mle_max_iter, mle_method, mle_restarts, run_mle_btn,)
 
 
 @app.cell
@@ -1576,6 +1583,7 @@ def _(
     log10_params,
     mle_max_iter,
     mle_method,
+    mle_restarts,
     mo,
     np,
     obs_data,
@@ -1884,109 +1892,168 @@ def _(
                             pass
 
                 # 5. Run MLE Optimization
+                # Warm up emulator caches (Cholesky factorisation etc.)
+                # before starting the optimizer timer, so the first eval
+                # isn't artificially slow.
+                _spinner.update("Building emulator cache (one-time)...")
+                try:
+                    _ = _model()
+                except Exception:
+                    pass
+
                 _spinner.update(f"Running {_opt_method} optimisation...")
 
                 _nll_history = []
                 _iter_count = [0]
                 _start_time = _time.time()
                 _max_iter = int(mle_max_iter.value)
+                _n_restarts = max(1, int(mle_restarts.value))
+
+                _global_best_f = [float("inf")]  # mutable for callback
+                _cur_restart = [0]
 
                 def _nll_with_callback(P):
                     _model.set_param_vector(P)
-                    nll = -_model.log_likelihood(_priors)
+                    # Fast bounds check — skip expensive GPU eval for out-of-range proposals
+                    _gp = np.array(_model.grid_params)
+                    if (np.any(_gp < _model.emulator.min_params) or
+                            np.any(_gp > _model.emulator.max_params)):
+                        nll = 1e30
+                    else:
+                        try:
+                            nll = -_model.log_likelihood(_priors)
+                        except (ValueError, np.linalg.LinAlgError):
+                            nll = 1e30
                     _nll_history.append(nll)
                     _iter_count[0] += 1
                     if _iter_count[0] % 50 == 0:
                         _elapsed = _time.time() - _start_time
-                        _best_nll = min(_nll_history) if _nll_history else nll
                         _spinner.update(
-                            f"{_opt_method} Eval {_iter_count[0]} | "
-                            f"Best NLL: {_best_nll:.10f} | "
+                            f"{_opt_method} Restart {_cur_restart[0]}/{_n_restarts} | "
+                            f"Eval {_iter_count[0]} | "
+                            f"Best NLL: {_global_best_f[0]:.10f} | "
                             f"Time: {_elapsed:.1f}s"
                         )
                     return nll
 
                 _p0 = _model.get_param_vector()
+                _lo_arr = np.array(_lo_bounds)
+                _hi_arr = np.array(_hi_bounds)
 
-                if _opt_method == "Nelder-Mead":
-                    _soln = scipy_minimize(
-                        _nll_with_callback,
-                        _p0,
-                        method="Nelder-Mead",
-                        options=dict(
-                            maxiter=_max_iter,
-                            disp=False,
-                            adaptive=True,
-                            initial_simplex=_simplex,
+                # Generate starting points: first = bootstrapped x0, rest = random
+                _start_points = [_p0.copy()]
+                if _n_restarts > 1:
+                    np.random.seed(None)
+                    for _ in range(_n_restarts - 1):
+                        _rnd = _lo_arr + np.random.rand(_N) * (_hi_arr - _lo_arr)
+                        # Bootstrap log_scale for random starts too
+                        if 'log_scale' in _active_labels:
+                            _ls_idx = _active_labels.index('log_scale')
+                            try:
+                                _model.set_param_vector(_rnd)
+                                _ = _model()
+                                if _model._log_scale is not None and np.isfinite(_model._log_scale):
+                                    _rnd[_ls_idx] = _model._log_scale
+                            except Exception:
+                                pass
+                        _start_points.append(_rnd)
+
+                _global_best_x = _p0.copy()
+                _global_best_nit = 0
+
+                for _restart_idx, _x0 in enumerate(_start_points):
+                    _cur_restart[0] = _restart_idx + 1
+                    _spinner.update(
+                        f"{_opt_method} | Restart {_cur_restart[0]}/{_n_restarts} | "
+                        f"Starting... | {_time.time() - _start_time:.1f}s"
+                    )
+                    _model.set_param_vector(_x0)
+
+                    if _opt_method == "Nelder-Mead":
+                        # For restart 0 use the pre-built simplex; for later
+                        # restarts use adaptive simplex from the random x0.
+                        _nm_opts = dict(maxiter=_max_iter, disp=False, adaptive=True)
+                        if _restart_idx == 0 and _simplex is not None:
+                            _nm_opts["initial_simplex"] = _simplex
+                        _run_soln = scipy_minimize(
+                            _nll_with_callback,
+                            _x0,
+                            method="Nelder-Mead",
+                            options=_nm_opts,
                         )
-                    )
 
-                elif _opt_method == "L-BFGS-B":
-                    _bounds_list = list(zip(_lo_bounds, _hi_bounds))
-                    _soln = scipy_minimize(
-                        _nll_with_callback,
-                        _p0,
-                        method="L-BFGS-B",
-                        bounds=_bounds_list,
-                        options=dict(
-                            maxiter=_max_iter,
-                            ftol=1e-15,
-                            gtol=1e-12,
-                            eps=1e-5,
-                        ),
-                    )
-
-                elif _opt_method == "CMA-ES":
-                    try:
-                        import cma
-                    except ImportError:
-                        raise ImportError(
-                            "CMA-ES requires the 'cma' package. "
-                            "Install it with: pip install cma"
+                    elif _opt_method == "L-BFGS-B":
+                        _bounds_list = list(zip(_lo_bounds, _hi_bounds))
+                        _run_soln = scipy_minimize(
+                            _nll_with_callback,
+                            _x0,
+                            method="L-BFGS-B",
+                            bounds=_bounds_list,
+                            options=dict(
+                                maxiter=_max_iter,
+                                ftol=1e-15,
+                                gtol=1e-12,
+                                eps=1e-5,
+                            ),
                         )
-                    _cma_bounds = [_lo_bounds, _hi_bounds]
-                    # Start from the bootstrapped model state (includes the
-                    # data-informed log_scale) rather than the raw bounds
-                    # midpoint.  Clip to strictly inside bounds as CMA-ES
-                    # requires x0 within the feasible region.
-                    _p0_cma = np.clip(
-                        _p0,
-                        np.array(_lo_bounds) + 1e-8,
-                        np.array(_hi_bounds) - 1e-8,
-                    )
-                    # Per-coordinate initial σ = 20% of prior range.  Parameters
-                    # span wildly different scales (inclination ~60 vs cheb_1 ~1)
-                    # so per-coordinate scaling is essential.
-                    _cma_stds = [0.2 * (hi - lo) for lo, hi in zip(_lo_bounds, _hi_bounds)]
-                    # Double the default popsize for better landscape sampling
-                    # in the 7–12 dimensional spectral fitting regime.
-                    _popsize = 2 * (4 + int(3 * np.log(_N)))
-                    _es = cma.CMAEvolutionStrategy(
-                        _p0_cma.tolist(), 1.0,
-                        {
-                            "bounds": _cma_bounds,
-                            "CMA_stds": _cma_stds,
-                            "popsize": _popsize,
-                            "maxfevals": _max_iter,
-                            "verbose": -9,
-                            "tolfun": 1e-10,
-                        },
-                    )
-                    _best_x, _best_f = _p0.copy(), float("inf")
-                    while not _es.stop():
-                        _solutions = _es.ask()
-                        _fits = [_nll_with_callback(np.array(s)) for s in _solutions]
-                        _es.tell(_solutions, _fits)
-                        _gen_best = min(_fits)
-                        if _gen_best < _best_f:
-                            _best_f = _gen_best
-                            _best_x = np.array(_solutions[_fits.index(_gen_best)])
-                    from types import SimpleNamespace
-                    _soln = SimpleNamespace(
-                        x=_best_x, fun=_best_f, success=True,
-                        message="CMA-ES terminated",
-                        nit=_es.result.iterations,
-                    )
+
+                    elif _opt_method == "CMA-ES":
+                        try:
+                            import cma
+                        except ImportError:
+                            raise ImportError(
+                                "CMA-ES requires the 'cma' package. "
+                                "Install it with: pip install cma"
+                            )
+                        _cma_bounds = [_lo_bounds, _hi_bounds]
+                        _p0_cma = np.clip(
+                            _x0,
+                            _lo_arr + 1e-8,
+                            _hi_arr - 1e-8,
+                        )
+                        _cma_stds = [0.2 * (hi - lo) for lo, hi in zip(_lo_bounds, _hi_bounds)]
+                        _popsize = 2 * (4 + int(3 * np.log(_N)))
+                        _es = cma.CMAEvolutionStrategy(
+                            _p0_cma.tolist(), 1.0,
+                            {
+                                "bounds": _cma_bounds,
+                                "CMA_stds": _cma_stds,
+                                "popsize": _popsize,
+                                "maxfevals": _max_iter,
+                                "verbose": -9,
+                                "tolfun": 1e-10,
+                            },
+                        )
+                        _run_best_x, _run_best_f = _x0.copy(), float("inf")
+                        while not _es.stop():
+                            _solutions = _es.ask()
+                            _fits = [_nll_with_callback(np.array(s)) for s in _solutions]
+                            _es.tell(_solutions, _fits)
+                            _gen_best = min(_fits)
+                            if _gen_best < _run_best_f:
+                                _run_best_f = _gen_best
+                                _run_best_x = np.array(_solutions[_fits.index(_gen_best)])
+                            if _run_best_f < _global_best_f[0]:
+                                _global_best_f[0] = _run_best_f
+                        from types import SimpleNamespace
+                        _run_soln = SimpleNamespace(
+                            x=_run_best_x, fun=_run_best_f, success=True,
+                            message="CMA-ES terminated",
+                            nit=_es.result.iterations,
+                        )
+
+                    # Keep global best across restarts
+                    if _run_soln.fun <= _global_best_f[0]:
+                        _global_best_f[0] = _run_soln.fun
+                        _global_best_x = _run_soln.x.copy()
+                        _global_best_nit = getattr(_run_soln, 'nit', 0)
+
+                from types import SimpleNamespace
+                _soln = SimpleNamespace(
+                    x=_global_best_x, fun=_global_best_f[0], success=True,
+                    message=f"Best of {_n_restarts} restart(s)",
+                    nit=_global_best_nit,
+                )
 
                 if _soln.success:
                     _model.set_param_vector(_soln.x)
@@ -1996,8 +2063,9 @@ def _(
                 set_mle_priors(_priors)
 
                 _elapsed_total = _time.time() - _start_time
+                _restart_msg = f" ({_n_restarts} restart{'s' if _n_restarts > 1 else ''})" if _n_restarts > 1 else ""
                 fit_status = mo.callout(
-                    mo.md(f"{mo.icon('lucide:check-circle')} MLE Complete via {_opt_method}! ({_iter_count[0]} iterations, {_elapsed_total:.1f}s)"),
+                    mo.md(f"{mo.icon('lucide:check-circle')} MLE Complete via {_opt_method}{_restart_msg}! ({_iter_count[0]} iterations, {_elapsed_total:.1f}s)"),
                     kind="success"
                 )
 
