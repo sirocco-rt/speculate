@@ -3158,8 +3158,8 @@ def _(
 @app.cell
 def _(mo):
     qf_opt_method = mo.ui.dropdown(
-        options=["Nelder-Mead", "L-BFGS-B", "CMA-ES"],
-        value="Nelder-Mead",
+        options=["CMA-ES", "Nelder-Mead", "L-BFGS-B"],
+        value="CMA-ES",
         label="Optimizer:",
     )
     qf_max_iter = mo.ui.number(
@@ -3332,16 +3332,24 @@ def _(
                     "CMA-ES requires the 'cma' package. "
                     "Install it with: pip install cma"
                 )
-            _sigma0 = 0.5
             _cma_bounds = [_lo.tolist(), _hi.tolist()]
-            _p0_cma = 0.5 * (_lo + _hi)
+            # Start from the user-configured initial guess (clipped to bounds)
+            # rather than the raw bounds midpoint.
+            _p0_cma = np.clip(_p0, _lo + 1e-8, _hi - 1e-8)
+            # Per-coordinate initial σ = 20% of prior range — essential when
+            # parameters span different scales.
+            _cma_stds = [0.2 * float(hi - lo) for lo, hi in zip(_lo, _hi)]
+            _N_cma = len(_p0_cma)
+            _popsize = 2 * (4 + int(3 * np.log(_N_cma)))
             _es = cma.CMAEvolutionStrategy(
-                _p0_cma.tolist(), _sigma0,
+                _p0_cma.tolist(), 1.0,
                 {
                     "bounds": _cma_bounds,
+                    "CMA_stds": _cma_stds,
+                    "popsize": _popsize,
                     "maxfevals": int(qf_max_iter.value),
                     "verbose": -9,
-                    "tolfun": 1e-8,
+                    "tolfun": 1e-10,
                 },
             )
             _best_x, _best_f = _p0.copy(), float("inf")

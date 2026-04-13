@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import cma
 from scipy import stats
 from scipy.optimize import minimize as scipy_minimize
 
@@ -487,54 +488,40 @@ def run_mle_single(
 
     labels_before = list(model.labels)
 
-    # Build a simplex whose vertices span the prior support of every active
-    # parameter. This is much more stable than starting Nelder-Mead from a single
-    # midpoint in this highly coupled likelihood surface.
+    # Derive per-parameter bounds from the priors for CMA-ES box constraints.
     active_labels = list(model.labels)
     N = len(active_labels)
-    simplex = np.zeros((N + 1, N))
 
-    for col_idx, label in enumerate(active_labels):
+    lo_bounds = []
+    hi_bounds = []
+    for label in active_labels:
         if label in priors:
             dist = priors[label]
             loc, sc = _get_loc_scale(dist)
             if dist.dist.name == "uniform":
-                # Spread the simplex across the truncated support so each row sees
-                # a different region of the allowed parameter interval.
-                col = _simplex_column_uniform(loc, sc, N)
+                lo_bounds.append(loc)
+                hi_bounds.append(loc + sc)
             elif dist.dist.name == "norm":
-                # For normal priors, approximate the interesting support as ±2σ.
-                col = _simplex_column_norm(loc, sc, N)
+                lo_bounds.append(loc - 4 * sc)
+                hi_bounds.append(loc + 4 * sc)
             else:
-                # Unknown prior families fall back to a small perturbation around
-                # the current parameter vector instead of failing outright.
-                cv = model.get_param_vector()[col_idx]
-                col = [cv + (cv * 0.01 * k) for k in range(N + 1)]
+                cv = model.get_param_vector()[active_labels.index(label)]
+                lo_bounds.append(cv - abs(cv) * 0.5)
+                hi_bounds.append(cv + abs(cv) * 0.5)
         else:
-            cv = model.get_param_vector()[col_idx]
-            col = [cv] * (N + 1)
+            cv = model.get_param_vector()[active_labels.index(label)]
+            lo_bounds.append(cv - abs(cv) * 0.5 - 1e-6)
+            hi_bounds.append(cv + abs(cv) * 0.5 + 1e-6)
 
-        simplex[:, col_idx] = col
-        # Rotate each column so simplex vertices are not all aligned on the same
-        # coordinate-wise corner of the prior hyper-rectangle.
-        simplex[:, col_idx] = np.roll(simplex[:, col_idx], col_idx)
-
-    # Bootstrap log_scale at every simplex vertex so the optimizer starts
-    # with a data-informed scale at each point in parameter space.
+    # Bootstrap log_scale at the starting point so the optimizer begins
+    # with a data-informed normalisation.
     if "log_scale" in active_labels:
-        ls_idx = active_labels.index("log_scale")
-        for row in range(N + 1):
-            try:
-                model.set_param_vector(simplex[row])
-                _ = model()  # triggers auto log_scale calc
-                if model._log_scale is not None and np.isfinite(model._log_scale):
-                    simplex[row, ls_idx] = model._log_scale
-            except Exception:
-                pass  # keep the prior-based value
-
-    # Restore model to the centroid of the simplex
-    centroid = simplex.mean(axis=0)
-    model.set_param_vector(centroid)
+        try:
+            _ = model()  # triggers auto log_scale calc
+            if model._log_scale is not None and np.isfinite(model._log_scale):
+                model.params["log_scale"] = model._log_scale
+        except Exception:
+            pass
 
     _nll_history = []
     _iter_count = [0]
@@ -542,15 +529,6 @@ def run_mle_single(
 
     def nll(P):
         model.set_param_vector(P)
-        # Penalise out-of-bounds grid params so Nelder-Mead steers back in range
-        # rather than propagating an exception and aborting the whole run.
-        gp = np.array(model.grid_params)
-        violation = (
-            np.sum(np.maximum(0.0, emu.min_params - gp) ** 2)
-            + np.sum(np.maximum(0.0, gp - emu.max_params) ** 2)
-        )
-        if violation > 0.0:
-            return 1e10 * (1.0 + violation)
         try:
             val = -model.log_likelihood(priors)
         except Exception:
@@ -562,16 +540,43 @@ def run_mle_single(
             iteration_callback(_iter_count[0], max_iter, _best, time.time() - _mle_t0)
         return val
 
-    p0 = model.get_param_vector()
-    soln = scipy_minimize(
-        nll,
-        p0,
-        method="Nelder-Mead",
-        options={
-            "maxiter": max_iter,
-            "adaptive": True,
-            "initial_simplex": simplex,
+    # CMA-ES: start from the bootstrapped model state (includes the
+    # data-informed log_scale) rather than the raw bounds midpoint.
+    p0_cma = np.clip(
+        model.get_param_vector(),
+        np.array(lo_bounds) + 1e-8,
+        np.array(hi_bounds) - 1e-8,
+    )
+    # Per-coordinate initial σ = 20% of prior range.
+    cma_stds = [0.2 * (hi - lo) for lo, hi in zip(lo_bounds, hi_bounds)]
+    # Double the default popsize for better landscape sampling.
+    popsize = 2 * (4 + int(3 * np.log(N)))
+    es = cma.CMAEvolutionStrategy(
+        p0_cma.tolist(), 1.0,
+        {
+            "bounds": [lo_bounds, hi_bounds],
+            "CMA_stds": cma_stds,
+            "popsize": popsize,
+            "maxfevals": max_iter,
+            "verbose": -9,
+            "tolfun": 1e-10,
         },
+    )
+    best_x, best_f = model.get_param_vector().copy(), float("inf")
+    while not es.stop():
+        solutions = es.ask()
+        fits = [nll(np.array(s)) for s in solutions]
+        es.tell(solutions, fits)
+        gen_best = min(fits)
+        if gen_best < best_f:
+            best_f = gen_best
+            best_x = np.array(solutions[fits.index(gen_best)])
+
+    from types import SimpleNamespace
+    soln = SimpleNamespace(
+        x=best_x, fun=best_f, success=True,
+        message="CMA-ES terminated",
+        nit=es.result.iterations,
     )
 
     if soln.success:
@@ -639,11 +644,27 @@ def run_mcmc_single(
 
     ndim = len(model.labels)
 
-    # Initialise walkers around MLE
-    ball = np.random.randn(nwalkers, ndim)
+    # Initialise walkers in a truncated-normal ball around MLE.
+    # σ = 2% of prior width (or 1σ for Normal priors).  Truncated normal
+    # avoids edge pile-up that np.clip would cause near prior bounds.
+    _INIT_FRAC = 0.02
+    ball = np.empty((nwalkers, ndim))
     for i, key in enumerate(model.labels):
-        ball[:, i] *= 0.1
-        ball[:, i] += model[key]
+        pr = priors.get(key)
+        mle_val = model[key]
+        if pr is not None and hasattr(pr, 'interval'):
+            lo, hi = pr.interval(1.0)
+            if hasattr(pr, 'std'):
+                sigma = pr.std()
+            else:
+                sigma = _INIT_FRAC * (hi - lo)
+            a = (lo - mle_val) / sigma
+            b = (hi - mle_val) / sigma
+            ball[:, i] = stats.truncnorm.rvs(
+                a, b, loc=mle_val, scale=sigma, size=nwalkers
+            )
+        else:
+            ball[:, i] = mle_val + 0.1 * np.random.randn(nwalkers)
 
     def log_prob(P):
         model.set_param_vector(P)
@@ -657,7 +678,13 @@ def run_mcmc_single(
         except (ValueError, np.linalg.LinAlgError):
             return -np.inf
 
-    sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob)
+    # Use DEMove + DESnookerMove for better performance in ≥5D
+    # (Ter Braak 2006; Nelson et al. 2014).
+    _moves = [
+        (emcee.moves.DEMove(), 0.8),
+        (emcee.moves.DESnookerMove(), 0.2),
+    ]
+    sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob, moves=_moves)
 
     # Run MCMC, calling iteration_callback every 50 steps if provided
     if iteration_callback is not None:
@@ -681,7 +708,7 @@ def run_mcmc_single(
         tau_valid = False
 
     if tau_valid:
-        auto_burnin = int(tau.max())
+        auto_burnin = int(2 * tau.max())  # 2×τ (Foreman-Mackey 2013)
         thin = max(1, int(0.3 * np.min(tau)))
         burnin_used = max(burnin, auto_burnin)
     else:

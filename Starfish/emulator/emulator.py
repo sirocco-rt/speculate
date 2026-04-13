@@ -397,7 +397,8 @@ class Emulator:
         self.lambda_xi = lambda_xi
 
         self.variances = (
-            variances if variances is not None else 1e4 * np.ones(self.ncomps)
+            variances if variances is not None
+            else np.maximum(np.var(weights, axis=0), 1.0)
         )
 
         unique = [sorted(np.unique(param_set)) for param_set in self._grid_points_norm.T]
@@ -584,8 +585,6 @@ class Emulator:
             self.log.info("PyTorch not available - using NumPy fallback")
         elif not torch.cuda.is_available():
             self.log.info("CUDA not available - using CPU")
-
-    
 
     @property
     def lambda_xi(self) -> float:
@@ -2004,11 +2003,10 @@ class Emulator:
         print(f"Optimizing {len(self.get_param_vector())} hyperparameters")
         
         # Calculate maximum allowed variance based on data variance
-        # We allow the kernel variance to be up to 100x the data variance
-        # This prevents "runaway" optimization while allowing flexibility
+        # Cap at 5× empirical weight variance per component to prevent
+        # inflated GP variances that flatten the MCMC likelihood via C_emu.
         weights_variance = np.var(self.weights, axis=0) # (n_comp,)
-        # Use valid max_variance bounds (at least 1.0 to avoid too tight constraints on small components)
-        max_variances = np.maximum(100.0 * weights_variance, 1.0)
+        max_variances = np.maximum(5.0 * weights_variance, 1.0)
         
         def nll(P, apply_penalty=True):
             if np.any(~np.isfinite(P)):
@@ -2068,7 +2066,9 @@ class Emulator:
         ls_ceil  = 5.0 * np.ones(d)
 
         var_lo  = np.full(K, -30.0)
-        var_hi  = np.full(K, np.log(1e4))
+        _emp_var_j = np.var(self.weights, axis=0)  # (K,)
+        _var_ceil_j = np.maximum(_emp_var_j * 5.0, 1.0)
+        var_hi  = np.log(_var_ceil_j)
         ls_lo   = np.tile(np.log(ls_floor), K)
         ls_hi   = np.tile(np.log(ls_ceil),  K)
         if self.strict_weight_fit:
@@ -2231,7 +2231,6 @@ class Emulator:
         self.log.info(self)
             
         # Clean up progress tracking variables
-        delattr(self, '_training_start_time')
         delattr(self, '_iteration_count')
         delattr(self, '_best_loss')
         delattr(self, '_last_progress_time')
@@ -2289,10 +2288,12 @@ class Emulator:
         ls_ceil  = 5.0 * np.ones(d)           # (d,) — beyond this the GP is ~constant
 
         # Log-space bounds for bounded optimizers (L-BFGS-B, CMA-ES)
-        # variance (index 0): unbounded below, capped at log(1e4)
+        # variance (index 0): unbounded below, capped at 5× empirical weight variance
         # lengthscales (indices 1..d): [log(ls_floor), log(ls_ceil)]
+        _emp_var = np.var(self.weights, axis=0)  # (K,)
+        _var_ceil = max(np.max(_emp_var) * 5.0, 1.0)
         log_bounds_lower = np.concatenate([[-30.0], np.log(ls_floor)])
-        log_bounds_upper = np.concatenate([[np.log(1e4)], np.log(ls_ceil)])
+        log_bounds_upper = np.concatenate([[np.log(_var_ceil)], np.log(ls_ceil)])
 
         # Parse user options
         default_kwargs = {

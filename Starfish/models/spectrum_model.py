@@ -457,7 +457,7 @@ class SpectrumModel:
             L_weights = torch.linalg.cholesky(weights_cov)  # (m, m)
             Y = torch.matmul(L_weights.mT, X)   # (m,m)@(m,N_pix) → (m, N_pix)
             cov = torch.matmul(Y.mT, Y)          # (N_pix,m)@(m,N_pix) → (N_pix, N_pix)
-            
+
             # Add trivial covariance — cache sigma on GPU
             if self._cached_data_sigma_gpu is None:
                 self._cached_data_sigma_gpu = torch.from_numpy(
@@ -727,8 +727,10 @@ class SpectrumModel:
         
         if PYTORCH_AVAILABLE and isinstance(cov, torch.Tensor):
             # GPU Path
-            # Diagonal-relative jitter for Cholesky stability (~1e-6 × max(diag))
-            _jitter = max(1e-12, 1e-6 * cov.diagonal().max().item())
+            # Purely relative jitter for Cholesky stability (~1e-6 × max(diag)).
+            # The floor must be tiny (1e-35) so it never dominates the actual
+            # covariance entries — physical-unit spectra have C_ii ~ 1e-26.
+            _jitter = max(1e-35, 1e-6 * cov.diagonal().max().item())
             cov.diagonal().add_(_jitter)
             
             try:
@@ -764,7 +766,7 @@ class SpectrumModel:
                 return -np.inf
         else:
             # CPU Path
-            _jitter = max(1e-12, 1e-6 * np.max(cov.diagonal()))
+            _jitter = max(1e-30, 1e-6 * np.max(cov.diagonal()))
             np.fill_diagonal(cov, cov.diagonal() + _jitter)
             try:
                 factor, flag = cho_factor(cov, overwrite_a=True)
@@ -1135,7 +1137,7 @@ class SpectrumModel:
         resid_params = {"lw": 0.3}
         resid_params.update(resid_kwargs)
         ax = axes[1]
-        ax.plot(self.data.wave, R, c="k", label="Data - Model", **resid_params)
+        ax.plot(self.data.wave, R, c="g", label="Data - Model", **resid_params)
         ax.fill_between(
             self.data.wave, -std, std, color="C2", alpha=0.6, label=r"$\sigma$"
         )
@@ -1154,7 +1156,7 @@ class SpectrumModel:
         # Relative Error plot
         R_f = R / self.data.flux
         ax = axes[2]
-        ax.plot(self.data.wave, R_f, label="Data - Model", c="k", **resid_params)
+        ax.plot(self.data.wave, R_f, label="Data - Model", c="r", **resid_params)
         ax.set_xlabel(r"$\lambda$ [$\AA$]")
         ax.set_ylabel(r"$\Delta f_\lambda / f_\lambda$")
         ax.yaxis.tick_right()

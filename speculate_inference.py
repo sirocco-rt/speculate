@@ -193,18 +193,19 @@ def _():
     #
     # In emulator space param1, param3, and param5 are stored in log10.
     # param2 (wind.mdot) is stored as the ratio wind/disk mass-loss rate.
+    # Tuple: (friendly_name, default_min, default_max, is_log10)
     param_map_db = {
-        1: ("disk.mdot", 0.0, 1.0),              # log10(Msol/yr)
-        2: ("wind.mdot", 0.0, 1.0),              # ratio: wind / disk
-        3: ("KWD.d", 0.0, 1.0),                  # wind launch radius (r_star)
-        4: ("KWD.mdot_r_exponent", 0.0, 1.0),    # radial mdot power law
-        5: ("KWD.acceleration_length", 0.0, 1.0), # log10(cm)
-        6: ("KWD.acceleration_exponent", 0.0, 1.0),
-        7: ("Boundary_layer.luminosity", 0.0, 1.0),
-        8: ("Boundary_layer.temp", 0.0, 1.0),
-        9: ("Inclination (Sparse)", 30.0, 80.0),  # 3 angles (30, 55, 80)
-        10: ("Inclination (Mid)", 30.0, 80.0),    # 6 angles
-        11: ("Inclination (Full)", 30.0, 80.0),   # 12 angles
+        1: ("disk.mdot", 0.0, 1.0, True),              # log10(Msol/yr)
+        2: ("wind.mdot", 0.0, 1.0, False),              # ratio: wind / disk
+        3: ("KWD.d", 0.0, 1.0, True),                  # log10(wind launch radius / r_star)
+        4: ("KWD.mdot_r_exponent", 0.0, 1.0, False),    # radial mdot power law
+        5: ("KWD.acceleration_length", 0.0, 1.0, True), # log10(cm)
+        6: ("KWD.acceleration_exponent", 0.0, 1.0, False),
+        7: ("Boundary_layer.luminosity", 0.0, 1.0, True),  # log10(erg/s)
+        8: ("Boundary_layer.temp", 0.0, 1.0, True),        # log10(K)
+        9: ("Inclination (Sparse)", 30.0, 80.0, False),  # 3 angles (30, 55, 80)
+        10: ("Inclination (Mid)", 30.0, 80.0, False),    # 6 angles
+        11: ("Inclination (Full)", 30.0, 80.0, False),   # 12 angles
     }
     return (param_map_db,)
 
@@ -1239,6 +1240,7 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
     param_names = []
     defaults = {}
     bounds = {}
+    log10_params = set()  # names of params whose values are log10-scaled
 
     # Parameter Mapping Dictionary
     if emu is not None:
@@ -1253,6 +1255,8 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
                  if idx in param_map_db:
                      _p_name = param_map_db[idx][0]
                      current_names.append(_p_name)
+                     if param_map_db[idx][3]:
+                         log10_params.add(_p_name)
                  else:
                      current_names.append(f"Param {idx} (Unknown)")
         else:
@@ -1263,6 +1267,8 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
                     idx = int(match.group(1))
                     if idx in param_map_db:
                         current_names.append(param_map_db[idx][0])
+                        if param_map_db[idx][3]:
+                            log10_params.add(param_map_db[idx][0])
                     else:
                         current_names.append(f"Param {idx}")
                 else:
@@ -1396,11 +1402,11 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
     # Wrap in mo.ui.dictionary for Marimo reactivity
     w_fix = mo.ui.dictionary(_fix_dict) if _fix_dict else mo.ui.dictionary({})
     w_val = mo.ui.dictionary(_val_dict) if _val_dict else mo.ui.dictionary({})
-    return bounds, param_names, w_fix, w_max, w_min, w_val
+    return bounds, log10_params, param_names, w_fix, w_max, w_min, w_val
 
 
 @app.cell(hide_code=True)
-def _(bounds, mo, param_names, w_fix, w_max, w_min, w_val):
+def _(bounds, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
     # Render Parameter UI
     if not param_names:
          param_settings = mo.md("*Load an emulator to see parameters.*")
@@ -1428,6 +1434,9 @@ def _(bounds, mo, param_names, w_fix, w_max, w_min, w_val):
         for _name in param_names:
             is_fixed = _fix_values.get(_name, False)
             display_name = _label_map.get(_name, _name)
+            # Wrap log10-scaled parameters so the user knows the value is a logarithm
+            if _name in log10_params and not display_name.startswith('log'):
+                display_name = f"log10({display_name})"
             _mn, _mx = bounds.get(_name, [0.0, 1.0])
             is_global = _name in ('Av', 'log_scale', 'cheb_1', 'log_amp', 'log_ls')
 
@@ -1524,8 +1533,8 @@ def _(mo):
 def _(mo):
     # Inference Control
     mle_method = mo.ui.dropdown(
-        options=["Nelder-Mead", "L-BFGS-B", "CMA-ES"],
-        value="Nelder-Mead",
+        options=["CMA-ES", "Nelder-Mead", "L-BFGS-B"],
+        value="CMA-ES",
         label="Optimization Method:",
     )
     mle_max_iter = mo.ui.number(
@@ -1538,13 +1547,13 @@ def _(mo):
         f"{mo.icon('lucide:info')} Optimizer Details": mo.md("""
         | Method | Type | Best For |
         |--------|------|----------|
-        | **Nelder-Mead** | Derivative-free simplex | General use; robust default for low-to-moderate dimensions |
+        | **CMA-ES** | Evolutionary strategy | **Recommended default** — robust in multi-modal, high-dimensional landscapes |
+        | **Nelder-Mead** | Derivative-free simplex | Fast for low-dimensional problems; can stall in >6 dimensions |
         | **L-BFGS-B** | Quasi-Newton (gradient) | Fast convergence when the likelihood surface is smooth |
-        | **CMA-ES** | Evolutionary strategy | Complex, multi-modal landscapes; slower but very robust |
 
+        **CMA-ES** is population-based and adapts its search covariance — best for 7+ dimensional spectral fitting.
         **Nelder-Mead** uses an adaptive simplex spanning the prior volume.
         **L-BFGS-B** uses box constraints derived from your priors and finite-difference gradients.
-        **CMA-ES** is population-based and requires the `cma` package.
         """)
     })
 
@@ -1564,6 +1573,7 @@ def _(
     emu,
     fit_power_law_continuum,
     ground_truth_params,
+    log10_params,
     mle_max_iter,
     mle_method,
     mo,
@@ -1891,7 +1901,7 @@ def _(
                         _best_nll = min(_nll_history) if _nll_history else nll
                         _spinner.update(
                             f"{_opt_method} Eval {_iter_count[0]} | "
-                            f"Best NLL: {_best_nll:.2f} | "
+                            f"Best NLL: {_best_nll:.10f} | "
                             f"Time: {_elapsed:.1f}s"
                         )
                     return nll
@@ -1934,17 +1944,32 @@ def _(
                             "CMA-ES requires the 'cma' package. "
                             "Install it with: pip install cma"
                         )
-                    _sigma0 = 0.5
                     _cma_bounds = [_lo_bounds, _hi_bounds]
-                    # CMA-ES requires x0 strictly inside bounds; use midpoint
-                    _p0_cma = 0.5 * (np.array(_lo_bounds) + np.array(_hi_bounds))
+                    # Start from the bootstrapped model state (includes the
+                    # data-informed log_scale) rather than the raw bounds
+                    # midpoint.  Clip to strictly inside bounds as CMA-ES
+                    # requires x0 within the feasible region.
+                    _p0_cma = np.clip(
+                        _p0,
+                        np.array(_lo_bounds) + 1e-8,
+                        np.array(_hi_bounds) - 1e-8,
+                    )
+                    # Per-coordinate initial σ = 20% of prior range.  Parameters
+                    # span wildly different scales (inclination ~60 vs cheb_1 ~1)
+                    # so per-coordinate scaling is essential.
+                    _cma_stds = [0.2 * (hi - lo) for lo, hi in zip(_lo_bounds, _hi_bounds)]
+                    # Double the default popsize for better landscape sampling
+                    # in the 7–12 dimensional spectral fitting regime.
+                    _popsize = 2 * (4 + int(3 * np.log(_N)))
                     _es = cma.CMAEvolutionStrategy(
-                        _p0_cma.tolist(), _sigma0,
+                        _p0_cma.tolist(), 1.0,
                         {
                             "bounds": _cma_bounds,
+                            "CMA_stds": _cma_stds,
+                            "popsize": _popsize,
                             "maxfevals": _max_iter,
                             "verbose": -9,
-                            "tolfun": 1e-8,
+                            "tolfun": 1e-10,
                         },
                     )
                     _best_x, _best_f = _p0.copy(), float("inf")
@@ -2023,7 +2048,8 @@ def _(
 
                 for _i, _p in enumerate(phys_names):
                     fitted_val = res_grid[_i]
-                    _results_md += f"| **{_p}** | {fitted_val:.4f} | "
+                    _display_p = f"log10({_p})" if _p in log10_params else _p
+                    _results_md += f"| **{_display_p}** | {fitted_val:.4f} | "
 
                     if ground_truth_params and _p in ground_truth_params:
                         _gt_val = ground_truth_params[_p]
@@ -2034,20 +2060,22 @@ def _(
                     else:
                         _results_md += "\n"
 
-                # Add Global Params
-                _results_md += "\n**Global Parameters:**\n"
-                if 'Av' in res_global: 
-                    _results_md += f"- **Av**: {res_global['Av']:.4f}\n"
-                if 'log_scale' in res_global: 
-                    _results_md += f"- **log_scale**: {res_global['log_scale']:.4f}\n"
+                # Global parameters in the same table style
+                _results_md += "\n### Global Parameters\n\n"
+                _results_md += "| Parameter | Fitted |\n"
+                _results_md += "|-----------|--------|\n"
+                if 'Av' in res_global:
+                    _results_md += f"| **Av** | {res_global['Av']:.4f} |\n"
+                if 'log_scale' in res_global:
+                    _results_md += f"| **ln(scale)** | {res_global['log_scale']:.4f} |\n"
                 elif hasattr(_model, '_log_scale') and _model._log_scale is not None:
-                    _results_md += f"- **log_scale (auto)**: {_model._log_scale:.4f}\n"
+                    _results_md += f"| **ln(scale) (auto)** | {_model._log_scale:.4f} |\n"
                 if 'cheb:1' in res_global:
-                    _results_md += f"- **cheb_1** (continuum tilt): {res_global['cheb:1']:.4f}\n"
+                    _results_md += f"| **cheb₁** | {res_global['cheb:1']:.4f} |\n"
                 if 'global_cov:log_amp' in res_global:
-                    _results_md += f"- **log_amp**: {res_global['global_cov:log_amp']:.4f}\n"
+                    _results_md += f"| **ln(GP amp)** | {res_global['global_cov:log_amp']:.4f} |\n"
                 if 'global_cov:log_ls' in res_global:
-                    _results_md += f"- **log_ls**: {res_global['global_cov:log_ls']:.4f}\n"
+                    _results_md += f"| **ln(GP length)** | {res_global['global_cov:log_ls']:.4f} |\n"
 
                 # Keep the result view as a single stack so the fit summary, loss
                 # curve, and model figure stay coupled during reactive reruns.
@@ -2103,7 +2131,7 @@ def _(emu, get_mle_model, mo, param_names, re):
 
     mcmc_nwalkers = mo.ui.number(value=64, label="Walkers", step=4, start=8)
     mcmc_nsteps = mo.ui.number(value=2500, label="Steps", step=100, start=100)
-    mcmc_burnin = mo.ui.number(value=200, label="Burn-in", step=50, start=0)
+    mcmc_burnin = mo.ui.number(value=200, label="Min Burn-in (floor)", step=50, start=0)
 
     run_mcmc_btn = mo.ui.run_button(
         label=f"{mo.icon('lucide:shuffle')} Run MCMC", 
@@ -2139,6 +2167,7 @@ def _(emu, get_mle_model, mo, param_names, re):
     else:
         # Show friendly names in the active params list
         _friendly_labels = [mcmc_label_map.get(l, l) for l in _model.labels]
+
         mcmc_config_ui = mo.vstack([
             mo.md(f"**Active Parameters:** {', '.join(_friendly_labels)}"),
             mo.hstack([mcmc_nwalkers, mcmc_nsteps, mcmc_burnin], justify="start"),
@@ -2200,7 +2229,12 @@ def _(
 
         # Apply the optional MCMC-only freezes to the already-fit model so the
         # sampler explores only the subset of parameters the user left thawed.
+        # First, thaw every param that the MCMC checkboxes cover.  This
+        # prevents freezes from a previous MCMC run accumulating when the
+        # user re-runs with a different freeze selection.
         _freeze_values = mcmc_freeze.value  # {internal_name: bool}
+        for _key in _freeze_values:
+            _model.thaw(_key)
         _frozen_list = []
         for _key, _is_frozen in _freeze_values.items():
             if _is_frozen:
@@ -2230,36 +2264,54 @@ def _(
                 # Define log probability function
                 def _log_prob(P, model, priors):
                     model.set_param_vector(P)
-                    return model.log_likelihood(priors)
+                    # Reject proposals outside the emulator training grid.
+                    # Without this, walkers that wander beyond the grid get
+                    # garbage likelihood values instead of being rejected,
+                    # causing them to diffuse across the full prior volume.
+                    gp = np.array(model.grid_params)
+                    if np.any(gp < model.emulator.min_params) or np.any(gp > model.emulator.max_params):
+                        return -np.inf
+                    try:
+                        return model.log_likelihood(priors)
+                    except (ValueError, np.linalg.LinAlgError):
+                        return -np.inf
 
-                # The proposal ball is keyed by both internal and display labels so
-                # sampling stays stable even when Stage 2 renamed parameters.
-                _default_scales = {
-                    "disk.mdot": 0.05, "wind.mdot": 0.02, "KWD.d": 0.1,
-                    "KWD.mdot_r_exponent": 0.05, "KWD.acceleration_length": 0.1,
-                    "KWD.acceleration_exponent": 0.1,
-                    "Boundary_layer.luminosity": 0.05, "Boundary_layer.temp": 0.05,
-                    "Inclination (Sparse)": 2.0, "Inclination (Mid)": 2.0,
-                    "Inclination (Full)": 1.0,
-                    "param1": 0.05, "param2": 0.02, "param3": 0.1,
-                    "param4": 0.05, "param5": 0.1, "param6": 0.1,
-                    "param7": 0.05, "param8": 0.05, "param9": 2.0,
-                    "param10": 2.0, "param11": 1.0,
-                    "global_cov:log_amp": 1.0, "global_cov:log_ls": 0.5,
-                    "GP log_amp": 1.0, "GP log_ls": 0.5,
-                    "Av": 0.1, "log_scale": 0.5
-                }
-
-                _ball = np.random.randn(_nwalkers, _ndim)
+                # Initialise walkers in a truncated-normal ball around the MLE.
+                # σ = 2% of prior width (or 1σ for Normal priors).  Using a
+                # truncated normal rather than clip avoids artificial density
+                # pile-up at the prior edges when the MLE sits near a bound.
+                _INIT_FRAC = 0.02  # σ as a fraction of prior width
+                _ball = np.empty((_nwalkers, _ndim))
                 for _i, _key in enumerate(_model.labels):
-                    # Try internal name first, then friendly name
-                    _scale = _default_scales.get(_key, _default_scales.get(_friendly(_key), 0.1))
-                    _ball[:, _i] *= _scale
-                    _ball[:, _i] += _model[_key]
+                    _pr = _priors.get(_key)
+                    _mle_val = _model[_key]
+                    if _pr is not None and hasattr(_pr, 'interval'):
+                        _lo, _hi = _pr.interval(1.0)
+                        if hasattr(_pr, 'std'):
+                            _sigma = _pr.std()          # Normal prior
+                        else:
+                            _sigma = _INIT_FRAC * (_hi - _lo)  # Uniform prior
+                        _a = (_lo - _mle_val) / _sigma  # lower bound in std units
+                        _b = (_hi - _mle_val) / _sigma  # upper bound in std units
+                        _ball[:, _i] = stats.truncnorm.rvs(
+                            _a, _b, loc=_mle_val, scale=_sigma, size=_nwalkers
+                        )
+                    else:
+                        # No prior registered (shouldn't happen for thawed
+                        # params) — fall back to small absolute jitter.
+                        _ball[:, _i] = _mle_val + 0.1 * np.random.randn(_nwalkers)
 
-                # Create sampler
+                # Create sampler — use DEMove + DESnookerMove for better
+                # performance in ≥5D (Ter Braak 2006; Nelson et al. 2014).
+                # The default StretchMove becomes increasingly inefficient
+                # above ~5 dimensions.
+                _moves = [
+                    (_emcee.moves.DEMove(), 0.8),
+                    (_emcee.moves.DESnookerMove(), 0.2),
+                ]
                 _sampler = _emcee.EnsembleSampler(
-                    _nwalkers, _ndim, _log_prob, args=(_model, _priors)
+                    _nwalkers, _ndim, _log_prob, args=(_model, _priors),
+                    moves=_moves,
                 )
 
                 # Run with progress bar
@@ -2300,7 +2352,7 @@ def _(
                     _tau_valid = False
 
                 if _tau_valid:
-                    _auto_burnin = int(_tau.max())
+                    _auto_burnin = int(2 * _tau.max())  # 2×τ (Foreman-Mackey 2013)
                     _auto_thin = max(1, int(0.3 * np.min(_tau)))
                     _burnin_used = max(_burnin_manual, _auto_burnin)
                 else:
