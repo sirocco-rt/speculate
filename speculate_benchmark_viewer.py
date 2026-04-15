@@ -253,6 +253,8 @@ def _(
                 entry["burnin_used"] = p.get("burnin_used", 200)
             if "bestfit_spec" in p:
                 entry["bestfit_spec"] = p["bestfit_spec"]
+            if "prior_ranges" in p:
+                entry["prior_ranges"] = p["prior_ranges"]
             posteriors.append(entry)
         return posteriors if posteriors else None
 
@@ -863,11 +865,42 @@ def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
         labels=_labels,
         show_titles=True,
         quantiles=[0.16, 0.5, 0.84],
+        levels=[0.6827, 0.9545, 0.9973],
         title_fmt=".4f",
         truths=_truths if _has_any_truth else None,
         truth_color="#ff4444",
         truth_kwargs={"linewidth": 2},
     )
+
+    # Prior-range corner plot: axes span the full emulator grid bounds so
+    # the user can judge posterior breadth relative to the full prior.
+    _pr_dict = _post.get("prior_ranges", {})
+    if _pr_dict:
+        _pr_list = []
+        for _lbl in _labels:
+            _key = "Inclination" if "Inclination" in _lbl else _lbl
+            if _key in _pr_dict:
+                _pr_list.append(tuple(_pr_dict[_key]))
+            else:
+                _pr_list.append((1.0,))  # auto-range sentinel for corner
+        _fig_prior = _corner.corner(
+            _samples,
+            labels=_labels,
+            show_titles=True,
+            quantiles=[0.16, 0.5, 0.84],
+            levels=[0.6827, 0.9545, 0.9973],
+            title_fmt=".4f",
+            truths=_truths if _has_any_truth else None,
+            truth_color="#ff4444",
+            truth_kwargs={"linewidth": 2},
+            range=_pr_list,
+        )
+        _corner_display = mo.ui.tabs({
+            "Posterior (Auto Range)": _fig,
+            "Full Prior Range": _fig_prior,
+        })
+    else:
+        _corner_display = _fig
 
     _conv_tag = "converged" if _converged else "**not converged**"
     _summary_rows = []
@@ -894,7 +927,7 @@ def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
     mo.vstack([
         mo.md(f"### {_filename} @ {_inc:.0f}° — {_conv_tag}"),
         mo.ui.table(_summary_rows, label="Posterior Summary", selection=None),
-        _fig,
+        _corner_display,
     ])
     return
 
@@ -1873,6 +1906,8 @@ def _(
                                     _post_entry["burnin_used"] = _entry.get("burnin_used", 200)
                                 if "bestfit_spec" in _entry:
                                     _post_entry["bestfit_spec"] = _entry["bestfit_spec"]
+                                if "prior_ranges" in _entry:
+                                    _post_entry["prior_ranges"] = _entry["prior_ranges"]
                                 _tier2_posteriors.append(_post_entry)
                             else:
                                 # Legacy checkpoint: reconstruct from per-param samples
@@ -2062,6 +2097,17 @@ def _(
                         "bestfit_spec": _mcmc.get("bestfit_spec", {}),
                     }
 
+                    # Build prior ranges dict from emulator grid bounds (used for
+                    # the corner-plot full-prior-range view).
+                    _prior_ranges_dict = {}
+                    for _pi, _pn in enumerate(_emu.param_names):
+                        _fn = _friendly[_pi] if _pi < len(_friendly) else _pn
+                        _prior_ranges_dict[_fn] = [
+                            float(_emu.min_params[_pi]),
+                            float(_emu.max_params[_pi]),
+                        ]
+                    _cp_entry["prior_ranges"] = _prior_ranges_dict
+
                     # Map friendly names to their column index in the flat
                     # MCMC samples array. Columns follow model.labels order
                     # (nuisance params first), so we cannot assume grid param
@@ -2101,6 +2147,7 @@ def _(
                         "converged": _mcmc["converged"],
                         "truths": dict(_gt),
                         "bestfit_spec": _mcmc.get("bestfit_spec", {}),
+                        "prior_ranges": _prior_ranges_dict,
                     })
 
                     # Append checkpoint line (crash-safe: one write per spectrum)

@@ -2510,9 +2510,41 @@ def _(
                     labels=_friendly_labels,
                     show_titles=True,
                     quantiles=[0.16, 0.5, 0.84],
+                    levels=[0.6827, 0.9545, 0.9973],
                     title_fmt=".4f",
                     truths=_truths
                 )
+
+                # Prior-range corner plot: axes span the full prior support so
+                # the user can judge posterior breadth relative to the prior.
+                _prior_ranges = []
+                for _label in _model.labels:
+                    _pr = _priors.get(_label)
+                    if _pr is not None and hasattr(_pr, 'interval'):
+                        _lo, _hi = _pr.interval(1.0)
+                        _prior_ranges.append((_lo, _hi))
+                    else:
+                        _prior_ranges.append(None)
+                # Only build the second plot if we resolved at least one range
+                if any(_r is not None for _r in _prior_ranges):
+                    # Replace None entries with auto-range sentinel (corner uses 0.999 quantile)
+                    _safe_ranges = [_r if _r is not None else (1.0,) for _r in _prior_ranges]
+                    _fig_corner_prior = _corner.corner(
+                        _burn_samples,
+                        labels=_friendly_labels,
+                        show_titles=True,
+                        quantiles=[0.16, 0.5, 0.84],
+                        levels=[0.6827, 0.9545, 0.9973],
+                        title_fmt=".4f",
+                        truths=_truths,
+                        range=_safe_ranges,
+                    )
+                    _corner_display = mo.ui.tabs({
+                        "Posterior (Auto Range)": _fig_corner,
+                        "Full Prior Range": _fig_corner_prior,
+                    })
+                else:
+                    _corner_display = _fig_corner
 
                 # ============================================================
                 # Stage 19: Best-fit MCMC model plot
@@ -2597,7 +2629,7 @@ def _(
                     mo.md(_results_md),
                     _chain_accordion,
                     mo.md("### Corner Plot"),
-                    _fig_corner,
+                    _corner_display,
                     mo.md("### Best-Fit Model (MCMC Posterior Mean)"),
                     _fig_bestfit,
                 ])

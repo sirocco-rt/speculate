@@ -716,8 +716,8 @@ def _(get_loaded_emu_config, set_loaded_emu_display, mo):
     _cfg = get_loaded_emu_config()
     _scales = ["linear", "log", "continuum-normalised"]
 
-    wl_min = mo.ui.number(start=800, stop=8000, value=_cfg['wl_min'] if _cfg and 'wl_min' in _cfg else 850, step=10, label="Min Wavelength (Å):", on_change=lambda _: set_loaded_emu_display(None))
-    wl_max = mo.ui.number(start=800, stop=8000, value=_cfg['wl_max'] if _cfg and 'wl_max' in _cfg else 1850, step=10, label="Max Wavelength (Å):", on_change=lambda _: set_loaded_emu_display(None))
+    wl_min = mo.ui.number(start=800, stop=8000, value=_cfg['wl_min'] if _cfg and 'wl_min' in _cfg else 850, step=1, label="Min Wavelength (Å):", on_change=lambda _: set_loaded_emu_display(None))
+    wl_max = mo.ui.number(start=800, stop=8000, value=_cfg['wl_max'] if _cfg and 'wl_max' in _cfg else 1850, step=1, label="Max Wavelength (Å):", on_change=lambda _: set_loaded_emu_display(None))
 
     scale_selector = mo.ui.dropdown(
         options=_scales,

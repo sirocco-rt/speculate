@@ -359,6 +359,10 @@ class SpectrumModel:
                 # If emulator returned numpy (fallback), switch to CPU mode
                 if not isinstance(weights, torch.Tensor):
                     using_gpu = False
+            except ValueError:
+                # Out-of-bounds or other model errors must propagate immediately
+                # so the caller (e.g. MCMC log_prob) can reject the sample.
+                raise
             except Exception as e:
                 self.log.warning(f"GPU acceleration failed in __call__: {e}. Falling back to CPU.")
                 using_gpu = False
@@ -766,7 +770,7 @@ class SpectrumModel:
                 return -np.inf
         else:
             # CPU Path
-            _jitter = max(1e-30, 1e-6 * np.max(cov.diagonal()))
+            _jitter = max(1e-35, 1e-6 * np.max(cov.diagonal()))
             np.fill_diagonal(cov, cov.diagonal() + _jitter)
             try:
                 factor, flag = cho_factor(cov, overwrite_a=True)
