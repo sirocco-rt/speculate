@@ -912,9 +912,9 @@ class Emulator:
 
         # This is basically the mean square error of the reconstruction
         log.info(
-            f"PCA fit {exp_var:.2f}% of the variance with {pca.n_components_:d} components."
+            f"PCA fit {exp_var:.2f} of the variance with {pca.n_components_:d} components."
         )
-        print(f"PCA fit {exp_var:.2f}% of the variance with {pca.n_components_:d} components.")
+        print(f"PCA fit {exp_var:.2f} of the variance with {pca.n_components_:d} components.")
 
         w_hat = get_w_hat(eigenspectra, fluxes)
         print('Completed get_w_hat')
@@ -2003,10 +2003,14 @@ class Emulator:
         print(f"Optimizing {len(self.get_param_vector())} hyperparameters")
         
         # Calculate maximum allowed variance based on data variance
-        # Cap at 5× empirical weight variance per component to prevent
-        # inflated GP variances that flatten the MCMC likelihood via C_emu.
+        # Cap at 100× empirical weight variance per component to prevent
+        # genuinely runaway GP variances (which flatten the MCMC likelihood
+        # via C_emu) while leaving the marginal-likelihood optimum essentially
+        # unrestricted in normal operation.  The paper (Czekala 2015, App. A)
+        # places no prior on a_int; the cap here is a pragmatic safety rail
+        # against numerical divergence during training, not a Bayesian prior.
         weights_variance = np.var(self.weights, axis=0) # (n_comp,)
-        max_variances = np.maximum(5.0 * weights_variance, 1.0)
+        max_variances = np.maximum(100.0 * weights_variance, 1.0)
         
         def nll(P, apply_penalty=True):
             if np.any(~np.isfinite(P)):
@@ -2067,7 +2071,7 @@ class Emulator:
 
         var_lo  = np.full(K, -30.0)
         _emp_var_j = np.var(self.weights, axis=0)  # (K,)
-        _var_ceil_j = np.maximum(_emp_var_j * 5.0, 1.0)
+        _var_ceil_j = np.maximum(_emp_var_j * 100.0, 1.0)
         var_hi  = np.log(_var_ceil_j)
         ls_lo   = np.tile(np.log(ls_floor), K)
         ls_hi   = np.tile(np.log(ls_ceil),  K)
@@ -2100,7 +2104,11 @@ class Emulator:
                     burn_in_kwargs = default_kwargs.copy()
                     burn_in_kwargs["options"] = burn_in_options
 
-                    burn_in_soln = minimize(nll, P0, args=(False,), **burn_in_kwargs)
+                    # apply_penalty=True: enforce the variance cap during
+                    # burn-in too, otherwise burn-in can settle inside the
+                    # penalty region and leave auto-fatol at ∼|1e15|, which
+                    # short-circuits main-phase convergence.
+                    burn_in_soln = minimize(nll, P0, args=(True,), **burn_in_kwargs)
                     P0 = burn_in_soln.x.copy()
                     current_loss = burn_in_soln.fun
 
@@ -2287,13 +2295,20 @@ class Emulator:
         ls_floor = 0.5 * self._grid_sep      # (d,) — minimum useful resolution
         ls_ceil  = 5.0 * np.ones(d)           # (d,) — beyond this the GP is ~constant
 
-        # Log-space bounds for bounded optimizers (L-BFGS-B, CMA-ES)
-        # variance (index 0): unbounded below, capped at 5× empirical weight variance
+        # Log-space bounds for bounded optimizers (L-BFGS-B, CMA-ES).
+        # variance  (index 0): unbounded below, capped at 100× per-component
+        #                      empirical weight variance (runaway guard only;
+        #                      Czekala 2015 App. A imposes no prior on a_int).
         # lengthscales (indices 1..d): [log(ls_floor), log(ls_ceil)]
-        _emp_var = np.var(self.weights, axis=0)  # (K,)
-        _var_ceil = max(np.max(_emp_var) * 5.0, 1.0)
+        # Per-component ceiling: each component k gets its own bound based on
+        # Var(w_k); using a single scalar (e.g. max over k) leaks the noisiest
+        # component's bound onto the quietest one.
+        _emp_var = np.var(self.weights, axis=0)              # (K,)
+        _var_ceil_k = np.maximum(_emp_var * 100.0, 1.0)      # (K,) per-component
+        log_var_ceil_k = np.log(_var_ceil_k)                 # (K,)
         log_bounds_lower = np.concatenate([[-30.0], np.log(ls_floor)])
-        log_bounds_upper = np.concatenate([[np.log(_var_ceil)], np.log(ls_ceil)])
+        # log_bounds_upper is built per-component inside the loop below
+        # using log_var_ceil_k[k].
 
         # Parse user options
         default_kwargs = {
@@ -2343,7 +2358,7 @@ class Emulator:
             p0[0] = np.log(self.variances[k])
             p0[1:] = np.log(self.lengthscales[k])
 
-            def nll_k(P, _k=k):
+            def nll_k(P, apply_penalty=True, _k=k):
                 if np.any(~np.isfinite(P)):
                     return np.inf
 
@@ -2351,6 +2366,12 @@ class Emulator:
                 log_ls = P[1:]
                 var_k = np.exp(log_var)
                 ls_k = np.exp(log_ls)
+
+                # Per-component variance cap (runaway guard; see notes above).
+                # Large finite penalty — not np.inf — so Nelder-Mead retains
+                # gradient information about how far outside the cap we are.
+                if apply_penalty and var_k > _var_ceil_k[_k]:
+                    return 1e15 + (var_k - _var_ceil_k[_k])
 
                 # Lengthscale bounds
                 if np.any(ls_k < ls_floor) or np.any(ls_k > ls_ceil):
@@ -2444,11 +2465,13 @@ class Emulator:
 
             # --- Optimizer dispatch per component ---
             if optimizer == "nelder-mead":
-                # Burn-in for fatol calibration
+                # Burn-in for fatol calibration.  apply_penalty=True so the
+                # baseline loss reflects the capped region — without it,
+                # burn-in can settle inside a runaway and set fatol ∼ 1e9.
                 burn_in_iter = 50
                 burn_in_opts = {"maxiter": burn_in_iter, "disp": False}
                 burn_soln = minimize(
-                    nll_k, p0,
+                    nll_k, p0, args=(True,),
                     method="Nelder-Mead", options=burn_in_opts,
                     callback=callback,
                 )
@@ -2463,16 +2486,19 @@ class Emulator:
                     "disp": False,
                 }
                 soln = minimize(
-                    nll_k, p0,
+                    nll_k, p0, args=(True,),
                     method="Nelder-Mead", options=comp_opts,
                     callback=callback,
                 )
 
             elif optimizer == "l-bfgs-b":
-                # L-BFGS-B with box constraints in log-space
-                bounds_list = list(zip(log_bounds_lower, log_bounds_upper))
+                # Per-component log-space box bounds (variance ceiling depends on k).
+                log_bounds_upper_k = np.concatenate([[log_var_ceil_k[k]], np.log(ls_ceil)])
+                bounds_list = list(zip(log_bounds_lower, log_bounds_upper_k))
+                # Box bounds enforce the variance cap structurally; skip the
+                # soft penalty to avoid early-return before loss computation.
                 soln = minimize(
-                    nll_k, p0,
+                    nll_k, p0, args=(False,),
                     method="L-BFGS-B",
                     bounds=bounds_list,
                     callback=callback,
@@ -2487,10 +2513,12 @@ class Emulator:
 
             elif optimizer == "cma-es":
                 import cma
+                # Per-component log-space box bounds (variance ceiling depends on k).
+                log_bounds_upper_k = np.concatenate([[log_var_ceil_k[k]], np.log(ls_ceil)])
                 # CMA-ES: population-based evolutionary strategy
                 sigma0 = 0.5  # initial step size in log-space
                 cma_opts = {
-                    "bounds": [log_bounds_lower.tolist(), log_bounds_upper.tolist()],
+                    "bounds": [log_bounds_lower.tolist(), log_bounds_upper_k.tolist()],
                     "maxfevals": per_comp_max_iter,
                     "verbose": -9,  # suppress CMA-ES internal output
                     "tolfun": 1e-8,
@@ -2498,7 +2526,8 @@ class Emulator:
                 es = cma.CMAEvolutionStrategy(p0, sigma0, cma_opts)
                 while not es.stop():
                     solutions = es.ask()
-                    fitnesses = [nll_k(x) for x in solutions]
+                    # Box bounds enforce cap structurally; skip soft penalty.
+                    fitnesses = [nll_k(x, apply_penalty=False) for x in solutions]
                     es.tell(solutions, fitnesses)
                     if callback is not None:
                         callback(None)

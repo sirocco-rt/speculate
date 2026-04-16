@@ -527,21 +527,57 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
             plt.close()
 
         # --- Per-wavelength RMSE envelope ---
+        # Source data from live arrays (if available) or serialised report.
         _arrays = get_tier1_arrays() or {}
         _pca_wl = _arrays.get("pca_per_wl_rmse")
         _loo_wl = _arrays.get("loo_per_wl_rmse")
         _wl = _arrays.get("wavelength")
+        # Fall back to serialised lists in the loaded report
+        if _pca_wl is None:
+            _pca_wl = _t1.get("pca_per_wl_rmse")
+        if _loo_wl is None:
+            _loo_wl = _t1.get("loo_per_wl_rmse")
+        if _wl is None:
+            _wl = _t1.get("wavelength")
+        # Convert to numpy for consistency
+        if _pca_wl is not None:
+            _pca_wl = np.asarray(_pca_wl)
+        if _loo_wl is not None:
+            _loo_wl = np.asarray(_loo_wl)
+        if _wl is not None:
+            _wl = np.asarray(_wl)
+
         if _pca_wl is not None and _wl is not None:
-            _fig_wl, _ax_wl = plt.subplots(figsize=(12, 4))
-            _ax_wl.plot(_wl, _pca_wl, label="PCA truncation only", color="#3498db", lw=1.0)
+            _model_label = "LOO (PCA + GP)"
+            _pca_df = pd.DataFrame({"Wavelength": _wl, "RMSE": _pca_wl, "Source": "PCA truncation only"})
+            _rmse_frames = [_pca_df]
             if _loo_wl is not None:
-                _ax_wl.plot(_wl, _loo_wl, label="LOO (PCA + GP)", color="#e74c3c", lw=1.0, alpha=0.8)
-            _ax_wl.set_xlabel("Wavelength (\u00c5)")
-            _ax_wl.set_ylabel("RMSE (normalised flux)")
-            _ax_wl.set_title("Per-Wavelength Reconstruction Error")
-            _ax_wl.legend()
-            _ax_wl.set_xlim(_wl[0], _wl[-1])
-            plt.tight_layout()
+                _total_df = pd.DataFrame({"Wavelength": _wl, "RMSE": _loo_wl, "Source": _model_label})
+                _rmse_frames.append(_total_df)
+            else:
+                _model_label = "PCA truncation only"   # only one line
+            _rmse_df = pd.concat(_rmse_frames, ignore_index=True)
+
+            _rmse_chart = alt.Chart(_rmse_df).mark_line(
+                strokeWidth=1.5,
+            ).encode(
+                x=alt.X("Wavelength:Q", title="Wavelength (Å)",
+                         scale=alt.Scale(domain=[float(_wl.min()), float(_wl.max())])),
+                y=alt.Y("RMSE:Q", title="RMSE (normalised flux)", axis=alt.Axis(format=".1e")),
+                color=alt.Color("Source:N", title="",
+                                scale=alt.Scale(
+                                    domain=["PCA truncation only", _model_label],
+                                    range=["#3498db", "#e74c3c"]),
+                                legend=alt.Legend(orient="top")),
+                tooltip=[
+                    alt.Tooltip("Source:N"),
+                    alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+                    alt.Tooltip("RMSE:Q", format=".4e"),
+                ],
+            ).properties(
+                width="container", height=200,
+                title="Per-Wavelength Reconstruction Error"
+            )
             _wl_info = mo.md(
                 "### Per-Wavelength RMSE\n\n"
                 "**What this shows:** Reconstruction error at every wavelength bin. The blue "
@@ -557,9 +593,8 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                 "try a different optimiser."
             )
             _t1_items.append(mo.accordion(
-                {"Per-Wavelength RMSE Envelope": mo.hstack([mo.as_html(_fig_wl), _wl_info], widths=[3, 1])}
+                {"Per-Wavelength RMSE Envelope": mo.hstack([_rmse_chart, _wl_info], widths=[3, 1])}
             ))
-            plt.close()
 
         # --- Worst-case spectra overlay ---
         _orig = _arrays.get("original_flux")

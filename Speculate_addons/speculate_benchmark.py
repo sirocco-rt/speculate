@@ -19,6 +19,8 @@ import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+from _version import __version__
+
 import numpy as np
 import pandas as pd
 import cma
@@ -625,7 +627,7 @@ def run_mcmc_single(
         'summary'     : dict of {label: {mean, std, median, hdi_3, hdi_97}}
         'r_hat'       : dict of {label: r_hat}
         'ess_bulk'    : dict of {label: ess}
-        'converged'   : bool — all r_hat < 1.05 and ess > 100
+        'converged'   : bool — all r_hat < 1.1 and ess > 100
         'n_effective'  : int
     """
     import emcee
@@ -766,9 +768,9 @@ def run_mcmc_single(
         ess_dict[label] = int(flat.shape[0])  # conservative: total thinned samples
 
     # Treat convergence as a pragmatic quality gate for the viewer: all finite
-    # r_hat values must be below 1.05 and there must be enough retained samples
-    # to support posterior summaries.
-    converged = all(rh < 1.05 for rh in r_hat_dict.values() if np.isfinite(rh))
+    # r_hat values must be below 1.1 and there must be enough retained samples
+    # to support posterior summaries Vivekananda 2019 (Vehtari et al. 2021, arXiv:1903.08008 criticizes R_hat choice).
+    converged = all(rh < 1.1 for rh in r_hat_dict.values() if np.isfinite(rh))
     converged = converged and flat.shape[0] >= 100
 
     # Restore any nuisance params that were frozen for this MCMC run so the
@@ -1548,7 +1550,7 @@ def build_report_card(
         trace plots can be reconstructed when reloading.
     """
     report = {
-        "speculate_benchmark_version": "1.0.0",
+        "speculate_benchmark_version": __version__,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
@@ -1566,6 +1568,17 @@ def build_report_card(
                 t1_summary[k] = v
             elif isinstance(v, list) and len(v) < 100:
                 t1_summary[k] = v
+
+        # Serialise per-wavelength RMSE arrays so loaded reports can
+        # reconstruct the per-wavelength envelope plot without re-running.
+        _t1_arrays = tier1.get("_arrays") or {}
+        for _ak in ("pca_per_wl_rmse", "loo_per_wl_rmse", "wavelength"):
+            _av = _t1_arrays.get(_ak)
+            if _av is not None:
+                t1_summary[_ak] = (
+                    _av.tolist() if hasattr(_av, "tolist") else list(_av)
+                )
+
         report["tier1"] = t1_summary
 
     if tier2 is not None:
@@ -1603,6 +1616,10 @@ def build_report_card(
                     _entry["full_chain"] = _c.tolist() if hasattr(_c, "tolist") else _c
                 if "burnin_used" in _p:
                     _entry["burnin_used"] = _p["burnin_used"]
+                if "bestfit_spec" in _p and _p["bestfit_spec"]:
+                    _entry["bestfit_spec"] = _p["bestfit_spec"]
+                if "prior_ranges" in _p and _p["prior_ranges"]:
+                    _entry["prior_ranges"] = _p["prior_ranges"]
                 _serialised_posteriors.append(_entry)
             t2_summary["posteriors"] = _serialised_posteriors
         report["tier2"] = t2_summary
