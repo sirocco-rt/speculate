@@ -173,7 +173,7 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
         _mode = "Local Machine"
 
     _items = [mo.md(f"#Speculate {mo.icon('lucide:telescope')}")]
-    _items.extend([mo.md(" "), mo.md("---"), mo.md("---"), mo.md(" ")])
+    _items.extend([mo.md(" "), mo.md("---"), mo.md(" ")])
 
     if _mode == "HuggingFace Space":
         _items.append(mo.nav_menu({
@@ -183,7 +183,6 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
         }, orientation="vertical"))
         _items.extend([
             mo.md(" "),
-            mo.md("---"),
             mo.md("---"),
             mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
             mo.md("Install Speculate Locally"), mo.md(" "),
@@ -204,7 +203,7 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
         }, orientation="vertical"))
 
     _items.extend([
-        mo.md(" "), mo.md("---"), mo.md("---"),
+        mo.md(" "), mo.md("---"),
         mo.nav_menu({
             "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
             "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
@@ -214,7 +213,6 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
             "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
             "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs",
         }, orientation="vertical"),
-        mo.md("---"),
         mo.md("---"),
     ])
     if hf_mode_switch is not None:

@@ -122,7 +122,6 @@ def _(hf_mode_switch, is_hf_space, mo, usage_bars):
         mo.md(f"#Speculate {mo.icon('lucide:telescope')}"),
         mo.md(" "),
         mo.md("---"),
-        mo.md("---"),
         mo.md(" "),
     ]
 
@@ -161,7 +160,6 @@ def _(hf_mode_switch, is_hf_space, mo, usage_bars):
     sidebar_items.extend([
         mo.md(" "),
         mo.md("---"),
-        mo.md("---"),
         mo.nav_menu({
             "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
             "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
@@ -172,7 +170,6 @@ def _(hf_mode_switch, is_hf_space, mo, usage_bars):
             "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
             "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs",
         }, orientation="vertical"),
-        mo.md("---"),
         mo.md("---"),
     ])
 

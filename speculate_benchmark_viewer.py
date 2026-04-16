@@ -74,7 +74,7 @@ def _(mo, os, usage_bars):
     _is_hf = os.environ.get("SPACE_ID") is not None
 
     _items = [mo.md(f"# Speculate {mo.icon('lucide:telescope')}")]
-    _items.extend([mo.md(" "), mo.md("---"), mo.md("---"), mo.md(" ")])
+    _items.extend([mo.md(" "), mo.md("---"), mo.md(" ")])
 
     if _is_hf:
         _items.append(mo.nav_menu({
@@ -84,7 +84,6 @@ def _(mo, os, usage_bars):
         }, orientation="vertical"))
         _items.extend([
             mo.md(" "),
-            mo.md("---"),
             mo.md("---"),
             mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
             mo.md("Install Speculate Locally"),
@@ -109,7 +108,7 @@ def _(mo, os, usage_bars):
         }, orientation="vertical"))
 
     _items.extend([
-        mo.md(" "), mo.md("---"), mo.md("---"),
+        mo.md(" "), mo.md("---"),
         mo.nav_menu({
             "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
             "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
