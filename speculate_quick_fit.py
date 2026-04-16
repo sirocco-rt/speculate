@@ -2954,6 +2954,7 @@ def _(
 def _(
     mo,
     np,
+    param_map_db,
     qf_inf_emu_data,
     qf_inf_input_scaler,
     qf_inf_is_grid_interp,
@@ -2964,11 +2965,12 @@ def _(
     qf_obs_scale_selector,
     qf_predict_flux,
     qf_transform_observation_data,
+    re,
 ):
-    # ── Nuisance Parameter Playground ──
-    # Interactive sliders to preview how Av, log_scale, and cheb_1 shift the
-    # emulated midpoint spectrum relative to the observation. Helps find
-    # sensible prior bounds before running MLE.
+    # ── Parameter Playground ──
+    # Interactive sliders to preview how Av, log_scale, cheb_1, and the
+    # physical grid axes shift the emulated spectrum relative to the
+    # observation. Helps find sensible prior bounds before running MLE.
 
     # Default slider widgets — created unconditionally so downstream cells
     # always receive valid references even before a model is loaded.
@@ -3024,7 +3026,38 @@ def _(
                                    label="log_scale (ln flux scaling)", show_value=True, full_width=True)
     qf_pg_cheb1 = mo.ui.slider(start=-2.0, stop=2.0, value=0.0, step=0.01,
                                 label="cheb_1 (continuum tilt)", show_value=True, full_width=True)
-    return qf_pg_av, qf_pg_cheb1, qf_pg_logscale
+
+    # ── Physical parameter sliders ──
+    # One slider per emulator axis so the user can reshape the emulated
+    # spectrum. Ranges span the emulator's training grid; defaults sit at
+    # the midpoint (matching the reference point used for auto-centring).
+    # Labels are resolved through param_map_db so users see physical names
+    # (e.g. "disk.mdot") instead of generic "paramN" tags, and a log10()
+    # wrapper is added for parameters stored on a log10 axis.
+    _qf_phys_sliders = []
+    _qf_param_names = qf_inf_emu_data["param_names"]
+    for _pi, _pname in enumerate(_qf_param_names):
+        _lo = float(_min_p[_pi])
+        _hi = float(_max_p[_pi])
+        _mid = (_lo + _hi) / 2.0
+        _step = max((_hi - _lo) / 200.0, 1e-6)
+
+        _m = re.search(r"(\d+)", str(_pname))
+        _db_idx = int(_m.group(1)) if _m else None
+        if _db_idx is not None and _db_idx in param_map_db:
+            _base_name = param_map_db[_db_idx][0]
+            _is_log = (len(param_map_db[_db_idx]) > 3
+                       and bool(param_map_db[_db_idx][3]))
+            _label = f"log10({_base_name})" if _is_log else _base_name
+        else:
+            _label = str(_pname)
+
+        _qf_phys_sliders.append(mo.ui.slider(
+            start=_lo, stop=_hi, value=_mid, step=_step,
+            label=_label, show_value=True, full_width=True,
+        ))
+    qf_pg_phys_sliders = mo.ui.array(_qf_phys_sliders)
+    return qf_pg_av, qf_pg_cheb1, qf_pg_logscale, qf_pg_phys_sliders
 
 
 @app.cell
@@ -3045,18 +3078,25 @@ def _(
     qf_pg_av,
     qf_pg_cheb1,
     qf_pg_logscale,
+    qf_pg_phys_sliders,
     qf_predict_flux,
     qf_transform_observation_data,
 ):
-    # ── Playground chart: reactive Altair overlay of emulated midpoint spectrum
-    # (with current nuisance slider values) vs observation.
+    # ── Playground chart: reactive Altair overlay of emulated spectrum
+    # (at user-selected physical parameters with current nuisance slider
+    # values) vs observation.
     _pg_chart = None
 
     if qf_inf_emu_data is not None and qf_inf_models is not None and qf_obs_data is not None:
         try:
             _min_p = qf_inf_emu_data["min_params"]
             _max_p = qf_inf_emu_data["max_params"]
-            _mid_params = (_min_p + _max_p) / 2.0
+            # Physical parameter vector — from sliders when available, otherwise
+            # fall back to the training-grid midpoint.
+            if qf_pg_phys_sliders is not None:
+                _mid_params = np.array(qf_pg_phys_sliders.value, dtype=float)
+            else:
+                _mid_params = (_min_p + _max_p) / 2.0
             _wl_lo, _wl_hi = qf_inf_wl_slider.value
 
             _emu_fl, _ = qf_predict_flux(
@@ -3129,26 +3169,37 @@ def _(
             _pg_chart = mo.callout(mo.md(f"Playground error: {_e}"), kind="danger")
 
     if _pg_chart is not None:
+        _nuisance_tab = mo.vstack([
+            qf_pg_av,
+            qf_pg_logscale,
+            qf_pg_cheb1,
+        ])
+        if qf_pg_phys_sliders is not None and len(qf_pg_phys_sliders) > 0:
+            _physical_tab = mo.vstack(list(qf_pg_phys_sliders))
+        else:
+            _physical_tab = mo.md("*No physical parameters available.*")
+        _slider_tabs = mo.ui.tabs({
+            "Nuisance Parameters": _nuisance_tab,
+            "Physical Parameters": _physical_tab,
+        })
         _pg_content = mo.vstack([
             mo.callout(mo.md(
-                "**Nuisance Parameter Playground — Find sensible prior settings**\n\n"
-                "Adjust the sliders to see how nuisance parameters shift the emulated "
-                "spectrum. Physical grid parameters are held at midpoint. Focus on "
-                "getting the spectra to a similar *scale* — the shape will be refined by MLE.\n\n"
+                "**Parameter Playground — Find sensible prior settings**\n\n"
+                "Use the **Nuisance Parameters** tab to bring the emulated spectrum "
+                "to a similar scale as the observation, and the **Physical Parameters** "
+                "tab to reshape the emulated spectrum by varying the grid axes.\n\n"
                 "- **Av** — Interstellar dust extinction (magnitudes)\n"
                 "- **log_scale** — Natural log of flux scaling factor\n"
                 "- **cheb_1** — Chebyshev c₁ coefficient (continuum tilt)"
             ), kind="neutral"),
-            qf_pg_av,
-            qf_pg_logscale,
-            qf_pg_cheb1,
+            _slider_tabs,
             _pg_chart,
         ])
     else:
         _pg_content = mo.md("*Load a model and observation to use the playground.*")
 
     mo.accordion({
-        "Nuisance Parameter Playground — Aid to find optimal prior settings": _pg_content
+        "Parameter Playground — Aid to find optimal prior settings": _pg_content
     })
     return
 

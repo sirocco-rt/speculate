@@ -882,12 +882,11 @@ def _(mo):
 
 
 @app.cell
-def _(emu, fit_power_law_continuum, mo, np, obs_data, obs_flux_scale, wl_range_slider):
-    # ── Nuisance Parameter Playground ──
-    # Interactive sliders for the four nuisance/inference parameters so the user
-    # can visually explore how they shift the emulated spectrum before committing
-    # to prior bounds.  Physical (grid) parameters are held at the midpoint of
-    # the emulator training range.
+def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_scale, param_map_db, re, wl_range_slider):
+    # ── Parameter Playground ──
+    # Interactive sliders for the nuisance/inference parameters and the
+    # physical grid axes so the user can visually explore how each shifts
+    # the emulated spectrum before committing to prior bounds.
     #
     # Slider ranges for log_scale and log_amp are auto-computed from the ratio
     # of the emulator's midpoint flux to the (transformed) observation flux, so
@@ -995,6 +994,45 @@ def _(emu, fit_power_law_continuum, mo, np, obs_data, obs_flux_scale, wl_range_s
         else:
             pg_mid_params = np.zeros(len(emu.param_names))
 
+        # ── Physical parameter sliders ──
+        # One slider per emulator axis so the user can reshape the emulated
+        # spectrum.  Ranges span the emulator's training grid; default values
+        # sit at the midpoint (matching pg_mid_params used for auto-centring).
+        # Labels are resolved through param_map_db so users see physical names
+        # (e.g. "disk.mdot") instead of generic "paramN" tags, and a log10()
+        # wrapper is added for parameters stored on a log10 axis.
+        _phys_sliders = []
+        _sorted_phys_idx = sorted(list(grid_indices)) if grid_indices else []
+        for _pi, _pname in enumerate(emu.param_names):
+            _lo = float(emu.min_params[_pi]) if hasattr(emu, 'min_params') else 0.0
+            _hi = float(emu.max_params[_pi]) if hasattr(emu, 'max_params') else 1.0
+            _mid = (_lo + _hi) / 2.0
+            _step = max((_hi - _lo) / 200.0, 1e-6)
+
+            # Prefer the grid_indices mapping when it lines up; otherwise
+            # fall back to parsing "paramN" directly from the axis name.
+            _db_idx = None
+            if len(_sorted_phys_idx) == len(emu.param_names):
+                _db_idx = _sorted_phys_idx[_pi]
+            else:
+                _m = re.search(r"param(\d+)", str(_pname))
+                if _m:
+                    _db_idx = int(_m.group(1))
+
+            if _db_idx is not None and _db_idx in param_map_db:
+                _base_name = param_map_db[_db_idx][0]
+                _is_log = (len(param_map_db[_db_idx]) > 3
+                           and bool(param_map_db[_db_idx][3]))
+                _label = f"log10({_base_name})" if _is_log else _base_name
+            else:
+                _label = str(_pname)
+
+            _phys_sliders.append(mo.ui.slider(
+                start=_lo, stop=_hi, value=_mid, step=_step,
+                label=_label, show_value=True, full_width=True,
+            ))
+        pg_phys_sliders = mo.ui.array(_phys_sliders)
+
         _playground_ui = mo.md("")
     else:
         pg_av_slider = None
@@ -1003,9 +1041,10 @@ def _(emu, fit_power_law_continuum, mo, np, obs_data, obs_flux_scale, wl_range_s
         pg_logamp_slider = None
         pg_logls_slider = None
         pg_mid_params = None
+        pg_phys_sliders = None
 
     _playground_ui
-    return pg_av_slider, pg_cheb1_slider, pg_logamp_slider, pg_logls_slider, pg_logscale_slider, pg_mid_params
+    return pg_av_slider, pg_cheb1_slider, pg_logamp_slider, pg_logls_slider, pg_logscale_slider, pg_mid_params, pg_phys_sliders
 
 
 @app.cell
@@ -1024,12 +1063,14 @@ def _(
     pg_logls_slider,
     pg_logscale_slider,
     pg_mid_params,
+    pg_phys_sliders,
     wl_range_slider,
 ):
     # ── Playground: Reactive Emulated vs Observed Spectrum Chart ──
-    # Generates the emulated spectrum at physical-parameter midpoints with
-    # the current nuisance-slider values, then overlays it with the
-    # observation inside an interactive Altair chart.
+    # Generates the emulated spectrum at the user-selected physical parameters
+    # (from the Physical tab sliders) combined with the current nuisance
+    # slider values, then overlays it with the observation inside an
+    # interactive Altair chart.
 
     _playground_chart = None
 
@@ -1041,8 +1082,15 @@ def _(
             _wl_min = wl_range_slider.value[0]
             _wl_max = wl_range_slider.value[1]
 
+            # Physical parameter vector — from sliders when available, otherwise
+            # fall back to the emulator training-grid midpoint.
+            if pg_phys_sliders is not None:
+                _phys_params = np.array(pg_phys_sliders.value, dtype=float)
+            else:
+                _phys_params = pg_mid_params
+
             # --- Emulated spectrum reconstruction ---
-            weights, cov = emu(pg_mid_params)
+            weights, cov = emu(_phys_params)
             X = emu.eigenspectra * emu.flux_std
             emu_flux = (weights @ X) + emu.flux_mean
             emu_wl = np.array(emu.wl)
@@ -1183,25 +1231,35 @@ def _(
 
     # Assemble everything inside the accordion: callout, sliders, then chart
     if (pg_av_slider is not None and _playground_chart is not None):
+        _nuisance_tab = mo.vstack([
+            pg_av_slider,
+            pg_logscale_slider,
+            pg_cheb1_slider,
+            pg_logamp_slider,
+            pg_logls_slider,
+        ])
+        if pg_phys_sliders is not None and len(pg_phys_sliders) > 0:
+            _physical_tab = mo.vstack(list(pg_phys_sliders))
+        else:
+            _physical_tab = mo.md("*No physical parameters available.*")
+        _slider_tabs = mo.ui.tabs({
+            "Nuisance Parameters": _nuisance_tab,
+            "Physical Parameters": _physical_tab,
+        })
         _pg_content = mo.vstack([
             mo.callout(mo.md(
-                "**Nuisance Parameter Playground - Find sensible prior settings**\n\n"
-                "Adjust the sliders below to see how nuisance parameters affect "
-                "the emulated spectrum compared to your observation. Physical grid "
-                "parameters are held at the midpoint of each parameter's range. The shape of the emulated"
-                " spectrum does not matter here. Instead, just focus on making the spectra look like they are at"
-                " a similar scale to each other and the uncertainty is reasonable.\n\n"
+                "**Parameter Playground - Find sensible prior settings**\n\n"
+                "Use the **Nuisance Parameters** tab to bring the emulated spectrum "
+                "to a similar scale and uncertainty as the observation, and the "
+                "**Physical Parameters** tab to reshape the emulated spectrum by "
+                "varying the grid axes.\n\n"
                 "- **Av** — Interstellar dust extinction (magnitudes). Reddens and dims the spectrum.\n"
                 "- **log_scale** — Natural log of the flux scaling factor. Shifts the spectrum up/down.\n"
                 "- **cheb_1** — Chebyshev c₁ coefficient. Applies a linear tilt to the continuum gradient.\n"
                 "- **log_amp** — GP covariance amplitude (affects uncertainty envelope, not the mean spectrum).\n"
                 "- **log_ls** — GP covariance length scale (affects uncertainty smoothness, not the mean spectrum)."
             ), kind="neutral"),
-            pg_av_slider,
-            pg_logscale_slider,
-            pg_cheb1_slider,
-            pg_logamp_slider,
-            pg_logls_slider,
+            _slider_tabs,
             _playground_chart,
         ])
     elif _playground_chart is not None:
@@ -1212,7 +1270,7 @@ def _(
         )
 
     mo.accordion({
-        "Nuisance Parameter Playground - Aid to find optimal prior settings": _pg_content
+        "Parameter Playground - Aid to find optimal prior settings": _pg_content
     })
     return
 
