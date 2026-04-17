@@ -364,10 +364,10 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
             "n_params": ("Parameters", ""),
             "tier1_time_s": ("Runtime (s)", ""),
             "pca_explained_variance": ("PCA Explained Variance", "higher is better; \u22650.999 typical"),
-            "q2_aggregate": ("Aggregate Q\u00b2 (LOO R\u00b2)", "higher is better; \u22650.99 ideal"),
-            "nlpd_mean": ("Mean NLPD", "lower is better; compare across configs"),
+            "q2_aggregate": ("Aggregate Q\u00b2 (LOO R\u00b2)", "higher is better; \u22650.80 good for sparse physics grids, \u22650.95 excellent"),
+            "nlpd_mean": ("Mean NLPD", "lower is better; compare across configs (drops with k due to shrinking weight scale, not better fit)"),
             "std_resid_mean": ("Std. Residual Mean", "\u22480 ideal; bias if far from 0"),
-            "std_resid_var": ("Std. Residual Variance", "\u22481 ideal; >1 \u2192 under-confident"),
+            "std_resid_var": ("Std. Residual Variance", "\u22481 ideal; >1 \u2192 over-confident (\u03c3 too small); <1 \u2192 under-confident (\u03c3 too large)"),
             "pca_recon_rmse_median": ("PCA RMSE (median)", "lower is better; PCA truncation floor"),
             "pca_recon_rmse_95": ("PCA RMSE (95th pctl)", "lower is better; worst-case PCA error"),
             "pca_max_fractional_resid": ("PCA Max Frac. Residual", "lower is better; worst PCA pixel error"),
@@ -417,7 +417,7 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
         # --- Q² per component ---
         if _q2s:
             _fig_q2, _ax_q2 = plt.subplots(figsize=(7, 4))
-            _colors = ["#2ecc71" if v >= 0.99 else "#f39c12" if v >= 0.9 else "#e74c3c" for v in _q2s]
+            _colors = ["#2ecc71" if v >= 0.90 else "#f39c12" if v >= 0.70 else "#e74c3c" for v in _q2s]
             _ax_q2.bar(range(len(_q2s)), _q2s, color=_colors)
             _ax_q2.set_xlabel("PCA Component")
             _ax_q2.set_ylabel("Q\u00b2")
@@ -427,8 +427,8 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
             _q2_info = mo.md(
                 "### Per-Component Q\u00b2\n\n"
                 "**What this shows:** The leave-one-out predictive R\u00b2 for each PCA "
-                "component. Bars are colour-coded: green (\u22650.99), amber (\u22650.9), "
-                "red (<0.9).\n\n"
+                "component. Bars are colour-coded: green (\u22650.90), amber (\u22650.70), "
+                "red (<0.70).\n\n"
                 "**Better looks like:** All bars green and close to 1.0.\n\n"
                 "**Watch out for:** Red or amber bars, especially on the leading "
                 "components which carry the most spectral variance.\n\n"
@@ -481,9 +481,9 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                 "components, overlaid with the expected N(0,1) Gaussian (red curve).\n\n"
                 "**Better looks like:** The histogram closely tracks the red curve — "
                 "symmetric, centred on zero, with the same width.\n\n"
-                "**Watch out for:** Heavy tails (the GP underestimates uncertainty), "
-                "a shifted centre (systematic bias), or a narrower/wider peak than N(0,1) "
-                "(over/under-confident variances).\n\n"
+                "**Watch out for:** Heavy tails (the GP is over-confident \u2014 \u03c3 too small), "
+                "a shifted centre (systematic bias), or a narrower peak than N(0,1) "
+                "(under-confident \u2014 \u03c3 too large).\n\n"
                 "**How to improve:** Bias \u2192 check for a bug in the mean function. "
                 "Heavy tails \u2192 add training points or try a different optimiser."
             )
@@ -516,13 +516,53 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                 "against a standard normal distribution. If the GP uncertainty estimates are "
                 "well-calibrated the points should lie on the red diagonal.\n\n"
                 "**Better looks like:** All points hugging the 1:1 red line with minimal scatter.\n\n"
-                "**Watch out for:** An S-shape (heavy tails \u2014 under-confident or outlier-prone), "
-                "a banana curve (skew), or systematic departure from the diagonal.\n\n"
+                "**Watch out for:** An S-shape or slope > 1 (heavy tails \u2014 GP is over-confident, "
+                "\u03c3 too small), a banana curve (skew), or systematic departure from the diagonal. "
+                "Note: marginal standardised residuals are correlated, which can induce apparent "
+                "heavy tails even in a well-calibrated GP (Bastos & O'Hagan 2009). See the "
+                "decorrelated Q\u2013Q panel below for a cleaner diagnostic.\n\n"
                 "**How to improve:** Heavy tails suggest the GP variance is too small for some "
                 "predictions \u2014 try adding training points or a different kernel/optimiser."
             )
             _t1_items.append(mo.accordion(
                 {"Q\u2013Q Plot": mo.hstack([mo.as_html(_fig_qq), _qq_info], widths=[2, 1])}
+            ))
+            plt.close()
+
+        # --- Decorrelated Q-Q plot (Bastos & O'Hagan 2009) ---
+        _decorr_resid = _t1.get("loo_decorr_resid", [])
+        if _decorr_resid:
+            from scipy import stats as _sp_stats
+            _dflat = np.sort(np.array(_decorr_resid).flatten())
+            _dn_pts = len(_dflat)
+            _dtheoretical = _sp_stats.norm.ppf(
+                (np.arange(1, _dn_pts + 1) - 0.5) / _dn_pts
+            )
+            _fig_dqq, _ax_dqq = plt.subplots(figsize=(5, 5))
+            _ax_dqq.scatter(_dtheoretical, _dflat, s=1, alpha=0.4, color="darkorange")
+            _dqq_lim = max(abs(_dtheoretical[0]), abs(_dtheoretical[-1]),
+                           abs(_dflat[0]), abs(_dflat[-1]))
+            _ax_dqq.plot([-_dqq_lim, _dqq_lim], [-_dqq_lim, _dqq_lim], "r-", lw=1.0)
+            _ax_dqq.set_xlabel("Theoretical Quantiles (N(0,1))")
+            _ax_dqq.set_ylabel("Decorrelated Sample Quantiles")
+            _ax_dqq.set_title("Decorrelated Q\u2013Q Plot (Bastos & O\u2019Hagan 2009)")
+            _ax_dqq.set_aspect("equal")
+            plt.tight_layout()
+            _dqq_info = mo.md(
+                "### Decorrelated Q\u2013Q Plot\n\n"
+                "**What this shows:** Quantiles of Cholesky-decorrelated LOO residuals "
+                "against N(0,1). Unlike the marginal Q\u2013Q above, this removes the "
+                "correlation between LOO predictions (Bastos & O\u2019Hagan 2009 \u00a74), "
+                "giving a correctly interpretable diagnostic.\n\n"
+                "**Better looks like:** Points on the 1:1 red line.\n\n"
+                "**Watch out for:** Slope > 1 \u2192 GP is over-confident (\u03c3 too small). "
+                "Slope < 1 \u2192 GP is under-confident (\u03c3 too large). "
+                "S-shape \u2192 heavy-tailed or non-Gaussian residuals.\n\n"
+                "**How to improve:** Systematic slope \u2260 1 \u2192 retrain with different "
+                "kernel or optimiser. Localised outliers \u2192 add training points."
+            )
+            _t1_items.append(mo.accordion(
+                {"Decorrelated Q\u2013Q Plot": mo.hstack([mo.as_html(_fig_dqq), _dqq_info], widths=[2, 1])}
             ))
             plt.close()
 

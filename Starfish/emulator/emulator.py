@@ -1562,11 +1562,11 @@ class Emulator:
         )
 
         if use_gpu:
-            loo_mu, loo_var = self._loo_cv_gpu(w_hat_all, M)
+            loo_mu, loo_var, loo_decorr = self._loo_cv_gpu(w_hat_all, M)
         elif use_gpu_mem_eff:
-            loo_mu, loo_var = self._loo_cv_gpu_memory_efficient(w_hat_all, M)
+            loo_mu, loo_var, loo_decorr = self._loo_cv_gpu_memory_efficient(w_hat_all, M)
         else:
-            loo_mu, loo_var = self._loo_cv_cpu(w_hat_all, M)
+            loo_mu, loo_var, loo_decorr = self._loo_cv_cpu(w_hat_all, M)
 
         # -----------------------------------------------------------
         # Derived weight-space metrics (always on CPU/numpy)
@@ -1598,6 +1598,7 @@ class Emulator:
             'loo_var': loo_var,
             'loo_residuals': loo_residuals,
             'loo_std_resid': loo_std_resid,
+            'loo_decorr_resid': loo_decorr,
             'loo_mse_per_comp': loo_mse,
             'loo_rmse_per_comp': loo_rmse,
             'q2_per_comp': q2_per_comp,
@@ -1701,6 +1702,7 @@ class Emulator:
 
         loo_mu_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
         loo_var_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
+        loo_decorr_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
         is_block_diagonal = (self._v11_gpu.dim() == 3)
 
         for k in range(self.ncomps):
@@ -1727,8 +1729,25 @@ class Emulator:
             loo_mu_gpu[k] = w_k - K_inv_w / K_inv_diag
             loo_var_gpu[k] = 1.0 / K_inv_diag
 
-        # Transfer results back to CPU (small: 2 × ncomps × M floats)
-        return loo_mu_gpu.cpu().numpy(), loo_var_gpu.cpu().numpy()
+            # Decorrelated residuals (Bastos & O'Hagan 2009, pivoted-Cholesky).
+            # R[i,j] = K_inv[i,j] / sqrt(K_inv[i,i]*K_inv[j,j]) is the
+            # correlation matrix of the LOO standardised residuals.
+            _isqd = 1.0 / torch.sqrt(torch.clamp(K_inv_diag, min=1e-30))
+            R_k = K_inv * (_isqd.unsqueeze(0) * _isqd.unsqueeze(1))
+            R_k.diagonal().add_(1e-8)  # stabilise Cholesky
+            try:
+                L_R = torch.linalg.cholesky(R_k)
+            except torch.linalg.LinAlgError:
+                R_k.diagonal().add_(1e-6)
+                L_R = torch.linalg.cholesky(R_k)
+            z_k = (w_k - loo_mu_gpu[k]) * torch.sqrt(torch.clamp(K_inv_diag, min=1e-30))
+            loo_decorr_gpu[k] = torch.linalg.solve_triangular(
+                L_R, z_k.unsqueeze(1), upper=False
+            ).squeeze(1)
+
+        # Transfer results back to CPU (small: 3 × ncomps × M floats)
+        return (loo_mu_gpu.cpu().numpy(), loo_var_gpu.cpu().numpy(),
+                loo_decorr_gpu.cpu().numpy())
 
     def _loo_cv_gpu_memory_efficient(self, w_hat_all: np.ndarray, M: int):
         """
@@ -1776,6 +1795,7 @@ class Emulator:
 
         loo_mu_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
         loo_var_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
+        loo_decorr_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
 
         self.log.info(f"Memory-efficient LOO-CV: building V11 blocks on-the-fly ({self.ncomps} components, M={M})")
 
@@ -1824,10 +1844,26 @@ class Emulator:
             loo_mu_gpu[k] = w_k - K_inv_w / K_inv_diag
             loo_var_gpu[k] = 1.0 / K_inv_diag
 
+            # Decorrelated residuals (Bastos & O'Hagan 2009)
+            _isqd = 1.0 / torch.sqrt(torch.clamp(K_inv_diag, min=1e-30))
+            R_k = K_inv * (_isqd.unsqueeze(0) * _isqd.unsqueeze(1))
+            R_k.diagonal().add_(1e-8)
+            try:
+                L_R = torch.linalg.cholesky(R_k)
+            except torch.linalg.LinAlgError:
+                R_k.diagonal().add_(1e-6)
+                L_R = torch.linalg.cholesky(R_k)
+            z_k = (w_k - loo_mu_gpu[k]) * torch.sqrt(torch.clamp(K_inv_diag, min=1e-30))
+            loo_decorr_gpu[k] = torch.linalg.solve_triangular(
+                L_R, z_k.unsqueeze(1), upper=False
+            ).squeeze(1)
+            del R_k, L_R
+
             del K_inv
             torch.cuda.empty_cache()
 
-        return loo_mu_gpu.cpu().numpy(), loo_var_gpu.cpu().numpy()
+        return (loo_mu_gpu.cpu().numpy(), loo_var_gpu.cpu().numpy(),
+                loo_decorr_gpu.cpu().numpy())
 
     def _loo_cv_cpu(self, w_hat_all: np.ndarray, M: int):
         """
@@ -1848,6 +1884,7 @@ class Emulator:
 
         loo_mu = np.zeros((self.ncomps, M))
         loo_var = np.zeros((self.ncomps, M))
+        loo_decorr = np.zeros((self.ncomps, M))
 
         for k in range(self.ncomps):
             if self.block_diagonal:
@@ -1868,7 +1905,19 @@ class Emulator:
             loo_mu[k] = w_k - K_inv_w / K_inv_diag
             loo_var[k] = 1.0 / K_inv_diag
 
-        return loo_mu, loo_var
+            # Decorrelated residuals (Bastos & O'Hagan 2009)
+            _isqd = 1.0 / np.sqrt(np.maximum(K_inv_diag, 1e-30))
+            R_k = K_inv * np.outer(_isqd, _isqd)
+            R_k[np.diag_indices_from(R_k)] += 1e-8
+            try:
+                L_R = np.linalg.cholesky(R_k)
+            except np.linalg.LinAlgError:
+                R_k[np.diag_indices_from(R_k)] += 1e-6
+                L_R = np.linalg.cholesky(R_k)
+            z_k = (w_k - loo_mu[k]) * np.sqrt(np.maximum(K_inv_diag, 1e-30))
+            loo_decorr[k] = np.linalg.solve(L_R, z_k)
+
+        return loo_mu, loo_var, loo_decorr
 
     def norm_factor(self, params: Union[Sequence[float], np.ndarray]) -> float:
         """
