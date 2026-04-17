@@ -3078,7 +3078,9 @@ def _(
     qf_pg_av,
     qf_pg_cheb1,
     qf_pg_logscale,
+     qf_pg_nll_result,
     qf_pg_phys_sliders,
+    qf_pg_test_nll_btn,
     qf_predict_flux,
     qf_transform_observation_data,
 ):
@@ -3194,6 +3196,8 @@ def _(
             ), kind="neutral"),
             _slider_tabs,
             _pg_chart,
+            qf_pg_test_nll_btn,
+            qf_pg_nll_result,
         ])
     else:
         _pg_content = mo.md("*Load a model and observation to use the playground.*")
@@ -3202,6 +3206,132 @@ def _(
         "Parameter Playground — Aid to find optimal prior settings": _pg_content
     })
     return
+
+
+@app.cell
+def _(mo):
+    # Run button for on-demand NLL evaluation from the playground sliders.
+    # Kept in its own cell so the evaluator below picks up click events
+    # reactively (a run_button's `.value` only flips in downstream cells).
+    qf_pg_test_nll_btn = mo.ui.run_button(
+        label=f"{mo.icon('lucide:calculator')} Test NLL"
+    )
+    return (qf_pg_test_nll_btn,)
+
+
+@app.cell
+def _(
+    chebval,
+    mo,
+    np,
+    qf_inf_emu_data,
+    qf_inf_input_scaler,
+    qf_inf_is_grid_interp,
+    qf_inf_models,
+    qf_inf_output_scaler,
+    qf_inf_wl_slider,
+    qf_obs_data,
+    qf_obs_scale_selector,
+    qf_pg_av,
+    qf_pg_cheb1,
+    qf_pg_logscale,
+    qf_pg_phys_sliders,
+    qf_pg_test_nll_btn,
+    qf_predict_flux,
+    qf_transform_observation_data,
+):
+    # ── Test NLL ──
+    # On click, replicate the Quick Fit MLE objective (χ² = Σ((model −
+    # obs)/σ)²) at the current playground slider values, so the user can
+    # sanity-check whether their chosen prior region is near a reasonable
+    # fit before committing to a full MLE run.
+    qf_pg_nll_result = mo.md("")
+
+    if qf_pg_test_nll_btn.value:
+        if (qf_inf_emu_data is None or qf_inf_models is None
+                or qf_obs_data is None or qf_pg_phys_sliders is None):
+            qf_pg_nll_result = mo.callout(
+                mo.md("Load a model and observation first."),
+                kind="warn",
+            )
+        else:
+            try:
+                _wl_lo, _wl_hi = qf_inf_wl_slider.value
+                _obs_mask = ((qf_obs_data['wavelength'] >= _wl_lo)
+                             & (qf_obs_data['wavelength'] <= _wl_hi))
+                _obs_wl = np.array(qf_obs_data[_obs_mask]['wavelength'])
+                _raw_fl = np.array(qf_obs_data[_obs_mask]['flux'])
+                _raw_err = (np.array(qf_obs_data[_obs_mask]['error'])
+                            if 'error' in qf_obs_data.columns else None)
+
+                _scale = qf_obs_scale_selector.value
+                _obs_fl, _obs_err = qf_transform_observation_data(
+                    _obs_wl, _raw_fl, _raw_err, _scale
+                )
+
+                _phys = np.array(qf_pg_phys_sliders.value, dtype=float)
+                _model_fl, _ = qf_predict_flux(
+                    qf_inf_models, _phys, qf_inf_emu_data,
+                    qf_inf_input_scaler, qf_inf_output_scaler,
+                    is_grid_interp=qf_inf_is_grid_interp,
+                )
+                _emu_wl = qf_inf_emu_data["wl"]
+                _em = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
+                _fl = _model_fl[_em].copy()
+                _wl = _emu_wl[_em]
+
+                if _scale == "log":
+                    _fl = 10.0 ** _fl
+
+                _av = float(qf_pg_av.value)
+                if _av > 0:
+                    try:
+                        from extinction import fitzpatrick99
+                        _a_lambda = fitzpatrick99(
+                            _wl.astype(np.float64), _av, 3.1
+                        )
+                        _fl = _fl * 10 ** (-0.4 * _a_lambda)
+                    except ImportError:
+                        pass
+
+                _cheb1 = float(qf_pg_cheb1.value)
+                if _cheb1 != 0.0:
+                    _scale_wl = _wl / _wl.max()
+                    _fl = _fl * chebval(_scale_wl, [1.0, _cheb1])
+
+                _fl = _fl * np.exp(float(qf_pg_logscale.value))
+
+                if _scale == "log":
+                    _fl = np.log10(np.clip(_fl, 1e-30, None))
+
+                _model_interp = np.interp(_obs_wl, _wl, _fl)
+                _resid = (_model_interp - _obs_fl) / _obs_err
+                _chi2_val = float(np.sum(_resid ** 2))
+                # Gaussian NLL (up to an additive constant independent of
+                # parameters): NLL = 0.5·χ² + 0.5·Σ ln(2π σ²).
+                _n = len(_obs_err)
+                _const = 0.5 * float(
+                    np.sum(np.log(2.0 * np.pi * _obs_err ** 2))
+                )
+                _nll_val = 0.5 * _chi2_val + _const
+
+                qf_pg_nll_result = mo.callout(
+                    mo.md(
+                        f"**NLL = {_nll_val:.4f}** "
+                        f"(χ² = {_chi2_val:.4f}, "
+                        f"reduced χ² = {_chi2_val / max(_n, 1):.4f})\n\n"
+                        f"Evaluated at current playground slider values "
+                        f"over {_n} observation points."
+                    ),
+                    kind="success" if np.isfinite(_nll_val) else "danger",
+                )
+            except Exception as _e:
+                qf_pg_nll_result = mo.callout(
+                    mo.md(f"NLL evaluation failed: `{_e}`"),
+                    kind="danger",
+                )
+
+    return (qf_pg_nll_result,)
 
 
 @app.cell

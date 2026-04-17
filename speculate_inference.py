@@ -1063,7 +1063,9 @@ def _(
     pg_logls_slider,
     pg_logscale_slider,
     pg_mid_params,
+    pg_nll_result,
     pg_phys_sliders,
+    pg_test_nll_btn,
     wl_range_slider,
 ):
     # ── Playground: Reactive Emulated vs Observed Spectrum Chart ──
@@ -1261,9 +1263,15 @@ def _(
             ), kind="neutral"),
             _slider_tabs,
             _playground_chart,
+            pg_test_nll_btn,
+            pg_nll_result,
         ])
     elif _playground_chart is not None:
-        _pg_content = _playground_chart
+        _pg_content = mo.vstack([
+            _playground_chart,
+            pg_test_nll_btn,
+            pg_nll_result,
+        ])
     else:
         _pg_content = mo.md(
             "*Load an emulator and observation to see the playground chart.*"
@@ -1273,6 +1281,151 @@ def _(
         "Parameter Playground - Aid to find optimal prior settings": _pg_content
     })
     return
+
+
+@app.cell
+def _(mo):
+    # Run button for on-demand NLL evaluation from the playground sliders.
+    # Kept in its own cell so the evaluator cell below picks up click events
+    # reactively (a run_button's `.value` only flips in downstream cells).
+    pg_test_nll_btn = mo.ui.run_button(
+        label=f"{mo.icon('lucide:calculator')} Test NLL"
+    )
+    return (pg_test_nll_btn,)
+
+
+@app.cell
+def _(
+    Spectrum,
+    SpectrumModel,
+    emu,
+    fit_power_law_continuum,
+    mo,
+    np,
+    obs_data,
+    obs_flux_scale,
+    pg_av_slider,
+    pg_cheb1_slider,
+    pg_logamp_slider,
+    pg_logls_slider,
+    pg_logscale_slider,
+    pg_phys_sliders,
+    pg_test_nll_btn,
+    stats,
+    wl_range_slider,
+):
+    # ── Test NLL ──
+    # On click, build a SpectrumModel at the current playground slider values
+    # and evaluate the negative log-likelihood — the same objective the MLE
+    # optimiser minimises — so the user can sanity-check whether their
+    # chosen prior region is close to a reasonable fit.  The result widget
+    # is rendered inside the playground accordion by the cell above.
+    pg_nll_result = mo.md("")
+
+    if pg_test_nll_btn.value:
+        if emu is None or obs_data is None or pg_phys_sliders is None:
+            pg_nll_result = mo.callout(
+                mo.md("Load an emulator and observation first."),
+                kind="warn",
+            )
+        else:
+            try:
+                _wl_lo, _wl_hi = wl_range_slider.value
+                _mask = ((obs_data['wavelength'] >= _wl_lo)
+                         & (obs_data['wavelength'] <= _wl_hi))
+                _sub = obs_data[_mask].copy()
+
+                _scale = obs_flux_scale.value
+                _raw_fl = np.array(_sub['flux'])
+                _cont_safe = None
+                if _scale == 'log':
+                    _raw_fl = np.where(
+                        _raw_fl > 0,
+                        np.log10(_raw_fl),
+                        np.log10(np.abs(_raw_fl) + 1e-30),
+                    )
+                elif _scale == 'continuum-normalised':
+                    _cont, _ = fit_power_law_continuum(
+                        np.array(_sub['wavelength']), _raw_fl
+                    )
+                    _cont_safe = np.where(_cont > 0, _cont, 1.0)
+                    _raw_fl = _raw_fl / _cont_safe
+                _sub['flux'] = _raw_fl
+
+                if 'error' in _sub.columns:
+                    _sigma = np.array(_sub['error'])
+                    if _scale == 'log':
+                        _orig = np.array(obs_data[_mask]['flux'])
+                        _sigma = _sigma / (np.abs(_orig) * np.log(10) + 1e-30)
+                    elif _scale == 'continuum-normalised':
+                        _sigma = _sigma / _cont_safe
+                else:
+                    _sigma = np.abs(_raw_fl) * 0.05
+                _sigma = np.maximum(_sigma,
+                                    np.abs(_sub['flux'].values) * 0.01)
+
+                _spec = Spectrum(
+                    np.array(_sub['wavelength']),
+                    np.array(_sub['flux']),
+                    sigmas=_sigma,
+                )
+
+                _phys = np.array(pg_phys_sliders.value, dtype=float)
+                _global = {
+                    'Av': float(pg_av_slider.value),
+                    'log_scale': float(pg_logscale_slider.value),
+                    'cheb': [float(pg_cheb1_slider.value)],
+                    'global_cov': {
+                        'log_amp': float(pg_logamp_slider.value),
+                        'log_ls': float(pg_logls_slider.value),
+                    },
+                }
+                _model = SpectrumModel(
+                    emulator=emu,
+                    data=_spec,
+                    grid_params=list(_phys),
+                    flux_scale=_scale,
+                    **_global,
+                )
+
+                # Flat (uniform) priors spanning the slider ranges so the
+                # prior contribution is constant and NLL reflects only the
+                # data-likelihood term at the chosen slider point.
+                _priors = {}
+                for _pi, _pname in enumerate(emu.param_names):
+                    _lo = float(emu.min_params[_pi])
+                    _hi = float(emu.max_params[_pi])
+                    if _hi > _lo:
+                        _priors[_pname] = stats.uniform(loc=_lo, scale=_hi - _lo)
+                _priors['Av'] = stats.uniform(loc=0.0, scale=5.0)
+                _priors['log_scale'] = stats.uniform(
+                    loc=pg_logscale_slider.start,
+                    scale=pg_logscale_slider.stop - pg_logscale_slider.start,
+                )
+                _priors['cheb:1'] = stats.uniform(loc=-2.0, scale=4.0)
+                _priors['global_cov:log_amp'] = stats.uniform(
+                    loc=pg_logamp_slider.start,
+                    scale=pg_logamp_slider.stop - pg_logamp_slider.start,
+                )
+                _priors['global_cov:log_ls'] = stats.uniform(loc=0.0, scale=15.0)
+
+                _ll = float(_model.log_likelihood(_priors))
+                _nll = -_ll
+                pg_nll_result = mo.callout(
+                    mo.md(
+                        f"**NLL = {_nll:.4f}** "
+                        f"(log-likelihood = {_ll:.4f})\n\n"
+                        f"Evaluated at current playground slider values."
+                    ),
+                    kind="success" if np.isfinite(_nll) else "danger",
+                )
+            except Exception as _e:
+                pg_nll_result = mo.callout(
+                    mo.md(f"NLL evaluation failed: `{_e}`"),
+                    kind="danger",
+                )
+
+    return (pg_nll_result,)
 
 
 @app.cell

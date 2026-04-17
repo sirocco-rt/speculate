@@ -51,7 +51,7 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    # Welcome to the Speculate interface!
+    # Welcome to the Speculate Interface!
 
     Here, you can find all the tools for analysing spectra against sirocco simulations through the sidebar menu on the left. This suite provides:
     - **Grid Downloader** -- An intuitive interface for downloading and decompressing Sirocco spectral files (.spec).
