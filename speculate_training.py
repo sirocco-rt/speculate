@@ -1819,14 +1819,14 @@ def _(
             ])
         })
 
-    gp_figure
     return (gp_figure,)
 
 
 @app.cell
-def _(alt, get_loss_history, gp_figure, mo, pd):
+def _(alt, get_loss_history, get_trained_emu, gp_figure, mo, pd):
     # Reactive plot cell
     loss_data = get_loss_history()
+    _emu = get_trained_emu()
 
     # Create DataFrame (handles empty case)
     if len(loss_data) > 0:
@@ -1863,10 +1863,53 @@ def _(alt, get_loss_history, gp_figure, mo, pd):
     else:
         chart = line
 
+    # ── Emulator summary (mirrors the training-log __repr__ output) ──
+    # Uses loss_history for the best NLL instead of calling log_likelihood()
+    # (which would require an expensive V11 Cholesky factorisation).
+    _emu_summary = mo.md("")
+    if _emu is not None:
+        _s = "Emulator\n" + "-" * 40 + "\n"
+        if _emu.name:
+            _s += f"Name:           {_emu.name}\n"
+        _s += f"Trained:        {_emu._trained}\n"
+        _s += f"lambda_xi:      {_emu.lambda_xi:.4f}\n"
+        _s += f"Kernel:         {getattr(_emu, 'kernel', 'rbf')}\n"
+        _s += f"PCA Components: {_emu.ncomps}\n"
+        _s += f"Grid Points:    {_emu.grid_points.shape[0]}\n"
+        _desc_map = {
+            1: "Disk.mdot", 2: "Wind.mdot", 3: "KWD.d",
+            4: "KWD.mdot_r_exponent", 5: "KWD.accel_length",
+            6: "KWD.accel_exponent", 7: "BL.luminosity", 8: "BL.temp",
+            9: "Inc (sparse)", 10: "Inc (mid)", 11: "Inc (full)",
+        }
+        _raw_pnames = list(_emu.param_names) if hasattr(_emu, 'param_names') else []
+        _pnames = []
+        for _pn in _raw_pnames:
+            _pidx = int(_pn.replace("param", "")) if _pn.startswith("param") else None
+            _pnames.append(_desc_map.get(_pidx, _pn) if _pidx is not None else _pn)
+        if _pnames:
+            _s += f"Parameters:     {', '.join(_pnames)}\n"
+        _s += "\nVariances:\n"
+        for _i, _v in enumerate(_emu.variances):
+            _s += f"  Comp {_i:2d}:  {_v:.4f}\n"
+        _s += "\nLengthscales:\n"
+        if _pnames:
+            _hdr = "          " + "  ".join(f"{p:>8s}" for p in _pnames)
+            _s += _hdr + "\n"
+        for _i, _ls in enumerate(_emu.lengthscales):
+            _s += f"  Comp {_i:2d}: [ " + "  ".join(f"{l:.4f}" for l in _ls) + " ]\n"
+        if len(loss_data) > 0:
+            _s += f"\nBest NLL:       {min(loss_data):.2f}\n"
+            _s += f"Iterations:     {len(loss_data)}\n"
+        _emu_summary = mo.accordion(
+            {f"{mo.icon('lucide:cpu')} Emulator Summary": mo.md(f"```\n{_s}```")}
+        )
+
     # Always display the chart container with GP diagnostics below
     mo.vstack([
         mo.md(f"### {mo.icon('lucide:trending-up')} Trained Emulator Loss Curve"),
         mo.ui.altair_chart(chart),
+        _emu_summary,
         gp_figure
     ])
     return
