@@ -249,7 +249,7 @@ def _(
                 entry["samples"] = np.array(p["samples"])
             if "full_chain" in p:
                 entry["full_chain"] = np.array(p["full_chain"])
-                entry["burnin_used"] = p.get("burnin_used", 200)
+                entry["burnin_used"] = p.get("burnin_used", 500)
             if "bestfit_spec" in p:
                 entry["bestfit_spec"] = p["bestfit_spec"]
             if "prior_ranges" in p:
@@ -1661,6 +1661,10 @@ def _(glob, mo, os):
         start=100, stop=5000, value=2500, step=100, show_value=True,
         label="MCMC steps",
     )
+    mle_restarts_slider = mo.ui.slider(
+        start=1, stop=10, value=3, step=1, show_value=True,
+        label="MLE restarts",
+    )
 
     # Inclination selector for Tier 2: which viewing angle column to read from
     # each .spec file.  "Random" assigns a reproducibly random inclination per
@@ -1681,6 +1685,7 @@ def _(glob, mo, os):
         inclination_picker,
         max_spectra_slider,
         mcmc_steps_slider,
+        mle_restarts_slider,
         obs_picker,
         tier_picker,
     )
@@ -1779,6 +1784,7 @@ def _(
     inclination_picker,
     max_spectra_slider,
     mcmc_steps_slider,
+    mle_restarts_slider,
     mo,
     obs_picker,
     tier_picker,
@@ -1788,7 +1794,7 @@ def _(
         mo.hstack([emu_picker, flux_scale_picker], gap=1),
         emu_grid_info,
         mo.hstack([obs_picker], gap=1),
-        mo.hstack([tier_picker, max_spectra_slider, mcmc_steps_slider, inclination_picker], gap=1),
+        mo.hstack([tier_picker, max_spectra_slider, mcmc_steps_slider, mle_restarts_slider, inclination_picker], gap=1),
     ])
     return
 
@@ -1809,6 +1815,7 @@ def _(
     matched_testgrid_path,
     max_spectra_slider,
     mcmc_steps_slider,
+    mle_restarts_slider,
     mo,
     obs_picker,
     os,
@@ -1977,7 +1984,7 @@ def _(
                                 }
                                 if "full_chain" in _entry:
                                     _post_entry["full_chain"] = _np.array(_entry["full_chain"])
-                                    _post_entry["burnin_used"] = _entry.get("burnin_used", 200)
+                                    _post_entry["burnin_used"] = _entry.get("burnin_used", 500)
                                 if "bestfit_spec" in _entry:
                                     _post_entry["bestfit_spec"] = _entry["bestfit_spec"]
                                 if "prior_ranges" in _entry:
@@ -2096,6 +2103,7 @@ def _(
                             _mle = _run_mle(
                                 _emu, _wl, _flux, _sigma, flux_scale=_flux_scale,
                                 max_iter=10_000, iteration_callback=_mle_cb,
+                                n_restarts=mle_restarts_slider.value,
                             )
                         except Exception as _e:
                             _failure_log.append({
@@ -2124,7 +2132,7 @@ def _(
                                 _mle["model"], _mle["priors"],
                                 nwalkers=64,
                                 nsteps=_mcmc_steps_val,
-                                burnin=200,
+                                burnin=500,
                                 iteration_callback=_mcmc_cb,
                                 freeze_nuisance=True,
                             )
@@ -2161,7 +2169,7 @@ def _(
                         # Full posterior for corner-plot explorer on resume
                         "full_samples": _mcmc["samples"].tolist(),
                         "full_chain": _mcmc["full_chain"].tolist(),
-                        "burnin_used": _mcmc.get("burnin_used", 200),
+                        "burnin_used": _mcmc.get("burnin_used", 500),
                         "full_labels": _mcmc.get("labels", []),
                         "full_summary": {
                             k: {sk: sv for sk, sv in v.items()}
@@ -2215,7 +2223,7 @@ def _(
                         "inclination": _inc,
                         "samples": _mcmc["samples"],  # (N, ndim) burnt+thinned flat samples
                         "full_chain": _mcmc["full_chain"],  # (nsteps, nwalkers, ndim) full chain
-                        "burnin_used": _mcmc.get("burnin_used", 200),
+                        "burnin_used": _mcmc.get("burnin_used", 500),
                         "labels": _mcmc_labels,
                         "summary": _mcmc["summary"],
                         "converged": _mcmc["converged"],
@@ -2252,7 +2260,7 @@ def _(
                 failure_log=_failure_log,
                 mcmc_walkers=64,
                 mcmc_steps=_mcmc_steps_val,
-                mcmc_burnin=200,
+                mcmc_burnin=500,
                 elapsed=time.time() - _t2_t0,
                 n_not_converged=_n_not_converged,
             )
@@ -2320,6 +2328,7 @@ def _(
             "test_grid": matched_testgrid_path,
             "tiers": _tiers,
             "mcmc_steps": mcmc_steps_slider.value,
+            "mle_restarts": mle_restarts_slider.value,
             "max_spectra": max_spectra_slider.value,
         }
         _report = _build_report_card(

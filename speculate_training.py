@@ -815,7 +815,7 @@ def _(get_loaded_emu_config, set_loaded_emu_display, mo):
     )
 
     refine_lambda_xi = mo.ui.checkbox(
-        value=False,
+        value=True,
         label="Refine λ_ξ after training (1-D bounded optimisation of truncation noise)"
     )
 

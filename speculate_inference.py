@@ -2403,12 +2403,12 @@ def _(emu, get_mle_model, mo, param_names, re):
     # reasonable balance of speed vs. posterior quality:
     #   64 walkers  – twice the typical active-parameter count
     #   2500 steps  – gives ~30 000 post-burn samples at thin=1
-    #   200 burn-in – conservative; the auto-burn heuristic may override
+    #   500 burn-in – conservative; the auto-burn heuristic may override
     _model = get_mle_model()
 
     mcmc_nwalkers = mo.ui.number(value=64, label="Walkers", step=4, start=8)
     mcmc_nsteps = mo.ui.number(value=2500, label="Steps", step=100, start=100)
-    mcmc_burnin = mo.ui.number(value=200, label="Min Burn-in (floor)", step=50, start=0)
+    mcmc_burnin = mo.ui.number(value=500, label="Min Burn-in (floor)", step=50, start=0)
 
     run_mcmc_btn = mo.ui.run_button(
         label=f"{mo.icon('lucide:shuffle')} Run MCMC", 
@@ -2554,17 +2554,22 @@ def _(
                         return -np.inf
 
                 # Initialise walkers in a truncated-normal ball around the MLE.
-                # σ = 2% of prior width (or 1σ for Normal priors).  Using a
-                # truncated normal rather than clip avoids artificial density
-                # pile-up at the prior edges when the MLE sits near a bound.
-                _INIT_FRAC = 0.02  # σ as a fraction of prior width
+                # For Normal priors: σ = the distribution's own std (1σ).
+                # For Uniform / other priors: σ = _INIT_FRAC × prior width.
+                # Truncated normal avoids edge pile-up at the prior edges
+                # when the MLE sits near a bound.
+                _INIT_FRAC = 0.15  # σ as a fraction of prior width
                 _ball = np.empty((_nwalkers, _ndim))
                 for _i, _key in enumerate(_model.labels):
                     _pr = _priors.get(_key)
                     _mle_val = _model[_key]
                     if _pr is not None and hasattr(_pr, 'interval'):
                         _lo, _hi = _pr.interval(1.0)
-                        if hasattr(_pr, 'std'):
+                        # Use the distribution's native σ only for Normal-family
+                        # priors; for Uniform (and anything else) use a controlled
+                        # fraction of the prior width.
+                        _is_normal = getattr(getattr(_pr, 'dist', None), 'name', '') in ('norm', 'truncnorm')
+                        if _is_normal:
                             _sigma = _pr.std()          # Normal prior
                         else:
                             _sigma = _INIT_FRAC * (_hi - _lo)  # Uniform prior

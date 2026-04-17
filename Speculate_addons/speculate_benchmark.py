@@ -367,6 +367,7 @@ def run_mle_single(
     max_iter: int = 10_000,
     freeze_av: bool = True,
     iteration_callback=None,
+    n_restarts: int = 1,
 ) -> dict:
     """
     Run MLE inference on a single spectrum.
@@ -381,7 +382,7 @@ def run_mle_single(
     flux_scale : str
         'linear', 'log', or 'continuum-normalised'.
     max_iter : int
-        Maximum Nelder-Mead iterations.
+        Maximum CMA-ES function evaluations per restart.
     freeze_av : bool
         If True (default), fix Av=0.  Use True for synthetic test-grid
         spectra (Tier 2) which have no dust; False for observational
@@ -389,6 +390,12 @@ def run_mle_single(
     iteration_callback : callable or None
         If provided, called as ``iteration_callback(iter_num, max_iter, best_nll, elapsed_s)``
         every 50 iterations during optimisation.
+    n_restarts : int
+        Number of CMA-ES restarts.  The first restart starts from the
+        bootstrapped midpoint; subsequent restarts use random starting
+        points drawn uniformly from the prior bounds (with log_scale
+        re-bootstrapped at each).  The best result across all restarts
+        is returned.
 
     Returns
     -------
@@ -528,6 +535,7 @@ def run_mle_single(
     _nll_history = []
     _iter_count = [0]
     _mle_t0 = time.time()
+    _global_best_f = [float("inf")]  # mutable for callback visibility
 
     def nll(P):
         model.set_param_vector(P)
@@ -538,7 +546,7 @@ def run_mle_single(
         _nll_history.append(val)
         _iter_count[0] += 1
         if iteration_callback is not None and _iter_count[0] % 50 == 0:
-            _best = min(_nll_history) if _nll_history else val
+            _best = min(_global_best_f[0], min(_nll_history) if _nll_history else val)
             iteration_callback(_iter_count[0], max_iter, _best, time.time() - _mle_t0)
         return val
 
@@ -549,36 +557,69 @@ def run_mle_single(
         np.array(lo_bounds) + 1e-8,
         np.array(hi_bounds) - 1e-8,
     )
-    # Per-coordinate initial σ = 20% of prior range.
-    cma_stds = [0.2 * (hi - lo) for lo, hi in zip(lo_bounds, hi_bounds)]
-    # Double the default popsize for better landscape sampling.
-    popsize = 2 * (4 + int(3 * np.log(N)))
-    es = cma.CMAEvolutionStrategy(
-        p0_cma.tolist(), 1.0,
-        {
-            "bounds": [lo_bounds, hi_bounds],
-            "CMA_stds": cma_stds,
-            "popsize": popsize,
-            "maxfevals": max_iter,
-            "verbose": -9,
-            "tolfun": 1e-10,
-        },
-    )
-    best_x, best_f = model.get_param_vector().copy(), float("inf")
-    while not es.stop():
-        solutions = es.ask()
-        fits = [nll(np.array(s)) for s in solutions]
-        es.tell(solutions, fits)
-        gen_best = min(fits)
-        if gen_best < best_f:
-            best_f = gen_best
-            best_x = np.array(solutions[fits.index(gen_best)])
+
+    # Generate starting points: first = bootstrapped x0, rest = random
+    lo_arr = np.array(lo_bounds)
+    hi_arr = np.array(hi_bounds)
+    start_points = [p0_cma.copy()]
+    if n_restarts > 1:
+        for _ri in range(n_restarts - 1):
+            rnd = lo_arr + np.random.rand(N) * (hi_arr - lo_arr)
+            # Bootstrap log_scale for random starts too
+            if "log_scale" in active_labels:
+                ls_idx = active_labels.index("log_scale")
+                try:
+                    model.set_param_vector(rnd)
+                    model()
+                    if model._log_scale is not None and np.isfinite(model._log_scale):
+                        rnd[ls_idx] = model._log_scale
+                except Exception:
+                    pass
+            start_points.append(rnd)
+
+    global_best_x = p0_cma.copy()
+    global_best_nit = 0
+
+    for restart_idx, x0 in enumerate(start_points):
+        # Per-coordinate initial σ = 20% of prior range.
+        cma_stds = [0.2 * (hi - lo) for lo, hi in zip(lo_bounds, hi_bounds)]
+        # Double the default popsize for better landscape sampling.
+        popsize = 2 * (4 + int(3 * np.log(N)))
+        x0_clipped = np.clip(x0, lo_arr + 1e-8, hi_arr - 1e-8)
+        es = cma.CMAEvolutionStrategy(
+            x0_clipped.tolist(), 1.0,
+            {
+                "bounds": [lo_bounds, hi_bounds],
+                "CMA_stds": cma_stds,
+                "popsize": popsize,
+                "maxfevals": max_iter,
+                "verbose": -9,
+                "tolfun": 1e-10,
+            },
+        )
+        run_best_x, run_best_f = x0_clipped.copy(), float("inf")
+        while not es.stop():
+            solutions = es.ask()
+            fits = [nll(np.array(s)) for s in solutions]
+            es.tell(solutions, fits)
+            gen_best = min(fits)
+            if gen_best < run_best_f:
+                run_best_f = gen_best
+                run_best_x = np.array(solutions[fits.index(gen_best)])
+            if run_best_f < _global_best_f[0]:
+                _global_best_f[0] = run_best_f
+
+        # Keep global best across restarts
+        if run_best_f <= _global_best_f[0]:
+            _global_best_f[0] = run_best_f
+            global_best_x = run_best_x.copy()
+            global_best_nit = es.result.iterations
 
     from types import SimpleNamespace
     soln = SimpleNamespace(
-        x=best_x, fun=best_f, success=True,
-        message="CMA-ES terminated",
-        nit=es.result.iterations,
+        x=global_best_x, fun=_global_best_f[0], success=True,
+        message=f"Best of {n_restarts} CMA-ES restart(s)",
+        nit=global_best_nit,
     )
 
     if soln.success:
@@ -601,7 +642,7 @@ def run_mcmc_single(
     priors: dict,
     nwalkers: int = 32,
     nsteps: int = 1000,
-    burnin: int = 200,
+    burnin: int = 500,
     iteration_callback=None,
     freeze_nuisance: bool = False,
 ) -> dict:
@@ -647,16 +688,22 @@ def run_mcmc_single(
     ndim = len(model.labels)
 
     # Initialise walkers in a truncated-normal ball around MLE.
-    # σ = 2% of prior width (or 1σ for Normal priors).  Truncated normal
-    # avoids edge pile-up that np.clip would cause near prior bounds.
-    _INIT_FRAC = 0.02
+    # For Normal priors: σ = the distribution's own std (1σ).
+    # For Uniform / other priors: σ = _INIT_FRAC × prior width.
+    # Truncated normal avoids edge pile-up that np.clip would cause
+    # near prior bounds.
+    _INIT_FRAC = 0.15
     ball = np.empty((nwalkers, ndim))
     for i, key in enumerate(model.labels):
         pr = priors.get(key)
         mle_val = model[key]
         if pr is not None and hasattr(pr, 'interval'):
             lo, hi = pr.interval(1.0)
-            if hasattr(pr, 'std'):
+            # Use the distribution's native σ only for Normal-family
+            # priors; for Uniform (and anything else) use a controlled
+            # fraction of the prior width.
+            _is_normal = getattr(getattr(pr, 'dist', None), 'name', '') in ('norm', 'truncnorm')
+            if _is_normal:
                 sigma = pr.std()
             else:
                 sigma = _INIT_FRAC * (hi - lo)
@@ -1007,8 +1054,9 @@ def run_tier2(
     inclination: float = 55.0,
     mcmc_walkers: int = 32,
     mcmc_steps: int = 1000,
-    mcmc_burnin: int = 200,
+    mcmc_burnin: int = 500,
     max_mle_iter: int = 5000,
+    mle_restarts: int = 1,
     max_spectra: Optional[int] = None,
     progress_callback=None,
 ) -> dict:
@@ -1025,6 +1073,9 @@ def run_tier2(
     inclination : float
     mcmc_walkers, mcmc_steps, mcmc_burnin : int
     max_mle_iter : int
+    mle_restarts : int
+        Number of CMA-ES restarts per spectrum.  More restarts reduce the
+        chance of settling in a local minimum at the cost of runtime.
     max_spectra : int or None
         If set, limit the number of test spectra processed.
     progress_callback : callable or None
@@ -1103,7 +1154,8 @@ def run_tier2(
 
         try:
             mle_result = run_mle_single(
-                emu, wl, flux, sigma, flux_scale=flux_scale, max_iter=max_mle_iter
+                emu, wl, flux, sigma, flux_scale=flux_scale,
+                max_iter=max_mle_iter, n_restarts=mle_restarts,
             )
         except Exception as e:
             import traceback as _tb
@@ -1280,7 +1332,7 @@ def run_tier3_single(
     n_ppc_draws: int = 100,
     mcmc_walkers: int = 32,
     mcmc_steps: int = 1000,
-    mcmc_burnin: int = 200,
+    mcmc_burnin: int = 500,
     grid_name: Optional[str] = None,
     output_dir: Optional[str] = None,
 ) -> dict:
