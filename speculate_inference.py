@@ -2172,6 +2172,7 @@ def _(
 
                 for _restart_idx, _x0 in enumerate(_start_points):
                     _cur_restart[0] = _restart_idx + 1
+                    _iter_count[0] = 0  # reset eval counter per restart
                     _spinner.update(
                         f"{_opt_method} | Restart {_cur_restart[0]}/{_n_restarts} | "
                         f"Starting... | {_time.time() - _start_time:.1f}s"
@@ -2328,8 +2329,14 @@ def _(
                     _display_p = f"log10({_p})" if _p in log10_params else _p
                     _results_md += f"| **{_display_p}** | {fitted_val:.4f} | "
 
-                    if ground_truth_params and _p in ground_truth_params:
-                        _gt_val = ground_truth_params[_p]
+                    # Resolve ground-truth key: inclination variants all map
+                    # to the single 'Inclination' entry in ground_truth_params.
+                    _gt_key = _p
+                    if 'Inclination' in _gt_key:
+                        _gt_key = 'Inclination'
+
+                    if ground_truth_params and _gt_key in ground_truth_params:
+                        _gt_val = ground_truth_params[_gt_key]
                         delta = fitted_val - _gt_val
                         _results_md += f"{_gt_val:.4f} | {delta:+.4f} |\n"
                     elif ground_truth_params:
@@ -2337,28 +2344,28 @@ def _(
                     else:
                         _results_md += "\n"
 
-                # Global parameters in the same table style
-                _results_md += "\n### Global Parameters\n\n"
-                _results_md += "| Parameter | Fitted |\n"
-                _results_md += "|-----------|--------|\n"
+                # Global parameters in a separate table for side-by-side layout
+                _global_md = "### Global Parameters\n\n"
+                _global_md += "| Parameter | Fitted |\n"
+                _global_md += "|-----------|--------|\n"
                 if 'Av' in res_global:
-                    _results_md += f"| **Av** | {res_global['Av']:.4f} |\n"
+                    _global_md += f"| **Av** | {res_global['Av']:.4f} |\n"
                 if 'log_scale' in res_global:
-                    _results_md += f"| **ln(scale)** | {res_global['log_scale']:.4f} |\n"
+                    _global_md += f"| **ln(scale)** | {res_global['log_scale']:.4f} |\n"
                 elif hasattr(_model, '_log_scale') and _model._log_scale is not None:
-                    _results_md += f"| **ln(scale) (auto)** | {_model._log_scale:.4f} |\n"
+                    _global_md += f"| **ln(scale) (auto)** | {_model._log_scale:.4f} |\n"
                 if 'cheb:1' in res_global:
-                    _results_md += f"| **cheb₁** | {res_global['cheb:1']:.4f} |\n"
+                    _global_md += f"| **cheb₁** | {res_global['cheb:1']:.4f} |\n"
                 if 'global_cov:log_amp' in res_global:
-                    _results_md += f"| **ln(GP amp)** | {res_global['global_cov:log_amp']:.4f} |\n"
+                    _global_md += f"| **ln(GP amp)** | {res_global['global_cov:log_amp']:.4f} |\n"
                 if 'global_cov:log_ls' in res_global:
-                    _results_md += f"| **ln(GP length)** | {res_global['global_cov:log_ls']:.4f} |\n"
+                    _global_md += f"| **ln(GP length)** | {res_global['global_cov:log_ls']:.4f} |\n"
 
                 # Keep the result view as a single stack so the fit summary, loss
                 # curve, and model figure stay coupled during reactive reruns.
                 _result_elements = [
                     fit_status,
-                    mo.md(_results_md),
+                    mo.hstack([mo.md(_results_md), mo.md(_global_md)], align="start", gap="2rem"),
                 ]
                 if _fig_loss is not None:
                     _result_elements.extend([

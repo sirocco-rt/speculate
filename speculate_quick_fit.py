@@ -3531,6 +3531,7 @@ def _(
 
         for _restart_idx, _x0 in enumerate(_start_points):
             _cur_restart[0] = _restart_idx + 1
+            _iter_count[0] = 0  # reset eval counter per restart
             _spinner.update(
                 f"{qf_opt_method.value} | Restart {_cur_restart[0]}/{_n_restarts} | "
                 f"Starting... | {time_mod.time() - _t0:.1f}s"

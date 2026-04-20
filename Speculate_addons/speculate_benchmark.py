@@ -536,6 +536,7 @@ def run_mle_single(
     _iter_count = [0]
     _mle_t0 = time.time()
     _global_best_f = [float("inf")]  # mutable for callback visibility
+    _cur_restart = [0]  # 1-based index of current restart
 
     def nll(P):
         model.set_param_vector(P)
@@ -547,7 +548,10 @@ def run_mle_single(
         _iter_count[0] += 1
         if iteration_callback is not None and _iter_count[0] % 50 == 0:
             _best = min(_global_best_f[0], min(_nll_history) if _nll_history else val)
-            iteration_callback(_iter_count[0], max_iter, _best, time.time() - _mle_t0)
+            iteration_callback(
+                _iter_count[0], max_iter, _best, time.time() - _mle_t0,
+                _cur_restart[0], n_restarts,
+            )
         return val
 
     # CMA-ES: start from the bootstrapped model state (includes the
@@ -581,6 +585,8 @@ def run_mle_single(
     global_best_nit = 0
 
     for restart_idx, x0 in enumerate(start_points):
+        _cur_restart[0] = restart_idx + 1
+        _iter_count[0] = 0  # reset eval counter per restart
         # Per-coordinate initial σ = 20% of prior range.
         cma_stds = [0.2 * (hi - lo) for lo, hi in zip(lo_bounds, hi_bounds)]
         # Double the default popsize for better landscape sampling.

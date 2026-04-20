@@ -363,7 +363,7 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
             "n_grid_points": ("Grid Points", ""),
             "n_params": ("Parameters", ""),
             "tier1_time_s": ("Runtime (s)", ""),
-            "pca_explained_variance": ("PCA Explained Variance", "higher is better; \u22650.999 typical"),
+            "pca_explained_variance": ("PCA Explained Variance", "higher is better; 1 = 100% = perfect reconstruction"),
             "q2_aggregate": ("Aggregate Q\u00b2 (LOO R\u00b2)", "higher is better; \u22650.80 good for sparse physics grids, \u22650.95 excellent"),
             "nlpd_mean": ("Mean NLPD", "lower is better; compare across configs (drops with k due to shrinking weight scale, not better fit)"),
             "std_resid_mean": ("Std. Residual Mean", "\u22480 ideal; bias if far from 0"),
@@ -2091,10 +2091,12 @@ def _(
                         subtitle=f"Optimising ({_si + 1}/{_n_t2})…",
                         remove_on_exit=True,
                     ) as _mle_spin:
-                        def _mle_cb(it, mx, best_nll, elapsed):
+                        def _mle_cb(it, mx, best_nll, elapsed, restart=1, n_rst=1):
+                            _rst_info = f"Restart {restart}/{n_rst} | " if n_rst > 1 else ""
                             _mle_spin.update(
                                 subtitle=(
-                                    f"Iteration {it}/{mx} | "
+                                    f"{_rst_info}"
+                                    f"Eval {it}/{mx} | "
                                     f"Best NLL: {best_nll:.2f} | "
                                     f"Time: {elapsed:.1f}s"
                                 )
