@@ -637,9 +637,10 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
             ))
 
         # --- Worst-case spectra overlay ---
-        _orig = _arrays.get("original_flux")
-        _pca_rec = _arrays.get("pca_recon_flux")
-        _loo_rec = _arrays.get("loo_recon_flux")
+        _orig = _arrays.get("display_original_flux", _arrays.get("original_flux"))
+        _pca_rec = _arrays.get("display_pca_recon_flux", _arrays.get("pca_recon_flux"))
+        _loo_rec = _arrays.get("display_loo_recon_flux", _arrays.get("loo_recon_flux"))
+        _flux_axis_title = _arrays.get("flux_axis_title", "Flux")
         if _orig is not None and _loo_rec is not None and _wl is not None:
             _loo_rmse_arr = _arrays.get("loo_flux_rmse")
             if _loo_rmse_arr is None:
@@ -656,7 +657,7 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                     if _pca_rec is not None:
                         _ax.plot(_wl, _pca_rec[_idx], label="PCA recon", color="#3498db", lw=0.8, ls="--")
                     _ax.plot(_wl, _loo_rec[_idx], label="LOO recon", color="#e74c3c", lw=0.8, ls="--")
-                    _ax.set_ylabel("Normalised Flux")
+                    _ax.set_ylabel(_flux_axis_title)
                     _rmse_val = _loo_rmse_arr[_idx] if hasattr(_loo_rmse_arr, '__getitem__') else "?"
                     _ax.set_title(f"Spectrum #{_idx} (LOO RMSE = {_rmse_val:.5f})")
                     if _wi == 0:
@@ -1199,11 +1200,12 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
     _idx = spectrum_slider.value
 
     _wl = _arrs["wavelength"]
-    _orig = _arrs["original_flux"][_idx]
-    _pca = _arrs["pca_recon_flux"][_idx]
-    _loo = _arrs["loo_recon_flux"][_idx]
+    _orig = _arrs.get("display_original_flux", _arrs["original_flux"])[_idx]
+    _pca = _arrs.get("display_pca_recon_flux", _arrs["pca_recon_flux"])[_idx]
+    _loo = _arrs.get("display_loo_recon_flux", _arrs["loo_recon_flux"])[_idx]
     _gp = _arrs["grid_points"][_idx]
     _pnames = recon_param_names
+    _flux_axis_title = _arrs.get("flux_axis_title", "Flux")
 
     # Pair the flux plots with the exact parameter point and scalar error metrics
     # so the user can correlate bad reconstructions with specific regions of the
@@ -1244,7 +1246,7 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
 
     # LOO GP confidence band (±2σ) — propagated from per-component LOO
     # predictive variance through the PCA inverse transform.
-    _loo_recon_var = _arrs.get("loo_recon_var")
+    _loo_recon_var = _arrs.get("display_loo_recon_var", _arrs.get("loo_recon_var"))
     _ci_chart = alt.LayerChart()
     if _loo_recon_var is not None:
         _sigma = np.sqrt(np.maximum(_loo_recon_var[_idx], 0.0))
@@ -1258,7 +1260,7 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
             .mark_area(opacity=0.18, color="#54a24b")
             .encode(
                 x=alt.X("Wavelength:Q"),
-                y=alt.Y("Lower (2σ):Q"),
+                y=alt.Y("Lower (2σ):Q", scale=alt.Scale(zero=False)),
                 y2=alt.Y2("Upper (2σ):Q"),
             )
         )
@@ -1268,7 +1270,7 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
         .mark_line(strokeWidth=1.5, opacity=0.85)
         .encode(
             x=alt.X("Wavelength:Q", title="Wavelength (Å)"),
-            y=alt.Y("Flux:Q", title="Normalised Flux"),
+            y=alt.Y("Flux:Q", title=_flux_axis_title, scale=alt.Scale(zero=False)),
             color=alt.Color("Series:N", scale=_color_scale, legend=alt.Legend(title="Series")),
             strokeDash=alt.StrokeDash("Series:N", scale=_dash_scale, legend=None),
             tooltip=["Wavelength:Q", "Flux:Q", "Series:N"],

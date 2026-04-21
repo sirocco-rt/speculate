@@ -220,6 +220,19 @@ class SpectrumModel:
 
         self.log = logging.getLogger(self.__class__.__name__)
 
+    def _estimate_log_scale_from_log_flux(self, flux_log10: np.ndarray) -> float:
+        """Estimate ln(scale) by renormalising in linear-flux space."""
+        model_log = np.asarray(flux_log10, dtype=np.float64)
+        data_log = np.asarray(self.data.flux, dtype=np.float64)
+
+        model_lin = np.power(10.0, np.clip(model_log, -300.0, 300.0))
+        data_lin = np.power(10.0, np.clip(data_log, -300.0, 300.0))
+
+        scale = _get_renorm_factor(self.data.wave, model_lin, data_lin)
+        if not np.isfinite(scale) or scale <= 0:
+            return 0.0
+        return float(np.log(scale))
+
     @property
     def grid_params(self):
         """
@@ -427,18 +440,9 @@ class SpectrumModel:
                     self._log_scale = self.params["log_scale"]
                     flux = flux + self.params["log_scale"] / _ln10
                 else:
-                    # Auto-renorm in log₁₀ space: additive offset that aligns
-                    # integrated emu vs data.  data.flux is already in log₁₀.
-                    from scipy.integrate import trapezoid as _trapz
                     _flux_np = flux.detach().cpu().numpy()
-                    _data_int = _trapz(self.data.flux, self.data.wave)
-                    _emu_int = _trapz(_flux_np, self.data.wave)
-                    if abs(_emu_int) > 1e-30:
-                        _offset = (_data_int - _emu_int) / len(self.data.wave)
-                    else:
-                        _offset = 0.0
-                    self._log_scale = _offset * _ln10  # store as natural-log equiv
-                    flux = flux + _offset
+                    self._log_scale = self._estimate_log_scale_from_log_flux(_flux_np)
+                    flux = flux + self._log_scale / _ln10
                 # X is NOT scaled — additive transforms don't change covariance
             else:
                 # ── Linear-space nuisance transforms (original path) ─────
@@ -569,15 +573,8 @@ class SpectrumModel:
                 self._log_scale = self.params["log_scale"]
                 flux = flux + self.params["log_scale"] / _ln10
             else:
-                from scipy.integrate import trapezoid as _trapz
-                _data_int = _trapz(self.data.flux, self.data.wave)
-                _emu_int = _trapz(flux, self.data.wave)
-                if abs(_emu_int) > 1e-30:
-                    _offset = (_data_int - _emu_int) / len(self.data.wave)
-                else:
-                    _offset = 0.0
-                self._log_scale = _offset * _ln10
-                flux = flux + _offset
+                self._log_scale = self._estimate_log_scale_from_log_flux(flux)
+                flux = flux + self._log_scale / _ln10
             # X is NOT scaled — additive transforms don't change covariance
         else:
             # ── Linear-space nuisance transforms (original path) ─────

@@ -1132,19 +1132,21 @@ def _(
     # Reduce the flux matrix from (N_spectra, N_wavelengths) to (N_spectra, N_pca_components).
     # The emulator learns to predict these low-dimensional PCA weights rather than
     # the full spectral flux, dramatically reducing the output dimension.
-    # PCA data is saved so we can reconstruct spectra during inference:
-    #   flux_rn = (weights @ eigenspectra) * std + mean   (row-normalised flux)
+    # PCA data is saved so we can reconstruct spectra during inference in the
+    # same PCA preprocessing space used during training.
     with mo.status.spinner(title="PCA decomposition..."):
         _n_comp = int(qf_n_components.value)
 
-        # Row-mean normalisation: divide each spectrum by its mean so all
-        # spectra have approximately unit average flux.  This prevents PCA
-        # from wasting components on trivial brightness differences (raw
-        # fluxes can span orders of magnitude, e.g. 10^-12).  This matches
-        # the Starfish Emulator.test_pca normalisation.
+        # Remove per-spectrum scale before PCA. In linear / continuum-normalised
+        # space this is a divide-by-mean normalisation; in log space it becomes
+        # subtracting the mean log flux, which is the consistent analogue of
+        # removing a multiplicative flux offset.
         _norm_factors = _flux_matrix.mean(axis=1)
-        _norm_factors = np.where(_norm_factors != 0, _norm_factors, 1.0)
-        _flux_matrix = _flux_matrix / _norm_factors[:, np.newaxis]
+        if _scale == "log":
+            _flux_matrix = _flux_matrix - _norm_factors[:, np.newaxis]
+        else:
+            _norm_factors = np.where(_norm_factors != 0, _norm_factors, 1.0)
+            _flux_matrix = _flux_matrix / _norm_factors[:, np.newaxis]
 
         # Per-wavelength standardisation (zero mean, unit variance).
         _flux_mean = _flux_matrix.mean(axis=0)

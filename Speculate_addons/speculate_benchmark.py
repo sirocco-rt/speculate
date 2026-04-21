@@ -181,9 +181,10 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     # Separate large flux arrays (kept in-memory, never serialised)
     _ARRAY_KEYS = {
         "original_flux", "pca_recon_flux", "loo_recon_flux", "wavelength",
+        "display_original_flux", "display_pca_recon_flux", "display_loo_recon_flux",
         "pca_per_wl_rmse", "loo_per_wl_rmse",
         "loo_flux_rmse", "pca_recon_rmse",
-        "loo_recon_var", "loo_mu", "loo_var",
+        "loo_recon_var", "display_loo_recon_var", "loo_mu", "loo_var",
     }
     arrays = {}
     for k in _ARRAY_KEYS:
@@ -192,6 +193,12 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     # Also stash grid_points + param_names for the interactive viewer
     arrays["grid_points"] = emu.grid_points
     arrays["param_names"] = list(emu.param_names)
+    if getattr(emu, "flux_scale", "linear") == "log":
+        arrays["flux_axis_title"] = "log10 Flux"
+    elif getattr(emu, "flux_scale", "linear") == "continuum-normalised":
+        arrays["flux_axis_title"] = "Continuum-normalised Flux"
+    else:
+        arrays["flux_axis_title"] = "Flux"
 
     # Convert remaining numpy arrays to lists for JSON serialisation
     serialisable = {}
@@ -407,6 +414,14 @@ def run_mle_single(
 
     # Match the observation onto the emulator's training scale before building a
     # SpectrumModel, including consistent propagation of the uncertainties.
+    flux = np.asarray(flux, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+
+    # Keep the 1% safeguard in native linear-flux units, then propagate it
+    # through the requested transform. Applying a 1% floor after log10() would
+    # incorrectly inflate sigma by the magnitude of the logged flux itself.
+    sigma = np.maximum(sigma, np.abs(flux) * 0.01)
+
     if flux_scale == "log":
         sigma = sigma / (np.abs(flux) * np.log(10) + 1e-30)
         flux = np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
@@ -417,7 +432,7 @@ def run_mle_single(
         sigma = sigma / cont_safe
         flux = flux / cont_safe
 
-    sigma = np.maximum(sigma, np.abs(flux) * 0.01)
+    sigma = np.maximum(sigma, 1e-30)
     spec = Spectrum(wl, flux, sigmas=sigma)
 
     # Default grid params: midpoints

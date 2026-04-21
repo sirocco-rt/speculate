@@ -1834,35 +1834,35 @@ def _(
 
                 # Apply exactly the same flux transform used during emulator training.
                 _flux_scale = obs_flux_scale.value
-                _raw_flux = np.array(_data_subset['flux'])
+                _native_flux = np.array(_data_subset['flux'], dtype=float)
+
+                # Keep the fractional sigma floor in native linear-flux units,
+                # then propagate it through the selected transform.
+                if 'error' in _data_subset.columns:
+                    _native_sigma = np.array(_data_subset['error'], dtype=float)
+                else:
+                    _native_sigma = np.abs(_native_flux) * 0.05
+                _native_sigma = np.maximum(_native_sigma, np.abs(_native_flux) * 0.01)
+
+                _raw_flux = _native_flux.copy()
                 if _flux_scale == 'log':
                     # Guard against non-positive values
                     _raw_flux = np.where(_raw_flux > 0, np.log10(_raw_flux), np.log10(np.abs(_raw_flux) + 1e-30))
+                    _sigma = _native_sigma / (np.abs(_native_flux) * np.log(10) + 1e-30)
                 elif _flux_scale == 'continuum-normalised':
                     _cont, _ = fit_power_law_continuum(
-                        np.array(_data_subset['wavelength']), _raw_flux
+                        np.array(_data_subset['wavelength']), _native_flux
                     )
                     _cont_safe = np.where(_cont > 0, _cont, 1.0)
-                    _raw_flux = _raw_flux / _cont_safe
+                    _raw_flux = _native_flux / _cont_safe
+                    _sigma = _native_sigma / _cont_safe
+                else:
+                    _sigma = _native_sigma
                 # else: linear (no transform)
                 _data_subset['flux'] = _raw_flux
 
-                # Respect provided uncertainties when present; otherwise use a simple
-                # fractional-error model so SpectrumModel always receives sigmas.
-                if 'error' in _data_subset.columns:
-                    _sigma = np.array(_data_subset['error'])
-                    # Propagate uncertainties through the same transform applied to flux.
-                    if _flux_scale == 'log':
-                        # Propagate error through log10: sigma_log = sigma / (val * ln(10))
-                        _orig_flux = np.array(obs_data[_mask]['flux'])
-                        _sigma = _sigma / (np.abs(_orig_flux) * np.log(10) + 1e-30)
-                    elif _flux_scale == 'continuum-normalised':
-                        _sigma = _sigma / _cont_safe
-                else:
-                    _sigma = np.abs(_raw_flux) * 0.05
-
-                # Ensure no zero/negative sigmas
-                _sigma = np.maximum(_sigma, np.abs(_data_subset['flux'].values) * 0.01)
+                # Ensure no zero/negative sigmas after propagation.
+                _sigma = np.maximum(_sigma, 1e-30)
 
                 spec_data = Spectrum(
                     np.array(_data_subset['wavelength']),

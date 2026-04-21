@@ -286,6 +286,59 @@ def _create_optimal_interpolator(grid_points, factors, logger=None):
     return interpolator
 
 
+def _infer_flux_scale_from_source(source) -> str:
+    """Best-effort flux-scale inference for grids and saved emulator names."""
+    if source is None:
+        return "linear"
+
+    for attr in ("flux_scale", "scale"):
+        value = getattr(source, attr, None)
+        if value is not None:
+            value = str(value)
+            if value:
+                return value
+
+    candidates = []
+    if isinstance(source, (str, os.PathLike)):
+        candidates.append(os.fspath(source))
+    for attr in ("filename", "name"):
+        value = getattr(source, attr, None)
+        if value is not None:
+            candidates.append(str(value))
+
+    for candidate in candidates:
+        text = candidate.lower()
+        if "continuum-normalised" in text or "continuum_normalised" in text:
+            return "continuum-normalised"
+        if any(token in text for token in ("_log_", "-log-", "/log/", "\\log\\", "scale=log")):
+            return "log"
+
+    return "linear"
+
+
+def _preprocess_flux_matrix(fluxes: np.ndarray, flux_scale: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply the per-spectrum preprocessing used before PCA."""
+    factors = fluxes.mean(axis=1)
+    if flux_scale == "log":
+        return fluxes - factors[:, np.newaxis], factors
+    safe_factors = np.where(np.abs(factors) > 0, factors, 1.0)
+    return fluxes / safe_factors[:, np.newaxis], safe_factors
+
+
+def _restore_flux_matrix(fluxes: np.ndarray, factors: np.ndarray, flux_scale: str) -> np.ndarray:
+    """Undo the per-spectrum preprocessing used before PCA."""
+    if flux_scale == "log":
+        return fluxes + factors[:, np.newaxis]
+    return fluxes * factors[:, np.newaxis]
+
+
+def _restore_flux_variance(variances: np.ndarray, factors: np.ndarray, flux_scale: str) -> np.ndarray:
+    """Propagate variance back to the raw display space."""
+    if flux_scale == "log":
+        return variances
+    return variances * np.square(factors[:, np.newaxis])
+
+
 class Emulator:
     """
     A Bayesian spectral emulator.
@@ -353,6 +406,7 @@ class Emulator:
         kernel: str = "rbf",
         _param_min: Optional[np.ndarray] = None,
         _param_range: Optional[np.ndarray] = None,
+        flux_scale: str = "linear",
         ):
         self.log = logging.getLogger(self.__class__.__name__)
         
@@ -368,6 +422,7 @@ class Emulator:
         self.strict_weight_fit = strict_weight_fit
         self.per_component = per_component
         self.kernel = kernel
+        self.flux_scale = flux_scale
         
         # Parameter normalization: scale grid_points to [0,1] for GP kernel operations
         if _param_min is not None and _param_range is not None:
@@ -727,6 +782,11 @@ class Emulator:
         else:
             name = ".".join(filename.split(".")[:-1])
 
+        if "flux_scale" in data:
+            flux_scale = str(data["flux_scale"])
+        else:
+            flux_scale = _infer_flux_scale_from_source(name)
+
         # Load normalization params if present (backward compatibility)
         _param_min = data["_param_min"] if "_param_min" in data else None
         _param_range = data["_param_range"] if "_param_range" in data else None
@@ -751,6 +811,7 @@ class Emulator:
             kernel=kernel,
             _param_min=_param_min,
             _param_range=_param_range,
+            flux_scale=flux_scale,
         )
         emulator._trained = trained
         
@@ -795,6 +856,7 @@ class Emulator:
             "strict_weight_fit": self.strict_weight_fit,
             "per_component": self.per_component,
             "kernel": self.kernel,
+            "flux_scale": self.flux_scale,
             "_param_min": self._param_min,
             "_param_range": self._param_range,
         }
@@ -838,9 +900,8 @@ class Emulator:
             grid = NPZInterface(grid)
 
         fluxes = np.array(list(grid.fluxes))
-        # Normalize to an average of 1
-        norm_factors = fluxes.mean(1)
-        fluxes /= norm_factors[:, np.newaxis]
+        flux_scale = _infer_flux_scale_from_source(grid)
+        fluxes, norm_factors = _preprocess_flux_matrix(fluxes, flux_scale)
         # Center and whiten
         flux_mean = fluxes.mean(0)
         fluxes -= flux_mean
@@ -887,9 +948,8 @@ class Emulator:
             grid = NPZInterface(grid)
 
         fluxes = np.array(list(grid.fluxes))
-        # Normalize to an average of 1 to remove uninteresting correlation
-        norm_factors = fluxes.mean(1)
-        fluxes /= norm_factors[:, np.newaxis]
+        flux_scale = _infer_flux_scale_from_source(grid)
+        fluxes, norm_factors = _preprocess_flux_matrix(fluxes, flux_scale)
         # Center and whiten
         flux_mean = fluxes.mean(0)
         fluxes -= flux_mean
@@ -937,6 +997,7 @@ class Emulator:
             strict_weight_fit=strict_weight_fit,
             per_component=per_component,
             kernel=kernel,
+            flux_scale=flux_scale,
         )
         emulator.pca_explained_variance = float(exp_var)
         # profiler.stop()
@@ -1477,7 +1538,11 @@ class Emulator:
         X = self.eigenspectra * self.flux_std
         flux = weights @ X + self.flux_mean
         if norm:
-            flux *= self.norm_factor(params)[:, np.newaxis]
+            factors = np.atleast_1d(self.norm_factor(params))
+            if self.flux_scale == "log":
+                flux += factors[:, np.newaxis]
+            else:
+                flux *= factors[:, np.newaxis]
         return np.squeeze(flux)
 
     # ==================================================================
@@ -1614,11 +1679,8 @@ class Emulator:
             if isinstance(grid, str):
                 grid = NPZInterface(grid)
 
-            # Original normalised spectra (same transform as from_grid:
-            # raw → divide by per-spectrum mean → we compare against this)
             fluxes_raw = np.array(list(grid.fluxes))
-            norm_factors = fluxes_raw.mean(1)
-            original = fluxes_raw / norm_factors[:, np.newaxis]
+            original, norm_factors = _preprocess_flux_matrix(fluxes_raw, self.flux_scale)
 
             # Inverse PCA transform:  flux = weights @ (eigenspectra * flux_std) + flux_mean
             # This matches load_flux() exactly — using the emulator's stored
@@ -1654,12 +1716,26 @@ class Emulator:
             #    independent so total variance is additive.
             X2 = X ** 2                                     # (K, P)
             loo_recon_var = loo_var.T @ X2                   # (M, P)
+            display_original = fluxes_raw
+            display_pca_recon = _restore_flux_matrix(
+                pca_recon, norm_factors, self.flux_scale
+            )
+            display_loo_recon = _restore_flux_matrix(
+                loo_recon, norm_factors, self.flux_scale
+            )
+            display_loo_recon_var = _restore_flux_variance(
+                loo_recon_var, norm_factors, self.flux_scale
+            )
 
             results.update({
                 'original_flux': original,          # (M, P) normalised grid spectra
                 'pca_recon_flux': pca_recon,         # (M, P) PCA truncation recon
                 'loo_recon_flux': loo_recon,          # (M, P) LOO GP recon
                 'loo_recon_var': loo_recon_var,       # (M, P) LOO flux-space variance
+                'display_original_flux': display_original,
+                'display_pca_recon_flux': display_pca_recon,
+                'display_loo_recon_flux': display_loo_recon,
+                'display_loo_recon_var': display_loo_recon_var,
                 'loo_mu': loo_mu,                    # (K, M) LOO predicted weights
                 'loo_var': loo_var,                   # (K, M) LOO predictive variances
                 'wavelength': self.wl,               # (P,)
@@ -1921,7 +1997,7 @@ class Emulator:
 
     def norm_factor(self, params: Union[Sequence[float], np.ndarray]) -> float:
         """
-        Return the scaling factor for the absolute flux units in flux-normalized spectra
+        Return the stored per-spectrum preprocessing factor.
 
         Parameters
         ----------
@@ -1931,7 +2007,8 @@ class Emulator:
         Returns
         -------
         factor: float
-            The multiplicative factor to normalize a spectrum to the model's absolute flux units
+            The interpolated preprocessing factor. For non-log models this is
+            multiplicative; for log models it is additive.
         """
         _params = np.asarray(params)
         return self.factor_interpolator(_params)
