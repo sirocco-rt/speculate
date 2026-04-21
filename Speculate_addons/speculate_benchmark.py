@@ -706,7 +706,8 @@ def run_mcmc_single(
                 _frozen_nuisance[_lbl] = float(model.params[_lbl])
                 model.freeze(_lbl)
 
-    ndim = len(model.labels)
+    _sampled_labels = list(model.labels)
+    ndim = len(_sampled_labels)
 
     # Initialise walkers in a truncated-normal ball around MLE.
     # For Normal priors: σ = the distribution's own std (1σ).
@@ -841,23 +842,13 @@ def run_mcmc_single(
     converged = all(rh < 1.1 for rh in r_hat_dict.values() if np.isfinite(rh))
     converged = converged and flat.shape[0] >= 100
 
-    # Restore any nuisance params that were frozen for this MCMC run so the
-    # model object is left in a usable state for downstream callers.
-    for _lbl, _val in _frozen_nuisance.items():
-        model.thaw(_lbl)
-        model[_lbl] = _val
-
-    # Full chain (nsteps, nwalkers, ndim) before burn-in — used for
-    # chain trace plots in the benchmark viewer.
-    full_chain = sampler.get_chain()  # (nsteps, nwalkers, ndim)
-
     # Best-fit spectrum at posterior means — set model params, evaluate, and
     # store the arrays so the viewer can reconstruct the Starfish-style plot
     # without needing the live model object.
     bestfit_spec = {}
     try:
         _mean_params = {}
-        for i, label in enumerate(model.labels):
+        for i, label in enumerate(_sampled_labels):
             _mean_params[label] = float(np.mean(flat[:, i]))
         model.set_param_dict(_mean_params)
         _bf_flux, _bf_cov = model()
@@ -873,6 +864,16 @@ def run_mcmc_single(
         }
     except Exception:
         pass  # non-critical — viewer will skip the plot
+
+    # Restore any nuisance params that were frozen for this MCMC run so the
+    # model object is left in a usable state for downstream callers.
+    for _lbl, _val in _frozen_nuisance.items():
+        model.thaw(_lbl)
+        model[_lbl] = _val
+
+    # Full chain (nsteps, nwalkers, ndim) before burn-in — used for
+    # chain trace plots in the benchmark viewer.
+    full_chain = sampler.get_chain()  # (nsteps, nwalkers, ndim)
 
     return {
         "samples": flat,

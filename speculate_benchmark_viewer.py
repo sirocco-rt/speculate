@@ -294,7 +294,7 @@ def _(
 
 
 @app.cell(hide_code=True)
-def _(get_report, get_tier1_arrays, mo, np, plt):
+def _(alt, get_report, get_tier1_arrays, mo, np, plt):
     # ── Tier result tabs ──
     # Render the active report as a set of tabs, one per benchmark tier.
     # Each tab is self-contained: Tier 1 shows EAS + LOO diagnostics,
@@ -392,12 +392,27 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
         _nlpds = _t1.get("nlpd_per_comp", [])
 
         if _rmses:
-            _fig_rmse, _ax_rmse = plt.subplots(figsize=(7, 4))
-            _ax_rmse.bar(range(len(_rmses)), _rmses, color="steelblue")
-            _ax_rmse.set_xlabel("PCA Component")
-            _ax_rmse.set_ylabel("LOO RMSE")
-            _ax_rmse.set_title("Leave-One-Out RMSE")
-            plt.tight_layout()
+            # This bar chart shows the leave-one-out RMSE for each PCA component.
+            # It highlights which PCA weights are hardest for the GP to reconstruct accurately.
+            _fig_rmse = alt.Chart(
+                alt.Data(
+                    values=[
+                        {"PCA Component": _component, "LOO RMSE": _rmse}
+                        for _component, _rmse in enumerate(_rmses)
+                    ]
+                )
+            ).mark_bar(color="steelblue").encode(
+                x=alt.X("PCA Component:O", title="PCA Component"),
+                y=alt.Y("LOO RMSE:Q", title="LOO RMSE"),
+                tooltip=[
+                    alt.Tooltip("PCA Component:O", title="PCA Component"),
+                    alt.Tooltip("LOO RMSE:Q", title="LOO RMSE", format=".4e"),
+                ],
+            ).properties(
+                width="container",
+                height=320,
+                title="Leave-One-Out RMSE",
+            )
             _rmse_info = mo.md(
                 "### LOO RMSE per Component\n\n"
                 "**What this shows:** The root-mean-square prediction error for each "
@@ -410,20 +425,40 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                 "PCA components to drop poorly-modelled trailing components."
             )
             _t1_items.append(mo.accordion(
-                {"LOO RMSE per Component": mo.hstack([mo.as_html(_fig_rmse), _rmse_info], widths=[3, 1])}
+                {"LOO RMSE per Component": mo.hstack([_fig_rmse, _rmse_info], widths=[3, 1])}
             ))
-            plt.close()
 
         # --- Q² per component ---
         if _q2s:
-            _fig_q2, _ax_q2 = plt.subplots(figsize=(7, 4))
             _colors = ["#2ecc71" if v >= 0.90 else "#f39c12" if v >= 0.70 else "#e74c3c" for v in _q2s]
-            _ax_q2.bar(range(len(_q2s)), _q2s, color=_colors)
-            _ax_q2.set_xlabel("PCA Component")
-            _ax_q2.set_ylabel("Q\u00b2")
-            _ax_q2.set_title("Per-Component Q\u00b2 (LOO R\u00b2)")
-            _ax_q2.axhline(1.0, color="grey", ls="--", lw=0.8)
-            plt.tight_layout()
+
+            # This bar chart shows the leave-one-out predictive Q² score for each PCA component.
+            # It highlights which components are well predicted by the GP and which ones are degrading.
+            _q2_values = [
+                {"PCA Component": _component, "Q2": _q2, "BarColor": _color}
+                for _component, (_q2, _color) in enumerate(zip(_q2s, _colors))
+            ]
+            _q2_rule = alt.Chart(alt.Data(values=[{"Reference": 1.0}])).mark_rule(
+                color="grey",
+                strokeDash=[6, 4],
+                strokeWidth=1.2,
+            ).encode(y="Reference:Q")
+            _q2_bars = alt.Chart(
+                alt.Data(values=_q2_values)
+            ).mark_bar().encode(
+                x=alt.X("PCA Component:O", title="PCA Component"),
+                y=alt.Y("Q2:Q", title="Q²"),
+                color=alt.Color("BarColor:N", scale=None, legend=None),
+                tooltip=[
+                    alt.Tooltip("PCA Component:O", title="PCA Component"),
+                    alt.Tooltip("Q2:Q", title="Q²", format=".4f"),
+                ],
+            )
+            _fig_q2 = (_q2_rule + _q2_bars).properties(
+                width="container",
+                height=320,
+                title="Per-Component Q² (LOO R²)",
+            )
             _q2_info = mo.md(
                 "### Per-Component Q\u00b2\n\n"
                 "**What this shows:** The leave-one-out predictive R\u00b2 for each PCA "
@@ -436,18 +471,32 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                 "If only trailing components are red, consider reducing the PCA rank."
             )
             _t1_items.append(mo.accordion(
-                {"Per-Component Q\u00b2": mo.hstack([mo.as_html(_fig_q2), _q2_info], widths=[3, 1])}
+                {"Per-Component Q\u00b2": mo.hstack([_fig_q2, _q2_info], widths=[3, 1])}
             ))
-            plt.close()
 
         # --- NLPD per component ---
         if _nlpds:
-            _fig_nlpd, _ax_nlpd = plt.subplots(figsize=(7, 4))
-            _ax_nlpd.bar(range(len(_nlpds)), _nlpds, color="darkorange")
-            _ax_nlpd.set_xlabel("PCA Component")
-            _ax_nlpd.set_ylabel("NLPD")
-            _ax_nlpd.set_title("LOO Neg. Log Predictive Density")
-            plt.tight_layout()
+            # This bar chart shows the leave-one-out negative log predictive density for each PCA component.
+            # It highlights which components have the poorest combined accuracy and uncertainty calibration.
+            _fig_nlpd = alt.Chart(
+                alt.Data(
+                    values=[
+                        {"PCA Component": _component, "NLPD": _nlpd}
+                        for _component, _nlpd in enumerate(_nlpds)
+                    ]
+                )
+            ).mark_bar(color="darkorange").encode(
+                x=alt.X("PCA Component:O", title="PCA Component"),
+                y=alt.Y("NLPD:Q", title="NLPD"),
+                tooltip=[
+                    alt.Tooltip("PCA Component:O", title="PCA Component"),
+                    alt.Tooltip("NLPD:Q", title="NLPD", format=".4f"),
+                ],
+            ).properties(
+                width="container",
+                height=320,
+                title="LOO Neg. Log Predictive Density",
+            )
             _nlpd_info = mo.md(
                 "### LOO Negative Log Predictive Density\n\n"
                 "**What this shows:** A proper scoring rule that penalises both inaccurate "
@@ -459,22 +508,76 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                 "or to adding training points near the problematic region of parameter space."
             )
             _t1_items.append(mo.accordion(
-                {"NLPD per Component": mo.hstack([mo.as_html(_fig_nlpd), _nlpd_info], widths=[3, 1])}
+                {"NLPD per Component": mo.hstack([_fig_nlpd, _nlpd_info], widths=[3, 1])}
             ))
-            plt.close()
 
         # --- LOO residual distribution ---
         _std_resid = _t1.get("loo_std_resid", [])
         if _std_resid:
             _flat = np.array(_std_resid).flatten()
-            _fig_hist, _ax_hist = plt.subplots(figsize=(7, 4))
-            _ax_hist.hist(_flat, bins=50, density=True, alpha=0.7, color="steelblue", label="Leave-One-Out")
-            _xgauss = np.linspace(-4, 4, 200)
-            _ax_hist.plot(_xgauss, 1.0/(np.sqrt(2*np.pi))*np.exp(-0.5*_xgauss**2), "r-", label="N(0,1)")
-            _ax_hist.set_xlabel("Standardised Residual")
-            _ax_hist.set_title("LOO Residual Distribution")
-            _ax_hist.legend()
-            plt.tight_layout()
+
+            # This histogram shows the distribution of standardised LOO residuals across all PCA components.
+            # It compares the empirical residual density against the ideal N(0,1) Gaussian reference curve.
+            # Clip the displayed x-range to the central residual bulk so extreme outliers do not squash the plot.
+            _display_limit = max(4.0, min(6.0, float(np.nanpercentile(np.abs(_flat), 99.5))))
+            _hist_density, _hist_edges = np.histogram(
+                _flat,
+                bins=50,
+                range=(-_display_limit, _display_limit),
+                density=True,
+            )
+            _hist_values = [
+                {
+                    "Bin Start": float(_left),
+                    "Bin End": float(_right),
+                    "Density": float(_density),
+                    "Baseline": 0.0,
+                }
+                for _left, _right, _density in zip(_hist_edges[:-1], _hist_edges[1:], _hist_density)
+            ]
+            _xgauss = np.linspace(-_display_limit, _display_limit, 400)
+            _gaussian_values = [
+                {
+                    "Residual": float(_x),
+                    "Density": float((1.0 / np.sqrt(2 * np.pi)) * np.exp(-0.5 * _x**2)),
+                    "Series": "N(0,1)",
+                }
+                for _x in _xgauss
+            ]
+            _hist_bars = alt.Chart(alt.Data(values=_hist_values)).mark_rect(
+                color="steelblue",
+                opacity=0.7,
+            ).encode(
+                x=alt.X(
+                    "Bin Start:Q",
+                    title="Standardised Residual",
+                    scale=alt.Scale(domain=[-_display_limit, _display_limit]),
+                ),
+                x2="Bin End:Q",
+                y=alt.Y("Density:Q", title="Density"),
+                y2="Baseline:Q",
+                tooltip=[
+                    alt.Tooltip("Bin Start:Q", title="Bin Start", format=".3f"),
+                    alt.Tooltip("Bin End:Q", title="Bin End", format=".3f"),
+                    alt.Tooltip("Density:Q", title="Density", format=".4f"),
+                ],
+            )
+            _hist_gaussian = alt.Chart(alt.Data(values=_gaussian_values)).mark_line(
+                color="red",
+                strokeWidth=2,
+            ).encode(
+                x=alt.X("Residual:Q", scale=alt.Scale(domain=[-_display_limit, _display_limit])),
+                y=alt.Y("Density:Q"),
+                tooltip=[
+                    alt.Tooltip("Residual:Q", title="Residual", format=".3f"),
+                    alt.Tooltip("Density:Q", title="N(0,1)", format=".4f"),
+                ],
+            )
+            _fig_hist = (_hist_bars + _hist_gaussian).properties(
+                width="container",
+                height=320,
+                title="LOO Residual Distribution",
+            )
             _hist_info = mo.md(
                 "### Residual Distribution\n\n"
                 "**What this shows:** Histogram of standardised LOO residuals across all "
@@ -488,9 +591,8 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                 "Heavy tails \u2192 add training points or try a different optimiser."
             )
             _t1_items.append(mo.accordion(
-                {"LOO Residual Distribution": mo.hstack([mo.as_html(_fig_hist), _hist_info], widths=[3, 1])}
+                {"LOO Residual Distribution": mo.hstack([_fig_hist, _hist_info], widths=[3, 1])}
             ))
-            plt.close()
 
         # --- Q-Q plot of standardised residuals ---
         _std_resid = _t1.get("loo_std_resid", [])
@@ -501,15 +603,61 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
             _theoretical = _sp_stats.norm.ppf(
                 (np.arange(1, _n_pts + 1) - 0.5) / _n_pts
             )
-            _fig_qq, _ax_qq = plt.subplots(figsize=(5, 5))
-            _ax_qq.scatter(_theoretical, _flat, s=1, alpha=0.4, color="steelblue")
             _qq_lim = max(abs(_theoretical[0]), abs(_theoretical[-1]), abs(_flat[0]), abs(_flat[-1]))
-            _ax_qq.plot([-_qq_lim, _qq_lim], [-_qq_lim, _qq_lim], "r-", lw=1.0)
-            _ax_qq.set_xlabel("Theoretical Quantiles (N(0,1))")
-            _ax_qq.set_ylabel("Sample Quantiles")
-            _ax_qq.set_title("Q\u2013Q Plot of Standardised LOO Residuals")
-            _ax_qq.set_aspect("equal")
-            plt.tight_layout()
+
+            # This scatter plot compares empirical residual quantiles against standard normal quantiles.
+            # It shows whether the standardised LOO residuals follow the expected N(0,1) distribution.
+            _qq_values = [
+                {
+                    "Theoretical Quantile": float(_theory),
+                    "Sample Quantile": float(_sample),
+                }
+                for _theory, _sample in zip(_theoretical, _flat)
+            ]
+            _qq_reference = [
+                {"Theoretical Quantile": float(-_qq_lim), "Reference": float(-_qq_lim)},
+                {"Theoretical Quantile": float(_qq_lim), "Reference": float(_qq_lim)},
+            ]
+            _qq_line = alt.Chart(alt.Data(values=_qq_reference)).mark_line(
+                color="red",
+                strokeWidth=1.5,
+            ).encode(
+                x=alt.X(
+                    "Theoretical Quantile:Q",
+                    title="Theoretical Quantiles (N(0,1))",
+                    scale=alt.Scale(domain=[-_qq_lim, _qq_lim]),
+                ),
+                y=alt.Y(
+                    "Reference:Q",
+                    title="Sample Quantiles",
+                    scale=alt.Scale(domain=[-_qq_lim, _qq_lim]),
+                ),
+            )
+            _qq_points = alt.Chart(alt.Data(values=_qq_values)).mark_circle(
+                color="steelblue",
+                opacity=0.4,
+                size=14,
+            ).encode(
+                x=alt.X(
+                    "Theoretical Quantile:Q",
+                    title="Theoretical Quantiles (N(0,1))",
+                    scale=alt.Scale(domain=[-_qq_lim, _qq_lim]),
+                ),
+                y=alt.Y(
+                    "Sample Quantile:Q",
+                    title="Sample Quantiles",
+                    scale=alt.Scale(domain=[-_qq_lim, _qq_lim]),
+                ),
+                tooltip=[
+                    alt.Tooltip("Theoretical Quantile:Q", title="Theoretical", format=".3f"),
+                    alt.Tooltip("Sample Quantile:Q", title="Sample", format=".3f"),
+                ],
+            )
+            _fig_qq = (_qq_line + _qq_points).properties(
+                width=400,
+                height=400,
+                title="Q\u2013Q Plot of Standardised LOO Residuals",
+            ).interactive()
             _qq_info = mo.md(
                 "### Q\u2013Q Plot\n\n"
                 "**What this shows:** Compares the quantiles of the standardised LOO residuals "
@@ -525,9 +673,8 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                 "predictions \u2014 try adding training points or a different kernel/optimiser."
             )
             _t1_items.append(mo.accordion(
-                {"Q\u2013Q Plot": mo.hstack([mo.as_html(_fig_qq), _qq_info], widths=[2, 1])}
+                {"Q\u2013Q Plot": mo.hstack([_fig_qq, _qq_info], widths=[2, 1])}
             ))
-            plt.close()
 
         # --- Decorrelated Q-Q plot (Bastos & O'Hagan 2009) ---
         _decorr_resid = _t1.get("loo_decorr_resid", [])
@@ -538,16 +685,62 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
             _dtheoretical = _sp_stats.norm.ppf(
                 (np.arange(1, _dn_pts + 1) - 0.5) / _dn_pts
             )
-            _fig_dqq, _ax_dqq = plt.subplots(figsize=(5, 5))
-            _ax_dqq.scatter(_dtheoretical, _dflat, s=1, alpha=0.4, color="darkorange")
             _dqq_lim = max(abs(_dtheoretical[0]), abs(_dtheoretical[-1]),
                            abs(_dflat[0]), abs(_dflat[-1]))
-            _ax_dqq.plot([-_dqq_lim, _dqq_lim], [-_dqq_lim, _dqq_lim], "r-", lw=1.0)
-            _ax_dqq.set_xlabel("Theoretical Quantiles (N(0,1))")
-            _ax_dqq.set_ylabel("Decorrelated Sample Quantiles")
-            _ax_dqq.set_title("Decorrelated Q\u2013Q Plot (Bastos & O\u2019Hagan 2009)")
-            _ax_dqq.set_aspect("equal")
-            plt.tight_layout()
+
+            # This scatter plot compares decorrelated residual quantiles against standard normal quantiles.
+            # It shows whether the Cholesky-decorrelated LOO residuals follow the expected N(0,1) distribution.
+            _dqq_values = [
+                {
+                    "Theoretical Quantile": float(_theory),
+                    "Decorrelated Sample Quantile": float(_sample),
+                }
+                for _theory, _sample in zip(_dtheoretical, _dflat)
+            ]
+            _dqq_reference = [
+                {"Theoretical Quantile": float(-_dqq_lim), "Reference": float(-_dqq_lim)},
+                {"Theoretical Quantile": float(_dqq_lim), "Reference": float(_dqq_lim)},
+            ]
+            _dqq_line = alt.Chart(alt.Data(values=_dqq_reference)).mark_line(
+                color="red",
+                strokeWidth=1.5,
+            ).encode(
+                x=alt.X(
+                    "Theoretical Quantile:Q",
+                    title="Theoretical Quantiles (N(0,1))",
+                    scale=alt.Scale(domain=[-_dqq_lim, _dqq_lim]),
+                ),
+                y=alt.Y(
+                    "Reference:Q",
+                    title="Decorrelated Sample Quantiles",
+                    scale=alt.Scale(domain=[-_dqq_lim, _dqq_lim]),
+                ),
+            )
+            _dqq_points = alt.Chart(alt.Data(values=_dqq_values)).mark_circle(
+                color="darkorange",
+                opacity=0.4,
+                size=14,
+            ).encode(
+                x=alt.X(
+                    "Theoretical Quantile:Q",
+                    title="Theoretical Quantiles (N(0,1))",
+                    scale=alt.Scale(domain=[-_dqq_lim, _dqq_lim]),
+                ),
+                y=alt.Y(
+                    "Decorrelated Sample Quantile:Q",
+                    title="Decorrelated Sample Quantiles",
+                    scale=alt.Scale(domain=[-_dqq_lim, _dqq_lim]),
+                ),
+                tooltip=[
+                    alt.Tooltip("Theoretical Quantile:Q", title="Theoretical", format=".3f"),
+                    alt.Tooltip("Decorrelated Sample Quantile:Q", title="Decorrelated Sample", format=".3f"),
+                ],
+            )
+            _fig_dqq = (_dqq_line + _dqq_points).properties(
+                width=400,
+                height=400,
+                title="Decorrelated Q\u2013Q Plot (Bastos & O\u2019Hagan 2009)",
+            ).interactive()
             _dqq_info = mo.md(
                 "### Decorrelated Q\u2013Q Plot\n\n"
                 "**What this shows:** Quantiles of Cholesky-decorrelated LOO residuals "
@@ -562,9 +755,8 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                 "kernel or optimiser. Localised outliers \u2192 add training points."
             )
             _t1_items.append(mo.accordion(
-                {"Decorrelated Q\u2013Q Plot": mo.hstack([mo.as_html(_fig_dqq), _dqq_info], widths=[2, 1])}
+                {"Decorrelated Q\u2013Q Plot": mo.hstack([_fig_dqq, _dqq_info], widths=[2, 1])}
             ))
-            plt.close()
 
         # --- Per-wavelength RMSE envelope ---
         # Source data from live arrays (if available) or serialised report.
@@ -648,22 +840,83 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
             if hasattr(_loo_rmse_arr, '__len__') and len(_loo_rmse_arr) > 0:
                 _sorted_idx = np.argsort(_loo_rmse_arr)
                 _worst_idx = _sorted_idx[-3:][::-1]
-                _fig_worst, _axes_worst = plt.subplots(len(_worst_idx), 1, figsize=(12, 3 * len(_worst_idx)), sharex=True)
-                if len(_worst_idx) == 1:
-                    _axes_worst = [_axes_worst]
+                _series_domain = ["Original", "LOO recon"]
+                _series_colors = ["#f1c40f", "#e74c3c"]
+                _series_dashes = [[1, 0], [6, 4]]
+                if _pca_rec is not None:
+                    _series_domain.insert(1, "PCA recon")
+                    _series_colors.insert(1, "#3498db")
+                    _series_dashes.insert(1, [4, 4])
+
+                # These stacked line charts show the three worst-reconstructed spectra in Tier 1.
+                # Each panel overlays the original spectrum with the PCA-only and full LOO reconstructions.
+                _worst_charts = []
                 for _wi, _idx in enumerate(_worst_idx):
-                    _ax = _axes_worst[_wi]
-                    _ax.plot(_wl, _orig[_idx], label="Original", color="#f1c40f", lw=0.8)
+                    _rmse_text = (
+                        f"{float(_loo_rmse_arr[_idx]):.5f}"
+                        if hasattr(_loo_rmse_arr, '__getitem__')
+                        else "?"
+                    )
+                    _worst_values = []
+                    for _wavelength, _flux in zip(_wl, _orig[_idx]):
+                        _worst_values.append({
+                            "Wavelength": float(_wavelength),
+                            "Flux": float(_flux),
+                            "Series": "Original",
+                        })
                     if _pca_rec is not None:
-                        _ax.plot(_wl, _pca_rec[_idx], label="PCA recon", color="#3498db", lw=0.8, ls="--")
-                    _ax.plot(_wl, _loo_rec[_idx], label="LOO recon", color="#e74c3c", lw=0.8, ls="--")
-                    _ax.set_ylabel(_flux_axis_title)
-                    _rmse_val = _loo_rmse_arr[_idx] if hasattr(_loo_rmse_arr, '__getitem__') else "?"
-                    _ax.set_title(f"Spectrum #{_idx} (LOO RMSE = {_rmse_val:.5f})")
-                    if _wi == 0:
-                        _ax.legend(fontsize=8)
-                _axes_worst[-1].set_xlabel("Wavelength (\u00c5)")
-                plt.tight_layout()
+                        for _wavelength, _flux in zip(_wl, _pca_rec[_idx]):
+                            _worst_values.append({
+                                "Wavelength": float(_wavelength),
+                                "Flux": float(_flux),
+                                "Series": "PCA recon",
+                            })
+                    for _wavelength, _flux in zip(_wl, _loo_rec[_idx]):
+                        _worst_values.append({
+                            "Wavelength": float(_wavelength),
+                            "Flux": float(_flux),
+                            "Series": "LOO recon",
+                        })
+
+                    _worst_chart = alt.Chart(alt.Data(values=_worst_values)).mark_line(
+                        strokeWidth=1.5,
+                    ).encode(
+                        x=alt.X(
+                            "Wavelength:Q",
+                            title="Wavelength (Å)",
+                            scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))]),
+                        ),
+                        y=alt.Y(
+                            "Flux:Q",
+                            title=_flux_axis_title,
+                            scale=alt.Scale(zero=False),
+                        ),
+                        color=alt.Color(
+                            "Series:N",
+                            title="Series",
+                            scale=alt.Scale(domain=_series_domain, range=_series_colors),
+                            legend=alt.Legend(orient="top") if _wi == 0 else None,
+                        ),
+                        strokeDash=alt.StrokeDash(
+                            "Series:N",
+                            scale=alt.Scale(domain=_series_domain, range=_series_dashes),
+                            legend=None,
+                        ),
+                        tooltip=[
+                            alt.Tooltip("Series:N", title="Series"),
+                            alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+                            alt.Tooltip("Flux:Q", title=_flux_axis_title, format=".4e"),
+                        ],
+                    ).properties(
+                        width="container",
+                        height=180,
+                        title=f"Spectrum #{_idx} (LOO RMSE = {_rmse_text})",
+                    )
+                    _worst_charts.append(_worst_chart)
+
+                _fig_worst = alt.vconcat(*_worst_charts, spacing=12).resolve_scale(
+                    y="independent"
+                ).interactive()
                 _worst_info = mo.md(
                     "### Worst-Case Spectra\n\n"
                     "**What this shows:** The three grid-point spectra with the largest "
@@ -679,28 +932,80 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                     "PCA reconstruction (blue) is already poor, more PCA components are needed."
                 )
                 _t1_items.append(mo.accordion(
-                    {"Worst-Case Spectra Overlay": mo.hstack([mo.as_html(_fig_worst), _worst_info], widths=[3, 1])}
+                    {"Worst-Case Spectra Overlay": mo.hstack([_fig_worst, _worst_info], widths=[3, 1])}
                 ))
-                plt.close()
 
                 # --- Best-case spectra overlay ---
                 _best_idx = _sorted_idx[:3]
-                _fig_best, _axes_best = plt.subplots(len(_best_idx), 1, figsize=(12, 3 * len(_best_idx)), sharex=True)
-                if len(_best_idx) == 1:
-                    _axes_best = [_axes_best]
+                # These stacked line charts show the three best-reconstructed spectra in Tier 1.
+                # Each panel shows how closely the PCA-only and LOO reconstructions track the original spectrum.
+                _best_charts = []
                 for _bi, _idx in enumerate(_best_idx):
-                    _ax = _axes_best[_bi]
-                    _ax.plot(_wl, _orig[_idx], label="Original", color="#f1c40f", lw=0.8)
+                    _rmse_text = (
+                        f"{float(_loo_rmse_arr[_idx]):.5f}"
+                        if hasattr(_loo_rmse_arr, '__getitem__')
+                        else "?"
+                    )
+                    _best_values = []
+                    for _wavelength, _flux in zip(_wl, _orig[_idx]):
+                        _best_values.append({
+                            "Wavelength": float(_wavelength),
+                            "Flux": float(_flux),
+                            "Series": "Original",
+                        })
                     if _pca_rec is not None:
-                        _ax.plot(_wl, _pca_rec[_idx], label="PCA recon", color="#3498db", lw=0.8, ls="--")
-                    _ax.plot(_wl, _loo_rec[_idx], label="LOO recon", color="#e74c3c", lw=0.8, ls="--")
-                    _ax.set_ylabel("Normalised Flux")
-                    _rmse_val = _loo_rmse_arr[_idx] if hasattr(_loo_rmse_arr, '__getitem__') else "?"
-                    _ax.set_title(f"Spectrum #{_idx} (LOO RMSE = {_rmse_val:.5f})")
-                    if _bi == 0:
-                        _ax.legend(fontsize=8)
-                _axes_best[-1].set_xlabel("Wavelength (\u00c5)")
-                plt.tight_layout()
+                        for _wavelength, _flux in zip(_wl, _pca_rec[_idx]):
+                            _best_values.append({
+                                "Wavelength": float(_wavelength),
+                                "Flux": float(_flux),
+                                "Series": "PCA recon",
+                            })
+                    for _wavelength, _flux in zip(_wl, _loo_rec[_idx]):
+                        _best_values.append({
+                            "Wavelength": float(_wavelength),
+                            "Flux": float(_flux),
+                            "Series": "LOO recon",
+                        })
+
+                    _best_chart = alt.Chart(alt.Data(values=_best_values)).mark_line(
+                        strokeWidth=1.5,
+                    ).encode(
+                        x=alt.X(
+                            "Wavelength:Q",
+                            title="Wavelength (Å)",
+                            scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))]),
+                        ),
+                        y=alt.Y(
+                            "Flux:Q",
+                            title=_flux_axis_title,
+                            scale=alt.Scale(zero=False),
+                        ),
+                        color=alt.Color(
+                            "Series:N",
+                            title="Series",
+                            scale=alt.Scale(domain=_series_domain, range=_series_colors),
+                            legend=alt.Legend(orient="top") if _bi == 0 else None,
+                        ),
+                        strokeDash=alt.StrokeDash(
+                            "Series:N",
+                            scale=alt.Scale(domain=_series_domain, range=_series_dashes),
+                            legend=None,
+                        ),
+                        tooltip=[
+                            alt.Tooltip("Series:N", title="Series"),
+                            alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+                            alt.Tooltip("Flux:Q", title=_flux_axis_title, format=".4e"),
+                        ],
+                    ).properties(
+                        width="container",
+                        height=180,
+                        title=f"Spectrum #{_idx} (LOO RMSE = {_rmse_text})",
+                    )
+                    _best_charts.append(_best_chart)
+
+                _fig_best = alt.vconcat(*_best_charts, spacing=12).resolve_scale(
+                    y="independent"
+                ).interactive()
                 _best_info = mo.md(
                     "### Best-Case Spectra\n\n"
                     "**What this shows:** The three grid-point spectra with the smallest "
@@ -714,9 +1019,8 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                     "the PCA truncation is too aggressive \u2014 increase the number of components."
                 )
                 _t1_items.append(mo.accordion(
-                    {"Best-Case Spectra Overlay": mo.hstack([mo.as_html(_fig_best), _best_info], widths=[3, 1])}
+                    {"Best-Case Spectra Overlay": mo.hstack([_fig_best, _best_info], widths=[3, 1])}
                 ))
-                plt.close()
 
         _tabs["Tier 1"] = mo.vstack(_t1_items)
 
@@ -784,38 +1088,170 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
                 })
             _t2_items.append(mo.ui.table(_agg_rows, label="Aggregate Metrics"))
 
-            _fig2, _ax2 = plt.subplots(figsize=(6, 6))
-            _ax2.plot([0, 1], [0, 1], "k--", alpha=0.4, label="ideal")
-            for _pn, _m in _agg.items():
-                if "coverage_alphas" in _m:
-                    _ax2.plot(_m["coverage_alphas"], _m["coverage_values"], label=_pn)
-            _ax2.set_xlabel("Nominal Credible Level")
-            _ax2.set_ylabel("Empirical Coverage")
-            _ax2.set_title("PP-Plot (Calibration)")
-            _ax2.legend(fontsize=8)
-            _ax2.set_xlim(0, 1)
-            _ax2.set_ylim(0, 1)
-            plt.tight_layout()
-            _t2_items.append(mo.as_html(_fig2))
-            plt.close()
+            # This calibration plot compares nominal credible levels against empirical coverage.
+            # Points should fall near the y=x diagonal if the posterior intervals are well calibrated.
+            _pp_values = [
+                {
+                    "Parameter": _pn,
+                    "Nominal Credible Level": float(_alpha),
+                    "Empirical Coverage": float(_coverage),
+                }
+                for _pn, _m in _agg.items()
+                if "coverage_alphas" in _m and "coverage_values" in _m
+                for _alpha, _coverage in zip(_m["coverage_alphas"], _m["coverage_values"])
+            ]
+            _pp_reference = [
+                {"Nominal Credible Level": 0.0, "Ideal Coverage": 0.0},
+                {"Nominal Credible Level": 1.0, "Ideal Coverage": 1.0},
+            ]
+            _pp_reference_line = alt.Chart(alt.Data(values=_pp_reference)).mark_line(
+                color="grey",
+                strokeDash=[6, 4],
+                strokeWidth=1.5,
+                opacity=0.8,
+            ).encode(
+                x=alt.X(
+                    "Nominal Credible Level:Q",
+                    title="Nominal Credible Level",
+                    scale=alt.Scale(domain=[0, 1]),
+                ),
+                y=alt.Y(
+                    "Ideal Coverage:Q",
+                    title="Empirical Coverage",
+                    scale=alt.Scale(domain=[0, 1]),
+                ),
+            )
+            _pp_lines = alt.Chart(alt.Data(values=_pp_values)).mark_line(strokeWidth=2).encode(
+                x=alt.X(
+                    "Nominal Credible Level:Q",
+                    title="Nominal Credible Level",
+                    scale=alt.Scale(domain=[0, 1]),
+                ),
+                y=alt.Y(
+                    "Empirical Coverage:Q",
+                    title="Empirical Coverage",
+                    scale=alt.Scale(domain=[0, 1]),
+                ),
+                color=alt.Color("Parameter:N", title="", legend=alt.Legend(orient="top-left")),
+            )
+            _pp_points = alt.Chart(alt.Data(values=_pp_values)).mark_circle(size=40).encode(
+                x=alt.X(
+                    "Nominal Credible Level:Q",
+                    title="Nominal Credible Level",
+                    scale=alt.Scale(domain=[0, 1]),
+                ),
+                y=alt.Y(
+                    "Empirical Coverage:Q",
+                    title="Empirical Coverage",
+                    scale=alt.Scale(domain=[0, 1]),
+                ),
+                color=alt.Color("Parameter:N", title="", legend=None),
+                tooltip=[
+                    alt.Tooltip("Parameter:N", title="Parameter"),
+                    alt.Tooltip("Nominal Credible Level:Q", title="Nominal", format=".3f"),
+                    alt.Tooltip("Empirical Coverage:Q", title="Empirical", format=".3f"),
+                ],
+            )
+            _fig2 = (_pp_reference_line + _pp_lines + _pp_points).properties(
+                width=420,
+                height=420,
+                title="PP-Plot (Calibration)",
+            ).interactive()
+            _pp_info = mo.md(
+                "### PP-Plot (Calibration)\n\n"
+                "**What this shows:** For each parameter, the chart evaluates 50 nominal "
+                "credible levels between 0.01 and 0.999. Each point is the empirical "
+                "fraction of processed spectra whose ground-truth value lies inside that "
+                "posterior interval.\n\n"
+                "**Better looks like:** Curves track the dashed y=x line across the full "
+                "range of nominal credible levels.\n\n"
+                "**Why the step pattern:** Coverage is computed over a finite number of test "
+                "spectra, so it can only change in jumps of 1/n_processed. For example, if "
+                "10 spectra were processed, the vertical jumps are 0.1.\n\n"
+                "**How to read the endpoints:** A curve reaching 1.0 at high nominal "
+                "coverage means every processed truth falls inside the widest tested "
+                "interval. That does not imply the 68% or 95% summary coverages are also 1.0.\n\n"
+                "**How to improve:** Curves below the diagonal indicate over-confident "
+                "intervals; curves above the diagonal indicate under-confident intervals."
+            )
+            _t2_items.append(mo.accordion(
+                {"PP-Plot (Calibration)": mo.hstack([_fig2, _pp_info], widths=[2, 1])}
+            ))
 
             _param_names = list(_agg.keys())
-            _fig3, _axes3 = plt.subplots(1, 2, figsize=(12, 4))
-            _xp = np.arange(len(_param_names))
-            _axes3[0].bar(_xp, [_agg[_p]["rmse"] for _p in _param_names], color="steelblue")
-            _axes3[0].set_xticks(_xp)
-            _axes3[0].set_xticklabels(_param_names, rotation=45, ha="right", fontsize=8)
-            _axes3[0].set_ylabel("RMSE")
-            _axes3[0].set_title("Parameter RMSE")
-            _axes3[1].bar(_xp, [_agg[_p]["bias"] for _p in _param_names], color="salmon")
-            _axes3[1].axhline(0, color="k", lw=0.5)
-            _axes3[1].set_xticks(_xp)
-            _axes3[1].set_xticklabels(_param_names, rotation=45, ha="right", fontsize=8)
-            _axes3[1].set_ylabel("Bias")
-            _axes3[1].set_title("Parameter Bias")
-            plt.tight_layout()
-            _t2_items.append(mo.as_html(_fig3))
-            plt.close()
+
+            # This paired bar chart shows the aggregate recovery RMSE and signed bias for each Tier 2 parameter.
+            # It highlights which parameters are least accurate overall and whether the errors are systematically high or low.
+            _param_metric_values = [
+                {
+                    "Parameter": _param,
+                    "RMSE": float(_agg[_param]["rmse"]),
+                    "Bias": float(_agg[_param]["bias"]),
+                }
+                for _param in _param_names
+            ]
+            _fig3_rmse = alt.Chart(alt.Data(values=_param_metric_values)).mark_bar(
+                color="steelblue",
+            ).encode(
+                x=alt.X(
+                    "Parameter:N",
+                    title="Parameter",
+                    sort=_param_names,
+                    axis=alt.Axis(labelAngle=-35, labelLimit=220),
+                ),
+                y=alt.Y("RMSE:Q", title="RMSE"),
+                tooltip=[
+                    alt.Tooltip("Parameter:N", title="Parameter"),
+                    alt.Tooltip("RMSE:Q", title="RMSE", format=".4f"),
+                ],
+            ).properties(
+                width=280,
+                height=320,
+                title="Parameter RMSE",
+            )
+            _fig3_bias_rule = alt.Chart(alt.Data(values=[{"Reference": 0.0}])).mark_rule(
+                color="grey",
+                strokeWidth=1.2,
+            ).encode(y="Reference:Q")
+            _fig3_bias_bars = alt.Chart(alt.Data(values=_param_metric_values)).mark_bar(
+                color="salmon",
+            ).encode(
+                x=alt.X(
+                    "Parameter:N",
+                    title="Parameter",
+                    sort=_param_names,
+                    axis=alt.Axis(labelAngle=-35, labelLimit=220),
+                ),
+                y=alt.Y("Bias:Q", title="Bias"),
+                tooltip=[
+                    alt.Tooltip("Parameter:N", title="Parameter"),
+                    alt.Tooltip("Bias:Q", title="Bias", format=".4f"),
+                ],
+            )
+            _fig3 = (_fig3_rmse | (_fig3_bias_rule + _fig3_bias_bars).properties(
+                width=280,
+                height=320,
+                title="Parameter Bias",
+            )).resolve_scale(y="independent")
+            _fig3_info = mo.md(
+                "### Parameter RMSE and Bias\n\n"
+                "**What this shows:** The left panel shows the aggregate recovery RMSE for "
+                "each Tier 2 parameter, while the right panel shows the signed mean bias. "
+                "Use these charts to compare runs for the same parameter; absolute RMSE "
+                "heights are not directly comparable across parameters with different scales.\n\n"
+                "**Better looks like:** Short RMSE bars and bias bars clustered around the "
+                "zero reference line.\n\n"
+                "**Watch out for:** Large RMSE with small bias means the posteriors are noisy "
+                "or broad but not systematically shifted. Large positive or negative bias means "
+                "the inference is systematically overshooting or undershooting that parameter.\n\n"
+                "**How to improve:** Persistent bias usually points to emulator mismatch, model "
+                "degeneracy, or priors pushing the fit. High RMSE without strong bias often "
+                "improves with more informative spectra, tighter priors, or more reliable "
+                "posterior sampling."
+            )
+            _t2_items.append(mo.accordion(
+                {"Parameter RMSE and Bias": mo.hstack([_fig3, _fig3_info], widths=[3, 1])}
+            ))
 
         _tabs["Tier 2"] = mo.vstack(_t2_items)
 
@@ -837,26 +1273,68 @@ def _(get_report, get_tier1_arrays, mo, np, plt):
 
         try:
             _obs_names = [_r.get("obs_file", f"#{_i}") for _i, _r in enumerate(_t3)]
-            _chi2s = [_r.get("reduced_chi2", float("nan")) for _r in _t3]
-            _ppcs = [_r.get("ppc_coverage", float("nan")) for _r in _t3]
 
-            _fig4, _axes4 = plt.subplots(1, 2, figsize=(max(10, len(_obs_names)*2), 4))
-            _xr = np.arange(len(_obs_names))
-            _axes4[0].bar(_xr, _chi2s, color="steelblue")
-            _axes4[0].axhline(1.0, color="r", lw=1, ls="--")
-            _axes4[0].set_xticks(_xr)
-            _axes4[0].set_xticklabels(_obs_names, rotation=45, ha="right", fontsize=8)
-            _axes4[0].set_ylabel("Reduced chi2")
-            _axes4[0].set_title("Reduced chi2")
-            _axes4[1].bar(_xr, _ppcs, color="mediumseagreen")
-            _axes4[1].axhline(0.95, color="r", lw=1, ls="--")
-            _axes4[1].set_xticks(_xr)
-            _axes4[1].set_xticklabels(_obs_names, rotation=45, ha="right", fontsize=8)
-            _axes4[1].set_ylabel("PPC Coverage")
-            _axes4[1].set_title("Posterior Predictive Coverage")
-            plt.tight_layout()
-            _t3_items.append(mo.as_html(_fig4))
-            plt.close()
+            # This paired bar chart shows reduced chi2 and posterior predictive coverage for each observation.
+            # It highlights which observed spectra are fit well and which ones fail basic calibration checks.
+            _obs_metric_values = [
+                {
+                    "Observation": _name,
+                    "Reduced chi2": float(_row.get("reduced_chi2", float("nan"))),
+                    "PPC Coverage": float(_row.get("ppc_coverage", float("nan"))),
+                }
+                for _name, _row in zip(_obs_names, _t3)
+            ]
+            _obs_chart_width = max(280, min(700, 40 * len(_obs_names)))
+            _fig4_chi2_rule = alt.Chart(alt.Data(values=[{"Reference": 1.0}])).mark_rule(
+                color="red",
+                strokeDash=[6, 4],
+                strokeWidth=1.2,
+            ).encode(y="Reference:Q")
+            _fig4_chi2_bars = alt.Chart(alt.Data(values=_obs_metric_values)).mark_bar(
+                color="steelblue",
+            ).encode(
+                x=alt.X(
+                    "Observation:N",
+                    title="Observation",
+                    sort=_obs_names,
+                    axis=alt.Axis(labelAngle=-35, labelLimit=240),
+                ),
+                y=alt.Y("Reduced chi2:Q", title="Reduced chi2"),
+                tooltip=[
+                    alt.Tooltip("Observation:N", title="Observation"),
+                    alt.Tooltip("Reduced chi2:Q", title="Reduced chi2", format=".3f"),
+                ],
+            )
+            _fig4_ppc_rule = alt.Chart(alt.Data(values=[{"Reference": 0.95}])).mark_rule(
+                color="red",
+                strokeDash=[6, 4],
+                strokeWidth=1.2,
+            ).encode(y="Reference:Q")
+            _fig4_ppc_bars = alt.Chart(alt.Data(values=_obs_metric_values)).mark_bar(
+                color="mediumseagreen",
+            ).encode(
+                x=alt.X(
+                    "Observation:N",
+                    title="Observation",
+                    sort=_obs_names,
+                    axis=alt.Axis(labelAngle=-35, labelLimit=240),
+                ),
+                y=alt.Y("PPC Coverage:Q", title="PPC Coverage"),
+                tooltip=[
+                    alt.Tooltip("Observation:N", title="Observation"),
+                    alt.Tooltip("PPC Coverage:Q", title="PPC Coverage", format=".3f"),
+                ],
+            )
+            _fig4 = ((_fig4_chi2_rule + _fig4_chi2_bars).properties(
+                width=_obs_chart_width,
+                height=320,
+                title="Reduced chi2",
+            ) | (_fig4_ppc_rule + _fig4_ppc_bars).properties(
+                width=_obs_chart_width,
+                height=320,
+                title="Posterior Predictive Coverage",
+            )).resolve_scale(y="independent").interactive()
+            _t3_items.append(_fig4)
         except Exception:
             pass
 
@@ -1087,7 +1565,7 @@ def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
 
 
 @app.cell(hide_code=True)
-def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
+def _(alt, get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
     # ── Tier 2 Best-Fit Spectrum Plot ──
     # Reconstructs the Starfish-style 3-panel plot (data vs model, residuals,
     # relative error) from spectral arrays stored during the benchmark run.
@@ -1099,61 +1577,173 @@ def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
     _bf = _post.get("bestfit_spec")
     mo.stop(
         _bf is None or not _bf,
-        mo.md("*Best-fit spectrum data not available for this spectrum (older benchmark run).*"),
+        mo.md("*Best-fit spectrum data not available for this spectrum. Older reports and runs produced before the best-fit export fix will not have it.*"),
     )
 
     _wl = np.asarray(_bf["wavelength"])
     _data_flux = np.asarray(_bf["data_flux"])
     _model_flux = np.asarray(_bf["model_flux"])
     _cov_diag = np.asarray(_bf["model_cov_diag"])
-    _std = np.sqrt(np.abs(_cov_diag))
+    _std = np.sqrt(np.maximum(np.abs(_cov_diag), 0.0))
 
     _filename = _post.get("filename", f"run{_post['run']}.spec")
     _inc = _post.get("inclination", 55.0)
     _converged = _post.get("converged", False)
     _conv_tag = "converged" if _converged else "not converged"
-
-    _fig, _axes = plt.subplots(
-        2, 2, figsize=(14, 7),
-        gridspec_kw={"width_ratios": (1.25, 1)},
-    )
-    # Main panel: data vs model (span both rows in left column)
-    _axes[0, 0].remove()
-    _axes[1, 0].remove()
-    _ax_main = _fig.add_subplot(1, 2, 1)
-    _ax_main.plot(_wl, _data_flux, lw=0.7, label="Data")
-    _ax_main.plot(_wl, _model_flux, lw=0.7, label="Model")
-    _ax_main.set_xlabel(r"$\lambda$ [$\AA$]")
-    _ax_main.set_ylabel(r"$f_\lambda$")
-    _ax_main.legend()
-
-    # Residuals panel (top right)
     _R = _data_flux - _model_flux
-    _ax_resid = _axes[0, 1]
-    _ax_resid.plot(_wl, _R, c="g", lw=0.3, label="Data − Model")
-    _ax_resid.fill_between(_wl, -_std, _std, color="C2", alpha=0.6, label=r"$1\sigma$")
-    _ax_resid.fill_between(_wl, -2*_std, 2*_std, color="C2", alpha=0.4, label=r"$2\sigma$")
-    _ax_resid.fill_between(_wl, -3*_std, 3*_std, color="C2", alpha=0.2, label=r"$3\sigma$")
-    _ax_resid.set_ylabel(r"$\Delta f_\lambda$")
-    _ax_resid.yaxis.tick_right()
-    _ax_resid.yaxis.set_label_position("right")
-    _ax_resid.legend(fontsize=7)
-    _ax_resid.tick_params(labelbottom=False)
-
-    # Relative error panel (bottom right)
     _R_frac = _R / np.where(np.abs(_data_flux) > 0, _data_flux, 1.0)
-    _ax_rel = _axes[1, 1]
-    _ax_rel.plot(_wl, _R_frac, c="r", lw=0.3, label="Relative Error")
-    _ax_rel.set_xlabel(r"$\lambda$ [$\AA$]")
-    _ax_rel.set_ylabel(r"$\Delta f_\lambda / f_\lambda$")
-    _ax_rel.yaxis.tick_right()
-    _ax_rel.yaxis.set_label_position("right")
 
-    _fig.suptitle(
-        f"Best-Fit Model — {_filename} @ {_inc:.0f}° ({_conv_tag})",
-        fontsize=11, y=1.01,
+    # This main spectrum chart shows the observed flux and posterior-mean best-fit model.
+    # It lets you see whether the fit tracks the overall continuum and line structure.
+    _main_values = []
+    for _wavelength, _flux in zip(_wl, _data_flux):
+        _main_values.append({
+            "Wavelength": float(_wavelength),
+            "Flux": float(_flux),
+            "Series": "Data",
+        })
+    for _wavelength, _flux in zip(_wl, _model_flux):
+        _main_values.append({
+            "Wavelength": float(_wavelength),
+            "Flux": float(_flux),
+            "Series": "Model",
+        })
+    _main_chart = alt.Chart(alt.Data(values=_main_values)).mark_line(
+        strokeWidth=1.4,
+    ).encode(
+        x=alt.X(
+            "Wavelength:Q",
+            title="Wavelength (Å)",
+            scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))]),
+        ),
+        y=alt.Y(
+            "Flux:Q",
+            title="Flux",
+            scale=alt.Scale(zero=False),
+        ),
+        color=alt.Color(
+            "Series:N",
+            title="Series",
+            scale=alt.Scale(domain=["Data", "Model"], range=["#4c78a8", "#f58518"]),
+            legend=alt.Legend(orient="top"),
+        ),
+        tooltip=[
+            alt.Tooltip("Series:N", title="Series"),
+            alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+            alt.Tooltip("Flux:Q", title="Flux", format=".4e"),
+        ],
+    ).properties(
+        width=640,
+        height=420,
+        title=f"Best-Fit Model — {_filename} @ {_inc:.0f}° ({_conv_tag})",
+    ).interactive()
+
+    # This residual chart shows Data - Model together with ±1σ, ±2σ, and ±3σ model bands.
+    # It highlights where the fit misses the data relative to the emulator uncertainty estimate.
+    _resid_values = []
+    _band_1sigma = []
+    _band_2sigma = []
+    _band_3sigma = []
+    _rel_values = []
+    for _wavelength, _residual, _sigma, _rel_error in zip(_wl, _R, _std, _R_frac):
+        _wavelength = float(_wavelength)
+        _sigma = float(_sigma)
+        _resid_values.append({
+            "Wavelength": _wavelength,
+            "Residual": float(_residual),
+        })
+        _band_1sigma.append({
+            "Wavelength": _wavelength,
+            "Lower": -_sigma,
+            "Upper": _sigma,
+        })
+        _band_2sigma.append({
+            "Wavelength": _wavelength,
+            "Lower": -2.0 * _sigma,
+            "Upper": 2.0 * _sigma,
+        })
+        _band_3sigma.append({
+            "Wavelength": _wavelength,
+            "Lower": -3.0 * _sigma,
+            "Upper": 3.0 * _sigma,
+        })
+        _rel_values.append({
+            "Wavelength": _wavelength,
+            "Relative Error": float(_rel_error),
+        })
+
+    _resid_band_3 = alt.Chart(alt.Data(values=_band_3sigma)).mark_area(
+        color="#54a24b",
+        opacity=0.12,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))])),
+        y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False)),
+        y2="Upper:Q",
     )
-    _fig.tight_layout()
+    _resid_band_2 = alt.Chart(alt.Data(values=_band_2sigma)).mark_area(
+        color="#54a24b",
+        opacity=0.20,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))])),
+        y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False)),
+        y2="Upper:Q",
+    )
+    _resid_band_1 = alt.Chart(alt.Data(values=_band_1sigma)).mark_area(
+        color="#54a24b",
+        opacity=0.30,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))])),
+        y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False)),
+        y2="Upper:Q",
+    )
+    _resid_zero = alt.Chart(alt.Data(values=[{"Zero": 0.0}])).mark_rule(
+        color="grey",
+        strokeDash=[4, 4],
+        opacity=0.7,
+    ).encode(y="Zero:Q")
+    _resid_line = alt.Chart(alt.Data(values=_resid_values)).mark_line(
+        color="#2ca02c",
+        strokeWidth=1.2,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))])),
+        y=alt.Y("Residual:Q", title="Residual", scale=alt.Scale(zero=False)),
+        tooltip=[
+            alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+            alt.Tooltip("Residual:Q", title="Data - Model", format=".4e"),
+        ],
+    )
+    _resid_chart = (_resid_band_3 + _resid_band_2 + _resid_band_1 + _resid_zero + _resid_line).properties(
+        width=360,
+        height=200,
+        title="Residuals and Model Uncertainty",
+    ).interactive()
+
+    # This relative-error chart shows the fractional mismatch across wavelength.
+    # It makes it easier to spot coherent percent-level biases that are hard to see in raw flux units.
+    _rel_zero = alt.Chart(alt.Data(values=[{"Zero": 0.0}])).mark_rule(
+        color="grey",
+        strokeDash=[4, 4],
+        opacity=0.7,
+    ).encode(y="Zero:Q")
+    _rel_chart = (_rel_zero + alt.Chart(alt.Data(values=_rel_values)).mark_line(
+        color="#e45756",
+        strokeWidth=1.2,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))])),
+        y=alt.Y("Relative Error:Q", title="Relative Error", scale=alt.Scale(zero=False)),
+        tooltip=[
+            alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+            alt.Tooltip("Relative Error:Q", title="Relative Error", format=".4e"),
+        ],
+    )).properties(
+        width=360,
+        height=200,
+        title="Relative Error",
+    ).interactive()
+
+    _fig = (_main_chart | alt.vconcat(_resid_chart, _rel_chart, spacing=14)).resolve_scale(
+        y="independent"
+    )
 
     mo.vstack([
         mo.md("#### Best-Fit Spectrum (MCMC Posterior Mean)"),
@@ -1877,10 +2467,17 @@ def _(
         # cells (e.g. cumulative component analysis) can access eigenspectra,
         # weights, flux scaling, etc. without reloading from disk.
         set_emulator(_emu)
+        # Clear tier-specific live notebook state before the new run starts so
+        # partial reruns cannot inherit stale Tier 1 or Tier 2 diagnostics.
+        set_tier1_arrays(None)
+        set_tier2_posteriors(None)
 
         # The picker stores numeric tier ids; keep the selected run isolated to
         # this execution so later reactive reruns do not reuse stale results.
         _tiers = [_v for _v in (tier_picker.value or [])]
+        # Resolve the shared flux-scaling mode once so both Tier 2 and Tier 3
+        # use the same setting even if only one tier is selected.
+        _flux_scale = flux_scale_picker.value
         _tier1_result = None
         _tier2_result = None
         _tier3_results = None
@@ -1918,8 +2515,7 @@ def _(
             _inc_fixed = float(_inc_raw) if not _inc_is_random else 55.0
             _VALID_INCS = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85]
 
-            # Resolve flux scale and wavelength range from emulator
-            _flux_scale = flux_scale_picker.value
+            # Resolve wavelength range from emulator
             _wl_range = (float(_emu.wl.min()) + 10, float(_emu.wl.max()) - 10)
 
             # The lookup table is optional metadata used to compare recovered
@@ -1958,6 +2554,12 @@ def _(
                             if not _line:
                                 continue
                             _entry = _json.loads(_line)
+                            # Legacy checkpoint entries created before the
+                            # best-fit spectrum export fix are incomplete for
+                            # the Tier 2 viewer, so rerun those spectra rather
+                            # than treating them as finished.
+                            if not _entry.get("bestfit_spec"):
+                                continue
                             _completed_runs.add(_entry["run"])
                             _per_spectrum.append(_entry["spec_result"])
                             for _fn in _friendly:
