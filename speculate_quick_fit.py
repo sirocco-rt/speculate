@@ -25,6 +25,7 @@ app = marimo.App(width="full", app_title="Speculate Quick Fit")
 @app.cell(hide_code=True)
 def _():
     import marimo as mo
+    import importlib
     import numpy as np
     import pandas as pd
     import altair as alt
@@ -39,6 +40,15 @@ def _():
     from scipy.interpolate import RegularGridInterpolator
     from numpy.polynomial.chebyshev import chebval
     from sklearn.decomposition import PCA
+    try:
+        from extinction import fitzpatrick99
+    except ImportError:
+        fitzpatrick99 = None
+
+    from Speculate_addons import Spec_functions as spec_functions
+    if not hasattr(spec_functions, "enable_speculate_altair_theme"):
+        spec_functions = importlib.reload(spec_functions)
+    spec_functions.enable_speculate_altair_theme(alt)
 
     alt.data_transformers.enable("vegafusion")
 
@@ -71,12 +81,22 @@ def _():
         re,
         scipy_minimize,
         time_mod,
+        fitzpatrick99,
         torch,
     )
 
 
 @app.cell
 def _(np):
+    import importlib
+    from Speculate_addons import Spec_functions as spec_functions
+
+    if not hasattr(spec_functions, "build_default_observation_sigma"):
+        spec_functions = importlib.reload(spec_functions)
+
+    build_default_observation_sigma = spec_functions.build_default_observation_sigma
+    build_synthetic_sirocco_sigma = spec_functions.build_synthetic_sirocco_sigma
+
     def qf_estimate_continuum(wl, flux, max_degree=5):
         _wl = np.asarray(wl, dtype=np.float64)
         _flux = np.asarray(flux, dtype=np.float64)
@@ -105,18 +125,31 @@ def _(np):
             1.0,
         )
 
-    def qf_transform_observation_data(wl, flux, err, scale):
+    def qf_transform_observation_data(wl, flux, err, scale, sigma_source=None):
         _wl = np.asarray(wl, dtype=np.float64)
         _flux = np.asarray(flux, dtype=np.float64)
 
+        _sigma_source = (
+            str(sigma_source).strip().lower()
+            if sigma_source is not None else None
+        )
+        if _sigma_source == "synthetic_sirocco_continuum":
+            _fallback_err, _ = build_synthetic_sirocco_sigma(_wl, _flux)
+        else:
+            _fallback_err, _ = build_default_observation_sigma(_wl, _flux)
+
+        _fallback_err = np.where(
+            np.isfinite(_fallback_err) & (_fallback_err > 0),
+            _fallback_err,
+            1e-30,
+        )
+
         if err is None:
-            _err = np.abs(_flux) * 0.05
+            _err = _fallback_err
         else:
             _err = np.asarray(err, dtype=np.float64)
 
-        _default_err = np.abs(_flux) * 0.05
-        _default_err = np.where(_default_err > 0, _default_err, 1e-30)
-        _err = np.where(np.isfinite(_err) & (_err > 0), _err, _default_err)
+        _err = np.where(np.isfinite(_err) & (_err > 0), _err, _fallback_err)
 
         if scale == "log":
             _safe_abs_flux = np.clip(np.abs(_flux), 1e-30, None)
@@ -2604,8 +2637,10 @@ def _(mo, np, os, pd, qf_obs_selector):
 
             if 'wavelength' in _df.columns and 'flux' in _df.columns:
                 _df = _df.sort_values('wavelength', ascending=True).reset_index(drop=True)
-                if 'error' not in _df.columns:
-                    _df['error'] = np.abs(_df['flux']) * 0.05
+                if 'sigma_source' in _df.columns:
+                    _df['sigma_source'] = _df['sigma_source'].astype(str).str.lower()
+                elif 'error' not in _df.columns:
+                    _df['sigma_source'] = 'uploaded_default_continuum'
                 qf_obs_data = _df
             else:
                 mo.output.replace(
@@ -2765,7 +2800,28 @@ def _(alt, mo, np, pd, qf_inf_emu_data, qf_inf_wl_slider, qf_obs_data, qf_obs_sc
         _obs_wl_v = np.array(_plot_df['wavelength'])
         _obs_fl_v = np.array(_plot_df['flux'])
         _obs_err_v = np.array(_plot_df['error']) if 'error' in _plot_df.columns else None
-        _flux_vals, _ = qf_transform_observation_data(_obs_wl_v, _obs_fl_v, _obs_err_v, _scale)
+        _sigma_source_v = (
+            qf_obs_data['sigma_source'].iat[0]
+            if 'sigma_source' in qf_obs_data.columns and len(qf_obs_data) > 0
+            else None
+        )
+        _flux_vals, _ = qf_transform_observation_data(
+            _obs_wl_v,
+            _obs_fl_v,
+            _obs_err_v,
+            _scale,
+            _sigma_source_v,
+        )
+        _show_sigma_band = _obs_err_v is not None
+        _, _sigma_vals = qf_transform_observation_data(
+            _obs_wl_v,
+            _obs_fl_v,
+            _obs_err_v,
+            _scale,
+            _sigma_source_v,
+        )
+        if not _show_sigma_band:
+            _sigma_vals = None
 
         _plot_df = pd.DataFrame({
             'Wavelength': _obs_wl_v,
@@ -2773,17 +2829,42 @@ def _(alt, mo, np, pd, qf_inf_emu_data, qf_inf_wl_slider, qf_obs_data, qf_obs_sc
             'Type': 'Observation',
         })
 
+        _plot_band_df = None
+        if _sigma_vals is not None:
+            _sigma_vals = np.maximum(_sigma_vals, 1e-30)
+            _plot_band_df = pd.DataFrame({
+                'Wavelength': _obs_wl_v,
+                'Lower': _flux_vals - _sigma_vals,
+                'Upper': _flux_vals + _sigma_vals,
+            })
+
         if len(_plot_df) > 5000:
             _plot_df = _plot_df.iloc[::max(1, len(_plot_df) // 5000)]
+        if _plot_band_df is not None and len(_plot_band_df) > 5000:
+            _plot_band_df = _plot_band_df.iloc[::max(1, len(_plot_band_df) // 5000)]
 
         _y_title = f'Flux ({_scale})'
         _y_format = '.1e' if _scale == 'linear' else '.2f'
 
-        _obs_chart = alt.Chart(_plot_df).mark_line(color='cyan').encode(
+        _obs_line = alt.Chart(_plot_df).mark_line(color='cyan').encode(
             x=alt.X('Wavelength:Q', title='Wavelength (Å)'),
             y=alt.Y('Flux:Q', title=_y_title, axis=alt.Axis(format=_y_format)),
             tooltip=['Wavelength', 'Flux'],
-        ).properties(width="container", height=400, title="Observation Spectrum").interactive()
+        )
+
+        _obs_band = alt.LayerChart()
+        if _plot_band_df is not None:
+            _obs_band = alt.Chart(_plot_band_df).mark_area(
+                opacity=0.10, color='cyan'
+            ).encode(
+                x=alt.X('Wavelength:Q'),
+                y=alt.Y('Lower:Q'),
+                y2=alt.Y2('Upper:Q'),
+            )
+
+        _obs_chart = (_obs_band + _obs_line).properties(
+            width="container", height=400, title="Observation Spectrum"
+        ).interactive()
 
     mo.accordion({
         f"{mo.icon('lucide:trending-up')} View Selected Spectrum":
@@ -2895,8 +2976,19 @@ def _(
             _obs_wl = np.array(qf_obs_data[_om]['wavelength'])
             _raw_fl = np.array(qf_obs_data[_om]['flux'])
             _raw_err = np.array(qf_obs_data[_om]['error']) if 'error' in qf_obs_data.columns else None
+            _sigma_source = (
+                qf_obs_data['sigma_source'].iat[0]
+                if 'sigma_source' in qf_obs_data.columns and len(qf_obs_data) > 0
+                else None
+            )
             _scale = qf_obs_scale_selector.value
-            _obs_fl, _ = qf_transform_observation_data(_obs_wl, _raw_fl, _raw_err, _scale)
+            _obs_fl, _ = qf_transform_observation_data(
+                _obs_wl,
+                _raw_fl,
+                _raw_err,
+                _scale,
+                _sigma_source,
+            )
             # Auto-centre log_scale.  When the emulator outputs log₁₀ flux,
             # the transformed means are negative and their ratio is meaningless.
             # Convert both back to linear space to get a sensible scaling offset.
@@ -3007,8 +3099,19 @@ def _(
         _obs_wl_pg = np.array(qf_obs_data[_om]['wavelength'])
         _raw_fl_pg = np.array(qf_obs_data[_om]['flux'])
         _raw_err_pg = np.array(qf_obs_data[_om]['error']) if 'error' in qf_obs_data.columns else None
+        _sigma_source_pg = (
+            qf_obs_data['sigma_source'].iat[0]
+            if 'sigma_source' in qf_obs_data.columns and len(qf_obs_data) > 0
+            else None
+        )
         _scale_pg = qf_obs_scale_selector.value
-        _obs_fl_pg, _ = qf_transform_observation_data(_obs_wl_pg, _raw_fl_pg, _raw_err_pg, _scale_pg)
+        _obs_fl_pg, _ = qf_transform_observation_data(
+            _obs_wl_pg,
+            _raw_fl_pg,
+            _raw_err_pg,
+            _scale_pg,
+            _sigma_source_pg,
+        )
         if _scale_pg == "log":
             _emu_mean_lin = np.mean(np.abs(10.0 ** _emu_fl[_em])) if _em.any() else 1.0
             _obs_mean_lin = np.mean(np.abs(_raw_fl_pg)) if len(_raw_fl_pg) > 0 else 1.0
@@ -3066,6 +3169,7 @@ def _(
 def _(
     alt,
     chebval,
+    fitzpatrick99,
     mo,
     np,
     pd,
@@ -3080,7 +3184,7 @@ def _(
     qf_pg_av,
     qf_pg_cheb1,
     qf_pg_logscale,
-     qf_pg_nll_result,
+    qf_pg_nll_result,
     qf_pg_phys_sliders,
     qf_pg_test_nll_btn,
     qf_predict_flux,
@@ -3121,13 +3225,9 @@ def _(
                 _emu_fl_c = 10.0 ** _emu_fl_c
 
             _av = qf_pg_av.value
-            if _av > 0:
-                try:
-                    from extinction import fitzpatrick99
-                    _a_lambda = fitzpatrick99(_emu_wl_c.astype(np.float64), _av, 3.1)
-                    _emu_fl_c = _emu_fl_c * 10 ** (-0.4 * _a_lambda)
-                except ImportError:
-                    pass
+            if _av > 0 and fitzpatrick99 is not None:
+                _a_lambda = fitzpatrick99(_emu_wl_c.astype(np.float64), _av, 3.1)
+                _emu_fl_c = _emu_fl_c * 10 ** (-0.4 * _a_lambda)
 
             _cheb1 = qf_pg_cheb1.value
 
@@ -3145,8 +3245,19 @@ def _(
             _obs_wl_c = np.array(qf_obs_data[_om]['wavelength'])
             _raw_fl_c = np.array(qf_obs_data[_om]['flux'])
             _raw_err_c = np.array(qf_obs_data[_om]['error']) if 'error' in qf_obs_data.columns else None
+            _sigma_source_c = (
+                qf_obs_data['sigma_source'].iat[0]
+                if 'sigma_source' in qf_obs_data.columns and len(qf_obs_data) > 0
+                else None
+            )
             _scale_c = qf_obs_scale_selector.value
-            _obs_fl_c, _ = qf_transform_observation_data(_obs_wl_c, _raw_fl_c, _raw_err_c, _scale_c)
+            _obs_fl_c, _ = qf_transform_observation_data(
+                _obs_wl_c,
+                _raw_fl_c,
+                _raw_err_c,
+                _scale_c,
+                _sigma_source_c,
+            )
 
             # Build chart
             _obs_df = pd.DataFrame({'Wavelength': _obs_wl_c, 'Flux': _obs_fl_c, 'Type': 'Observation'})
@@ -3224,6 +3335,7 @@ def _(mo):
 @app.cell
 def _(
     chebval,
+    fitzpatrick99,
     mo,
     np,
     qf_inf_emu_data,
@@ -3265,10 +3377,15 @@ def _(
                 _raw_fl = np.array(qf_obs_data[_obs_mask]['flux'])
                 _raw_err = (np.array(qf_obs_data[_obs_mask]['error'])
                             if 'error' in qf_obs_data.columns else None)
+                _sigma_source = (
+                    qf_obs_data['sigma_source'].iat[0]
+                    if 'sigma_source' in qf_obs_data.columns and len(qf_obs_data) > 0
+                    else None
+                )
 
                 _scale = qf_obs_scale_selector.value
                 _obs_fl, _obs_err = qf_transform_observation_data(
-                    _obs_wl, _raw_fl, _raw_err, _scale
+                    _obs_wl, _raw_fl, _raw_err, _scale, _sigma_source
                 )
 
                 _phys = np.array(qf_pg_phys_sliders.value, dtype=float)
@@ -3286,15 +3403,11 @@ def _(
                     _fl = 10.0 ** _fl
 
                 _av = float(qf_pg_av.value)
-                if _av > 0:
-                    try:
-                        from extinction import fitzpatrick99
-                        _a_lambda = fitzpatrick99(
-                            _wl.astype(np.float64), _av, 3.1
-                        )
-                        _fl = _fl * 10 ** (-0.4 * _a_lambda)
-                    except ImportError:
-                        pass
+                if _av > 0 and fitzpatrick99 is not None:
+                    _a_lambda = fitzpatrick99(
+                        _wl.astype(np.float64), _av, 3.1
+                    )
+                    _fl = _fl * 10 ** (-0.4 * _a_lambda)
 
                 _cheb1 = float(qf_pg_cheb1.value)
                 if _cheb1 != 0.0:
@@ -3369,6 +3482,7 @@ def _(mo):
 @app.cell
 def _(
     chebval,
+    fitzpatrick99,
     mo,
     np,
     qf_inf_emu_data,
@@ -3421,12 +3535,23 @@ def _(
     _obs_wl = np.array(qf_obs_data[_obs_mask]['wavelength'])
     _raw_obs_fl = np.array(qf_obs_data[_obs_mask]['flux'])
     _raw_obs_err = np.array(qf_obs_data[_obs_mask]['error']) if 'error' in qf_obs_data.columns else None
+    _sigma_source = (
+        qf_obs_data['sigma_source'].iat[0]
+        if 'sigma_source' in qf_obs_data.columns and len(qf_obs_data) > 0
+        else None
+    )
 
     if _obs_wl.size == 0:
         mo.stop(True, mo.callout(mo.md("No observation points fall within the selected wavelength range."), kind="warn"))
 
     _scale = qf_obs_scale_selector.value
-    _obs_fl, _obs_err = qf_transform_observation_data(_obs_wl, _raw_obs_fl, _raw_obs_err, _scale)
+    _obs_fl, _obs_err = qf_transform_observation_data(
+        _obs_wl,
+        _raw_obs_fl,
+        _raw_obs_err,
+        _scale,
+        _sigma_source,
+    )
 
     _emu_wl = qf_inf_emu_data["wl"]
     _emu_mask = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
@@ -3472,13 +3597,9 @@ def _(
         if _scale == "log":
             _fl = 10.0 ** _fl
 
-        if _av > 0:
-            try:
-                from extinction import fitzpatrick99
-                _a_lambda = fitzpatrick99(_wl.astype(np.float64), _av, 3.1)
-                _fl = _fl * 10 ** (-0.4 * _a_lambda)
-            except ImportError:
-                pass
+        if _av > 0 and fitzpatrick99 is not None:
+            _a_lambda = fitzpatrick99(_wl.astype(np.float64), _av, 3.1)
+            _fl = _fl * 10 ** (-0.4 * _a_lambda)
 
         if _cheb1 != 0.0:
             _scale_wl = _wl / _wl.max()
@@ -3643,13 +3764,9 @@ def _(
                 if _scale == "log":
                     fl = 10.0 ** fl
 
-                if _av_s > 0:
-                    try:
-                        from extinction import fitzpatrick99
-                        a_l = fitzpatrick99(wl.astype(np.float64), _av_s, 3.1)
-                        fl = fl * 10 ** (-0.4 * a_l)
-                    except ImportError:
-                        pass
+                if _av_s > 0 and fitzpatrick99 is not None:
+                    a_l = fitzpatrick99(wl.astype(np.float64), _av_s, 3.1)
+                    fl = fl * 10 ** (-0.4 * a_l)
                 if _ch_s != 0.0:
                     fl = fl * chebval(wl / wl.max(), [1.0, _ch_s])
                 fl = fl * np.exp(_ls_s)
@@ -3709,6 +3826,7 @@ def _(mo):
 def _(
     alt,
     chebval,
+    fitzpatrick99,
     mo,
     np,
     pd,
@@ -3750,13 +3868,9 @@ def _(
         fl = fl.copy()
         if _sc == "log":
             fl = 10.0 ** fl
-        if av > 0:
-            try:
-                from extinction import fitzpatrick99
-                a_l = fitzpatrick99(wl.astype(np.float64), av, 3.1)
-                fl = fl * 10 ** (-0.4 * a_l)
-            except ImportError:
-                pass
+        if av > 0 and fitzpatrick99 is not None:
+            a_l = fitzpatrick99(wl.astype(np.float64), av, 3.1)
+            fl = fl * 10 ** (-0.4 * a_l)
         if cheb1 != 0.0:
             fl = fl * chebval(wl / wl.max(), [1.0, cheb1])
         fl = fl * np.exp(log_scale)
@@ -3778,9 +3892,20 @@ def _(
     _obs_wl = np.array(qf_obs_data[_obs_mask_wl]['wavelength'])
     _raw_obs_fl = np.array(qf_obs_data[_obs_mask_wl]['flux'])
     _raw_obs_err = np.array(qf_obs_data[_obs_mask_wl]['error']) if 'error' in qf_obs_data.columns else None
+    _sigma_source = (
+        qf_obs_data['sigma_source'].iat[0]
+        if 'sigma_source' in qf_obs_data.columns and len(qf_obs_data) > 0
+        else None
+    )
 
     _sc = qf_obs_scale_selector.value
-    _obs_fl, _obs_err = qf_transform_observation_data(_obs_wl, _raw_obs_fl, _raw_obs_err, _sc)
+    _obs_fl, _obs_err = qf_transform_observation_data(
+        _obs_wl,
+        _raw_obs_fl,
+        _raw_obs_err,
+        _sc,
+        _sigma_source,
+    )
 
     _model_interp = np.interp(_obs_wl, _wl, _model_fl)
     _residuals = (_obs_fl - _model_interp) / _obs_err

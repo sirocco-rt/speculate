@@ -165,11 +165,17 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
 @app.cell
 def _():
     import os
+    import importlib
     import numpy as np
     import pandas as pd
     from pathlib import Path
     import altair as alt
-    from Speculate_addons.Spec_functions import fit_power_law_continuum
+    from Speculate_addons import Spec_functions as spec_functions
+
+    if not hasattr(spec_functions, "enable_speculate_altair_theme"):
+        spec_functions = importlib.reload(spec_functions)
+    spec_functions.enable_speculate_altair_theme(alt)
+    fit_power_law_continuum = spec_functions.fit_power_law_continuum
 
     alt.data_transformers.enable("vegafusion")
     return Path, alt, fit_power_law_continuum, np, os, pd
@@ -958,13 +964,13 @@ def _(
         ).configure_axis(
             labelColor='black',
             titleColor='black',
-            labelFontSize=14,
-            titleFontSize=16
+            labelFontSize=16,
+            titleFontSize=18
         ).configure_legend(
             labelColor='black',
             titleColor='black',
-            labelFontSize=14,
-            titleFontSize=16
+            labelFontSize=16,
+            titleFontSize=18
         ).configure_title(
             color='black',
             fontSize=20

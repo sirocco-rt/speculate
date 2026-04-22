@@ -43,7 +43,23 @@ def _():
     from Starfish.models import SpectrumModel
     import pathlib
     import scipy.stats as stats
-    from Speculate_addons.Spec_functions import fit_power_law_continuum
+    import importlib
+    from Speculate_addons import Spec_functions as spec_functions
+
+    # Marimo can keep an older helper module cached across notebook reloads.
+    # If a newly added helper is missing, reload the module before binding names.
+    if (
+        not hasattr(spec_functions, "build_default_observation_sigma")
+        or not hasattr(spec_functions, "build_bestfit_spectrum_altair")
+        or not hasattr(spec_functions, "enable_speculate_altair_theme")
+    ):
+        spec_functions = importlib.reload(spec_functions)
+
+    spec_functions.enable_speculate_altair_theme(alt)
+    build_bestfit_spectrum_altair = spec_functions.build_bestfit_spectrum_altair
+    build_default_observation_sigma = spec_functions.build_default_observation_sigma
+    build_synthetic_sirocco_sigma = spec_functions.build_synthetic_sirocco_sigma
+    fit_power_law_continuum = spec_functions.fit_power_law_continuum
     logo_path = "assets/logos/Speculate_logo2.png"
 
 
@@ -66,7 +82,22 @@ def _():
 
     # Combine in horizontal stack
     mo.hstack([title_col, logo_col], justify="space-between", align="center")
-    return Emulator, Spectrum, SpectrumModel, alt, fit_power_law_continuum, mo, np, os, pd, re, stats
+    return (
+        Emulator,
+        Spectrum,
+        SpectrumModel,
+        alt,
+        build_bestfit_spectrum_altair,
+        build_default_observation_sigma,
+        build_synthetic_sirocco_sigma,
+        fit_power_law_continuum,
+        mo,
+        np,
+        os,
+        pd,
+        re,
+        stats,
+    )
 
 
 @app.cell(hide_code=True)
@@ -538,6 +569,7 @@ def _(Emulator, emulator_selector, mo):
 
 @app.cell
 def _(
+    build_synthetic_sirocco_sigma,
     data_source_selector,
     emu,
     emulator_selector,
@@ -589,11 +621,14 @@ def _(
             fluxes = np.flip(data_raw[inc_col_idx])  # Selected inclination flux
 
             # Treat synthetic validation data like observations by attaching a
-            # simple fractional uncertainty column.
+            # continuum-anchored fallback uncertainty column in native units.
+            sigma, continuum = build_synthetic_sirocco_sigma(wavelengths, fluxes)
             obs_data = pd.DataFrame({
                 'wavelength': wavelengths,
                 'flux': fluxes,
-                'error': fluxes * 0.05  # Assume 5% error for test data
+                'error': sigma,
+                'continuum': continuum,
+                'sigma_source': 'synthetic_sirocco_continuum',
             })
 
             # Translate the lookup-table values into the emulator parameterisation:
@@ -691,7 +726,19 @@ def _(
 
 
 @app.cell
-def _(alt, data_source_info, mo, np, obs_data, obs_flux_scale, pd, wl_range_slider):
+def _(
+    alt,
+    build_default_observation_sigma,
+    build_synthetic_sirocco_sigma,
+    data_source_info,
+    fit_power_law_continuum,
+    mo,
+    np,
+    obs_data,
+    obs_flux_scale,
+    pd,
+    wl_range_slider,
+):
     # Rebuild the preview chart whenever the wavelength window or requested flux
     # transform changes, without mutating the underlying loaded dataframe.
     obs_chart = None
@@ -703,22 +750,80 @@ def _(alt, data_source_info, mo, np, obs_data, obs_flux_scale, pd, wl_range_slid
 
          _mask = (obs_data['wavelength'] >= _current_min) & (obs_data['wavelength'] <= _current_max)
          _plot_df = obs_data[_mask].copy()
+         _sigma_source = (
+             str(_plot_df['sigma_source'].iat[0]).strip().lower()
+             if 'sigma_source' in _plot_df.columns and len(_plot_df) > 0
+             else None
+         )
+         if _sigma_source == 'synthetic_sirocco_continuum':
+             _fallback_sigma_native, _ = build_synthetic_sirocco_sigma(
+                 np.array(_plot_df['wavelength']),
+                 np.array(_plot_df['flux']),
+             )
+         else:
+             _fallback_sigma_native, _ = build_default_observation_sigma(
+                 np.array(_plot_df['wavelength']),
+                 np.array(_plot_df['flux']),
+             )
+         if 'error' in _plot_df.columns:
+             _native_sigma = np.array(_plot_df['error'], dtype=float)
+             _native_sigma = np.where(
+                 np.isfinite(_native_sigma) & (_native_sigma > 0),
+                 _native_sigma,
+                 _fallback_sigma_native,
+             )
+         else:
+             _native_sigma = _fallback_sigma_native
 
          # Mirror the emulator training transform so the plotted data matches the
          # scale used during inference.
          _flux_vals = np.array(_plot_df['flux'])
+         _sigma_vals = None
+         _show_sigma_band = 'error' in _plot_df.columns
          _scale_label = obs_flux_scale.value
          if _scale_label == 'log':
              _flux_vals = np.where(_flux_vals > 0, np.log10(_flux_vals), np.log10(np.abs(_flux_vals) + 1e-30))
+             if _show_sigma_band:
+                 _orig_flux = np.array(_plot_df['flux'])
+                 _sigma_vals = _native_sigma / (
+                     np.abs(_orig_flux) * np.log(10) + 1e-30
+                 )
+         elif _scale_label == 'continuum-normalised':
+             _continuum, _ = fit_power_law_continuum(
+                 np.array(_plot_df['wavelength']),
+                 _flux_vals,
+             )
+             _cont_safe = np.where(_continuum > 0, _continuum, 1.0)
+             _flux_vals = _flux_vals / _cont_safe
+             if _show_sigma_band:
+                 _sigma_vals = _native_sigma / _cont_safe
+         elif _show_sigma_band:
+             _sigma_vals = _native_sigma
+
+         if _sigma_vals is not None:
+             _sigma_vals = np.where(
+                 np.isfinite(_sigma_vals) & (_sigma_vals > 0),
+                 _sigma_vals,
+                 1e-30,
+             )
          _plot_df = pd.DataFrame({
              'Wavelength': _plot_df['wavelength'],
              'Flux': _flux_vals,
              'Type': 'Observation'
          })
+         _plot_band_df = None
+         if _sigma_vals is not None:
+             _plot_band_df = pd.DataFrame({
+                 'Wavelength': _plot_df['Wavelength'],
+                 'Lower': _plot_df['Flux'] - _sigma_vals,
+                 'Upper': _plot_df['Flux'] + _sigma_vals,
+             })
 
          # Downsample only for plotting so large spectra remain responsive in Altair.
          if len(_plot_df) > 5000:
              _plot_df = _plot_df.iloc[::int(len(_plot_df)/5000)]
+         if _plot_band_df is not None and len(_plot_band_df) > 5000:
+             _plot_band_df = _plot_band_df.iloc[::max(1, len(_plot_band_df) // 5000)]
 
          _y_title = f'Flux ({_scale_label})'
          _y_format = '.1e' if _scale_label == 'linear' else '.2f'
@@ -733,11 +838,23 @@ def _(alt, data_source_info, mo, np, obs_data, obs_flux_scale, pd, wl_range_slid
          else:
              _y_scale = alt.Undefined
 
-         obs_chart = alt.Chart(_plot_df).mark_line(color='cyan').encode(
+         _obs_line = alt.Chart(_plot_df).mark_line(color='cyan').encode(
              x=alt.X('Wavelength', title='Wavelength (Å)'),
              y=alt.Y('Flux', title=_y_title, scale=_y_scale, axis=alt.Axis(format=_y_format)),
              tooltip=['Wavelength', 'Flux']
-         ).properties(
+         )
+
+         _obs_band = alt.LayerChart()
+         if _plot_band_df is not None:
+             _obs_band = alt.Chart(_plot_band_df).mark_area(
+                 opacity=0.10, color='cyan'
+             ).encode(
+                 x=alt.X('Wavelength:Q'),
+                 y=alt.Y('Lower:Q'),
+                 y2=alt.Y2('Upper:Q'),
+             )
+
+         obs_chart = (_obs_band + _obs_line).properties(
              width="container",
              height=400,
              title=f"{data_source_info} [{_scale_label}]" if data_source_info else "Spectrum"
@@ -1050,6 +1167,8 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
 @app.cell
 def _(
     alt,
+    build_default_observation_sigma,
+    build_synthetic_sirocco_sigma,
     emu,
     fit_power_law_continuum,
     mo,
@@ -1152,24 +1271,66 @@ def _(
                 & (obs_data['wavelength'] <= _wl_max)
             )
             _obs_sub = obs_data[_obs_mask].copy()
+            _sigma_source = (
+                str(_obs_sub['sigma_source'].iat[0]).strip().lower()
+                if 'sigma_source' in _obs_sub.columns and len(_obs_sub) > 0
+                else None
+            )
+            if _sigma_source == 'synthetic_sirocco_continuum':
+                _fallback_sigma_native, _ = build_synthetic_sirocco_sigma(
+                    np.array(_obs_sub['wavelength']),
+                    np.array(_obs_sub['flux']),
+                )
+            else:
+                _fallback_sigma_native, _ = build_default_observation_sigma(
+                    np.array(_obs_sub['wavelength']),
+                    np.array(_obs_sub['flux']),
+                )
+            if 'error' in _obs_sub.columns:
+                _native_sigma = np.array(_obs_sub['error'], dtype=float)
+                _native_sigma = np.where(
+                    np.isfinite(_native_sigma) & (_native_sigma > 0),
+                    _native_sigma,
+                    _fallback_sigma_native,
+                )
+            else:
+                _native_sigma = _fallback_sigma_native
 
             # Transform observation flux to match the emulator's output space.
             # The emulator already outputs in the trained space (e.g. continuum-
             # normalised), so we only transform the observation — NOT the emulator.
             _scale_label = obs_flux_scale.value
             _obs_flux = np.array(_obs_sub['flux'])
+            _obs_sigma = None
+            _show_obs_sigma_band = 'error' in _obs_sub.columns
             if _scale_label == 'log':
                 _obs_flux = np.where(
                     _obs_flux > 0,
                     np.log10(_obs_flux),
                     np.log10(np.abs(_obs_flux) + 1e-30),
                 )
+                if _show_obs_sigma_band:
+                    _orig_flux = np.array(_obs_sub['flux'])
+                    _obs_sigma = _native_sigma / (
+                        np.abs(_orig_flux) * np.log(10) + 1e-30
+                    )
             elif _scale_label == 'continuum-normalised':
                 _obs_cont, _ = fit_power_law_continuum(
                     np.array(_obs_sub['wavelength']), _obs_flux
                 )
                 _obs_cont_safe = np.where(_obs_cont > 0, _obs_cont, 1.0)
                 _obs_flux = _obs_flux / _obs_cont_safe
+                if _show_obs_sigma_band:
+                    _obs_sigma = _native_sigma / _obs_cont_safe
+            elif _show_obs_sigma_band:
+                _obs_sigma = _native_sigma
+
+            if _obs_sigma is not None:
+                _obs_sigma = np.where(
+                    np.isfinite(_obs_sigma) & (_obs_sigma > 0),
+                    _obs_sigma,
+                    1e-30,
+                )
 
             # --- Build Altair chart ---
             _obs_df = pd.DataFrame({
@@ -1187,6 +1348,13 @@ def _(
                 'Upper': emu_upper,
                 'Lower': emu_lower,
             })
+            _obs_band_df = None
+            if _show_obs_sigma_band and _obs_sigma is not None:
+                _obs_band_df = pd.DataFrame({
+                    'Wavelength': np.array(_obs_sub['wavelength']),
+                    'Lower': _obs_flux - _obs_sigma,
+                    'Upper': _obs_flux + _obs_sigma,
+                })
 
             # Downsample for responsiveness
             if len(_obs_df) > 5000:
@@ -1194,6 +1362,8 @@ def _(
             if len(_emu_df) > 5000:
                 _emu_df = _emu_df.iloc[::max(1, len(_emu_df) // 5000)]
                 _band_df = _band_df.iloc[::max(1, len(_band_df) // 5000)]
+            if _obs_band_df is not None and len(_obs_band_df) > 5000:
+                _obs_band_df = _obs_band_df.iloc[::max(1, len(_obs_band_df) // 5000)]
 
             _combined = pd.concat([_obs_df, _emu_df], ignore_index=True)
 
@@ -1220,7 +1390,17 @@ def _(
                 y2=alt.Y2('Upper:Q'),
             )
 
-            _playground_chart = (_band + _lines).properties(
+            _obs_band = alt.LayerChart()
+            if _obs_band_df is not None:
+                _obs_band = alt.Chart(_obs_band_df).mark_area(
+                    opacity=0.10, color='cyan',
+                ).encode(
+                    x=alt.X('Wavelength:Q'),
+                    y=alt.Y('Lower:Q'),
+                    y2=alt.Y2('Upper:Q'),
+                )
+
+            _playground_chart = (_band + _obs_band + _lines).properties(
                 width="container",
                 height=400,
                 title=f"Playground: Emulated (midpoint params) vs Observation [{_scale_label}]",
@@ -1296,8 +1476,12 @@ def _(mo):
 
 @app.cell
 def _(
+    alt,
+    build_bestfit_spectrum_altair,
+    build_default_observation_sigma,
     Spectrum,
     SpectrumModel,
+    build_synthetic_sirocco_sigma,
     emu,
     fit_power_law_continuum,
     mo,
@@ -1352,17 +1536,46 @@ def _(
                     _raw_fl = _raw_fl / _cont_safe
                 _sub['flux'] = _raw_fl
 
+                _sigma_source = (
+                    str(_sub['sigma_source'].iat[0]).strip().lower()
+                    if 'sigma_source' in _sub.columns and len(_sub) > 0
+                    else None
+                )
+                if _sigma_source == 'synthetic_sirocco_continuum':
+                    _fallback_sigma_native, _ = build_synthetic_sirocco_sigma(
+                        np.array(_sub['wavelength']),
+                        np.array(obs_data[_mask]['flux']),
+                    )
+                else:
+                    _fallback_sigma_native, _ = build_default_observation_sigma(
+                        np.array(_sub['wavelength']),
+                        np.array(obs_data[_mask]['flux']),
+                    )
+
                 if 'error' in _sub.columns:
-                    _sigma = np.array(_sub['error'])
+                    _sigma = np.array(_sub['error'], dtype=float)
+                    _sigma = np.where(
+                        np.isfinite(_sigma) & (_sigma > 0),
+                        _sigma,
+                        _fallback_sigma_native,
+                    )
                     if _scale == 'log':
                         _orig = np.array(obs_data[_mask]['flux'])
                         _sigma = _sigma / (np.abs(_orig) * np.log(10) + 1e-30)
                     elif _scale == 'continuum-normalised':
                         _sigma = _sigma / _cont_safe
                 else:
-                    _sigma = np.abs(_raw_fl) * 0.05
-                _sigma = np.maximum(_sigma,
-                                    np.abs(_sub['flux'].values) * 0.01)
+                    _sigma = _fallback_sigma_native
+                    if _scale == 'log':
+                        _orig = np.array(obs_data[_mask]['flux'])
+                        _sigma = _sigma / (np.abs(_orig) * np.log(10) + 1e-30)
+                    elif _scale == 'continuum-normalised':
+                        _sigma = _sigma / _cont_safe
+                _sigma = np.where(
+                    np.isfinite(_sigma) & (_sigma > 0),
+                    _sigma,
+                    1e-30,
+                )
 
                 _spec = Spectrum(
                     np.array(_sub['wavelength']),
@@ -1784,8 +1997,12 @@ def _(mo):
 
 @app.cell
 def _(
+    alt,
+    build_bestfit_spectrum_altair,
+    build_default_observation_sigma,
     Spectrum,
     SpectrumModel,
+    build_synthetic_sirocco_sigma,
     emu,
     fit_power_law_continuum,
     ground_truth_params,
@@ -1835,14 +2052,31 @@ def _(
                 # Apply exactly the same flux transform used during emulator training.
                 _flux_scale = obs_flux_scale.value
                 _native_flux = np.array(_data_subset['flux'], dtype=float)
+                _sigma_source = (
+                    str(_data_subset['sigma_source'].iat[0]).strip().lower()
+                    if 'sigma_source' in _data_subset.columns and len(_data_subset) > 0
+                    else None
+                )
+                if _sigma_source == 'synthetic_sirocco_continuum':
+                    _fallback_sigma_native, _ = build_synthetic_sirocco_sigma(
+                        np.array(_data_subset['wavelength']),
+                        _native_flux,
+                    )
+                else:
+                    _fallback_sigma_native, _ = build_default_observation_sigma(
+                        np.array(_data_subset['wavelength']),
+                        _native_flux,
+                    )
 
-                # Keep the fractional sigma floor in native linear-flux units,
-                # then propagate it through the selected transform.
                 if 'error' in _data_subset.columns:
                     _native_sigma = np.array(_data_subset['error'], dtype=float)
+                    _native_sigma = np.where(
+                        np.isfinite(_native_sigma) & (_native_sigma > 0),
+                        _native_sigma,
+                        _fallback_sigma_native,
+                    )
                 else:
-                    _native_sigma = np.abs(_native_flux) * 0.05
-                _native_sigma = np.maximum(_native_sigma, np.abs(_native_flux) * 0.01)
+                    _native_sigma = _fallback_sigma_native
 
                 _raw_flux = _native_flux.copy()
                 if _flux_scale == 'log':
@@ -1862,7 +2096,11 @@ def _(
                 _data_subset['flux'] = _raw_flux
 
                 # Ensure no zero/negative sigmas after propagation.
-                _sigma = np.maximum(_sigma, 1e-30)
+                _sigma = np.where(
+                    np.isfinite(_sigma) & (_sigma > 0),
+                    _sigma,
+                    1e-30,
+                )
 
                 spec_data = Spectrum(
                     np.array(_data_subset['wavelength']),
@@ -2281,9 +2519,20 @@ def _(
 
                 # 6. Plotting
                 import matplotlib.pyplot as _plt
-                _model.plot(yscale="linear")
-                _fig = _plt.gcf()
-                _fig.tight_layout()
+                _plot_flux, _plot_cov = _model()
+                if hasattr(_plot_flux, 'detach'):
+                    _plot_flux = _plot_flux.detach().cpu().numpy()
+                if hasattr(_plot_cov, 'detach'):
+                    _plot_cov = _plot_cov.detach().cpu().numpy()
+                _fig = build_bestfit_spectrum_altair(
+                    alt,
+                    wavelength=_model.data.wave,
+                    data_flux=_model.data.flux,
+                    model_flux=_plot_flux,
+                    model_cov_diag=_plot_cov,
+                    title=f"Best-Fit Model — {_model.data_name}",
+                    zoom_name="inference_mle_bestfit_zoom",
+                )
 
                 # 6b. Loss curve plot
                 if len(_nll_history) > 10:
@@ -2471,6 +2720,8 @@ def _(emu, get_mle_model, mo, param_names, re):
 
 @app.cell
 def _(
+    alt,
+    build_bestfit_spectrum_altair,
     get_mle_model,
     get_mle_priors,
     ground_truth_params,
@@ -2485,6 +2736,7 @@ def _(
     set_mcmc_labels,
     set_mcmc_samples,
     set_mcmc_summary_df,
+    stats,
 ):
     # ── Stage 4: MCMC Posterior Exploration ──
     # Steps:
@@ -2776,10 +3028,20 @@ def _(
                     _mcmc_means[_label] = float(np.mean(_burn_samples[:, _i]))
                 _model.set_param_dict(_mcmc_means)
 
-                _model.plot(yscale="linear")
-                _fig_bestfit = _plt.gcf()
-                _fig_bestfit.suptitle("Best-Fit Model (MCMC Posterior Mean)", y=1.02)
-                _fig_bestfit.tight_layout()
+                _plot_flux, _plot_cov = _model()
+                if hasattr(_plot_flux, 'detach'):
+                    _plot_flux = _plot_flux.detach().cpu().numpy()
+                if hasattr(_plot_cov, 'detach'):
+                    _plot_cov = _plot_cov.detach().cpu().numpy()
+                _fig_bestfit = build_bestfit_spectrum_altair(
+                    alt,
+                    wavelength=_model.data.wave,
+                    data_flux=_model.data.flux,
+                    model_flux=_plot_flux,
+                    model_cov_diag=_plot_cov,
+                    title=f"Best-Fit Model (MCMC Posterior Mean) — {_model.data_name}",
+                    zoom_name="inference_mcmc_bestfit_zoom",
+                )
 
                 # ============================================================
                 # Results table with ground truth comparison

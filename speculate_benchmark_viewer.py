@@ -128,6 +128,9 @@ def _():
     # ── Third-party imports ──
     # VegaFusion is enabled so Altair charts degrade gracefully when
     # the dataset exceeds the default 5 000-row inline limit.
+    import base64
+    import importlib
+    import io
     import json
     import os
     import re
@@ -136,11 +139,40 @@ def _():
     import numpy as np
     import pandas as pd
     import altair as alt
+    from Speculate_addons import Spec_functions as spec_functions
+    if (
+        not hasattr(spec_functions, "build_bestfit_spectrum_altair")
+        or not hasattr(spec_functions, "enable_speculate_altair_theme")
+    ):
+        spec_functions = importlib.reload(spec_functions)
+    spec_functions.enable_speculate_altair_theme(alt)
+    build_bestfit_spectrum_altair = spec_functions.build_bestfit_spectrum_altair
     alt.data_transformers.enable("vegafusion")
     import matplotlib
     matplotlib.use("Agg")  # non-interactive backend for server environments
     import matplotlib.pyplot as plt
-    return alt, glob, json, np, os, pd, plt, re, time
+
+    def render_fixed_matplotlib(mo, fig, width_px=900, dpi=160, close=True):
+        """Render a matplotlib figure at a fixed visual width inside marimo."""
+        _buf = io.BytesIO()
+        fig.savefig(
+            _buf,
+            format="png",
+            dpi=dpi,
+            bbox_inches="tight",
+            facecolor=fig.get_facecolor(),
+        )
+        _data = base64.b64encode(_buf.getvalue()).decode("ascii")
+        if close:
+            plt.close(fig)
+        return mo.Html(
+            "<div style='display:flex; justify-content:center; width:100%;'>"
+            f"<img src='data:image/png;base64,{_data}' "
+            f"style='width:{int(width_px)}px; max-width:100%; height:auto; display:block;' />"
+            "</div>"
+        )
+
+    return alt, build_bestfit_spectrum_altair, glob, json, np, os, pd, plt, re, render_fixed_matplotlib, time
 
 
 @app.cell
@@ -1382,7 +1414,7 @@ def _(get_tier2_posteriors, mo):
 
 
 @app.cell(hide_code=True)
-def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
+def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_slider):
     import corner as _corner
 
     _posteriors = get_tier2_posteriors()
@@ -1449,11 +1481,11 @@ def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
             range=_pr_list,
         )
         _corner_display = mo.ui.tabs({
-            "Posterior (Auto Range)": _fig,
-            "Full Prior Range": _fig_prior,
+            "Posterior (Auto Range)": render_fixed_matplotlib(mo, _fig, width_px=920),
+            "Full Prior Range": render_fixed_matplotlib(mo, _fig_prior, width_px=920),
         })
     else:
-        _corner_display = _fig
+        _corner_display = render_fixed_matplotlib(mo, _fig, width_px=920)
 
     _conv_tag = "converged" if _converged else "**not converged**"
     _summary_rows = []
@@ -1486,7 +1518,7 @@ def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
 
 
 @app.cell(hide_code=True)
-def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
+def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_slider):
     # ── Tier 2 Chain Trace Plot ──
     # Visualises the full MCMC walker chains for the selected spectrum,
     # mirroring the trace-plot diagnostic from the inference tool.
@@ -1559,13 +1591,13 @@ def _(get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
         mo.md(f"Full walker chains ({_nwalkers} walkers × {_nsteps} steps). "
                f"Orange dashed line marks burn-in at step {_burnin}. "
                "Red line marks ground truth."),
-        _fig,
+        render_fixed_matplotlib(mo, _fig, width_px=960),
     ])
     return
 
 
 @app.cell(hide_code=True)
-def _(alt, get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
+def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_slider):
     # ── Tier 2 Best-Fit Spectrum Plot ──
     # Reconstructs the Starfish-style 3-panel plot (data vs model, residuals,
     # relative error) from spectral arrays stored during the benchmark run.
@@ -1574,175 +1606,25 @@ def _(alt, get_tier2_posteriors, mo, np, plt, t2_spectrum_slider):
 
     _idx = t2_spectrum_slider.value
     _post = _posteriors[_idx]
-    _bf = _post.get("bestfit_spec")
-    mo.stop(
-        _bf is None or not _bf,
-        mo.md("*Best-fit spectrum data not available for this spectrum. Older reports and runs produced before the best-fit export fix will not have it.*"),
-    )
-
-    _wl = np.asarray(_bf["wavelength"])
-    _data_flux = np.asarray(_bf["data_flux"])
-    _model_flux = np.asarray(_bf["model_flux"])
-    _cov_diag = np.asarray(_bf["model_cov_diag"])
-    _std = np.sqrt(np.maximum(np.abs(_cov_diag), 0.0))
-
     _filename = _post.get("filename", f"run{_post['run']}.spec")
     _inc = _post.get("inclination", 55.0)
     _converged = _post.get("converged", False)
     _conv_tag = "converged" if _converged else "not converged"
-    _R = _data_flux - _model_flux
-    _R_frac = _R / np.where(np.abs(_data_flux) > 0, _data_flux, 1.0)
+    _bf = _post.get("bestfit_spec")
 
-    # This main spectrum chart shows the observed flux and posterior-mean best-fit model.
-    # It lets you see whether the fit tracks the overall continuum and line structure.
-    _main_values = []
-    for _wavelength, _flux in zip(_wl, _data_flux):
-        _main_values.append({
-            "Wavelength": float(_wavelength),
-            "Flux": float(_flux),
-            "Series": "Data",
-        })
-    for _wavelength, _flux in zip(_wl, _model_flux):
-        _main_values.append({
-            "Wavelength": float(_wavelength),
-            "Flux": float(_flux),
-            "Series": "Model",
-        })
-    _main_chart = alt.Chart(alt.Data(values=_main_values)).mark_line(
-        strokeWidth=1.4,
-    ).encode(
-        x=alt.X(
-            "Wavelength:Q",
-            title="Wavelength (Å)",
-            scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))]),
-        ),
-        y=alt.Y(
-            "Flux:Q",
-            title="Flux",
-            scale=alt.Scale(zero=False),
-        ),
-        color=alt.Color(
-            "Series:N",
-            title="Series",
-            scale=alt.Scale(domain=["Data", "Model"], range=["#4c78a8", "#f58518"]),
-            legend=alt.Legend(orient="top"),
-        ),
-        tooltip=[
-            alt.Tooltip("Series:N", title="Series"),
-            alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
-            alt.Tooltip("Flux:Q", title="Flux", format=".4e"),
-        ],
-    ).properties(
-        width=640,
-        height=420,
+    mo.stop(
+        not _bf,
+        mo.md("*Best-fit spectrum data not available for this spectrum. Older reports and runs produced before the best-fit export fix will not have it.*"),
+    )
+
+    _fig = build_bestfit_spectrum_altair(
+        alt,
+        wavelength=_bf["wavelength"],
+        data_flux=_bf["data_flux"],
+        model_flux=_bf["model_flux"],
+        model_cov_diag=_bf["model_cov_diag"],
         title=f"Best-Fit Model — {_filename} @ {_inc:.0f}° ({_conv_tag})",
-    ).interactive()
-
-    # This residual chart shows Data - Model together with ±1σ, ±2σ, and ±3σ model bands.
-    # It highlights where the fit misses the data relative to the emulator uncertainty estimate.
-    _resid_values = []
-    _band_1sigma = []
-    _band_2sigma = []
-    _band_3sigma = []
-    _rel_values = []
-    for _wavelength, _residual, _sigma, _rel_error in zip(_wl, _R, _std, _R_frac):
-        _wavelength = float(_wavelength)
-        _sigma = float(_sigma)
-        _resid_values.append({
-            "Wavelength": _wavelength,
-            "Residual": float(_residual),
-        })
-        _band_1sigma.append({
-            "Wavelength": _wavelength,
-            "Lower": -_sigma,
-            "Upper": _sigma,
-        })
-        _band_2sigma.append({
-            "Wavelength": _wavelength,
-            "Lower": -2.0 * _sigma,
-            "Upper": 2.0 * _sigma,
-        })
-        _band_3sigma.append({
-            "Wavelength": _wavelength,
-            "Lower": -3.0 * _sigma,
-            "Upper": 3.0 * _sigma,
-        })
-        _rel_values.append({
-            "Wavelength": _wavelength,
-            "Relative Error": float(_rel_error),
-        })
-
-    _resid_band_3 = alt.Chart(alt.Data(values=_band_3sigma)).mark_area(
-        color="#54a24b",
-        opacity=0.12,
-    ).encode(
-        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))])),
-        y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False)),
-        y2="Upper:Q",
-    )
-    _resid_band_2 = alt.Chart(alt.Data(values=_band_2sigma)).mark_area(
-        color="#54a24b",
-        opacity=0.20,
-    ).encode(
-        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))])),
-        y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False)),
-        y2="Upper:Q",
-    )
-    _resid_band_1 = alt.Chart(alt.Data(values=_band_1sigma)).mark_area(
-        color="#54a24b",
-        opacity=0.30,
-    ).encode(
-        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))])),
-        y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False)),
-        y2="Upper:Q",
-    )
-    _resid_zero = alt.Chart(alt.Data(values=[{"Zero": 0.0}])).mark_rule(
-        color="grey",
-        strokeDash=[4, 4],
-        opacity=0.7,
-    ).encode(y="Zero:Q")
-    _resid_line = alt.Chart(alt.Data(values=_resid_values)).mark_line(
-        color="#2ca02c",
-        strokeWidth=1.2,
-    ).encode(
-        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))])),
-        y=alt.Y("Residual:Q", title="Residual", scale=alt.Scale(zero=False)),
-        tooltip=[
-            alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
-            alt.Tooltip("Residual:Q", title="Data - Model", format=".4e"),
-        ],
-    )
-    _resid_chart = (_resid_band_3 + _resid_band_2 + _resid_band_1 + _resid_zero + _resid_line).properties(
-        width=360,
-        height=200,
-        title="Residuals and Model Uncertainty",
-    ).interactive()
-
-    # This relative-error chart shows the fractional mismatch across wavelength.
-    # It makes it easier to spot coherent percent-level biases that are hard to see in raw flux units.
-    _rel_zero = alt.Chart(alt.Data(values=[{"Zero": 0.0}])).mark_rule(
-        color="grey",
-        strokeDash=[4, 4],
-        opacity=0.7,
-    ).encode(y="Zero:Q")
-    _rel_chart = (_rel_zero + alt.Chart(alt.Data(values=_rel_values)).mark_line(
-        color="#e45756",
-        strokeWidth=1.2,
-    ).encode(
-        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))])),
-        y=alt.Y("Relative Error:Q", title="Relative Error", scale=alt.Scale(zero=False)),
-        tooltip=[
-            alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
-            alt.Tooltip("Relative Error:Q", title="Relative Error", format=".4e"),
-        ],
-    )).properties(
-        width=360,
-        height=200,
-        title="Relative Error",
-    ).interactive()
-
-    _fig = (_main_chart | alt.vconcat(_resid_chart, _rel_chart, spacing=14)).resolve_scale(
-        y="independent"
+        zoom_name="tier2_bestfit_zoom",
     )
 
     mo.vstack([
@@ -2145,7 +2027,7 @@ def _(add_mean_switch, get_emulator, get_tier1_arrays, mo, np, pd, plt, spectrum
 
 
 @app.cell(hide_code=True)
-def _(get_comparison_reports, mo, np, plt):
+def _(alt, get_comparison_reports, mo, np, os):
     _comp_reports = get_comparison_reports()
     mo.stop(
         not _comp_reports or len(_comp_reports) < 2,
@@ -2154,13 +2036,37 @@ def _(get_comparison_reports, mo, np, plt):
 
     _comp_items = [mo.md("## Report Comparison")]
 
+    def _report_full_label(_rep, _idx):
+        _emu_path = _rep.get("config", {}).get("emulator", "")
+        if _emu_path:
+            return os.path.splitext(os.path.basename(_emu_path))[0]
+        _tag = _rep.get("config", {}).get("tag")
+        if _tag:
+            return str(_tag)
+        return f"report_{_idx}"
+
+    def _report_short_label(_idx):
+        return f"Emulator {_idx}"
+
+    _report_meta = []
+    for _i, _rep in enumerate(_comp_reports):
+        _report_meta.append({
+            "Emulator": _report_short_label(_i),
+            "Emulator File": _report_full_label(_rep, _i),
+        })
+
+    _comp_items.append(mo.md("### Compared Emulators"))
+    _comp_items.append(mo.ui.table(_report_meta, label="Emulator Labels", selection=None))
+
     # Comparison reduces each report to a small shared schema so reports from
     # different runs can still be compared even if some optional fields differ.
     _t1_data = {}
     for _i, _rep in enumerate(_comp_reports):
-        _tag = _rep.get("config", {}).get("tag", f"report_{_i}")
+        _tag = _report_short_label(_i)
+        _full = _report_full_label(_rep, _i)
         _t1 = _rep.get("tier1", {})
         _t1_data[_tag] = {
+            "emulator_file": _full,
             "eas": _t1.get("emulator_accuracy_score"),
             "loo_rmse": _t1.get("loo_flux_rmse_median"),
             "pca_ev": _t1.get("pca_explained_variance"),
@@ -2171,7 +2077,8 @@ def _(get_comparison_reports, mo, np, plt):
     if _t1_data:
         _rows = [
             {
-                "Report": _k,
+                "Emulator": _k,
+                "Emulator File": _v["emulator_file"],
                 "EAS (%)": f"{_v['eas']:.2f}" if _v["eas"] is not None else "\u2014",
                 "Q\u00b2": f"{_v['q2']:.6g}" if _v["q2"] is not None else "\u2014",
                 "NLPD": f"{_v['nlpd']:.4f}" if _v["nlpd"] is not None else "\u2014",
@@ -2196,24 +2103,42 @@ def _(get_comparison_reports, mo, np, plt):
     if _all_params:
         _comp_items.append(mo.md("### Tier 2 Parameter RMSE Comparison"))
         _params = sorted(_all_params)
-        _fig, _ax = plt.subplots(figsize=(max(10, len(_params)*2), 5))
-        # Grouped bars keep each report aligned on the same parameter axis so
-        # changes in recovery quality are easy to scan across experiments.
-        _bar_width = 0.8 / len(_comp_reports)
+        _report_order = []
+        _rmse_rows = []
         for _i, _rep in enumerate(_comp_reports):
-            _tag = _rep.get("config", {}).get("tag", f"report_{_i}")
+            _tag = _report_short_label(_i)
+            _full = _report_full_label(_rep, _i)
+            _report_order.append(_tag)
             _agg = _rep.get("tier2", {}).get("aggregate", {})
-            _rmses = [_agg.get(_p, {}).get("rmse", float("nan")) for _p in _params]
-            _xb = np.arange(len(_params)) + _i * _bar_width
-            _ax.bar(_xb, _rmses, _bar_width, label=_tag)
-        _ax.set_xticks(np.arange(len(_params)) + _bar_width * (len(_comp_reports)-1)/2)
-        _ax.set_xticklabels(_params, rotation=45, ha="right", fontsize=8)
-        _ax.set_ylabel("RMSE")
-        _ax.legend()
-        _ax.set_title("Tier 2 RMSE — Side by Side")
-        plt.tight_layout()
-        _comp_items.append(mo.as_html(_fig))
-        plt.close()
+            for _p in _params:
+                _rmse_rows.append({
+                    "Parameter": _p,
+                    "RMSE": float(_agg.get(_p, {}).get("rmse", float("nan"))),
+                    "Emulator": _tag,
+                    "Emulator File": _full,
+                })
+
+        _rmse_chart = alt.Chart(alt.Data(values=_rmse_rows)).mark_bar().encode(
+            x=alt.X(
+                "Parameter:N",
+                sort=_params,
+                axis=alt.Axis(labelAngle=-40, labelLimit=280),
+            ),
+            xOffset=alt.XOffset("Emulator:N", sort=_report_order),
+            y=alt.Y("RMSE:Q", title="RMSE"),
+            color=alt.Color("Emulator:N", sort=_report_order, legend=alt.Legend(title="Emulator")),
+            tooltip=[
+                alt.Tooltip("Emulator:N", title="Emulator"),
+                alt.Tooltip("Emulator File:N", title="Emulator File"),
+                alt.Tooltip("Parameter:N", title="Parameter"),
+                alt.Tooltip("RMSE:Q", title="RMSE", format=".4g"),
+            ],
+        ).properties(
+            width=max(520, 120 * len(_params)),
+            height=360,
+            title="Tier 2 RMSE — Side by Side",
+        )
+        _comp_items.append(_rmse_chart)
 
     mo.vstack(_comp_items)
     return

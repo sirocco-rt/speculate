@@ -261,8 +261,9 @@ def _load_test_grid_spectrum(
             "and that the correct inclination column is being read."
         )
 
-    sigma = np.abs(flux) * 0.05  # 5% assumed error
-    sigma = np.maximum(sigma, np.abs(flux) * 0.01)
+    from Speculate_addons.Spec_functions import build_synthetic_sirocco_sigma
+
+    sigma, _ = build_synthetic_sirocco_sigma(wl, flux)
     return wl, flux, sigma
 
 
@@ -417,10 +418,10 @@ def run_mle_single(
     flux = np.asarray(flux, dtype=np.float64)
     sigma = np.asarray(sigma, dtype=np.float64)
 
-    # Keep the 1% safeguard in native linear-flux units, then propagate it
-    # through the requested transform. Applying a 1% floor after log10() would
-    # incorrectly inflate sigma by the magnitude of the logged flux itself.
-    sigma = np.maximum(sigma, np.abs(flux) * 0.01)
+    # Sigma is defined upstream in native linear-flux units; only keep a tiny
+    # absolute floor here so transform propagation does not reintroduce a
+    # flux-proportional collapse in deep features.
+    sigma = np.maximum(sigma, 1e-30)
 
     if flux_scale == "log":
         sigma = sigma / (np.abs(flux) * np.log(10) + 1e-30)
@@ -1383,7 +1384,12 @@ def run_tier3_single(
     df.columns = [c.strip().lower() for c in df.columns]
     wl = np.array(df["wavelength"])
     flux = np.array(df["flux"])
-    sigma = np.array(df["error"]) if "error" in df.columns else np.abs(flux) * 0.05
+    if "error" in df.columns:
+        sigma = np.array(df["error"])
+    else:
+        from Speculate_addons.Spec_functions import build_default_observation_sigma
+
+        sigma, _ = build_default_observation_sigma(wl, flux)
 
     mask = (wl >= wl_range[0]) & (wl <= wl_range[1])
     wl, flux, sigma = wl[mask], flux[mask], sigma[mask]

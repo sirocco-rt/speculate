@@ -216,6 +216,11 @@ def _(mo):
     import logging
     import pandas as pd
     import altair as alt
+    import importlib
+    from Speculate_addons import Spec_functions as spec_functions
+    if not hasattr(spec_functions, "enable_speculate_altair_theme"):
+        spec_functions = importlib.reload(spec_functions)
+    spec_functions.enable_speculate_altair_theme(alt)
     alt.data_transformers.enable("vegafusion")
     import time
 
