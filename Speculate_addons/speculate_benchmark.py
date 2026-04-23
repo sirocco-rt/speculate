@@ -70,6 +70,83 @@ def internal_to_friendly(param_names: Sequence[str]) -> List[str]:
     return out
 
 
+TIER2_NUISANCE_LABELS = (
+    "Av",
+    "log_scale",
+    "cheb:1",
+    "global_cov:log_amp",
+    "global_cov:log_ls",
+)
+
+TIER2_FRIENDLY_LABELS = {
+    "Av": "Av",
+    "log_scale": "log_scale",
+    "cheb:1": "cheb_1",
+    "global_cov:log_amp": "GP log_amp",
+    "global_cov:log_ls": "GP log_ls",
+}
+
+
+def build_tier2_label_map(param_names: Sequence[str]) -> Dict[str, str]:
+    """Return friendly labels for Tier 2 grid and nuisance parameters."""
+    label_map = {
+        internal: friendly
+        for internal, friendly in zip(param_names, internal_to_friendly(param_names))
+    }
+    label_map.update(TIER2_FRIENDLY_LABELS)
+    return label_map
+
+
+def build_tier2_freeze_defaults(param_names: Sequence[str]) -> dict:
+    """Return the default Tier 2 Stage 2/4 freeze dictionaries."""
+    label_map = build_tier2_label_map(param_names)
+    mle = {label: False for label in label_map}
+    for mle_label in ("Av", "cheb:1"):
+        if mle_label in mle:
+            mle[mle_label] = True
+
+    mcmc = {label: False for label in label_map}
+    for label in ("Av", "log_scale", "cheb:1", "global_cov:log_amp", "global_cov:log_ls"):
+        if label in mcmc:
+            mcmc[label] = True
+
+    return {
+        "labels": label_map,
+        "mle": mle,
+        "mcmc": mcmc,
+    }
+
+
+def _serialise_freeze_settings(freeze_params: Optional[dict]) -> Dict[str, bool]:
+    """Coerce a freeze settings mapping to JSON-safe bools."""
+    return {
+        str(label): bool(is_frozen)
+        for label, is_frozen in (freeze_params or {}).items()
+    }
+
+
+def _snapshot_model_params(model) -> Dict[str, float]:
+    """Capture the current SpectrumModel parameter state as plain floats."""
+    return {str(label): float(model.params[label]) for label in model.params.keys()}
+
+
+def _apply_freeze_settings(model, freeze_params: Optional[dict], thaw_first: bool = False) -> List[str]:
+    """Apply a freeze dictionary to the current SpectrumModel."""
+    applied = []
+    for label, is_frozen in (freeze_params or {}).items():
+        if label not in model.params:
+            continue
+        if thaw_first:
+            try:
+                model.thaw(label)
+            except Exception:
+                pass
+        if is_frozen:
+            model.freeze(label)
+            applied.append(label)
+    return applied
+
+
 def emulator_to_physical(param_names: Sequence[str], values: np.ndarray) -> dict:
     """
     Convert emulator-space parameter values to physical Sirocco units.
@@ -374,6 +451,7 @@ def run_mle_single(
     flux_scale: str = "linear",
     max_iter: int = 10_000,
     freeze_av: bool = True,
+    freeze_params: Optional[Dict[str, bool]] = None,
     iteration_callback=None,
     n_restarts: int = 1,
 ) -> dict:
@@ -395,6 +473,11 @@ def run_mle_single(
         If True (default), fix Av=0.  Use True for synthetic test-grid
         spectra (Tier 2) which have no dust; False for observational
         spectra (Tier 3) where Av should be optimised.
+    freeze_params : dict or None
+        Optional Stage 2 freeze settings keyed by internal parameter name.
+        Checked parameters are held at the benchmark's current initial value:
+        grid midpoints, ``Av=0``, bootstrapped ``log_scale``, ``cheb:1=0``,
+        and the benchmark's default GP hyperparameter initialisation.
     iteration_callback : callable or None
         If provided, called as ``iteration_callback(iter_num, max_iter, best_nll, elapsed_s)``
         every 50 iterations during optimisation.
@@ -451,14 +534,16 @@ def run_mle_single(
         flux_scale=flux_scale,
     )
 
+    _requested_freeze = _serialise_freeze_settings(freeze_params)
+    if "Av" not in _requested_freeze:
+        _requested_freeze["Av"] = bool(freeze_av)
+
     # Optionally fix Av = 0 (synthetic test-grid spectra have no dust
     # extinction, so allowing Av to float wastes degrees of freedom and
     # can push the optimizer into poor local minima).
-    if freeze_av:
-        model.params["Av"] = 0.0
+    model.params["Av"] = 0.0
+    if _requested_freeze.get("Av", False):
         model.freeze("Av")
-    else:
-        model.params["Av"] = 0.0
 
     # Bootstrap log_scale from auto-calculation *before* building priors
     # so we can centre the log_scale prior on the data-informed value.
@@ -480,7 +565,7 @@ def run_mle_single(
         for i, pn in enumerate(emu.param_names):
             lo, hi = float(emu.min_params[i]), float(emu.max_params[i])
             priors[pn] = stats.uniform(loc=lo, scale=hi - lo)
-        if not freeze_av:
+        if not _requested_freeze.get("Av", False):
             priors["Av"] = stats.uniform(loc=0, scale=2.0)
         # Keep log_scale centered on the bootstrap estimate so the optimizer does
         # not waste its early iterations finding the gross normalization.
@@ -511,11 +596,31 @@ def run_mle_single(
         # GP log_ls: [1, 8] — matches inference tool optimised range
         priors["global_cov:log_ls"] = stats.uniform(loc=1.0, scale=7.0)
 
+    _applied_freezes = _apply_freeze_settings(model, _requested_freeze)
+
     labels_before = list(model.labels)
 
     # Derive per-parameter bounds from the priors for CMA-ES box constraints.
     active_labels = list(model.labels)
     N = len(active_labels)
+
+    if N == 0:
+        try:
+            _nll = float(-model.log_likelihood(priors))
+        except Exception:
+            _nll = 1e10
+        return {
+            "grid_params": model.grid_params.tolist(),
+            "all_params": _snapshot_model_params(model),
+            "nll": _nll,
+            "success": True,
+            "n_iter": 0,
+            "labels": labels_before,
+            "freeze_params": dict(_requested_freeze),
+            "frozen_params": list(_applied_freezes),
+            "model": model,
+            "priors": priors,
+        }
 
     lo_bounds = []
     hi_bounds = []
@@ -649,11 +754,13 @@ def run_mle_single(
 
     return {
         "grid_params": model.grid_params.tolist(),
-        "all_params": {k: float(model.params[k]) for k in model.labels},
+        "all_params": _snapshot_model_params(model),
         "nll": float(soln.fun),
         "success": bool(soln.success),
         "n_iter": int(soln.nit),
         "labels": labels_before,
+        "freeze_params": dict(_requested_freeze),
+        "frozen_params": list(_applied_freezes),
         "model": model,
         "priors": priors,
     }
@@ -667,6 +774,7 @@ def run_mcmc_single(
     burnin: int = 500,
     iteration_callback=None,
     freeze_nuisance: bool = False,
+    freeze_params: Optional[Dict[str, bool]] = None,
 ) -> dict:
     """
     Run MCMC on a SpectrumModel already set to MLE best-fit.
@@ -682,6 +790,10 @@ def run_mcmc_single(
         values so the MCMC only samples over the physical grid parameters.
         This follows the Starfish paper recommendation (Czekala+2015,
         Section 2.5) and significantly speeds up convergence.
+    freeze_params : dict or None
+        Optional Stage 4 freeze settings keyed by internal parameter name.
+        When provided, this overrides ``freeze_nuisance`` and is applied with
+        a thaw-then-refreeze pass so each run starts from a clean MCMC state.
 
     Returns
     -------
@@ -695,20 +807,32 @@ def run_mcmc_single(
     """
     import emcee
 
-    # Optionally freeze nuisance params at MLE best-fit (Czekala+2015 §2.5):
-    # "one can first optimize the kernel parameters and then proceed with
-    # them fixed, since the stellar parameter posteriors are relatively
-    # insensitive to the precise value of the kernel parameters."
-    _nuisance_labels = {"log_scale", "cheb:1", "global_cov:log_amp", "global_cov:log_ls"}
-    _frozen_nuisance = {}
-    if freeze_nuisance:
-        for _lbl in list(_nuisance_labels):
-            if _lbl in model.labels:
-                _frozen_nuisance[_lbl] = float(model.params[_lbl])
-                model.freeze(_lbl)
+    # Optionally freeze parameters at the MLE state before sampling.  The
+    # Starfish paper directly motivates fixing the kernel hyperparameters after
+    # optimisation; broader Stage 4 freeze choices are treated as an explicit
+    # benchmark policy rather than a paper-mandated rule.
+    _requested_freeze = _serialise_freeze_settings(freeze_params)
+    if not _requested_freeze and freeze_nuisance:
+        _requested_freeze = {
+            label: True for label in TIER2_NUISANCE_LABELS if label != "Av"
+        }
+
+    _managed_labels = [label for label in _requested_freeze if label in model.params]
+    _pre_mcmc_values = {label: float(model.params[label]) for label in _managed_labels}
+    _pre_mcmc_frozen = {label: (label not in model.labels) for label in _managed_labels}
+    _applied_freezes = _apply_freeze_settings(model, _requested_freeze, thaw_first=True)
+    _frozen_param_values = {
+        label: float(model.params[label]) for label in _applied_freezes
+    }
+
+    if "Av" in model.params and "Av" in model.labels and "Av" not in priors:
+        priors = dict(priors)
+        priors["Av"] = stats.uniform(loc=0, scale=2.0)
 
     _sampled_labels = list(model.labels)
     ndim = len(_sampled_labels)
+    if ndim == 0:
+        raise ValueError("MCMC has no thawed parameters to sample after applying the freeze settings.")
 
     # Initialise walkers in a truncated-normal ball around MLE.
     # For Normal priors: σ = the distribution's own std (1σ).
@@ -868,9 +992,17 @@ def run_mcmc_single(
 
     # Restore any nuisance params that were frozen for this MCMC run so the
     # model object is left in a usable state for downstream callers.
-    for _lbl, _val in _frozen_nuisance.items():
-        model.thaw(_lbl)
-        model[_lbl] = _val
+    for _lbl in _managed_labels:
+        if _lbl not in model.params:
+            continue
+        if _pre_mcmc_frozen.get(_lbl, False):
+            model.freeze(_lbl)
+        else:
+            try:
+                model.thaw(_lbl)
+            except Exception:
+                pass
+        model[_lbl] = _pre_mcmc_values[_lbl]
 
     # Full chain (nsteps, nwalkers, ndim) before burn-in — used for
     # chain trace plots in the benchmark viewer.
@@ -888,6 +1020,9 @@ def run_mcmc_single(
         "n_effective": flat.shape[0],
         "labels": all_labels,
         "bestfit_spec": bestfit_spec,
+        "freeze_params": dict(_requested_freeze),
+        "frozen_params": list(_applied_freezes),
+        "frozen_param_values": dict(_frozen_param_values),
     }
 
 
@@ -993,6 +1128,8 @@ def aggregate_tier2_results(
     mcmc_burnin: int,
     elapsed: float,
     n_not_converged: int = 0,
+    mle_freeze_params: Optional[Dict[str, bool]] = None,
+    mcmc_freeze_params: Optional[Dict[str, bool]] = None,
 ) -> dict:
     """Aggregate per-spectrum Tier 2 results into final metrics dict.
 
@@ -1060,10 +1197,14 @@ def aggregate_tier2_results(
         "n_failures": failures,
         "n_not_converged": n_not_converged,
         "failure_log": failure_log,
+        "mle_config": {
+            "freeze_params": _serialise_freeze_settings(mle_freeze_params),
+        },
         "mcmc_config": {
             "walkers": mcmc_walkers,
             "steps": mcmc_steps,
             "burnin": mcmc_burnin,
+            "freeze_params": _serialise_freeze_settings(mcmc_freeze_params),
         },
         "tier2_time_s": elapsed,
     }
@@ -1081,6 +1222,8 @@ def run_tier2(
     max_mle_iter: int = 5000,
     mle_restarts: int = 1,
     max_spectra: Optional[int] = None,
+    mle_freeze_params: Optional[Dict[str, bool]] = None,
+    mcmc_freeze_params: Optional[Dict[str, bool]] = None,
     progress_callback=None,
 ) -> dict:
     """
@@ -1126,6 +1269,17 @@ def run_tier2(
 
     friendly_names = internal_to_friendly(emu.param_names)
     n_params = len(emu.param_names)
+    _tier2_defaults = build_tier2_freeze_defaults(emu.param_names)
+    _mle_defaults = _tier2_defaults["mle"]
+    _mcmc_defaults = _tier2_defaults["mcmc"]
+    mle_freeze_params = {
+        label: bool((mle_freeze_params or {}).get(label, _mle_defaults[label]))
+        for label in _mle_defaults
+    }
+    mcmc_freeze_params = {
+        label: bool((mcmc_freeze_params or {}).get(label, _mcmc_defaults[label]))
+        for label in _mcmc_defaults
+    }
 
     per_spectrum = []
     all_samples = {name: [] for name in friendly_names}
@@ -1179,6 +1333,7 @@ def run_tier2(
             mle_result = run_mle_single(
                 emu, wl, flux, sigma, flux_scale=flux_scale,
                 max_iter=max_mle_iter, n_restarts=mle_restarts,
+                freeze_params=mle_freeze_params,
             )
         except Exception as e:
             import traceback as _tb
@@ -1202,7 +1357,7 @@ def run_tier2(
                 nwalkers=mcmc_walkers,
                 nsteps=mcmc_steps,
                 burnin=mcmc_burnin,
-                freeze_nuisance=True,
+                freeze_params=mcmc_freeze_params,
             )
         except Exception as e:
             import traceback as _tb
@@ -1228,6 +1383,12 @@ def run_tier2(
             "mcmc_converged": mcmc_result["converged"],
             "n_effective": mcmc_result["n_effective"],
             "mle_grid_params": mle_result["grid_params"],
+            "mle_all_params": mle_result.get("all_params", {}),
+            "mle_freeze_settings": mle_result.get("freeze_params", {}),
+            "mle_frozen_params": mle_result.get("frozen_params", []),
+            "mcmc_freeze_settings": mcmc_result.get("freeze_params", {}),
+            "mcmc_frozen_params": mcmc_result.get("frozen_params", []),
+            "mcmc_frozen_param_values": mcmc_result.get("frozen_param_values", {}),
         }
 
         # Map friendly names to their column index in the flat samples array.
@@ -1332,10 +1493,14 @@ def run_tier2(
         "n_failures": failures,
         "n_not_converged": n_not_converged,
         "failure_log": failure_log,
+        "mle_config": {
+            "freeze_params": _serialise_freeze_settings(mle_freeze_params),
+        },
         "mcmc_config": {
             "walkers": mcmc_walkers,
             "steps": mcmc_steps,
             "burnin": mcmc_burnin,
+            "freeze_params": _serialise_freeze_settings(mcmc_freeze_params),
         },
         "tier2_time_s": elapsed,
     }
@@ -1670,6 +1835,7 @@ def build_report_card(
             "failure_log": tier2.get("failure_log", []),
             "per_spectrum": tier2.get("per_spectrum", []),
             "tier2_time_s": tier2["tier2_time_s"],
+            "mle_config": tier2.get("mle_config", {}),
             "mcmc_config": tier2["mcmc_config"],
             "aggregate": tier2["aggregate"],
         }
@@ -1700,6 +1866,18 @@ def build_report_card(
                     _entry["bestfit_spec"] = _p["bestfit_spec"]
                 if "prior_ranges" in _p and _p["prior_ranges"]:
                     _entry["prior_ranges"] = _p["prior_ranges"]
+                if "mle_all_params" in _p and _p["mle_all_params"]:
+                    _entry["mle_all_params"] = _p["mle_all_params"]
+                if "mle_freeze_settings" in _p and _p["mle_freeze_settings"]:
+                    _entry["mle_freeze_settings"] = _p["mle_freeze_settings"]
+                if "mle_frozen_params" in _p and _p["mle_frozen_params"]:
+                    _entry["mle_frozen_params"] = _p["mle_frozen_params"]
+                if "mcmc_freeze_settings" in _p and _p["mcmc_freeze_settings"]:
+                    _entry["mcmc_freeze_settings"] = _p["mcmc_freeze_settings"]
+                if "mcmc_frozen_params" in _p and _p["mcmc_frozen_params"]:
+                    _entry["mcmc_frozen_params"] = _p["mcmc_frozen_params"]
+                if "mcmc_frozen_param_values" in _p and _p["mcmc_frozen_param_values"]:
+                    _entry["mcmc_frozen_param_values"] = _p["mcmc_frozen_param_values"]
                 _serialised_posteriors.append(_entry)
             t2_summary["posteriors"] = _serialised_posteriors
         report["tier2"] = t2_summary

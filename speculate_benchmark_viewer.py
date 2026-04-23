@@ -286,6 +286,18 @@ def _(
                 entry["bestfit_spec"] = p["bestfit_spec"]
             if "prior_ranges" in p:
                 entry["prior_ranges"] = p["prior_ranges"]
+            if "mle_all_params" in p:
+                entry["mle_all_params"] = p["mle_all_params"]
+            if "mle_freeze_settings" in p:
+                entry["mle_freeze_settings"] = p["mle_freeze_settings"]
+            if "mle_frozen_params" in p:
+                entry["mle_frozen_params"] = p["mle_frozen_params"]
+            if "mcmc_freeze_settings" in p:
+                entry["mcmc_freeze_settings"] = p["mcmc_freeze_settings"]
+            if "mcmc_frozen_params" in p:
+                entry["mcmc_frozen_params"] = p["mcmc_frozen_params"]
+            if "mcmc_frozen_param_values" in p:
+                entry["mcmc_frozen_param_values"] = p["mcmc_frozen_param_values"]
             posteriors.append(entry)
         return posteriors if posteriors else None
 
@@ -870,6 +882,8 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
             if _loo_rmse_arr is None:
                 _loo_rmse_arr = _t1.get("loo_flux_rmse", [])
             if hasattr(_loo_rmse_arr, '__len__') and len(_loo_rmse_arr) > 0:
+                _overview_chart_width = 760
+                _overview_flux_axis = alt.Axis(format=".2e")
                 _sorted_idx = np.argsort(_loo_rmse_arr)
                 _worst_idx = _sorted_idx[-3:][::-1]
                 _series_domain = ["Original", "LOO recon"]
@@ -888,6 +902,13 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                         f"{float(_loo_rmse_arr[_idx]):.5f}"
                         if hasattr(_loo_rmse_arr, '__getitem__')
                         else "?"
+                    )
+                    _zoom_name = f"tier1_worst_zoom_{_idx}"
+                    _zoom = alt.selection_interval(
+                        name=_zoom_name,
+                        value={"x": [float(np.min(_wl)), float(np.max(_wl))]},
+                        bind="scales",
+                        encodings=["x"],
                     )
                     _worst_values = []
                     for _wavelength, _flux in zip(_wl, _orig[_idx]):
@@ -916,12 +937,13 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                         x=alt.X(
                             "Wavelength:Q",
                             title="Wavelength (Å)",
-                            scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))]),
+                            scale=alt.Scale(domain={"param": _zoom_name}),
                         ),
                         y=alt.Y(
                             "Flux:Q",
                             title=_flux_axis_title,
                             scale=alt.Scale(zero=False),
+                            axis=_overview_flux_axis,
                         ),
                         color=alt.Color(
                             "Series:N",
@@ -940,15 +962,13 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                             alt.Tooltip("Flux:Q", title=_flux_axis_title, format=".4e"),
                         ],
                     ).properties(
-                        width="container",
+                        width=_overview_chart_width,
                         height=180,
                         title=f"Spectrum #{_idx} (LOO RMSE = {_rmse_text})",
-                    )
+                    ).add_params(_zoom)
                     _worst_charts.append(_worst_chart)
 
-                _fig_worst = alt.vconcat(*_worst_charts, spacing=12).resolve_scale(
-                    y="independent"
-                ).interactive()
+                _fig_worst = mo.vstack(_worst_charts)
                 _worst_info = mo.md(
                     "### Worst-Case Spectra\n\n"
                     "**What this shows:** The three grid-point spectra with the largest "
@@ -978,6 +998,13 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                         if hasattr(_loo_rmse_arr, '__getitem__')
                         else "?"
                     )
+                    _zoom_name = f"tier1_best_zoom_{_idx}"
+                    _zoom = alt.selection_interval(
+                        name=_zoom_name,
+                        value={"x": [float(np.min(_wl)), float(np.max(_wl))]},
+                        bind="scales",
+                        encodings=["x"],
+                    )
                     _best_values = []
                     for _wavelength, _flux in zip(_wl, _orig[_idx]):
                         _best_values.append({
@@ -1005,12 +1032,13 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                         x=alt.X(
                             "Wavelength:Q",
                             title="Wavelength (Å)",
-                            scale=alt.Scale(domain=[float(np.min(_wl)), float(np.max(_wl))]),
+                            scale=alt.Scale(domain={"param": _zoom_name}),
                         ),
                         y=alt.Y(
                             "Flux:Q",
                             title=_flux_axis_title,
                             scale=alt.Scale(zero=False),
+                            axis=_overview_flux_axis,
                         ),
                         color=alt.Color(
                             "Series:N",
@@ -1029,15 +1057,13 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                             alt.Tooltip("Flux:Q", title=_flux_axis_title, format=".4e"),
                         ],
                     ).properties(
-                        width="container",
+                        width=_overview_chart_width,
                         height=180,
                         title=f"Spectrum #{_idx} (LOO RMSE = {_rmse_text})",
-                    )
+                    ).add_params(_zoom)
                     _best_charts.append(_best_chart)
 
-                _fig_best = alt.vconcat(*_best_charts, spacing=12).resolve_scale(
-                    y="independent"
-                ).interactive()
+                _fig_best = mo.vstack(_best_charts)
                 _best_info = mo.md(
                     "### Best-Case Spectra\n\n"
                     "**What this shows:** The three grid-point spectra with the smallest "
@@ -1464,10 +1490,17 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
         _pr_list = []
         for _lbl in _labels:
             _key = "Inclination" if "Inclination" in _lbl else _lbl
-            if _key in _pr_dict:
-                _pr_list.append(tuple(_pr_dict[_key]))
-            else:
-                _pr_list.append((1.0,))  # auto-range sentinel for corner
+            _raw_range = _pr_dict.get(_key)
+            if (
+                isinstance(_raw_range, (list, tuple, np.ndarray))
+                and len(_raw_range) == 2
+            ):
+                _lo = float(_raw_range[0])
+                _hi = float(_raw_range[1])
+                if np.isfinite(_lo) and np.isfinite(_hi) and _hi > _lo:
+                    _pr_list.append((_lo, _hi))
+                    continue
+            _pr_list.append(1.0)
         _fig_prior = _corner.corner(
             _samples,
             labels=_labels,
@@ -1624,7 +1657,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
         model_flux=_bf["model_flux"],
         model_cov_diag=_bf["model_cov_diag"],
         title=f"Best-Fit Model — {_filename} @ {_inc:.0f}° ({_conv_tag})",
-        zoom_name="tier2_bestfit_zoom",
+        zoom_name=f"tier2_bestfit_zoom_{_post['run']}",
     )
 
     mo.vstack([
@@ -1715,6 +1748,23 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
         domain=["Original", "PCA Recon", "Leave-One-Out GP Recon"],
         range=[[0, 0], [6, 4], [4, 2]],
     )
+    _wl_domain = [float(np.min(_wl)), float(np.max(_wl))]
+    _spec_zoom_name = f"tier1_recon_spec_zoom_{_idx}"
+    _resid_zoom_name = f"tier1_recon_resid_zoom_{_idx}"
+    _spec_zoom = alt.selection_interval(
+        name=_spec_zoom_name,
+        value={"x": _wl_domain},
+        bind="scales",
+        encodings=["x"],
+    )
+    _resid_zoom = alt.selection_interval(
+        name=_resid_zoom_name,
+        value={"x": _wl_domain},
+        bind="scales",
+        encodings=["x"],
+    )
+    _flux_axis = alt.Axis(format=".2e")
+    _resid_axis = alt.Axis(format=".2e")
 
     # LOO GP confidence band (±2σ) — propagated from per-component LOO
     # predictive variance through the PCA inverse transform.
@@ -1731,7 +1781,10 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
             alt.Chart(_df_ci)
             .mark_area(opacity=0.18, color="#54a24b")
             .encode(
-                x=alt.X("Wavelength:Q"),
+                x=alt.X(
+                    "Wavelength:Q",
+                    scale=alt.Scale(domain={"param": _spec_zoom_name}),
+                ),
                 y=alt.Y("Lower (2σ):Q", scale=alt.Scale(zero=False)),
                 y2=alt.Y2("Upper (2σ):Q"),
             )
@@ -1741,8 +1794,17 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
         alt.Chart(_df_spec)
         .mark_line(strokeWidth=1.5, opacity=0.85)
         .encode(
-            x=alt.X("Wavelength:Q", title="Wavelength (Å)"),
-            y=alt.Y("Flux:Q", title=_flux_axis_title, scale=alt.Scale(zero=False)),
+            x=alt.X(
+                "Wavelength:Q",
+                title="Wavelength (Å)",
+                scale=alt.Scale(domain={"param": _spec_zoom_name}),
+            ),
+            y=alt.Y(
+                "Flux:Q",
+                title=_flux_axis_title,
+                scale=alt.Scale(zero=False),
+                axis=_flux_axis,
+            ),
             color=alt.Color("Series:N", scale=_color_scale, legend=alt.Legend(title="Series")),
             strokeDash=alt.StrokeDash("Series:N", scale=_dash_scale, legend=None),
             tooltip=["Wavelength:Q", "Flux:Q", "Series:N"],
@@ -1752,7 +1814,7 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
     _spec_chart = (
         (_ci_chart + _spec_lines)
         .properties(width="container", height=350, title=f"Spectrum #{_idx}")
-        .interactive()
+        .add_params(_spec_zoom)
     )
 
     # Residuals make small local mismatches visible even when the overlaid flux
@@ -1771,25 +1833,41 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
     )
 
     _zero_rule = (
-        alt.Chart(pd.DataFrame({"y": [0]}))
-        .mark_rule(strokeDash=[4, 4], color="gray", opacity=0.5)
-        .encode(y="y:Q")
+        alt.Chart(pd.DataFrame({
+            "Wavelength": [float(_wl[0]), float(_wl[-1])],
+            "Residual": [0.0, 0.0],
+        }))
+        .mark_line(strokeDash=[4, 4], color="gray", opacity=0.5)
+        .encode(
+            x=alt.X(
+                "Wavelength:Q",
+                scale=alt.Scale(domain={"param": _resid_zoom_name}),
+            ),
+            y=alt.Y("Residual:Q"),
+        )
     )
 
     _resid_chart = (
         alt.Chart(_df_resid)
         .mark_line(strokeWidth=1, opacity=0.7)
         .encode(
-            x=alt.X("Wavelength:Q", title="Wavelength (Å)"),
-            y=alt.Y("Residual:Q", title="Residual (Original - Recon)"),
+            x=alt.X(
+                "Wavelength:Q",
+                title="Wavelength (Å)",
+                scale=alt.Scale(domain={"param": _resid_zoom_name}),
+            ),
+            y=alt.Y(
+                "Residual:Q",
+                title="Residual (Original - Recon)",
+                axis=_resid_axis,
+            ),
             color=alt.Color("Series:N", scale=_resid_color, legend=alt.Legend(title="")),
             tooltip=["Wavelength:Q", "Residual:Q", "Series:N"],
         )
         .properties(width="container", height=180)
-        .interactive()
     )
 
-    _combined_resid = _zero_rule + _resid_chart
+    _combined_resid = (_zero_rule + _resid_chart).add_params(_resid_zoom)
 
     display = mo.vstack([
         _readout,
@@ -2317,10 +2395,87 @@ def _(
 
 
 @app.cell(hide_code=True)
+def _(emu_picker, mo, np, os):
+    tier2_mle_freeze = mo.ui.dictionary({})
+    tier2_mcmc_freeze = mo.ui.dictionary({})
+    tier2_freeze_controls = mo.callout(
+        mo.md("Select an emulator to configure Tier 2 MLE/MCMC freeze settings."),
+        kind="neutral",
+    )
+
+    _emu_val = emu_picker.value or ""
+    if _emu_val and os.path.isfile(_emu_val):
+        try:
+            from Speculate_addons.speculate_benchmark import build_tier2_freeze_defaults
+
+            with np.load(_emu_val, allow_pickle=True) as _npz:
+                _raw_param_names = _npz["param_names"].tolist()
+
+            _param_names = [
+                _name.decode() if isinstance(_name, bytes) else str(_name)
+                for _name in _raw_param_names
+            ]
+            _defaults = build_tier2_freeze_defaults(_param_names)
+
+            _mle_widgets = {}
+            _mcmc_widgets = {}
+            for _label, _friendly in _defaults["labels"].items():
+                _mle_widgets[_label] = mo.ui.checkbox(
+                    value=bool(_defaults["mle"].get(_label, False)),
+                    label=_friendly,
+                )
+                _mcmc_widgets[_label] = mo.ui.checkbox(
+                    value=bool(_defaults["mcmc"].get(_label, False)),
+                    label=_friendly,
+                )
+
+            tier2_mle_freeze = mo.ui.dictionary(_mle_widgets)
+            tier2_mcmc_freeze = mo.ui.dictionary(_mcmc_widgets)
+            tier2_freeze_controls = mo.vstack([
+                mo.md("### Tier 2 Freeze Controls"),
+                mo.callout(
+                    mo.md(
+                        "Stage 2 freezes hold parameters at the benchmark starting values: "
+                        "grid midpoints, Av=0, bootstrapped log_scale, cheb_1=0, and the default GP initialisation. "
+                        "Stage 4 freezes hold parameters at their post-MLE values during MCMC."
+                    ),
+                    kind="neutral",
+                ),
+                mo.hstack([
+                    mo.vstack([
+                        mo.md("#### Stage 2 — MLE"),
+                        tier2_mle_freeze,
+                    ]),
+                    mo.vstack([
+                        mo.md("#### Stage 4 — MCMC"),
+                        tier2_mcmc_freeze,
+                    ]),
+                ], widths=[1, 1], align="start", gap=2),
+            ])
+        except Exception as _exc:
+            tier2_freeze_controls = mo.callout(
+                mo.md(f"Could not load Tier 2 freeze controls from emulator metadata: {_exc}"),
+                kind="warn",
+            )
+
+    return tier2_freeze_controls, tier2_mcmc_freeze, tier2_mle_freeze
+
+
+@app.cell(hide_code=True)
 def _(mo):
     run_btn = mo.ui.run_button(label="Run Benchmark")
-    run_btn
     return (run_btn,)
+
+
+@app.cell(hide_code=True)
+def _(mo, run_btn, tier2_freeze_controls, tier_picker):
+    _selected_tiers = set(tier_picker.value or [])
+    _items = []
+    if 2 in _selected_tiers or "Tier 2" in _selected_tiers:
+        _items.append(tier2_freeze_controls)
+    _items.append(run_btn)
+    mo.vstack(_items)
+    return
 
 
 @app.cell
@@ -2342,6 +2497,8 @@ def _(
     set_status_msg,
     set_tier1_arrays,
     set_tier2_posteriors,
+    tier2_mcmc_freeze,
+    tier2_mle_freeze,
     tier_picker,
     time,
 ):
@@ -2362,6 +2519,7 @@ def _(
             run_tier1 as _run_tier1,
             run_tier3_single as _run_tier3_single,
             build_report_card as _build_report_card,
+            build_tier2_freeze_defaults as _build_tier2_freeze_defaults,
             save_report as _save_report,
             # Tier 2 helpers — viewer drives the loop for nested progress
             load_test_grid_spectrum as _load_spec,
@@ -2403,6 +2561,9 @@ def _(
         # Resolve the shared flux-scaling mode once so both Tier 2 and Tier 3
         # use the same setting even if only one tier is selected.
         _flux_scale = flux_scale_picker.value
+        _tier2_defaults = _build_tier2_freeze_defaults(_emu.param_names)
+        _tier2_mle_freeze_settings = dict(tier2_mle_freeze.value or _tier2_defaults["mle"])
+        _tier2_mcmc_freeze_settings = dict(tier2_mcmc_freeze.value or _tier2_defaults["mcmc"])
         _tier1_result = None
         _tier2_result = None
         _tier3_results = None
@@ -2518,6 +2679,18 @@ def _(
                                     _post_entry["bestfit_spec"] = _entry["bestfit_spec"]
                                 if "prior_ranges" in _entry:
                                     _post_entry["prior_ranges"] = _entry["prior_ranges"]
+                                if "mle_all_params" in _entry:
+                                    _post_entry["mle_all_params"] = _entry["mle_all_params"]
+                                if "mle_freeze_settings" in _entry:
+                                    _post_entry["mle_freeze_settings"] = _entry["mle_freeze_settings"]
+                                if "mle_frozen_params" in _entry:
+                                    _post_entry["mle_frozen_params"] = _entry["mle_frozen_params"]
+                                if "mcmc_freeze_settings" in _entry:
+                                    _post_entry["mcmc_freeze_settings"] = _entry["mcmc_freeze_settings"]
+                                if "mcmc_frozen_params" in _entry:
+                                    _post_entry["mcmc_frozen_params"] = _entry["mcmc_frozen_params"]
+                                if "mcmc_frozen_param_values" in _entry:
+                                    _post_entry["mcmc_frozen_param_values"] = _entry["mcmc_frozen_param_values"]
                                 _tier2_posteriors.append(_post_entry)
                             else:
                                 # Legacy checkpoint: reconstruct from per-param samples
@@ -2635,6 +2808,7 @@ def _(
                                 _emu, _wl, _flux, _sigma, flux_scale=_flux_scale,
                                 max_iter=10_000, iteration_callback=_mle_cb,
                                 n_restarts=mle_restarts_slider.value,
+                                freeze_params=_tier2_mle_freeze_settings,
                             )
                         except Exception as _e:
                             _failure_log.append({
@@ -2665,7 +2839,7 @@ def _(
                                 nsteps=_mcmc_steps_val,
                                 burnin=500,
                                 iteration_callback=_mcmc_cb,
-                                freeze_nuisance=True,
+                                freeze_params=_tier2_mcmc_freeze_settings,
                             )
                         except Exception as _e:
                             _failure_log.append({
@@ -2688,6 +2862,12 @@ def _(
                         "mcmc_converged": _mcmc["converged"],
                         "n_effective": _mcmc["n_effective"],
                         "mle_grid_params": _mle["grid_params"],
+                        "mle_all_params": _mle.get("all_params", {}),
+                        "mle_freeze_settings": _mle.get("freeze_params", {}),
+                        "mle_frozen_params": _mle.get("frozen_params", []),
+                        "mcmc_freeze_settings": _mcmc.get("freeze_params", {}),
+                        "mcmc_frozen_params": _mcmc.get("frozen_params", []),
+                        "mcmc_frozen_param_values": _mcmc.get("frozen_param_values", {}),
                     }
 
                     # Checkpoint entry: includes samples for resume
@@ -2708,6 +2888,12 @@ def _(
                         },
                         "truths": dict(_gt),
                         "bestfit_spec": _mcmc.get("bestfit_spec", {}),
+                        "mle_all_params": _mle.get("all_params", {}),
+                        "mle_freeze_settings": _mle.get("freeze_params", {}),
+                        "mle_frozen_params": _mle.get("frozen_params", []),
+                        "mcmc_freeze_settings": _mcmc.get("freeze_params", {}),
+                        "mcmc_frozen_params": _mcmc.get("frozen_params", []),
+                        "mcmc_frozen_param_values": _mcmc.get("frozen_param_values", {}),
                     }
 
                     # Build prior ranges dict from emulator grid bounds (used for
@@ -2761,6 +2947,12 @@ def _(
                         "truths": dict(_gt),
                         "bestfit_spec": _mcmc.get("bestfit_spec", {}),
                         "prior_ranges": _prior_ranges_dict,
+                        "mle_all_params": _mle.get("all_params", {}),
+                        "mle_freeze_settings": _mle.get("freeze_params", {}),
+                        "mle_frozen_params": _mle.get("frozen_params", []),
+                        "mcmc_freeze_settings": _mcmc.get("freeze_params", {}),
+                        "mcmc_frozen_params": _mcmc.get("frozen_params", []),
+                        "mcmc_frozen_param_values": _mcmc.get("frozen_param_values", {}),
                     })
 
                     # Append checkpoint line (crash-safe: one write per spectrum)
@@ -2794,6 +2986,8 @@ def _(
                 mcmc_burnin=500,
                 elapsed=time.time() - _t2_t0,
                 n_not_converged=_n_not_converged,
+                mle_freeze_params=_tier2_mle_freeze_settings,
+                mcmc_freeze_params=_tier2_mcmc_freeze_settings,
             )
 
             # Clean up checkpoint file on successful completion
@@ -2861,6 +3055,8 @@ def _(
             "mcmc_steps": mcmc_steps_slider.value,
             "mle_restarts": mle_restarts_slider.value,
             "max_spectra": max_spectra_slider.value,
+            "tier2_mle_freeze": dict(_tier2_mle_freeze_settings),
+            "tier2_mcmc_freeze": dict(_tier2_mcmc_freeze_settings),
         }
         _report = _build_report_card(
             _tier1_result, _tier2_result, _tier3_results, _config,
