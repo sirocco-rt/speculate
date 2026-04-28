@@ -527,13 +527,13 @@ def _(mo):
     # Wavelength range: restricts which part of the spectrum is used for PCA/training.
     # Flux scale: how spectra are represented (linear, log, continuum-normalised, etc.).
     # Smoothing: optional boxcar-5 smoothing to reduce noise in raw spectra.
-    # PCA components: how many principal components to retain (2-20).
+    # PCA components: how many principal components to retain (2-30).
     # Model type: "Neural Network" or "Grid Interpolation (Linear)".
     #   - NN: learns a mapping from parameters → PCA weights via a feedforward network.
     #   - Grid Interpolation: uses scipy RegularGridInterpolator for exact multilinear
     #     interpolation on the Cartesian product grid (no training, O(d) per query).
-    # Ensemble checkbox: if checked, runs Optuna hyperparameter search (30 trials)
-    #   then trains 5 ensemble members for uncertainty estimation.
+    # Ensemble checkbox: if checked, trains 3 NN members for uncertainty estimation.
+    # Optuna checkbox: if checked, runs a 30-trial hyperparameter search first.
     qf_wl_min = mo.ui.number(
         start=800, stop=8000,
         value=850, step=1,
