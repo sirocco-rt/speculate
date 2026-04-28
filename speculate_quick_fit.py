@@ -25,7 +25,7 @@ app = marimo.App(width="full", app_title="Speculate Quick Fit")
 @app.cell(hide_code=True)
 def _():
     import marimo as mo
-    import importlib
+    import importlib as _importlib
     import numpy as np
     import pandas as pd
     import altair as alt
@@ -45,10 +45,10 @@ def _():
     except ImportError:
         fitzpatrick99 = None
 
-    from Speculate_addons import Spec_functions as spec_functions
-    if not hasattr(spec_functions, "enable_speculate_altair_theme"):
-        spec_functions = importlib.reload(spec_functions)
-    spec_functions.enable_speculate_altair_theme(alt)
+    from Speculate_addons import Spec_functions as _spec_functions
+    if not hasattr(_spec_functions, "enable_speculate_altair_theme"):
+        _spec_functions = _importlib.reload(_spec_functions)
+    _spec_functions.enable_speculate_altair_theme(alt)
 
     alt.data_transformers.enable("vegafusion")
 
@@ -88,14 +88,14 @@ def _():
 
 @app.cell
 def _(np):
-    import importlib
-    from Speculate_addons import Spec_functions as spec_functions
+    import importlib as _importlib
+    from Speculate_addons import Spec_functions as _spec_functions
 
-    if not hasattr(spec_functions, "build_default_observation_sigma"):
-        spec_functions = importlib.reload(spec_functions)
+    if not hasattr(_spec_functions, "build_default_observation_sigma"):
+        _spec_functions = _importlib.reload(_spec_functions)
 
-    build_default_observation_sigma = spec_functions.build_default_observation_sigma
-    build_synthetic_sirocco_sigma = spec_functions.build_synthetic_sirocco_sigma
+    build_default_observation_sigma = _spec_functions.build_default_observation_sigma
+    build_synthetic_sirocco_sigma = _spec_functions.build_synthetic_sirocco_sigma
 
     def qf_estimate_continuum(wl, flux, max_degree=5):
         _wl = np.asarray(wl, dtype=np.float64)
@@ -1962,8 +1962,13 @@ def _(
     _total_per_wl_rmse = np.sqrt(_pca_rmse ** 2 + _model_per_wl_rmse ** 2)
 
     _model_label = f"LOO (PCA + {'Interp' if _source == 'grid_interp' else 'NN'})"
-    _pca_df = pd.DataFrame({"Wavelength": _wl, "RMSE": _pca_rmse, "Source": "PCA truncation only"})
-    _total_df = pd.DataFrame({"Wavelength": _wl, "RMSE": _total_per_wl_rmse, "Source": _model_label})
+    # VegaFusion shortens float32 inline data in compiled Vega specs; cast chart
+    # data to float64 so exported RMSE values retain their available precision.
+    _rmse_wavelength = np.asarray(_wl, dtype=np.float64)
+    _pca_rmse_export = np.asarray(_pca_rmse, dtype=np.float64)
+    _total_rmse_export = np.asarray(_total_per_wl_rmse, dtype=np.float64)
+    _pca_df = pd.DataFrame({"Wavelength": _rmse_wavelength, "RMSE": _pca_rmse_export, "Source": "PCA truncation only"})
+    _total_df = pd.DataFrame({"Wavelength": _rmse_wavelength, "RMSE": _total_rmse_export, "Source": _model_label})
     _rmse_df = pd.concat([_pca_df, _total_df], ignore_index=True)
 
     _rmse_chart = alt.Chart(_rmse_df).mark_line(
