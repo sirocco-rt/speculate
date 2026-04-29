@@ -43,8 +43,10 @@ def _(mo):
     get_trained_emu, set_trained_emu = mo.state(None)
     get_loaded_emu_config, set_loaded_emu_config = mo.state(None)
     get_loaded_emu_display, set_loaded_emu_display = mo.state(None)
+    get_diagnostics_emu_display, set_diagnostics_emu_display = mo.state(None)
     return (
         get_console_logs,
+        get_diagnostics_emu_display,
         get_loaded_emu_config,
         get_loaded_emu_display,
         get_loss_history,
@@ -53,6 +55,7 @@ def _(mo):
         get_training_status,
         get_training_trigger,
         set_console_logs,
+        set_diagnostics_emu_display,
         set_loaded_emu_config,
         set_loaded_emu_display,
         set_loss_history,
@@ -61,6 +64,107 @@ def _(mo):
         set_training_status,
         set_training_trigger,
     )
+
+
+@app.cell
+def _(
+    get_diagnostics_emu_display,
+    get_loaded_emu_display,
+    get_trained_emu,
+    set_diagnostics_emu_display,
+    set_loaded_emu_display,
+    set_trained_emu,
+):
+    # ── Helpers for releasing GPU/CPU caches when the user changes the
+    # configuration or selects a different emulator from disk.  These run
+    # outside the cells that own the heavy state so any cell can call them
+    # without violating marimo's "value access in creating cell" rule.
+    def clear_trained_emu_cache(force=False):
+        """Drop GP/PCA caches on the currently-loaded emulator and free GPU memory.
+
+        Sets every known GPU-resident attribute on the trained emulator to
+        ``None`` (V11, iPhiPhi, Cholesky factors, kernel hyper-parameters,
+        memory-efficient block caches, …), then clears the kernel distance
+        cache and asks the CUDA caching allocator to release reserved blocks.
+
+        Parameters
+        ----------
+        force : bool, optional
+            When ``True`` the kernel cache and CUDA empty_cache call run even
+            if no emulator was loaded.  Used after a failed ``Emulator.load``
+            where partially-allocated tensors may still be live in the
+            allocator pool.
+        """
+        _emu = get_trained_emu()
+        _had_emu = _emu is not None
+        _had_diagnostics = get_diagnostics_emu_display() is not None
+
+        if _emu is not None:
+            # Hard-coded list of GPU/CPU caches the Emulator may attach.
+            # hasattr-guarded so missing attributes are ignored.
+            for _attr in (
+                "_v11_gpu",
+                "_iPhiPhi_gpu",
+                "_dots_inv_diag_gpu",
+                "_grid_points_gpu",
+                "_w_hat_gpu",
+                "_variances_gpu",
+                "_lengthscales_gpu",
+                "_L_gpu",
+                "_alpha_gpu",
+                "_L_gpu_source_id",
+                "_mem_eff_L_blocks",
+                "_mem_eff_alpha_blocks",
+                "_v11",
+                "_iPhiPhi",
+            ):
+                if hasattr(_emu, _attr):
+                    try:
+                        setattr(_emu, _attr, None)
+                    except Exception:
+                        pass
+
+        if _had_emu:
+            set_trained_emu(None)
+        if _had_diagnostics:
+            set_diagnostics_emu_display(None)
+
+        if force or _had_emu or _had_diagnostics:
+            try:
+                from Starfish.emulator.kernels import clear_kernel_cache as _clear_kernel_cache
+                _clear_kernel_cache()
+            except Exception:
+                pass
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+                    try:
+                        _torch.cuda.ipc_collect()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                import gc as _gc
+                _gc.collect()
+            except Exception:
+                pass
+
+    def invalidate_loaded_emu_config(_value=None):
+        """on_change handler used by every config widget.
+
+        Whenever the user edits a parameter that defines the emulator (grid,
+        params, wavelength range, scale, smoothing, n_components, …) we drop
+        the cached emulator so its GPU footprint is freed and the GP
+        diagnostics view stops showing stale data.  Called via marimo
+        ``on_change`` so it ignores its argument.
+        """
+        clear_trained_emu_cache()
+        if get_loaded_emu_display() is not None:
+            set_loaded_emu_display(None)
+
+    return clear_trained_emu_cache, invalidate_loaded_emu_config
 
 
 @app.cell(hide_code=True)
@@ -355,7 +459,16 @@ def _(mo):
 
 
 @app.cell
-def _(get_loaded_emu_display, get_training_trigger, set_loaded_emu_config, set_loaded_emu_display, mo, np):
+def _(
+    clear_trained_emu_cache,
+    get_diagnostics_emu_display,
+    get_loaded_emu_display,
+    get_training_trigger,
+    set_loaded_emu_config,
+    set_loaded_emu_display,
+    mo,
+    np,
+):
     import re as _re
     from pathlib import Path as _Path
 
@@ -444,6 +557,7 @@ def _(get_loaded_emu_display, get_training_trigger, set_loaded_emu_config, set_l
         _initial = _display
 
     def _on_load_select(value):
+        clear_trained_emu_cache()
         if value:
             config = _parse_emu_filename(value)
             if config:
@@ -467,27 +581,85 @@ def _(get_loaded_emu_display, get_training_trigger, set_loaded_emu_config, set_l
         on_change=_on_load_select
     )
 
+    load_emu_button = mo.ui.run_button(
+        label=f"{mo.icon('lucide:download')} Load",
+        kind="neutral",
+    )
+
     _status = ""
     if _display:
         _parsed = _parse_emu_filename(_display)
         if _parsed:
             _kernel = _read_kernel_from_npz(_display)
             _kernel_str = f" | Kernel: `{_kernel}`" if _kernel else ""
-            _status = (f"{mo.icon('lucide:check-circle')} **Loaded:** params={_parsed['params']}, "
+            _cache_state = "Diagnostics loaded" if get_diagnostics_emu_display() == _display else "Selected"
+            _load_hint = "" if get_diagnostics_emu_display() == _display else " Click **Load** to enable GP diagnostics."
+            _status = (f"{mo.icon('lucide:check-circle')} **{_cache_state}:** params={_parsed['params']}, "
                        f"scale=`{_parsed['scale']}`, "
                        f"{'smoothed, ' if _parsed['smoothing'] else ''}"
                        f"{_parsed['wl_min']}-{_parsed['wl_max']}Å, "
-                       f"{_parsed['n_components']} PCA{_kernel_str}")
+                       f"{_parsed['n_components']} PCA{_kernel_str}.{_load_hint}")
 
     mo.vstack([
-        load_emu_dropdown,
-        mo.md(_status) if _status else mo.md("")
+        mo.hstack([load_emu_dropdown, load_emu_button], justify="start", align="end", gap=1),
+        mo.md(_status) if _status else mo.md(""),
     ])
+    return (load_emu_button,)
+
+
+@app.cell
+def _(
+    Emulator,
+    clear_trained_emu_cache,
+    get_loaded_emu_display,
+    load_emu_button,
+    set_diagnostics_emu_display,
+    set_loss_history,
+    set_trained_emu,
+    mo,
+):
+    # ── Explicit "Load" action ──
+    # The dropdown only updates configuration state; the heavy
+    # ``Emulator.load`` (which materialises V11 on the GPU and can OOM) runs
+    # only when the user clicks the run button.  We read ``load_emu_button``
+    # in this downstream cell rather than in the cell that defines it,
+    # because marimo forbids reading a UI element's value in its creating
+    # cell.  Any failure path force-clears caches so a partially-loaded
+    # emulator does not leak GPU memory.
+    _load_status = mo.md("")
+
+    if load_emu_button.value:
+        _display = get_loaded_emu_display()
+        if not _display:
+            _load_status = mo.callout(
+                mo.md("Select an emulator first."),
+                kind="warn",
+            )
+        else:
+            clear_trained_emu_cache()
+            try:
+                _loaded_emu = Emulator.load(f"Grid-Emulator_Files/{_display}.npz")
+                set_trained_emu(_loaded_emu)
+                set_diagnostics_emu_display(_display)
+                if hasattr(_loaded_emu, "loss_history") and _loaded_emu.loss_history:
+                    set_loss_history(list(_loaded_emu.loss_history))
+                _load_status = mo.callout(
+                    mo.md(f"{mo.icon('lucide:check-circle')} Diagnostics loaded for `{_display}.npz`."),
+                    kind="success",
+                )
+            except Exception as e:
+                clear_trained_emu_cache(force=True)
+                _load_status = mo.callout(
+                    mo.md(f"{mo.icon('lucide:x-circle')} Failed to load `{_display}.npz`: {e}"),
+                    kind="alert",
+                )
+
+    _load_status
     return
 
 
 @app.cell
-def _(available_grids, get_loaded_emu_config, set_loaded_emu_display, mo):
+def _(available_grids, get_loaded_emu_config, invalidate_loaded_emu_config, mo):
     mo.md("### 1. Grid Selection")
 
     _cfg = get_loaded_emu_config()
@@ -505,7 +677,7 @@ def _(available_grids, get_loaded_emu_config, set_loaded_emu_display, mo):
             options=available_grids,
             value=_default_label,
             label="Select Grid:",
-            on_change=lambda _: set_loaded_emu_display(None)
+            on_change=invalidate_loaded_emu_config
         )
         mo.vstack([
             grid_selector,
@@ -526,7 +698,7 @@ def _(available_grids, get_loaded_emu_config, set_loaded_emu_display, mo):
 
 
 @app.cell
-def _(grid_configs, grid_selector, get_loaded_emu_config, set_loaded_emu_display, mo, sirocco_grids_path):
+def _(grid_configs, grid_selector, get_loaded_emu_config, invalidate_loaded_emu_config, mo, sirocco_grids_path):
     # Introspect the selected grid interface so the Stage 1 multiselect shows the
     # parameters that grid actually exposes, using the interface's own metadata
     # when possible.
@@ -578,7 +750,7 @@ def _(grid_configs, grid_selector, get_loaded_emu_config, set_loaded_emu_display
                 options={param_names.get(i, f"Parameter {i}"): str(i) for i in max_params},
                 value=[param_names.get(p, f"Parameter {p}") for p in default_params if p in max_params],
                 label="Select parameters to include:",
-                on_change=lambda _: set_loaded_emu_display(None)
+                on_change=invalidate_loaded_emu_config
             )
         else:
             params = mo.ui.multiselect(
@@ -626,7 +798,7 @@ def _(mo, n_components, params):
             # Add rough working-room for factorization and solve buffers on top of
             # the raw V11 tensor itself.
             estimated_total_bytes = v11_bytes * 3
-            estimated_gb = estimated_total_bytes / (1024**3)
+            estimated_gb = estimated_total_bytes * 1.1 / (1024**3) # * 1.1 more closely aligns with observed GPU usage
 
             # Detect actual GPU VRAM — both total and currently free.
             # Threshold decisions use free memory so other processes' allocations
@@ -715,23 +887,23 @@ def _(mo, n_components, params):
 
 
 @app.cell
-def _(get_loaded_emu_config, set_loaded_emu_display, mo):
+def _(get_loaded_emu_config, invalidate_loaded_emu_config, mo):
     _cfg = get_loaded_emu_config()
     _scales = ["linear", "log", "continuum-normalised"]
 
-    wl_min = mo.ui.number(start=800, stop=8000, value=_cfg['wl_min'] if _cfg and 'wl_min' in _cfg else 850, step=1, label="Min Wavelength (Å):", on_change=lambda _: set_loaded_emu_display(None))
-    wl_max = mo.ui.number(start=800, stop=8000, value=_cfg['wl_max'] if _cfg and 'wl_max' in _cfg else 1850, step=1, label="Max Wavelength (Å):", on_change=lambda _: set_loaded_emu_display(None))
+    wl_min = mo.ui.number(start=800, stop=8000, value=_cfg['wl_min'] if _cfg and 'wl_min' in _cfg else 850, step=1, label="Min Wavelength (Å):", on_change=invalidate_loaded_emu_config)
+    wl_max = mo.ui.number(start=800, stop=8000, value=_cfg['wl_max'] if _cfg and 'wl_max' in _cfg else 1850, step=1, label="Max Wavelength (Å):", on_change=invalidate_loaded_emu_config)
 
     scale_selector = mo.ui.dropdown(
         options=_scales,
         value=_cfg['scale'] if _cfg and _cfg.get('scale') in _scales else "linear",
         label="Flux Scale:",
-        on_change=lambda _: set_loaded_emu_display(None)
+        on_change=invalidate_loaded_emu_config
     )
 
-    use_smoothing = mo.ui.checkbox(value=_cfg['smoothing'] if _cfg and 'smoothing' in _cfg else False, label="Smooth Spectra (Boxcar=5)", on_change=lambda _: set_loaded_emu_display(None))
+    use_smoothing = mo.ui.checkbox(value=_cfg['smoothing'] if _cfg and 'smoothing' in _cfg else False, label="Smooth Spectra (Boxcar=5)", on_change=invalidate_loaded_emu_config)
 
-    n_components = mo.ui.slider(start=2, stop=30, value=max(2, min(30, _cfg['n_components'])) if _cfg and 'n_components' in _cfg else 10, step=1, label="PCA Components:",show_value=True, on_change=lambda _: set_loaded_emu_display(None))
+    n_components = mo.ui.slider(start=2, stop=30, value=max(2, min(30, _cfg['n_components'])) if _cfg and 'n_components' in _cfg else 10, step=1, label="PCA Components:",show_value=True, on_change=invalidate_loaded_emu_config)
 
     test_pca_btn = mo.ui.run_button(label="Test PCA Reconstruction", kind="neutral")
     return (
@@ -794,7 +966,7 @@ def _(
 
 
 @app.cell
-def _(get_loaded_emu_config, set_loaded_emu_display, mo):
+def _(get_loaded_emu_config, invalidate_loaded_emu_config, mo):
     mo.md("### 4. Training Options")
 
     _cfg = get_loaded_emu_config()
@@ -804,31 +976,35 @@ def _(get_loaded_emu_config, set_loaded_emu_display, mo):
     method = mo.ui.dropdown(
         options=["Nelder-Mead", "L-BFGS-B", "CMA-ES"],
         value="Nelder-Mead",
-        label="Optimisation Method:"
+        label="Optimisation Method:",
+        on_change=invalidate_loaded_emu_config,
     )
 
-    max_iter = mo.ui.number(start=100, stop=100000, value=10000, step=100, label="Max Iterations:")
+    max_iter = mo.ui.number(start=100, stop=100000, value=10000, step=100, label="Max Iterations:", on_change=invalidate_loaded_emu_config)
 
     strict_weight_fit = mo.ui.checkbox(
         value=False,
-        label="Strict Weight Fit (bypass λ_ξ truncation penalty)"
+        label="Strict Weight Fit (bypass λ_ξ truncation penalty)",
+        on_change=invalidate_loaded_emu_config,
     )
 
     per_component = mo.ui.checkbox(
         value=True,
-        label="Per-Component Training (optimise each PCA component independently)"
+        label="Per-Component Training (optimise each PCA component independently)",
+        on_change=invalidate_loaded_emu_config,
     )
 
     refine_lambda_xi = mo.ui.checkbox(
         value=True,
-        label="Refine λ_ξ after training (1-D bounded optimisation of truncation noise)"
+        label="Refine λ_ξ after training (1-D bounded optimisation of truncation noise)",
+        on_change=invalidate_loaded_emu_config,
     )
 
     kernel_selector = mo.ui.dropdown(
         options={"RBF (Squared Exponential)": "rbf", "Matérn-5/2": "matern52", "Matérn-3/2": "matern32"},
         value=_default_kernel,
         label="GP Kernel:",
-        on_change=lambda _: set_loaded_emu_display(None)
+        on_change=invalidate_loaded_emu_config
     )
 
     mo.vstack([
@@ -988,7 +1164,7 @@ def _(
 
 @app.cell
 def _(
-    Emulator,
+    clear_trained_emu_cache,
     get_training_trigger,
     grid_selector,
     mo,
@@ -998,7 +1174,6 @@ def _(
     params,
     scale_selector,
     set_loss_history,
-    set_trained_emu,
     use_smoothing,
     wl_max,
     wl_min,
@@ -1039,7 +1214,7 @@ def _(
         if os.path.exists(f'Grid-Emulator_Files/{_chk_name}.npz'):
             _emu_btn_label = f"{mo.icon('lucide:refresh-cw')} Re-train (An Emulator Already Exists)"
             _emu_btn_kind = "warn"
-            _emu_info_text = f"**Emulator found:** `{_chk_name}.npz`\n\nClicking **re-train** overwrites existing. Clicking **continue training** will resume from the existing model's state."
+            _emu_info_text = f"**Emulator found:** `{_chk_name}.npz`\n\nClicking **re-train** overwrites existing. Clicking **continue training** will resume from the existing model's state. Use the **Load Existing Emulator** button only when you want to build the GP diagnostics cache."
 
             # If a prior training run saved loss_history, hydrate it now so the
             # diagnostics panel shows something useful before retraining starts.
@@ -1054,17 +1229,10 @@ def _(
             except Exception:
                 set_loss_history([])
 
-            # Preload the existing emulator so the GP diagnostics widgets remain
-            # populated even before the user decides whether to retrain.
-            try:
-                _existing_emu = Emulator.load(f'Grid-Emulator_Files/{_chk_name}.npz')
-                set_trained_emu(_existing_emu)
-            except Exception:
-                pass
         else:
              # If emulator doesn't exist (new config), clear the graph and diagnostics
              set_loss_history([])
-             set_trained_emu(None)
+             clear_trained_emu_cache()
 
     train_button = mo.ui.run_button(label=_emu_btn_label, kind=_emu_btn_kind)
     continue_train_button = mo.ui.run_button(
@@ -1117,6 +1285,7 @@ def _(
     emu_exists = False
     emu_file_name = ""
     grid_file_name = ""
+    training_setup_display = mo.md("*Configure all settings and click 'Train Emulator' to start*")
 
     if (train_button.value or continue_train_button.value) and grid_selector is not None and params is not None:
         # Normalize the selected UI controls into the exact identifiers used by the
@@ -1180,6 +1349,7 @@ def _(
         # Build the concrete grid interface that knows how to read this grid's raw
         # spectra and convert them into the processed training representation.
         grid = None
+        grid_error_md = None
         if grid_name in grid_configs:
             grid_config = grid_configs[grid_name]
             grid = grid_config["class"](
@@ -1191,8 +1361,7 @@ def _(
                 smoothing=smoothing
             )
         else:
-            error_md = mo.md(f"{mo.icon('lucide:triangle-alert')} **Error:** Unknown grid configuration for `{grid_name}`")
-            mo.vstack([config_md, error_md])
+            grid_error_md = mo.md(f"{mo.icon('lucide:triangle-alert')} **Error:** Unknown grid configuration for `{grid_name}`")
 
         # Grid processing is the expensive preprocessing step that converts the raw
         # Sirocco files into the compact NPZ consumed by emulator training.
@@ -1241,6 +1410,8 @@ def _(
                 grid_info += f"\n  - {param_name}: {unique_vals}"
 
             results_md = mo.md(grid_info)
+        elif grid_error_md is not None:
+            results_md = grid_error_md
         else:
             # If the grid was already processed, summarize the cached NPZ instead
             # of rebuilding it.
@@ -1265,9 +1436,9 @@ def _(
             emu_status = mo.md(f"{mo.icon('lucide:file-text')} **Emulator `{emu_file_name}.npz` does not exist.** Ready to train.")
             emu_exists = False
 
-        mo.vstack([config_md, results_md, emu_status])
-    else:
-        mo.md("*Configure all settings and click 'Train Emulator' to start*")
+        training_setup_display = mo.vstack([config_md, results_md, emu_status])
+
+    training_setup_display
     return emu_file_name, grid_file_name
 
 
@@ -1283,6 +1454,7 @@ def _(mo):
 def _(
     Emulator,
     alt,
+    clear_trained_emu_cache,
     continue_train_button,
     emu_file_name,
     get_console_logs,
@@ -1299,6 +1471,7 @@ def _(
     per_component,
     refine_lambda_xi,
     set_console_logs,
+    set_diagnostics_emu_display,
     set_loss_history,
     set_trained_emu,
     set_training_status,
@@ -1316,6 +1489,8 @@ def _(
 
     if (train_button.value or continue_train_button.value) and grid_file_name:
         import contextlib
+
+        clear_trained_emu_cache()
 
         # Clear previous history only for fresh training (not continue)
         if not is_continue:
@@ -1521,6 +1696,7 @@ def _(
                 print(f"Emulator saved to Grid-Emulator_Files/{emu_file_name}.npz")
                 training_complete = True
                 set_trained_emu(emu)
+                set_diagnostics_emu_display(emu_file_name)
 
                 # Trigger button update
                 set_training_trigger(lambda v: v + 1)
@@ -1550,6 +1726,7 @@ def _(
             """)
             set_console_logs("".join(log_buffer))
             set_training_status(error_result)
+            clear_trained_emu_cache(force=True)
             update_ui(error_result)
 
     else:
@@ -1562,16 +1739,6 @@ def _(
                 last_status,
                 mo.accordion({"Training Console Output": mo.md(f"```text\n{last_logs}\n```")})
             ]))
-
-             # Attempt to restore emulator for visualizations if file matches
-             if os.path.exists(f'Grid-Emulator_Files/{emu_file_name}.npz'):
-                 try:
-                    emu = Emulator.load(f'Grid-Emulator_Files/{emu_file_name}.npz')
-                    # Only mark complete if successful load
-                    training_complete = True
-                    set_trained_emu(emu)
-                 except:
-                    pass
         else:
             mo.md("*Train an emulator to see results*")
     return
@@ -1708,12 +1875,6 @@ def _(
             _Xtest.append(tuple(_point))
         _Xtest = np.array(_Xtest)
 
-        # Evaluate GP at all test points in a single batched call
-        # This is critical for large grids: avoids 100× redundant Cholesky decompositions
-        _mus, _covs = _emu(_Xtest, full_cov=False, reinterpret_batch=True)
-        # _mus: (n_test, n_comp), _covs: (n_test, n_comp) — variances per component per point
-        _sigs = np.sqrt(_covs)
-
         # --- Universal Noise Variance Calculation ---
         # λ_ξ (lambda_xi) from Czekala et al. (2015) assigns a truncation noise
         # variance to each PCA weight.  The noise bar on each grid-point scatter
@@ -1722,6 +1883,112 @@ def _(
         # to deviate from the exact PCA weights at each training point.
         _dots = _emu.eigenspectra @ _emu.eigenspectra.T
         _dots_inv_diag = np.diag(np.linalg.inv(_dots))
+
+        def _predict_selected_components_streaming(_components):
+            """Evaluate only the plotted PCA components without caching all V11 factors."""
+            if not getattr(_emu, "block_diagonal", False):
+                _all_mus, _all_covs = _emu(_Xtest, full_cov=False, reinterpret_batch=True)
+                return (
+                    {_comp: _all_mus[:, _comp] for _comp in _components},
+                    {_comp: np.sqrt(np.maximum(_all_covs[:, _comp], 0.0)) for _comp in _components},
+                    None,
+                )
+
+            try:
+                import torch as _torch
+                from Starfish.emulator.emulator import TORCH_FLOAT64 as _TORCH_DTYPE
+                from Starfish.emulator.kernels import _apply_kernel_gpu_inplace as _apply_kernel_gpu_inplace_diag
+            except Exception as _import_error:
+                return {}, {}, f"GPU diagnostics dependencies are unavailable: {_import_error}"
+
+            if not _torch.cuda.is_available():
+                return {}, {}, "GPU diagnostics require CUDA for this loaded emulator."
+
+            _device = _torch.device("cuda")
+            _dtype = _TORCH_DTYPE or _torch.float64
+            _means = {}
+            _sigmas = {}
+
+            try:
+                with _torch.no_grad():
+                    _grid_gpu = _torch.from_numpy(_emu._grid_points_norm).to(_device, _dtype)
+                    _query_norm = (_Xtest - _emu._param_min) / _emu._param_range
+                    _query_gpu = _torch.from_numpy(_query_norm).to(_device, _dtype)
+                    _w_hat_stacked = _emu.w_hat.reshape(_emu.ncomps, -1)
+
+                    for _comp in _components:
+                        _variance = float(_emu.variances[_comp])
+                        _variance_gpu = _torch.tensor(_variance, device=_device, dtype=_dtype)
+                        _lengthscale_gpu = _torch.from_numpy(_emu.lengthscales[_comp]).to(_device, _dtype)
+
+                        _grid_scaled = _grid_gpu / _lengthscale_gpu
+                        _query_scaled = _query_gpu / _lengthscale_gpu
+
+                        _v11 = _torch.cdist(_grid_scaled, _grid_scaled, p=2.0)
+                        _apply_kernel_gpu_inplace_diag(_v11, _variance_gpu, _emu.kernel)
+
+                        _jitter = max(1e-5, 1e-6 * _variance)
+                        if _emu.strict_weight_fit:
+                            _v11.diagonal().add_(_jitter)
+                        else:
+                            _v11.diagonal().add_(float(_dots_inv_diag[_comp]) / _emu.lambda_xi + _jitter)
+
+                        _L = _torch.linalg.cholesky(_v11)
+                        del _v11
+
+                        _w_hat_gpu = _torch.from_numpy(_w_hat_stacked[_comp]).to(_device, _dtype).unsqueeze(-1)
+                        _alpha = _torch.cholesky_solve(_w_hat_gpu, _L)
+
+                        _v12 = _torch.cdist(_grid_scaled, _query_scaled, p=2.0)
+                        _apply_kernel_gpu_inplace_diag(_v12, _variance_gpu, _emu.kernel)
+                        _v22 = _torch.cdist(_query_scaled, _query_scaled, p=2.0)
+                        _apply_kernel_gpu_inplace_diag(_v22, _variance_gpu, _emu.kernel)
+
+                        _mu = _torch.matmul(_v12.T, _alpha).squeeze(-1)
+                        _v11_inv_v12 = _torch.cholesky_solve(_v12, _L)
+                        _cov_diag = (_v22 - _torch.matmul(_v12.T, _v11_inv_v12)).diagonal()
+
+                        _means[_comp] = _mu.cpu().numpy()
+                        _sigmas[_comp] = _torch.sqrt(_torch.clamp(_cov_diag, min=0.0)).cpu().numpy()
+
+                        del (
+                            _variance_gpu,
+                            _lengthscale_gpu,
+                            _grid_scaled,
+                            _query_scaled,
+                            _L,
+                            _w_hat_gpu,
+                            _alpha,
+                            _v12,
+                            _v22,
+                            _mu,
+                            _v11_inv_v12,
+                            _cov_diag,
+                        )
+                        _torch.cuda.empty_cache()
+
+                    del _grid_gpu, _query_gpu
+                    _torch.cuda.empty_cache()
+            except Exception as _diag_error:
+                try:
+                    _torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                return {}, {}, str(_diag_error)
+
+            return _means, _sigmas, None
+
+        _selected_components = list(range(_comp_start, _comp_end + 1))
+        _component_means, _component_sigmas, _diagnostics_error = _predict_selected_components_streaming(_selected_components)
+        if _diagnostics_error is not None:
+            try:
+                import gc as _gc
+                import torch as _torch
+                _gc.collect()
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except Exception:
+                pass
 
         # Parameter description for x-axis label
         _desc_map = {
@@ -1740,7 +2007,9 @@ def _(
 
         # Build Altair charts for selected components
         _charts = []
-        for _comp in range(_comp_start, _comp_end + 1):
+        for _comp in _selected_components:
+            if _diagnostics_error is not None:
+                break
 
             # Extract the variance attributed to the PCA truncation error
             _var = _dots_inv_diag[_comp] / _emu.lambda_xi
@@ -1757,9 +2026,9 @@ def _(
             # GP prediction line + uncertainty band
             _gp_df = pd.DataFrame({
                 'x': _param_x_test,
-                'mean': _mus[:, _comp],
-                'upper': _mus[:, _comp] + 2 * _sigs[:, _comp],
-                'lower': _mus[:, _comp] - 2 * _sigs[:, _comp],
+                'mean': _component_means[_comp],
+                'upper': _component_means[_comp] + 2 * _component_sigmas[_comp],
+                'lower': _component_means[_comp] - 2 * _component_sigmas[_comp],
             })
 
             _scatter = alt.Chart(_scatter_df).mark_circle(size=60, color='#3b82f6').encode(
@@ -1795,7 +2064,12 @@ def _(
             )
             _charts.append(_chart)
 
-        if _charts:
+        if _diagnostics_error is not None:
+            _combined = mo.callout(
+                mo.md(f"{mo.icon('lucide:triangle-alert')} **GP diagnostics could not be computed:** {_diagnostics_error}"),
+                kind="warn",
+            )
+        elif _charts:
             _combined = alt.vconcat(*_charts).resolve_scale(x='shared')
         else:
             _combined = alt.Chart(pd.DataFrame({'x': [], 'y': []})).mark_point()

@@ -409,20 +409,21 @@ def _apply_kernel_gpu_inplace(dist, var, kernel_type="rbf"):
         dist.mul_(var)
     elif kernel_type == "matern32":
         dist.mul_(_SQRT3)           # sqrt(3)*r
-        exp_neg = torch.exp(-dist)   # exp(-sqrt(3)*r)
+        exp_neg = torch.empty_like(dist) # saving memory with line below
+        exp_neg.copy_(dist).neg_().exp_()  # exp(-sqrt(3)*r), avoiding a unary-minus temp
         dist.add_(1.0)              # 1 + sqrt(3)*r
         dist.mul_(exp_neg)           # (1 + sqrt(3)*r) * exp(-sqrt(3)*r)
         dist.mul_(var)
         del exp_neg
     elif kernel_type == "matern52":
-        r_sq = dist.pow(2)           # r² (new tensor)
         dist.mul_(_SQRT5)           # sqrt(5)*r
-        exp_neg = torch.exp(-dist)   # exp(-sqrt(5)*r)
-        dist.add_(1.0)              # 1 + sqrt(5)*r
-        dist.add_(r_sq, alpha=5.0 / 3.0)  # 1 + sqrt(5)*r + (5/3)*r²
+        exp_neg = torch.empty_like(dist) # saving memory with line below
+        exp_neg.copy_(dist).neg_().exp_()  # exp(-sqrt(5)*r), avoiding a unary-minus temp
+        torch.addcmul(dist, dist, dist, value=1.0 / 3.0, out=dist)  # t + t²/3, t=sqrt(5)*r
+        dist.add_(1.0)              # 1 + sqrt(5)*r + (5/3)*r²
         dist.mul_(exp_neg)           # (...) * exp(-sqrt(5)*r)
         dist.mul_(var)
-        del r_sq, exp_neg
+        del exp_neg
     else:
         raise ValueError(f"Unknown kernel_type: {kernel_type!r}")
     return dist
