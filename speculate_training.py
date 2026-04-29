@@ -665,8 +665,14 @@ def _(available_grids, get_loaded_emu_config, invalidate_loaded_emu_config, mo):
     _cfg = get_loaded_emu_config()
 
     if available_grids:
-        # Find the label for the loaded grid, or fall back to first available
+        # Find the label for the loaded grid, or fall back to the no-BL grid
+        # when available because it is the lighter default training path.
+        _preferred_grid = "speculate_cv_no-bl_grid_v87f"
         _default_label = list(available_grids.keys())[0]
+        for _label, _name in available_grids.items():
+            if _name == _preferred_grid:
+                _default_label = _label
+                break
         if _cfg and _cfg.get('grid_name'):
             for _label, _name in available_grids.items():
                 if _name == _cfg['grid_name']:
@@ -817,65 +823,108 @@ def _(mo, n_components, params):
             v11_mb = v11_bytes / (1024**2)
             v11_display = f"{v11_mb:.0f} MB" if v11_mb < 1024 else f"{v11_mb/1024:.1f} GB"
             total_display = f"{estimated_gb:.1f} GB"
+            single_component_bytes = 2 * total_points * total_points * elem_bytes
+            single_component_gb = single_component_bytes / (1024**3)
+            memory_efficient_training_display = f"{single_component_gb:.1f} GB"
+            fast_cache_gb = v11_bytes / (1024**3)
+            fast_cache_display = f"{fast_cache_gb:.1f} GB"
+            # Inference cache build peak: retained per-component Cholesky cache
+            # plus a one-component workspace while the cache is being built.
+            # Mirrors the (cache + workspace) * 1.1 < free * 0.9 test inside
+            # Emulator._call_gpu_memory_efficient so this callout agrees with
+            # the runtime decision to build a reusable cache or stream blocks.
+            fast_cache_build_gb = (v11_bytes + single_component_bytes) * 1.1 / (1024**3)
+            fast_cache_build_display = f"{fast_cache_build_gb:.1f} GB"
 
             if gpu_vram_total_gb is not None and gpu_vram_free_gb is not None:
                 # All percentage comparisons are against free VRAM so the
                 # callout reflects what is actually available right now.
                 usage_pct = (estimated_gb / gpu_vram_free_gb) * 100
+                usage_pct_inference = (fast_cache_build_gb / gpu_vram_free_gb) * 100
                 vram_info = (
-                    f"GPU VRAM: **{gpu_vram_total_gb:.1f} GB** total "
+                    f"GPU VRAM: {gpu_vram_total_gb:.1f} GB total "
                     f"&nbsp;|&nbsp; **{gpu_vram_free_gb:.1f} GB** free"
+                )
+                can_fast_cache_inference = fast_cache_build_gb < gpu_vram_free_gb * 0.9
+                inference_note = (
+                    f"Inference cache estimate: **~{fast_cache_build_display} required** ({usage_pct_inference:.0f}% of free VRAM)"
+                    if can_fast_cache_inference else
+                    f"Inference cache estimate: **~{fast_cache_build_display} required** ({usage_pct_inference:.0f}% of free VRAM). Inference caching will be disabled, so MLE/MCMC will stream per component and be much slower. This setup is not recommended."
                 )
 
                 if estimated_gb > gpu_vram_free_gb:
                     # Memory-efficient mode never materializes the full V11 tensor;
                     # it only needs a couple of MxM working blocks at a time.
-                    efficient_bytes = 2 * total_points * total_points * elem_bytes
-                    efficient_gb = efficient_bytes / (1024**3)
-                    efficient_display = f"{efficient_gb:.1f} GB"
-                    efficient_pct = (efficient_gb / gpu_vram_free_gb) * 100
+                    efficient_pct = (single_component_gb / gpu_vram_free_gb) * 100
 
-                    if efficient_gb > gpu_vram_free_gb:
+                    if single_component_gb > gpu_vram_free_gb:
                         # Even a single block won't fit — truly too large
                         high_vram = mo.callout(
-                            mo.md(f"{mo.icon('lucide:ban')} **Grid too large for this GPU (~{total_points:,} grid points)**\n\n"
-                                  f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Memory-efficient est. usage: **~{efficient_display}** ({efficient_pct:.0f}% of free)\n\n"
+                            mo.md(f"{mo.icon('lucide:ban')} STOP: Training will be out of memory\n\n"
+                                  f"Grid Size: {total_points:,} grid points\n\n"
                                   f"{vram_info}\n\n"
-                                  f"Memory-efficient peak for a single M×M block is too large for this GPU — "
-                                  f"Reduce parameters."),
+                                  f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. Training Usage: **~{memory_efficient_training_display}** ({efficient_pct:.0f}% of free)\n\n"
+                                  f"Memory-efficient mode cannot fit a single M×M workspace. Standard mode would require ~{total_display}. Reduce parameters or PCA components.\n\n"
+                                  f"{inference_note}"),
+                            kind="alert"
+                        )
+                    elif usage_pct_inference > 100:
+                        # Training can technically run in memory-efficient mode, but inference caching is also expected to OOM — warn about the full implications of this setup.
+                        high_vram = mo.callout(
+                            mo.md(f"{mo.icon('lucide:ban')} STOP: Inference cache will be out of memory\n\n"
+                                  f"Grid Size: {total_points:,} grid points\n\n"
+                                  f"{vram_info}\n\n"
+                                  f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. Training Usage: **~{memory_efficient_training_display}** ({efficient_pct:.0f}% of free)\n\n"
+                                  f"Memory-efficient mode will be used because standard mode would require ~{total_display}. It builds V11 blocks on-the-fly instead of "
+                                  f"storing the full tensor. Mathematically identical results, training may be slightly slower.\n\n"
+                                  f"{inference_note}"),
                             kind="alert"
                         )
                     else:
                         # Memory-efficient mode can handle it — report its peak as
                         # the effective usage, not the unachievable standard-mode value.
                         high_vram = mo.callout(
-                            mo.md(f"{mo.icon('lucide:triangle-alert')} **Training will use memory-efficient mode (~{total_points:,} grid points)**\n\n"
-                                  f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. usage: **~{efficient_display}** ({efficient_pct:.0f}% of free)\n\n"
+                            mo.md(f"{mo.icon('lucide:triangle-alert')} Memory-efficient training mode enabled\n\n"
+                                  f"Grid Size: {total_points:,} grid points\n\n"
                                   f"{vram_info}\n\n"
-                                  f"Standard mode would require ~{total_display} — Memory-efficient mode builds V11 blocks on-the-fly instead of "
-                                  f"storing the full tensor. Mathematically identical results, training may be slightly slower. "),
+                                  f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. Training Usage: **~{memory_efficient_training_display}** ({efficient_pct:.0f}% of free)\n\n"
+                                  f"Memory-efficient mode will be used because standard mode would require ~{total_display}. It builds V11 blocks on-the-fly instead of "
+                                  f"storing the full tensor. Mathematically identical results, training may be slightly slower.\n\n"
+                                  f"{inference_note}"),
                             kind="warn"
                         )
-                elif usage_pct > 70:
+                elif usage_pct >= 90 or usage_pct_inference >= 90:
+                    _high_vram_title = (
+                        f"{mo.icon('lucide:ban')} STOP: Inference cache will be out of memory"
+                        if usage_pct_inference > 100 else
+                        f"{mo.icon('lucide:triangle-alert')} Warning: nearing VRAM limits"
+                    )
                     high_vram = mo.callout(
-                        mo.md(f"{mo.icon('lucide:triangle-alert')} **Warning: High VRAM usage (~{total_points:,} grid points)**\n\n"
-                              f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. usage: **~{total_display}** ({usage_pct:.0f}% of free)\n\n"
+                        mo.md(f"{_high_vram_title}\n\n"
+                              f"Grid Size: {total_points:,} grid points\n\n"
                               f"{vram_info}\n\n"
-                              f"Training should fit but memory will be tight. A high performance GPU is recommended."),
-                        kind="warn"
+                              f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. Training Usage: **~{total_display}** ({usage_pct:.0f}% of free)\n\n"
+                              f"Training should fit but memory will be tight.\n\n"
+                              f"{inference_note}"),
+                        kind="alert" if usage_pct_inference > 100 else "warn"
                     )
                 else:
+                    # GOOD TRAINING SCENARIO — both training and inference cache fit
+                    # comfortably (the >=90% elif above already routed tight cases away).
                     high_vram = mo.callout(
-                        mo.md(f"{mo.icon('lucide:check-circle')} **Estimated Grid Size: ~{total_points:,} grid points**\n\n"
-                              f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. usage: **~{total_display}** ({usage_pct:.0f}% of free)\n\n"
-                              f"{vram_info}"),
+                        mo.md(f"{mo.icon('lucide:check-circle')} Good to go!\n\n"
+                              f"Grid Size: {total_points:,} grid points\n\n"
+                              f"{vram_info}\n\n"
+                              f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Est. Training Usage: **~{total_display}** ({usage_pct:.0f}% of free)\n\n"
+                              f"{inference_note}"),
                         kind="success"
                     )
             else:
                 # No GPU detected — show estimate without comparison
                 high_vram = mo.callout(
-                    mo.md(f"{mo.icon('lucide:info')} **Estimated Grid Size: ~{total_points:,} grid points**\n\n"
-                          f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Total estimated: ~{total_display}\n\n"
+                    mo.md(f"{mo.icon('lucide:info')} No NVIDIA GPU detected\n\n"
+                          f"Grid Size: {total_points:,} grid points\n\n"
+                          f"V11 matrix: ~{v11_display} &nbsp;|&nbsp; Total estimated: **~{total_display}**\n\n"
                           f"No GPU detected. CPU training will be used. Likely very slow for moderate grids."),
                     kind="info"
                 )

@@ -1078,6 +1078,14 @@ class Emulator:
         if use_gpu and PYTORCH_AVAILABLE and torch.cuda.is_available() and self._v11_gpu is None and self.block_diagonal:
             try:
                 return self._call_gpu_memory_efficient(params, full_cov, reinterpret_batch, return_tensors=return_tensors)
+            except torch.cuda.OutOfMemoryError as e:
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    "Memory-efficient GPU inference ran out of VRAM while streaming a single "
+                    "component V11 block. CPU fallback is disabled for this large deferred "
+                    "emulator because it would build the full V11 on CPU. Free GPU memory, "
+                    "reduce the grid size/components, or run on a larger GPU."
+                ) from e
             except Exception as e:
                 self.log.warning(f"Memory-efficient GPU inference failed: {e}. Falling back to CPU.")
         
@@ -1201,14 +1209,17 @@ class Emulator:
     ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[torch.Tensor, torch.Tensor]]:
         """
         Memory-efficient GPU inference for large grids where V11 won't fit in VRAM.
-        
-        On the FIRST call, builds V11 blocks one component at a time, Cholesky-
-        factors each, and caches L blocks + alpha. Peak construction VRAM:
-        cached_L_so_far + 2 × M² × 8 bytes (V11 temp + new L block).
-        
-        On SUBSEQUENT calls, reuses cached L and alpha for fast O(M²) solves.
-        This makes MCMC (32K+ calls) feasible: ~20s first call, <1s thereafter.
-        
+
+        Uses a hybrid policy.  If the full per-component Cholesky cache fits in
+        currently free VRAM, build and reuse it for fast repeated inference.
+        Otherwise mirror memory-efficient training: build one component's V11
+        block, Cholesky-factor it, use it for the current prediction, then
+        discard it before moving to the next component.
+
+        Cache-fit criterion: ``(n_comp + 2) * M^2 * 8 * 1.1 < free * 0.9``,
+        which the training notebook also reports so its callout agrees with
+        the runtime decision made here.
+
         Mathematically identical to _call_gpu — no approximations.
         """
         device = torch.device('cuda')
@@ -1228,95 +1239,119 @@ class Emulator:
         
         n_comp = self.ncomps
         M = self.grid_points.shape[0]
-        
-        # --- Build and cache Cholesky factors L on first call ---
-        if not hasattr(self, '_mem_eff_L_blocks') or self._mem_eff_L_blocks is None:
-            import time as _time
-            _t0 = _time.time()
-            self.log.info(f"Building Cholesky cache for {n_comp} components (M={M})...")
-            print(f"Building Cholesky cache ({n_comp} components, M={M})...")
-            
-            w_hat_reshaped = self._w_hat_gpu.view(n_comp, M).unsqueeze(-1)  # (n_comp, M, 1)
-            L_blocks = []
-            alpha_blocks = []
-            
-            for i in range(n_comp):
-                # Build V11 block for component i
-                X_scaled = self._grid_points_gpu / self._lengthscales_gpu[i]
-                dist = torch.cdist(X_scaled, X_scaled, p=2.0)
-                _apply_kernel_gpu_inplace(dist, self._variances_gpu[i], self.kernel)
-                
-                # Add diagonal (match training: dots_inv_diag/lambda_xi + jitter)
-                jitter = _get_v11_jitter(self._variances_gpu[i].item())
-                if self.strict_weight_fit:
-                    dist.diagonal().add_(jitter)
-                else:
-                    dist.diagonal().add_(self._dots_inv_diag_gpu[i].item() / self.lambda_xi + jitter)
-                
-                # Cholesky factor — keep L, discard V11
-                L_i = torch.linalg.cholesky(dist)
-                del dist
-                
-                # Precompute alpha_i = V11^{-1} @ w_hat_i
-                alpha_i = torch.cholesky_solve(w_hat_reshaped[i], L_i)  # (M, 1)
-                
-                L_blocks.append(L_i)
-                alpha_blocks.append(alpha_i)
-                torch.cuda.empty_cache()
-            
-            self._mem_eff_L_blocks = L_blocks        # list of (M, M) tensors
-            self._mem_eff_alpha_blocks = alpha_blocks  # list of (M, 1) tensors
-            _elapsed = _time.time() - _t0
-            L_total_gb = n_comp * M * M * 8 / 1024**3
-            print(f"Cholesky cache ready ({_elapsed:.1f}s, {L_total_gb:.1f} GB)")
-        
-        # --- Fast inference using cached L and alpha ---
+        w_hat_reshaped = self._w_hat_gpu.view(n_comp, M).unsqueeze(-1)  # (n_comp, M, 1)
         params_gpu = torch.from_numpy(params).to(device, TORCH_FLOAT64)
-        n_query = params.shape[0]
-        
-        # Compute v12, v22 kernel blocks (small: M×n_query and n_query×n_query)
-        v12_gpu = batch_kernel_pytorch_gpu_only(
-            self._grid_points_gpu, params_gpu, 
-            self._variances_gpu, self._lengthscales_gpu,
-            device='cuda', return_stacked=True, kernel_type=self.kernel
-        )  # (n_comp, M, n_query)
-        
-        v22_gpu = batch_kernel_pytorch_gpu_only(
-            params_gpu, params_gpu, 
-            self._variances_gpu, self._lengthscales_gpu,
-            device='cuda', return_stacked=True, kernel_type=self.kernel
-        )  # (n_comp, n_query, n_query)
-        
-        v21_gpu = v12_gpu.transpose(-2, -1)  # (n_comp, n_query, M)
-        
+
+        def _build_v11_cholesky_for_component(i):
+            X_scaled = self._grid_points_gpu / self._lengthscales_gpu[i]
+            dist = torch.cdist(X_scaled, X_scaled, p=2.0)
+            _apply_kernel_gpu_inplace(dist, self._variances_gpu[i], self.kernel)
+
+            jitter = _get_v11_jitter(self._variances_gpu[i].item())
+            if self.strict_weight_fit:
+                dist.diagonal().add_(jitter)
+            else:
+                dist.diagonal().add_(self._dots_inv_diag_gpu[i].item() / self.lambda_xi + jitter)
+
+            L_i = torch.linalg.cholesky(dist)
+            del dist, X_scaled
+            alpha_i = torch.cholesky_solve(w_hat_reshaped[i], L_i)  # (M, 1)
+            return L_i, alpha_i
+
+        cache_ready = (
+            getattr(self, '_mem_eff_L_blocks', None) is not None
+            and getattr(self, '_mem_eff_alpha_blocks', None) is not None
+        )
+        if not cache_ready:
+            block_bytes = M * M * 8
+            cache_bytes = n_comp * block_bytes
+            workspace_bytes = 2 * block_bytes
+            try:
+                free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+            except TypeError:
+                free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
+
+            # The same shape estimate used by the training notebook: a cached
+            # inference path needs all component Cholesky blocks plus one
+            # component-sized working block during construction.  Keep a margin
+            # for PyTorch allocator fragmentation and small side tensors.
+            can_cache = (cache_bytes + workspace_bytes) * 1.1 < free_bytes * 0.9
+
+            if can_cache:
+                L_blocks = []
+                alpha_blocks = []
+                try:
+                    cache_gb = cache_bytes / 1024**3
+                    self.log.info(f"Building reusable Cholesky cache ({cache_gb:.1f} GB)...")
+                    print(f"Building reusable Cholesky cache ({cache_gb:.1f} GB)...")
+                    for i in range(n_comp):
+                        L_i, alpha_i = _build_v11_cholesky_for_component(i)
+                        L_blocks.append(L_i)
+                        alpha_blocks.append(alpha_i)
+                        torch.cuda.empty_cache()
+                    self._mem_eff_L_blocks = L_blocks
+                    self._mem_eff_alpha_blocks = alpha_blocks
+                    cache_ready = True
+                    print("Reusable Cholesky cache ready")
+                except torch.cuda.OutOfMemoryError:
+                    self._mem_eff_L_blocks = None
+                    self._mem_eff_alpha_blocks = None
+                    del L_blocks, alpha_blocks
+                    torch.cuda.empty_cache()
+                    self.log.warning("Cholesky cache did not fit; switching to streamed inference.")
+                    print("Cholesky cache did not fit; switching to streamed inference.")
+
         mu_list = []
         cov_list = []
-        
+
         for i in range(n_comp):
-            # mu_i = v21_i @ alpha_i  (cached alpha, O(M) matmul)
-            mu_i = torch.matmul(v21_gpu[i], self._mem_eff_alpha_blocks[i])  # (n_query, 1)
-            mu_list.append(mu_i.squeeze(-1))
-            
-            # cov_i = v22_i - v21_i @ L_i^{-T} L_i^{-1} @ v12_i  (Cholesky solve, O(M²))
-            v11_inv_v12_i = torch.cholesky_solve(v12_gpu[i], self._mem_eff_L_blocks[i])
-            cov_i = v22_gpu[i] - torch.matmul(v21_gpu[i], v11_inv_v12_i)
-            cov_list.append(cov_i)
-        
-        # Stack results
-        mu_gpu = torch.cat(mu_list)  # (n_comp * n_query,)
-        
-        if not full_cov:
-            cov_diag = torch.stack([c.diagonal() for c in cov_list])  # (n_comp, n_query)
+            X_scaled = self._grid_points_gpu / self._lengthscales_gpu[i]
+            params_scaled = params_gpu / self._lengthscales_gpu[i]
+
+            if cache_ready:
+                L_i = self._mem_eff_L_blocks[i]
+                alpha_i = self._mem_eff_alpha_blocks[i]
+            else:
+                # Build V11 for this component only, matching the training path.
+                L_i, alpha_i = _build_v11_cholesky_for_component(i)
+
+            v12_i = torch.cdist(X_scaled, params_scaled, p=2.0)
+            _apply_kernel_gpu_inplace(v12_i, self._variances_gpu[i], self.kernel)
+            v21_i = v12_i.transpose(-2, -1)
+
+            v22_i = torch.cdist(params_scaled, params_scaled, p=2.0)
+            _apply_kernel_gpu_inplace(v22_i, self._variances_gpu[i], self.kernel)
+
+            mu_i = torch.matmul(v21_i, alpha_i).squeeze(-1)
+            v11_inv_v12_i = torch.cholesky_solve(v12_i, L_i)
+            cov_i = v22_i - torch.matmul(v21_i, v11_inv_v12_i)
+
             if return_tensors:
-                return mu_gpu, cov_diag.flatten()
-            mu = mu_gpu.cpu().numpy()
-            cov = cov_diag.flatten().cpu().numpy()
+                mu_list.append(mu_i)
+                cov_list.append(cov_i if full_cov else cov_i.diagonal())
+            else:
+                mu_list.append(mu_i.detach().cpu())
+                cov_list.append((cov_i if full_cov else cov_i.diagonal()).detach().cpu())
+
+            del X_scaled, params_scaled, v12_i, v21_i, v22_i, v11_inv_v12_i, cov_i, mu_i
+            if not cache_ready:
+                del L_i, alpha_i
+                torch.cuda.empty_cache()
+
+        if return_tensors:
+            mu_gpu = torch.cat(mu_list)  # (n_comp * n_query,)
+            if full_cov:
+                cov_gpu = torch.block_diag(*cov_list)
+                mu, cov = mu_gpu, cov_gpu
+            else:
+                cov_diag = torch.stack(cov_list)  # (n_comp, n_query)
+                mu, cov = mu_gpu, cov_diag.flatten()
         else:
-            cov_gpu = torch.block_diag(*cov_list)
-            if return_tensors:
-                return mu_gpu, cov_gpu
-            mu = mu_gpu.cpu().numpy()
-            cov = cov_gpu.cpu().numpy()
+            mu = torch.cat(mu_list).numpy()
+            if full_cov:
+                cov = torch.block_diag(*cov_list).numpy()
+            else:
+                cov = torch.stack(cov_list).flatten().numpy()
         
         if reinterpret_batch:
             mu = mu.reshape(-1, self.ncomps, order="F").squeeze()

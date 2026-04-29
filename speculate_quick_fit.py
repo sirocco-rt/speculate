@@ -451,9 +451,16 @@ def _(mo, qf_available_grids, qf_is_hf_mode, qf_pretrained_selector):
             full_width=True,
         )
     elif qf_available_grids:
+        _preferred_grid = "speculate_cv_no-bl_grid_v87f"
+        _default_label = list(qf_available_grids.keys())[0]
+        for _label, _name in qf_available_grids.items():
+            if _name == _preferred_grid:
+                _default_label = _label
+                break
+
         qf_grid_selector = mo.ui.dropdown(
             options=qf_available_grids,
-            value=list(qf_available_grids.keys())[0],
+            value=_default_label,
             label=f"{mo.icon('lucide:database')} Train from Raw Grid:",
             full_width=True,
         )

@@ -100,6 +100,113 @@ def _():
     )
 
 
+@app.cell
+def _(mo):
+    # The selected emulator filename is cheap UI state; the loaded Emulator
+    # object can materialise V11/Cholesky caches on the GPU, so it lives behind
+    # an explicit Load button instead of being rebuilt on every dropdown change.
+    get_loaded_emu, set_loaded_emu = mo.state(None)
+    get_loaded_emu_filename, set_loaded_emu_filename = mo.state(None)
+    get_selected_grid, set_selected_grid = mo.state(None)
+    get_selected_emu_filename, set_selected_emu_filename = mo.state(None)
+    return (
+        get_loaded_emu,
+        get_loaded_emu_filename,
+        get_selected_emu_filename,
+        get_selected_grid,
+        set_loaded_emu,
+        set_loaded_emu_filename,
+        set_selected_emu_filename,
+        set_selected_grid,
+    )
+
+
+@app.cell
+def _(
+    get_loaded_emu,
+    get_loaded_emu_filename,
+    set_loaded_emu,
+    set_loaded_emu_filename,
+    set_selected_emu_filename,
+    set_selected_grid,
+):
+    def clear_loaded_emu_cache(_value=None, *, force=False):
+        """Drop the loaded Emulator and ask PyTorch to release cached GPU memory.
+
+        The Emulator may attach large GPU tensors lazily during load and first
+        inference, including V11, iPhiPhi, Cholesky factors, and block-wise
+        memory-efficient caches.  This helper is used as a widget on_change
+        callback and before explicit loads, so it accepts and ignores the UI
+        callback value.
+        """
+        _emu = get_loaded_emu()
+        _had_emu = _emu is not None or get_loaded_emu_filename() is not None
+
+        if _emu is not None:
+            # Ignore attributes that are not present on this Emulator version.
+            for _attr in (
+                "_v11_gpu",
+                "_iPhiPhi_gpu",
+                "_dots_inv_diag_gpu",
+                "_grid_points_gpu",
+                "_w_hat_gpu",
+                "_variances_gpu",
+                "_lengthscales_gpu",
+                "_L_gpu",
+                "_alpha_gpu",
+                "_L_gpu_source_id",
+                "_mem_eff_L_blocks",
+                "_mem_eff_alpha_blocks",
+                "_v11",
+                "_iPhiPhi",
+            ):
+                if hasattr(_emu, _attr):
+                    try:
+                        setattr(_emu, _attr, None)
+                    except Exception:
+                        pass
+
+        if _emu is not None:
+            set_loaded_emu(None)
+        if get_loaded_emu_filename() is not None:
+            set_loaded_emu_filename(None)
+
+        if force or _had_emu:
+            try:
+                from Starfish.emulator.kernels import clear_kernel_cache as _clear_kernel_cache
+                _clear_kernel_cache()
+            except Exception:
+                pass
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+                    try:
+                        _torch.cuda.ipc_collect()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                import gc as _gc
+                _gc.collect()
+            except Exception:
+                pass
+
+    def on_grid_select(value):
+        """Persist the selected grid while clearing any stale loaded emulator."""
+        set_selected_grid(value)
+        set_selected_emu_filename(None)
+        clear_loaded_emu_cache()
+
+    def on_emulator_select(value):
+        """Persist the selected emulator filename while clearing stale caches."""
+        set_selected_emu_filename(value)
+        clear_loaded_emu_cache()
+
+    return clear_loaded_emu_cache, on_emulator_select, on_grid_select
+
+
 @app.cell(hide_code=True)
 def _(mo):
     usage_toggle = mo.ui.switch(value=False, label=f"{mo.icon('lucide:activity')} System Resources")
@@ -240,7 +347,7 @@ def _():
 
 
 @app.cell
-def _(mo, os):
+def _(get_loaded_emu_filename, get_selected_grid, mo, on_grid_select, os):
     # --- Grid Selection ---
     # Scan the Grid-Emulator_Files directory for .npz emulator files and
     # extract unique grid stem names (everything before "_emu_").  The stem
@@ -271,24 +378,37 @@ def _(mo, os):
     _sorted_grids = sorted(list(_unique_grids))
 
     if _sorted_grids:
+        _preferred_grid = "speculate_cv_no-bl_grid_v87f"
+        _initial_grid = _preferred_grid if _preferred_grid in _sorted_grids else _sorted_grids[0]
+        _selected_grid = get_selected_grid()
+        _loaded_filename = get_loaded_emu_filename()
+        if _selected_grid in _sorted_grids:
+            _initial_grid = _selected_grid
+        elif _loaded_filename and "_emu_" in _loaded_filename:
+            _loaded_grid = _loaded_filename.split("_emu_")[0]
+            if _loaded_grid in _sorted_grids:
+                _initial_grid = _loaded_grid
+
         grid_selector = mo.ui.dropdown(
             options=_sorted_grids,
-            value=_sorted_grids[0],
+            value=_initial_grid,
             label="Select Grid Dataset:",
-            full_width=True
+            full_width=True,
+            on_change=on_grid_select,
         )
     else:
         grid_selector = mo.ui.dropdown(
             options=[],
             #disabled=True,
             label="No Grids Found",
-            full_width=True
+            full_width=True,
+            on_change=on_grid_select,
         )
     return (grid_selector,)
 
 
 @app.cell
-def _(grid_selector, mo, os, param_map_db, re):
+def _(get_loaded_emu_filename, get_selected_emu_filename, grid_selector, mo, on_emulator_select, os, param_map_db, re):
     # --- Emulator Selection (Dependent on Grid) ---
     # Filter the .npz files to those matching the selected grid stem and
     # discover which parameter indices this grid supports.  Indices are
@@ -331,19 +451,34 @@ def _(grid_selector, mo, os, param_map_db, re):
     _filtered_emus = sorted(_filtered_emus)
 
     if _filtered_emus:
+        _initial_emu = _filtered_emus[0]
+        _selected_emu = get_selected_emu_filename()
+        _loaded_emu = get_loaded_emu_filename()
+        if _selected_emu in _filtered_emus:
+            _initial_emu = _selected_emu
+        elif _loaded_emu in _filtered_emus:
+            _initial_emu = _loaded_emu
+
         emulator_selector = mo.ui.dropdown(
             options=_filtered_emus,
-            value=_filtered_emus[0],
+            value=_initial_emu,
             label="Select Trained Emulator:",
-            full_width=True
+            full_width=True,
+            on_change=on_emulator_select,
         )
     else:
         emulator_selector = mo.ui.dropdown(
             options=[],
             #disabled=True,
             label="No Emulators for this Grid",
-            full_width=True
+            full_width=True,
+            on_change=on_emulator_select,
         )
+
+    emulator_load_button = mo.ui.run_button(
+        label=f"{mo.icon('lucide:download')} Load Emulator",
+        kind="neutral",
+    )
 
     # Valid Parameters Accordion
     _param_lookup_info = []
@@ -361,7 +496,7 @@ def _(grid_selector, mo, os, param_map_db, re):
     param_info_accordion = mo.accordion({
         f"{mo.icon('lucide:key-round')} Parameter Key": mo.md("\n".join([f"- {s}" for s in _param_lookup_info]))
     })
-    return emulator_selector, grid_indices, param_info_accordion
+    return emulator_load_button, emulator_selector, grid_indices, param_info_accordion
 
 
 @app.cell
@@ -546,25 +681,70 @@ def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
 
 
 @app.cell
-def _(Emulator, emulator_selector, mo):
-    # Load the selected emulator eagerly so later cells can stop early if the
-    # model file is missing or incompatible.
+def _(
+    Emulator,
+    clear_loaded_emu_cache,
+    emulator_load_button,
+    emulator_selector,
+    get_loaded_emu,
+    get_loaded_emu_filename,
+    mo,
+    set_loaded_emu,
+    set_loaded_emu_filename,
+    set_selected_emu_filename,
+    set_selected_grid,
+):
+    # The dropdown only selects a file.  The expensive Emulator.load call is
+    # deliberately gated behind this run button because load can allocate V11
+    # and Cholesky caches large enough to exhaust GPU/CPU memory.  Note that
+    # the heaviest GPU caches (Cholesky blocks, V11) are populated lazily on
+    # the first inference call, not at load time, so a successful Load is
+    # itself a relatively light memory event.
+    emu = get_loaded_emu()
+    _loaded_name = get_loaded_emu_filename()
+    _selected_name = emulator_selector.value
+    emulator_load_status = mo.md("")
 
-    emu = None
-    stop_computation = False
+    if emu is not None and _loaded_name != _selected_name:
+        clear_loaded_emu_cache()
+        emu = None
+        _loaded_name = None
 
-    if emulator_selector.value:
-        try:
-             with mo.status.spinner(title=f"Loading emulator {emulator_selector.value}..."):
-                emu_path = f"Grid-Emulator_Files/{emulator_selector.value}"
-                emu = Emulator.load(emu_path)
-        except Exception as e:
-            mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Error loading emulator: {e}"), kind="danger"))
-            stop_computation = True
+    if emulator_load_button.value:
+        if not _selected_name:
+            emulator_load_status = mo.callout(
+                mo.md("Select an emulator before loading."),
+                kind="warn",
+            )
+        else:
+            clear_loaded_emu_cache(force=True)
+            try:
+                with mo.status.spinner(title=f"Loading emulator {_selected_name}..."):
+                    emu_path = f"Grid-Emulator_Files/{_selected_name}"
+                    emu = Emulator.load(emu_path)
+                set_loaded_emu(emu)
+                set_loaded_emu_filename(_selected_name)
+                set_selected_emu_filename(_selected_name)
+                if "_emu_" in _selected_name:
+                    set_selected_grid(_selected_name.split("_emu_")[0])
+                emulator_load_status = mo.callout(
+                    mo.md(f"{mo.icon('lucide:check-circle')} Loaded `{_selected_name}`."),
+                    kind="success",
+                )
+            except Exception as e:
+                emu = None
+                clear_loaded_emu_cache(force=True)
+                emulator_load_status = mo.callout(
+                    mo.md(f"{mo.icon('lucide:x-circle')} Error loading `{_selected_name}`: {e}"),
+                    kind="danger",
+                )
+    elif _selected_name and emu is None:
+        emulator_load_status = mo.callout(
+            mo.md(f"Selected `{_selected_name}`. Click **Load Emulator** to enable inference."),
+            kind="neutral",
+        )
 
-    if stop_computation:
-        mo.stop(True)
-    return (emu,)
+    return emu, emulator_load_status
 
 
 @app.cell
@@ -872,6 +1052,8 @@ def _(
     data_source_selector,
     delete_obs_btn,
     emu,
+    emulator_load_button,
+    emulator_load_status,
     emulator_selector,
     file_upload_ui,
     grid_selector,
@@ -940,7 +1122,8 @@ def _(
     # Includes Grid Selector, Emulator Selector, and Parameter Key
     emu_row = mo.vstack([
         grid_selector,
-        emulator_selector,
+        mo.hstack([emulator_selector, emulator_load_button], align="end", widths=[6, 1]),
+        emulator_load_status,
         param_info_accordion
     ])
 
