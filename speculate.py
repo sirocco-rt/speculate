@@ -54,7 +54,7 @@ def _(mo):
     # Welcome to the Speculate Interface!
 
     Here, you can find all the tools for analysing spectra against sirocco simulations through the sidebar menu on the left. This suite provides:
-    - **Grid Downloader** -- An intuitive interface for downloading and decompressing Sirocco spectral files (.spec).
+    - **Model Downloader** -- An intuitive interface for downloading Sirocco spectral grids and pre-trained emulator models.
     - **Grid Inspector** -- A plotting display interface to browse through our pre-made Sirocco spectra datasets.
     - **Training Tool** -- A training interface for the emulator. This tool requires GPU access, so it should only be run locally.
     - **Inference Tool** -- An analysis interface to uncover the best-matching sirocco emulated spectra to **YOUR** observational spectrum.
@@ -138,7 +138,7 @@ def _(hf_mode_switch, is_hf_space, mo, usage_bars):
             mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
             mo.md("Install Speculate Locally"),
             mo.md(" "),
-            mo.md(f"###{mo.icon('lucide:download')} Grid Downloader"),
+            mo.md(f"###{mo.icon('lucide:download')} Model Downloader"),
             mo.md(" "),
             mo.md(f"###{mo.icon('lucide:brain')} Training Tool"),
             mo.md(" "),
@@ -149,7 +149,7 @@ def _(hf_mode_switch, is_hf_space, mo, usage_bars):
     else:
         sidebar_items.append(mo.nav_menu({
             "/": f"###{mo.icon('lucide:home')} Home",
-            "/downloader": f"###{mo.icon('lucide:download')} Grid Downloader",
+            "/downloader": f"###{mo.icon('lucide:download')} Model Downloader",
             "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
             "/training": f"###{mo.icon('lucide:brain')} Training Tool",
             "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",

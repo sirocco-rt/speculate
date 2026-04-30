@@ -3,27 +3,29 @@
 # theme = "dark"
 # ///
 #
-# Speculate Grid Downloader
+# Speculate Model Downloader
 # =========================
-# Download and decompress Sirocco spectral grid files from HuggingFace
-# datasets hosted under the **Sirocco-rt** organisation.  The tool:
+# Download Sirocco spectral grids and pre-trained emulator models from
+# HuggingFace repositories hosted under the **Sirocco-rt** organisation. The tool:
 #
 #   1. Discovers available grid datasets via the HuggingFace Hub API.
 #   2. Lists the compressed spectrum files (.spec.xz) and auxiliary
 #      metadata (lookup table, README, etc.) in the selected dataset.
 #   3. Downloads selected files into the HuggingFace cache, then
 #      decompresses them with LZMA into ``sirocco_grids/<dataset>/``.
+#   4. Downloads selected pre-trained GP and Quick Fit emulator models into
+#      ``Grid-Emulator_Files/``.
 #
 # Once extracted, the files are consumable by the Training Tool, Grid
 # Inspector, Benchmark Suite, and Inference Tool.
 
 import marimo
 
-__generated_with = "0.19.7"
+__generated_with = "0.23.1"
 app = marimo.App(
     width="full",
-    app_title="Speculate Grid Downloader",
-    layout_file="layouts/speculate_grid_downloader.grid.json",
+    app_title="Speculate Model Downloader",
+    layout_file="layouts/speculate_model_downloader.grid.json",
 )
 
 
@@ -32,11 +34,11 @@ def _():
     import marimo as mo
     mo.md(
         """
-        # Grid Downloader
+        # Model Downloader
 
-        Download and decompress Sirocco spectral grid files from HuggingFace datasets.
+        Download Sirocco spectral grids and pre-trained emulator models from HuggingFace.
 
-        This tool fetches spectral grids from the **Sirocco-rt** organization on HuggingFace.
+        This tool fetches spectral grids and curated Speculate emulator models from the **Sirocco-rt** organization on HuggingFace.
         """
     )
     return (mo,)
@@ -93,7 +95,7 @@ def _(mo, os, usage_bars):
             mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
             mo.md("Install Speculate Locally"),
             mo.md(" "),
-            mo.md(f"###{mo.icon('lucide:download')} Grid Downloader"),
+            mo.md(f"###{mo.icon('lucide:download')} Model Downloader"),
             mo.md(" "),
             mo.md(f"###{mo.icon('lucide:brain')} Training Tool"),
             mo.md(" "),
@@ -104,7 +106,7 @@ def _(mo, os, usage_bars):
     else:
         _items.append(mo.nav_menu({
             "/": f"###{mo.icon('lucide:home')} Home",
-            "/downloader": f"###{mo.icon('lucide:download')} Grid Downloader",
+            "/downloader": f"###{mo.icon('lucide:download')} Model Downloader",
             "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
             "/training": f"###{mo.icon('lucide:brain')} Training Tool",
             "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
@@ -145,6 +147,14 @@ def _():
     os.environ['HF_HUB_VERBOSITY'] = 'error'
 
     from huggingface_hub import list_datasets, list_repo_files, hf_hub_download
+    from Speculate_addons.hf_model_registry import (
+        HF_MODEL_REPO_ID,
+        download_model_to_local,
+        is_gp_model,
+        is_quickfit_model,
+        list_hf_model_files,
+        model_type_label,
+    )
     import logging
 
     # Suppress huggingface_hub logging
@@ -155,12 +165,18 @@ def _():
     ORG_ID = "Sirocco-rt"
     REPO_TYPE = "dataset"
     return (
+        HF_MODEL_REPO_ID,
         ORG_ID,
         REPO_TYPE,
+        download_model_to_local,
         hf_hub_download,
+        is_gp_model,
+        is_quickfit_model,
         list_datasets,
+        list_hf_model_files,
         list_repo_files,
         lzma,
+        model_type_label,
         os,
         shutil,
     )
@@ -600,6 +616,162 @@ def _(
                 bar.update()
 
         mo.md(f"### {mo.icon('lucide:check-circle')} Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    ---
+
+    ## Pre-trained Emulator Models
+
+    Download curated GP and Quick Fit emulator models from HuggingFace Models into `Grid-Emulator_Files/`.
+    """)
+    return
+
+
+@app.cell
+def _(
+    HF_MODEL_REPO_ID,
+    is_gp_model,
+    is_quickfit_model,
+    list_hf_model_files,
+    mo,
+):
+    hf_model_files = []
+    try:
+        hf_model_files = list_hf_model_files()
+        _n_gp = sum(1 for _f in hf_model_files if is_gp_model(_f))
+        _n_qf = sum(1 for _f in hf_model_files if is_quickfit_model(_f))
+        if hf_model_files:
+            model_repo_status = mo.md(
+                f"{mo.icon('lucide:check-circle')} Found **{len(hf_model_files)}** models "
+                f"in `{HF_MODEL_REPO_ID}` (**{_n_gp}** GP, **{_n_qf}** Quick Fit)"
+            )
+        else:
+            model_repo_status = mo.md(f"{mo.icon('lucide:triangle-alert')} No supported `.npz` models found in `{HF_MODEL_REPO_ID}`")
+    except Exception as e:
+        hf_model_files = []
+        model_repo_status = mo.md(f"{mo.icon('lucide:x-circle')} Error fetching model list: {e}")
+
+    model_repo_status
+    return (hf_model_files,)
+
+
+@app.cell
+def _(hf_model_files, mo, model_type_label):
+    model_download_mode = mo.ui.radio(
+        options=["All models", "All GP emulators", "All Quick Fit models", "Specific model"],
+        value="All models",
+        label="Which pre-trained models would you like to download?",
+    )
+
+    if hf_model_files:
+        _options = {f"[{model_type_label(_f)}] {_f}": _f for _f in hf_model_files}
+        specific_model_dropdown = mo.ui.dropdown(
+            options=_options,
+            value=next(iter(_options.keys())),
+            label="Select model:",
+            full_width=True,
+        )
+    else:
+        specific_model_dropdown = None
+
+    model_download_mode
+    return model_download_mode, specific_model_dropdown
+
+
+@app.cell
+def _(mo, model_download_mode, specific_model_dropdown):
+    _display = None
+    if model_download_mode.value == "Specific model":
+        if specific_model_dropdown is not None:
+            _display = specific_model_dropdown
+        else:
+            _display = mo.md(f"{mo.icon('lucide:triangle-alert')} No models available")
+
+    _display
+    return
+
+
+@app.cell
+def _(
+    hf_model_files,
+    is_gp_model,
+    is_quickfit_model,
+    mo,
+    model_download_mode,
+    os,
+    specific_model_dropdown,
+):
+    models_to_download = []
+
+    if hf_model_files:
+        if model_download_mode.value == "All models":
+            models_to_download = hf_model_files
+        elif model_download_mode.value == "All GP emulators":
+            models_to_download = [_f for _f in hf_model_files if is_gp_model(_f)]
+        elif model_download_mode.value == "All Quick Fit models":
+            models_to_download = [_f for _f in hf_model_files if is_quickfit_model(_f)]
+        elif specific_model_dropdown is not None and specific_model_dropdown.value:
+            models_to_download = [specific_model_dropdown.value]
+
+    if models_to_download:
+        _destination = os.path.abspath("Grid-Emulator_Files")
+        model_download_summary = mo.vstack([
+            mo.md(f"{mo.icon('lucide:package')} Ready to download **{len(models_to_download)}** model file(s)"),
+            mo.md(f"{mo.icon('lucide:folder')} Models will be saved to: `{_destination}`"),
+        ])
+    else:
+        model_download_summary = mo.md(f"{mo.icon('lucide:triangle-alert')} No model files selected")
+
+    model_download_summary
+    return (models_to_download,)
+
+
+@app.cell
+def _(mo):
+    model_download_button = mo.ui.run_button(label=f"{mo.icon('lucide:download')} Download Selected Models")
+    model_download_button
+    return (model_download_button,)
+
+
+@app.cell
+def _(
+    download_model_to_local,
+    mo,
+    model_download_button,
+    models_to_download,
+    os,
+):
+    if model_download_button.value and models_to_download:
+        _downloaded = []
+        _skipped = []
+        _failed = []
+
+        with mo.status.progress_bar(total=len(models_to_download), title="Downloading models...") as _bar:
+            for _filename in models_to_download:
+                try:
+                    _result = download_model_to_local(_filename)
+                    if _result["status"] == "downloaded":
+                        _downloaded.append(_filename)
+                    else:
+                        _skipped.append(_filename)
+                except Exception as e:
+                    _failed.append((_filename, str(e)))
+                    mo.output.append(mo.md(f"{mo.icon('lucide:x-circle')} Failed to download `{_filename}`: {e}"))
+                _bar.update()
+
+        _lines = [
+            f"### {mo.icon('lucide:check-circle')} Model Download Complete",
+            "",
+            f"- Downloaded: **{len(_downloaded)}**",
+            f"- Already present: **{len(_skipped)}**",
+            f"- Failed: **{len(_failed)}**",
+            f"- Location: `{os.path.abspath('Grid-Emulator_Files')}`",
+        ]
+        mo.md("\n".join(_lines))
     return
 
 

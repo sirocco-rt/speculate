@@ -125,7 +125,7 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
             mo.md("---"),
             mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
             mo.md("Install Speculate Locally"), mo.md(" "),
-            mo.md(f"###{mo.icon('lucide:download')} Grid Downloader"), mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:download')} Model Downloader"), mo.md(" "),
             mo.md(f"###{mo.icon('lucide:brain')} Training Tool"), mo.md(" "),
             mo.md(f"###{mo.icon('lucide:sparkles')} Inference Tool"), mo.md(" "),
             mo.md(f"###{mo.icon('lucide:test-tubes')} Benchmark Suite"),
@@ -133,7 +133,7 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
     else:
         _items.append(mo.nav_menu({
             "/": f"###{mo.icon('lucide:home')} Home",
-            "/downloader": f"###{mo.icon('lucide:download')} Grid Downloader",
+            "/downloader": f"###{mo.icon('lucide:download')} Model Downloader",
             "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
             "/training": f"###{mo.icon('lucide:brain')} Training Tool",
             "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
@@ -238,7 +238,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, mo):
             )
         else:
             grid_selector = None
-            mo.md(f"{mo.icon('lucide:triangle-alert')} **No grids found in `sirocco_grids/` directory**\n\nPlease download grids using the Grid Downloader tool first.")
+            mo.md(f"{mo.icon('lucide:triangle-alert')} **No grids found in `sirocco_grids/` directory**\n\nPlease download grids using the Model Downloader tool first.")
 
     grid_selector
     return (grid_selector,)
@@ -282,7 +282,7 @@ def _(IS_HUGGINGFACE_SPACE, cache_tracker_state, grid_selector, mo):
 
     # Only proceed if grid is selected
     if grid_selector is None or grid_selector.value is None:
-        mo.md("Please download a grid first using the Grid Downloader tool.")
+        mo.md("Please download a grid first using the Model Downloader tool.")
         mo.stop()
     return
 

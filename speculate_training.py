@@ -233,7 +233,7 @@ def _(mo, os, usage_bars):
             mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
             mo.md("Install Speculate Locally"),
             mo.md(" "),
-            mo.md(f"###{mo.icon('lucide:download')} Grid Downloader"),
+            mo.md(f"###{mo.icon('lucide:download')} Model Downloader"),
             mo.md(" "),
             mo.md(f"###{mo.icon('lucide:brain')} Training Tool"),
             mo.md(" "),
@@ -244,7 +244,7 @@ def _(mo, os, usage_bars):
     else:
         _items.append(mo.nav_menu({
             "/": f"###{mo.icon('lucide:home')} Home",
-            "/downloader": f"###{mo.icon('lucide:download')} Grid Downloader",
+            "/downloader": f"###{mo.icon('lucide:download')} Model Downloader",
             "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
             "/training": f"###{mo.icon('lucide:brain')} Training Tool",
             "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
@@ -694,7 +694,7 @@ def _(available_grids, get_loaded_emu_config, invalidate_loaded_emu_config, mo):
             mo.md(f"""
             {mo.icon('lucide:triangle-alert')} **No grids found in `sirocco_grids/` folder**
 
-            Please use the **Grid Downloader** tool first:
+            Please use the **Model Downloader** tool first:
             """),
             kind="warn"
         )

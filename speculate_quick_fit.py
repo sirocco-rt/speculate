@@ -219,7 +219,7 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
             mo.md("---"),
             mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
             mo.md("Install Speculate Locally"), mo.md(" "),
-            mo.md(f"###{mo.icon('lucide:download')} Grid Downloader"), mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:download')} Model Downloader"), mo.md(" "),
             mo.md(f"###{mo.icon('lucide:brain')} Training Tool"), mo.md(" "),
             mo.md(f"###{mo.icon('lucide:sparkles')} Inference Tool"), mo.md(" "),
             mo.md(f"###{mo.icon('lucide:test-tubes')} Benchmark Suite"),
@@ -227,7 +227,7 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
     else:
         _items.append(mo.nav_menu({
             "/": f"###{mo.icon('lucide:home')} Home",
-            "/downloader": f"###{mo.icon('lucide:download')} Grid Downloader",
+            "/downloader": f"###{mo.icon('lucide:download')} Model Downloader",
             "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
             "/training": f"###{mo.icon('lucide:brain')} Training Tool",
             "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
@@ -291,6 +291,46 @@ def _(hf_mode_switch, is_hf_space_nav):
     else:
         qf_is_hf_mode = False
     return (qf_is_hf_mode,)
+
+
+@app.cell
+def _(mo, qf_is_hf_mode):
+    # In HF Space mode, stage the small public Quick Fit models locally before
+    # the existing file-based selectors scan Grid-Emulator_Files/.
+    qf_hf_model_cache_result = None
+    qf_hf_model_cache_status = mo.md("")
+
+    if qf_is_hf_mode:
+        from Speculate_addons.hf_model_registry import ensure_quickfit_models_cached
+
+        with mo.status.spinner(title="Checking pre-trained Quick Fit models..."):
+            qf_hf_model_cache_result = ensure_quickfit_models_cached()
+
+        if qf_hf_model_cache_result.get("error"):
+            qf_hf_model_cache_status = mo.callout(
+                mo.md(
+                    f"{mo.icon('lucide:triangle-alert')} Could not fetch pre-trained Quick Fit models: "
+                    f"{qf_hf_model_cache_result['error']}"
+                ),
+                kind="warn",
+            )
+        else:
+            _downloaded = len(qf_hf_model_cache_result.get("downloaded", []))
+            _skipped = len(qf_hf_model_cache_result.get("skipped", []))
+            _failed = len(qf_hf_model_cache_result.get("failed", []))
+            _available = len(qf_hf_model_cache_result.get("available", []))
+            _kind = "success" if _failed == 0 else "warn"
+            qf_hf_model_cache_status = mo.callout(
+                mo.md(
+                    f"{mo.icon('lucide:download')} Pre-trained Quick Fit models ready: "
+                    f"**{_available}** available, **{_downloaded}** downloaded, "
+                    f"**{_skipped}** cached, **{_failed}** failed."
+                ),
+                kind=_kind,
+            )
+
+    qf_hf_model_cache_status
+    return (qf_hf_model_cache_result,)
 
 
 @app.cell
@@ -387,11 +427,13 @@ def _(mo, np):
 
 
 @app.cell
-def _(mo, np, os):
+def _(mo, np, os, qf_hf_model_cache_result):
     # Scan Grid-Emulator_Files/ for previously exported Quick Fit models.
     # These are .npz files with "_qfnn_" (NN) or "_qfgi_" (grid interpolation) in the name.
     # GP emulator files ("_emu_") are excluded — they belong to the main Training Tool.
     # Populates a dropdown so the user can skip training and go straight to inference.
+    # The cache-result dependency makes HF Space rerun this scan after model warmup.
+    _ = qf_hf_model_cache_result
     _emu_dir = "Grid-Emulator_Files"
     _qf_files = {}  # {display_label: filename}
 
@@ -2404,8 +2446,11 @@ def _(mo):
 
 
 @app.cell
-def _(get_qf_inf_refresh, mo, os, qf_pretrained_selector):
+def _(get_qf_inf_refresh, mo, os, qf_hf_model_cache_result, qf_pretrained_selector):
     _ = get_qf_inf_refresh()
+    # Depend on HF cache warmup so newly downloaded public Quick Fit models are
+    # visible in the Stage 3 inference selector without changing loader code.
+    _ = qf_hf_model_cache_result
     _emu_dir = "Grid-Emulator_Files"
     _qf_files = {}
 
