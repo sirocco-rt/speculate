@@ -261,6 +261,7 @@ def build_bestfit_spectrum_altair(
     residual_title="Residuals and Model Uncertainty",
     relative_title="Relative Error",
     y_axis_format=".2e",
+    extra_flux_series=None,
 ):
     """Build the shared three-panel best-fit spectrum Altair chart.
 
@@ -274,6 +275,9 @@ def build_bestfit_spectrum_altair(
         Either the covariance diagonal or the full covariance matrix.
     title : str
         Chart title shown above the main spectrum panel.
+    extra_flux_series : dict, list of dict, or None
+        Optional additional spectra to overlay on the main panel.  Each dict may
+        contain ``wavelength``, ``flux``, ``label``, ``color``, and ``dash``.
     """
     wl = np.asarray(wavelength, dtype=np.float64)
     data_flux = np.asarray(data_flux, dtype=np.float64)
@@ -309,14 +313,40 @@ def build_bestfit_spectrum_altair(
         main_values.append({
             "Wavelength": float(wavelength_value),
             "Flux": float(flux_value),
-            "Series": "Data",
+            "Series": "Input Data",
         })
     for wavelength_value, flux_value in zip(wl, model_flux):
         main_values.append({
             "Wavelength": float(wavelength_value),
             "Flux": float(flux_value),
-            "Series": "Model",
+            "Series": "Emulated Model",
         })
+
+    series_order = ["Input Data", "Emulated Model"]
+    series_colors = ["#000000", "#0072B2"]
+    series_dashes = [[], []]
+    if extra_flux_series:
+        if isinstance(extra_flux_series, dict):
+            extra_flux_series = [extra_flux_series]
+        default_colors = ["#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"]
+        for idx, series in enumerate(extra_flux_series):
+            extra_wl = np.asarray(series.get("wavelength", wl), dtype=np.float64)
+            extra_flux = np.asarray(series.get("flux", []), dtype=np.float64)
+            n_extra = min(len(extra_wl), len(extra_flux))
+            if n_extra == 0:
+                continue
+            label = str(series.get("label", f"Comparison {idx + 1}"))
+            color = series.get("color", default_colors[idx % len(default_colors)])
+            dash = series.get("dash", [6, 3])
+            series_order.append(label)
+            series_colors.append(color)
+            series_dashes.append(dash)
+            for wavelength_value, flux_value in zip(extra_wl[:n_extra], extra_flux[:n_extra]):
+                main_values.append({
+                    "Wavelength": float(wavelength_value),
+                    "Flux": float(flux_value),
+                    "Series": label,
+                })
 
     main_chart = alt.Chart(alt.Data(values=main_values)).mark_line(
         strokeWidth=1.4,
@@ -335,8 +365,13 @@ def build_bestfit_spectrum_altair(
         color=alt.Color(
             "Series:N",
             title="Series",
-            scale=alt.Scale(domain=["Data", "Model"], range=["#4c78a8", "#f58518"]),
+            scale=alt.Scale(domain=series_order, range=series_colors),
             legend=alt.Legend(orient="top"),
+        ),
+        strokeDash=alt.StrokeDash(
+            "Series:N",
+            scale=alt.Scale(domain=series_order, range=series_dashes),
+            legend=None,
         ),
         tooltip=[
             alt.Tooltip("Series:N", title="Series"),

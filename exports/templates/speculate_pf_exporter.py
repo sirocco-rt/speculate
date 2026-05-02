@@ -32,7 +32,7 @@ import sys
 import warnings
 from math import pi
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -343,6 +343,7 @@ def write_pf(
     physical_params: Dict[str, float],
     output_path: str,
     header_lines: Optional[List[str]] = None,
+    observer_angles: Optional[Sequence[float]] = None,
 ):
     """
     Write a valid Sirocco .pf file by updating a template with fitted values.
@@ -365,6 +366,10 @@ def write_pf(
         Destination path for the exported .pf file.
     header_lines : list of str, optional
         ``###``-prefixed comment lines to prepend as a metadata header.
+    observer_angles : list of float, optional
+        If provided, replace the template's ``Spectrum.angle(0=pole)`` entries
+        and update ``Spectrum.no_observers`` to match. ``Spectrum_cycles`` is
+        intentionally left unchanged.
     """
     grid_type = _detect_grid_type(grid_name)
     template_path = _resolve_template(grid_name)
@@ -394,10 +399,21 @@ def write_pf(
     # (once for wind, once for final spectrum).  We track how many times
     # we've seen it to ensure both instances are updated.
     sed_file = remaining.pop("Input_spectra.model_file", None)
+    observer_angles = [] if observer_angles is None else list(observer_angles)
+    updated_no_observers = False
+    wrote_observer_angles = False
 
     for line in template_lines:
         key = _parse_key(line)
-        if key is not None and key in remaining:
+        if observer_angles and key == "Spectrum.no_observers":
+            output.append(_replace_value_in_line(line, _format_value(len(observer_angles), key)))
+            updated_no_observers = True
+        elif observer_angles and key == "Spectrum.angle(0=pole)":
+            if not wrote_observer_angles:
+                for angle in observer_angles:
+                    output.append(_replace_value_in_line(line, _format_value(float(angle), key)))
+                wrote_observer_angles = True
+        elif key is not None and key in remaining:
             new_val = _format_value(remaining.pop(key), key)
             output.append(_replace_value_in_line(line, new_val))
         elif key == "Input_spectra.model_file" and sed_file is not None:
@@ -405,6 +421,17 @@ def write_pf(
             output.append(_replace_value_in_line(line, sed_file))
         else:
             output.append(line)
+
+    if observer_angles and not updated_no_observers:
+        raise ValueError(
+            f"Template '{template_path.name}' has no Spectrum.no_observers line "
+            "to update for custom observer angles."
+        )
+    if observer_angles and not wrote_observer_angles:
+        raise ValueError(
+            f"Template '{template_path.name}' has no Spectrum.angle(0=pole) line "
+            "to replace with custom observer angles."
+        )
 
     for leftover_key in remaining:
         log.warning(

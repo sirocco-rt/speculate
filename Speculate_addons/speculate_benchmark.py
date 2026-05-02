@@ -14,6 +14,9 @@ Import these functions directly or use the marimo Benchmark Viewer
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import time
 import warnings
 from pathlib import Path
@@ -28,6 +31,18 @@ from scipy import stats
 from scipy.optimize import minimize as scipy_minimize
 
 log = logging.getLogger(__name__)
+
+_SIROCCO_CYCLE_RE = re.compile(
+    r"\b(?P<action>Starting|Finished)\s+"
+    r"(?P<current>\d+)\s+of\s+(?P<total>\d+)\s+"
+    r"(?P<kind>ionization|spectrum)\s+cycles\b",
+    re.IGNORECASE,
+)
+_SIROCCO_ION_CONVERGED_RE = re.compile(
+    r"\bIonization converged early at cycle\s+"
+    r"(?P<current>\d+)\s+of\s+(?P<total>\d+)\b",
+    re.IGNORECASE,
+)
 
 
 # ======================================================================
@@ -442,6 +457,60 @@ def _simplex_column_norm(mean, std, N):
     return [mn + interval * k for k in range(N + 1)]
 
 
+def _emulator_wavelength_bounds(emu) -> Tuple[float, float]:
+    """Return finite wavelength bounds for an emulator in Angstrom."""
+    wl = np.asarray(getattr(emu, "wl", []), dtype=np.float64)
+    wl = wl[np.isfinite(wl)]
+    if wl.size < 2:
+        raise ValueError("Emulator does not expose a usable wavelength grid.")
+    return float(np.min(wl)), float(np.max(wl))
+
+
+def _assert_wavelengths_within_emulator(
+    emu,
+    wl: np.ndarray,
+    context: str = "spectrum",
+) -> Tuple[float, float]:
+    """Raise before fitting if data would require emulator extrapolation."""
+    emu_min, emu_max = _emulator_wavelength_bounds(emu)
+    wl = np.asarray(wl, dtype=np.float64)
+    finite_wl = wl[np.isfinite(wl)]
+    if finite_wl.size == 0:
+        raise ValueError(f"No finite wavelengths were supplied for {context}.")
+    data_min = float(np.min(finite_wl))
+    data_max = float(np.max(finite_wl))
+    tol = max(1e-6, 1e-9 * max(abs(emu_min), abs(emu_max)))
+    if data_min < emu_min - tol or data_max > emu_max + tol:
+        raise ValueError(
+            f"{context} wavelength range ({data_min:.3f}, {data_max:.3f}) Å extends outside "
+            f"the emulator coverage ({emu_min:.3f}, {emu_max:.3f}) Å. "
+            "Use a matching emulator or restrict wl_range before fitting."
+        )
+    return emu_min, emu_max
+
+
+def _resolve_tier3_wl_range(
+    emu,
+    wl_range: Optional[Tuple[float, float]],
+) -> Tuple[float, float]:
+    """Resolve Tier 3's fitting window without leaving emulator support."""
+    emu_min, emu_max = _emulator_wavelength_bounds(emu)
+    if wl_range is None:
+        return emu_min, emu_max
+
+    wl_min, wl_max = float(wl_range[0]), float(wl_range[1])
+    if wl_min >= wl_max:
+        raise ValueError(f"wl_range must be increasing, got {wl_range}.")
+    tol = max(1e-6, 1e-9 * max(abs(emu_min), abs(emu_max)))
+    if wl_min < emu_min - tol or wl_max > emu_max + tol:
+        raise ValueError(
+            f"Requested wl_range=({wl_min:.3f}, {wl_max:.3f}) Å extends outside "
+            f"the emulator coverage ({emu_min:.3f}, {emu_max:.3f}) Å. "
+            "Use a matching emulator or restrict the Tier 3 wavelength range."
+        )
+    return max(wl_min, emu_min), min(wl_max, emu_max)
+
+
 def run_mle_single(
     emu,
     wl: np.ndarray,
@@ -516,6 +585,7 @@ def run_mle_single(
         sigma = sigma / cont_safe
         flux = flux / cont_safe
 
+    _assert_wavelengths_within_emulator(emu, wl, context="MLE input spectrum")
     sigma = np.maximum(sigma, 1e-30)
     spec = Spectrum(wl, flux, sigmas=sigma)
 
@@ -769,8 +839,8 @@ def run_mle_single(
 def run_mcmc_single(
     model,
     priors: dict,
-    nwalkers: int = 32,
-    nsteps: int = 1000,
+    nwalkers: int = 64,
+    nsteps: int = 2500,
     burnin: int = 500,
     iteration_callback=None,
     freeze_nuisance: bool = False,
@@ -1019,6 +1089,7 @@ def run_mcmc_single(
         "converged": converged,
         "n_effective": flat.shape[0],
         "labels": all_labels,
+        "internal_labels": _sampled_labels,
         "bestfit_spec": bestfit_spec,
         "freeze_params": dict(_requested_freeze),
         "frozen_params": list(_applied_freezes),
@@ -1216,8 +1287,8 @@ def run_tier2(
     flux_scale: str = "linear",
     wl_range: Tuple[float, float] = (850, 1850),
     inclination: float = 55.0,
-    mcmc_walkers: int = 32,
-    mcmc_steps: int = 1000,
+    mcmc_walkers: int = 64,
+    mcmc_steps: int = 2500,
     mcmc_burnin: int = 500,
     max_mle_iter: int = 5000,
     mle_restarts: int = 1,
@@ -1511,38 +1582,608 @@ def run_tier2(
 # ======================================================================
 
 
+def _prepend_env_path(name: str, path: Union[str, Path]) -> bool:
+    """Prepend a directory to a path-like environment variable if needed."""
+    path = str(Path(path).resolve())
+    current = os.environ.get(name, "")
+    parts = [part for part in current.split(os.pathsep) if part]
+    if path in parts:
+        return False
+    os.environ[name] = path if not current else path + os.pathsep + current
+    return True
+
+
+def _candidate_sirocco_roots() -> List[Path]:
+    """Return plausible Sirocco install roots for reconnect-safe discovery."""
+    candidates = []
+    env_root = os.environ.get("SIROCCO")
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+
+    try:
+        repo_parent = Path(__file__).resolve().parents[2]
+        candidates.append(repo_parent / "sirocco")
+    except Exception:
+        pass
+
+    candidates.append(Path.home() / "sirocco")
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve() if candidate.exists() else candidate
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(candidate)
+    return unique
+
+
+def _configure_sirocco_environment() -> dict:
+    """Patch this Python process environment from a discoverable Sirocco root."""
+    for root in _candidate_sirocco_roots():
+        root = root.expanduser()
+        bin_dir = root / "bin"
+        py_dir = root / "py_progs"
+        if not ((bin_dir / "sirocco").is_file() and (bin_dir / "Setup_Sirocco_Dir").is_file()):
+            continue
+
+        os.environ["SIROCCO"] = str(root.resolve())
+        added = []
+        if _prepend_env_path("PATH", bin_dir):
+            added.append(str(bin_dir.resolve()))
+        if py_dir.is_dir():
+            if _prepend_env_path("PATH", py_dir):
+                added.append(str(py_dir.resolve()))
+            _prepend_env_path("PYTHONPATH", py_dir)
+
+        return {
+            "configured": True,
+            "sirocco_root": str(root.resolve()),
+            "added_paths": added,
+        }
+
+    return {
+        "configured": False,
+        "sirocco_root": None,
+        "added_paths": [],
+    }
+
+
+def check_sirocco_runtime(cpus: int = 1) -> dict:
+    """Return executable availability for the Tier 3 Sirocco subprocess path.
+
+    Parameters
+    ----------
+    cpus : int
+        Requested Sirocco process count. Values greater than one require
+        ``mpirun`` in addition to the ``sirocco`` executable.
+
+    ``Setup_Sirocco_Dir`` is always required because Tier 3 prepares each
+    per-observation export directory before launching Sirocco.
+    """
+    cpus = max(1, int(cpus or 1))
+    env_setup = {
+        "configured": False,
+        "sirocco_root": os.environ.get("SIROCCO"),
+        "added_paths": [],
+    }
+    if shutil.which("sirocco") is None or shutil.which("Setup_Sirocco_Dir") is None:
+        env_setup = _configure_sirocco_environment()
+
+    result = {
+        "cpus": cpus,
+        "sirocco": shutil.which("sirocco"),
+        "mpirun": shutil.which("mpirun") if cpus > 1 else None,
+        "setup_sirocco_dir": shutil.which("Setup_Sirocco_Dir"),
+        "missing": [],
+        "environment": env_setup,
+    }
+    if result["sirocco"] is None:
+        result["missing"].append("sirocco")
+    if cpus > 1 and result["mpirun"] is None:
+        result["missing"].append("mpirun")
+    if result["setup_sirocco_dir"] is None:
+        result["missing"].append("Setup_Sirocco_Dir")
+    result["ok"] = not result["missing"]
+    return result
+
+
+def _repo_relative(path: Union[str, Path]) -> str:
+    """Return a stable path string relative to the current working directory."""
+    try:
+        return os.path.relpath(path, os.getcwd())
+    except Exception:
+        return str(path)
+
+
+def _emit_progress(callback, event: dict) -> None:
+    """Invoke an optional progress callback without letting UI errors abort work."""
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception as exc:
+        log.debug("Progress callback failed: %s", exc)
+
+
+def _parse_sirocco_signal_line(line: str) -> Optional[dict]:
+    """Parse a Sirocco `.sig` line into a user-facing cycle progress event."""
+    match = _SIROCCO_CYCLE_RE.search(line)
+    if match:
+        kind = match.group("kind").lower()
+        action = match.group("action").lower()
+        current = int(match.group("current"))
+        total = int(match.group("total"))
+        label = "Ionization" if kind == "ionization" else "Spectrum"
+        state = "complete" if action == "finished" else "started"
+        return {
+            "phase": "sirocco",
+            "cycle_type": kind,
+            "state": state,
+            "current": current,
+            "total": total,
+            "line": line.rstrip(),
+            "message": f"{label} cycle {current}/{total} {state}",
+        }
+
+    match = _SIROCCO_ION_CONVERGED_RE.search(line)
+    if match:
+        current = int(match.group("current"))
+        total = int(match.group("total"))
+        return {
+            "phase": "sirocco",
+            "cycle_type": "ionization",
+            "state": "converged",
+            "current": current,
+            "total": total,
+            "line": line.rstrip(),
+            "message": f"Ionization converged early at cycle {current}/{total}",
+        }
+
+    return None
+
+
+def _poll_sirocco_signal(
+    signal_path: Union[str, Path],
+    offset: int,
+    last_event_key: Optional[Tuple],
+    progress_callback=None,
+) -> Tuple[int, Optional[Tuple]]:
+    """Read new `.sig` lines and emit the latest unseen cycle progress event."""
+    signal_path = Path(signal_path)
+    if not signal_path.exists():
+        return offset, last_event_key
+
+    size = signal_path.stat().st_size
+    if size < offset:
+        offset = 0
+
+    latest_event = None
+    with open(signal_path, "r", errors="replace") as signal_file:
+        signal_file.seek(offset)
+        for line in signal_file:
+            event = _parse_sirocco_signal_line(line)
+            if event is not None:
+                latest_event = event
+        offset = signal_file.tell()
+
+    if latest_event is not None:
+        event_key = (
+            latest_event.get("cycle_type"),
+            latest_event.get("state"),
+            latest_event.get("current"),
+            latest_event.get("total"),
+        )
+        if event_key != last_event_key:
+            _emit_progress(progress_callback, latest_event)
+            last_event_key = event_key
+
+    return offset, last_event_key
+
+
+def _find_sirocco_spec_files(pf_path: Union[str, Path]) -> List[Path]:
+    """Return native Sirocco `.spec` outputs for an exported `.pf` run."""
+    pf_path = Path(pf_path)
+    work_dir = pf_path.parent
+    root_spec = work_dir / f"{pf_path.stem}.spec"
+    if root_spec.is_file():
+        return [root_spec]
+    return sorted(work_dir.glob("*.spec"))
+
+
+def _safe_artifact_stem(path: Union[str, Path]) -> str:
+    """Return a filesystem-safe stem for one observation's artifact names."""
+    stem = Path(path).stem
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stem)
+    return safe.strip("_") or "observation"
+
+
+def _run_command_logged(
+    command: List[str],
+    cwd: Union[str, Path],
+    log_path: Union[str, Path],
+    progress_callback=None,
+    signal_path: Optional[Union[str, Path]] = None,
+) -> None:
+    """Run a subprocess, capture combined output, and raise with log context."""
+    if progress_callback is None or signal_path is None:
+        completed = subprocess.run(
+            command,
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        with open(log_path, "w") as log_file:
+            log_file.write("$ " + " ".join(command) + "\n\n")
+            log_file.write(completed.stdout or "")
+        return_code = completed.returncode
+    else:
+        offset = 0
+        last_event_key = None
+        with open(log_path, "w") as log_file:
+            log_file.write("$ " + " ".join(command) + "\n\n")
+            log_file.flush()
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            while process.poll() is None:
+                offset, last_event_key = _poll_sirocco_signal(
+                    signal_path, offset, last_event_key, progress_callback
+                )
+                time.sleep(1.0)
+            return_code = process.returncode
+            _poll_sirocco_signal(signal_path, offset, last_event_key, progress_callback)
+
+    if return_code != 0:
+        raise RuntimeError(
+            f"Command failed with exit code {return_code}: "
+            f"{' '.join(command)}. See {_repo_relative(log_path)}"
+        )
+
+
+def run_sirocco_pf(
+    pf_path: Union[str, Path],
+    cpus: int = 1,
+    progress_callback=None,
+) -> dict:
+    """Run Sirocco for one exported .pf file and return log/output metadata.
+
+    ``Setup_Sirocco_Dir`` and the Sirocco command are both executed inside the
+    `.pf` file's directory so fixed-name outputs, such as ``run0.spec``, remain
+    isolated per observation. If provided, ``progress_callback`` receives
+    best-effort cycle updates parsed from Sirocco's live ``root.sig`` file.
+    """
+    pf_path = Path(pf_path)
+    work_dir = pf_path.parent
+    cpus = max(1, int(cpus or 1))
+    runtime = check_sirocco_runtime(cpus)
+    if not runtime["ok"]:
+        missing = ", ".join(runtime["missing"])
+        raise RuntimeError(f"Tier 3 requires Sirocco runtime command(s): {missing}")
+
+    setup_log = work_dir / "setup_sirocco_dir.log"
+    _emit_progress(progress_callback, {
+        "phase": "sirocco",
+        "state": "setup",
+        "message": "Preparing Sirocco run directory",
+    })
+    _run_command_logged([runtime["setup_sirocco_dir"]], work_dir, setup_log)
+
+    run_log = work_dir / "sirocco_run.log"
+    signal_path = work_dir / f"{pf_path.stem}.sig"
+    if cpus > 1:
+        command = [runtime["mpirun"], "-np", str(cpus), runtime["sirocco"], pf_path.name]
+    else:
+        command = [runtime["sirocco"], pf_path.name]
+    _emit_progress(progress_callback, {
+        "phase": "sirocco",
+        "state": "started",
+        "message": "Simulation started; waiting for cycle log",
+    })
+    _run_command_logged(
+        command,
+        work_dir,
+        run_log,
+        progress_callback=progress_callback,
+        signal_path=signal_path,
+    )
+
+    spec_files = _find_sirocco_spec_files(pf_path)
+    if not spec_files:
+        raise FileNotFoundError(
+            f"Sirocco completed but no .spec file was found in {_repo_relative(work_dir)}"
+        )
+
+    return {
+        "command": " ".join(command),
+        "setup_log_path": str(setup_log),
+        "run_log_path": str(run_log),
+        "signal_log_path": str(signal_path),
+        "spec_files": [str(path) for path in spec_files],
+    }
+
+
+def _load_single_observer_sirocco_spectrum(
+    spec_file: Union[str, Path],
+    wl_range: Tuple[float, float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load wavelength and flux from a reduced single-observer Sirocco `.spec`.
+
+    Sirocco writes frequency and wavelength in columns 0 and 1, followed by one
+    flux column per observer. Tier 3 exports exactly one observer, so column 2
+    is the comparison spectrum.
+    """
+    skiprows = 0
+    with open(spec_file, "r") as f:
+        for i, line in enumerate(f):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("Freq."):
+                skiprows = i + 1
+            else:
+                break
+
+    data = np.loadtxt(spec_file, skiprows=skiprows)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    if data.shape[1] < 3:
+        raise ValueError(f"Expected at least 3 columns in Sirocco spectrum {spec_file}")
+
+    order = np.argsort(data[:, 1])
+    wl = data[order, 1]
+    flux = data[order, 2]
+    mask = (wl >= wl_range[0]) & (wl <= wl_range[1])
+    wl = wl[mask]
+    flux = flux[mask]
+    if len(wl) < 2:
+        raise ValueError(
+            f"Only {len(wl)} Sirocco wavelength point(s) remain after filtering "
+            f"to wl_range={wl_range} in {spec_file}"
+        )
+    return wl, flux
+
+
+def _transform_flux_for_scale(
+    wl: np.ndarray,
+    flux: np.ndarray,
+    flux_scale: str,
+    reference_wl: Optional[np.ndarray] = None,
+    reference_flux: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Transform a native linear-flux spectrum onto the benchmark fit scale."""
+    flux = np.asarray(flux, dtype=np.float64)
+    if flux_scale == "log":
+        return np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
+    if flux_scale == "continuum-normalised":
+        from Speculate_addons.Spec_functions import fit_power_law_continuum
+
+        ref_wl = np.asarray(reference_wl if reference_wl is not None else wl, dtype=np.float64)
+        ref_flux = np.asarray(reference_flux if reference_flux is not None else flux, dtype=np.float64)
+        continuum, _ = fit_power_law_continuum(ref_wl, ref_flux)
+        order = np.argsort(ref_wl)
+        continuum = np.interp(wl, ref_wl[order], continuum[order])
+        return flux / np.where(continuum > 0, continuum, 1.0)
+    return flux
+
+
+def _extract_spectrum_nuisance_transforms(model) -> dict:
+    """Capture fitted continuum/scale nuisance values from a SpectrumModel."""
+    transforms = {}
+    for label in ("Av", "Rv", "log_scale"):
+        if label in model.params:
+            transforms[label] = float(model.params[label])
+    if "Av" in transforms and "Rv" not in transforms:
+        transforms["Rv"] = 3.1
+
+    cheb_terms = []
+    idx = 1
+    while f"cheb:{idx}" in model.params:
+        cheb_terms.append(float(model.params[f"cheb:{idx}"]))
+        idx += 1
+    if cheb_terms:
+        transforms["cheb"] = cheb_terms
+    return transforms
+
+
+def _apply_spectrum_nuisance_transforms(
+    wl: np.ndarray,
+    flux: np.ndarray,
+    flux_scale: str,
+    transforms: dict,
+) -> np.ndarray:
+    """Apply fitted Starfish nuisance transforms to an external spectrum.
+
+    The order mirrors ``SpectrumModel`` evaluation: extinction, Chebyshev
+    continuum correction, then global flux scale.  Log-scale spectra use the
+    additive forms of those transforms; linear and continuum-normalised spectra
+    use the multiplicative forms.
+    """
+    wl = np.asarray(wl, dtype=np.float64)
+    flux = np.asarray(flux, dtype=np.float64).copy()
+
+    if "Av" in transforms:
+        from Starfish.transforms import extinct
+
+        flux = extinct(
+            wl,
+            flux,
+            float(transforms["Av"]),
+            Rv=float(transforms.get("Rv", 3.1)),
+            flux_scale="log" if flux_scale == "log" else "linear",
+        )
+
+    cheb_terms = transforms.get("cheb") or []
+    if cheb_terms:
+        coeffs = np.asarray([1.0, *[float(value) for value in cheb_terms]], dtype=np.float64)
+        if flux_scale == "log":
+            from numpy.polynomial.chebyshev import chebval
+
+            cheb_poly = chebval(wl / np.max(wl), coeffs)
+            flux = flux + np.log10(np.clip(cheb_poly, 1e-30, None))
+        else:
+            from Starfish.transforms import chebyshev_correct
+
+            flux = chebyshev_correct(wl, flux, coeffs)
+
+    if "log_scale" in transforms:
+        log_scale = float(transforms["log_scale"])
+        if flux_scale == "log":
+            flux = flux + log_scale / np.log(10.0)
+        else:
+            flux = flux * np.exp(log_scale)
+    return flux
+
+
+def _format_sirocco_transform_label(transforms: dict) -> str:
+    """Return a compact plot legend label for the transformed Sirocco spectrum."""
+    parts = []
+    if "Av" in transforms:
+        parts.append(f"Av={float(transforms['Av']):.3g}")
+    if "log_scale" in transforms:
+        parts.append(f"log_scale={float(transforms['log_scale']):.3g}")
+    for idx, value in enumerate(transforms.get("cheb") or [], start=1):
+        parts.append(f"cheb{idx}={float(value):.3g}")
+    return "Sirocco Model" if not parts else "Sirocco Model (" + ", ".join(parts) + ")"
+
+
+def _extract_posterior_mean_inclination(
+    emu,
+    samples: np.ndarray,
+    friendly_labels: Sequence[str],
+) -> float:
+    """Return the posterior-mean inclination used for the Sirocco observer."""
+    friendly_grid = internal_to_friendly(emu.param_names)
+    if "Inclination" not in friendly_grid:
+        raise ValueError(
+            "Tier 3 Sirocco comparison requires an emulator with an Inclination "
+            "parameter (param9, param10, or param11)."
+        )
+    if "Inclination" not in friendly_labels:
+        raise ValueError("MCMC samples do not contain an Inclination column.")
+    col = list(friendly_labels).index("Inclination")
+    inclination = float(np.mean(samples[:, col]))
+    return float(np.clip(inclination, 0.0, 90.0))
+
+
+def _save_tier3_artifacts(
+    output_dir: Union[str, Path],
+    obs_stem: str,
+    mcmc: dict,
+    bestfit_spec: dict,
+    ppc_envelope: dict,
+    sirocco_plot: dict,
+    summary: dict,
+) -> dict:
+    """Persist bulky Tier 3 posterior and plot arrays outside the JSON report."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    posterior_path = output_dir / f"tier3_{obs_stem}_posterior.npz"
+    np.savez_compressed(
+        posterior_path,
+        samples=mcmc.get("samples", np.empty((0, 0))),
+        full_chain=mcmc.get("full_chain", np.empty((0, 0, 0))),
+        labels=np.asarray(mcmc.get("labels", []), dtype=str),
+        internal_labels=np.asarray(mcmc.get("internal_labels", []), dtype=str),
+        burnin_used=np.asarray([mcmc.get("burnin_used", 0)], dtype=np.int64),
+    )
+
+    plot_path = output_dir / f"tier3_{obs_stem}_plot_data.npz"
+    np.savez_compressed(
+        plot_path,
+        wavelength=np.asarray(bestfit_spec.get("wavelength", []), dtype=np.float64),
+        data_flux=np.asarray(bestfit_spec.get("data_flux", []), dtype=np.float64),
+        model_flux=np.asarray(bestfit_spec.get("model_flux", []), dtype=np.float64),
+        model_cov_diag=np.asarray(bestfit_spec.get("model_cov_diag", []), dtype=np.float64),
+        ppc_wavelength=np.asarray(ppc_envelope.get("wavelength", []), dtype=np.float64),
+        ppc_low=np.asarray(ppc_envelope.get("low", []), dtype=np.float64),
+        ppc_high=np.asarray(ppc_envelope.get("high", []), dtype=np.float64),
+        sirocco_wavelength=np.asarray(sirocco_plot.get("wavelength", []), dtype=np.float64),
+        sirocco_flux=np.asarray(sirocco_plot.get("flux", []), dtype=np.float64),
+        sirocco_label=np.asarray([sirocco_plot.get("label", "Sirocco Model")], dtype=str),
+    )
+
+    summary_path = output_dir / f"tier3_{obs_stem}_summary.json"
+    with open(summary_path, "w") as summary_file:
+        json.dump(summary, summary_file, indent=2, default=str)
+
+    return {
+        "posterior_npz": str(posterior_path),
+        "plot_data_npz": str(plot_path),
+        "summary_json": str(summary_path),
+    }
+
+
 def run_tier3_single(
     emu,
     obs_csv: str,
     flux_scale: str = "linear",
-    wl_range: Tuple[float, float] = (850, 1850),
+    wl_range: Optional[Tuple[float, float]] = None,
     max_mle_iter: int = 5000,
+    mle_restarts: int = 5,
     n_ppc_draws: int = 100,
-    mcmc_walkers: int = 32,
-    mcmc_steps: int = 1000,
+    mcmc_walkers: int = 64,
+    mcmc_steps: int = 2500,
     mcmc_burnin: int = 500,
     grid_name: Optional[str] = None,
     output_dir: Optional[str] = None,
+    sirocco_cpus: int = 1,
+    require_sirocco: bool = True,
+    run_sirocco: bool = True,
+    mle_iteration_callback=None,
+    mcmc_iteration_callback=None,
+    sirocco_progress_callback=None,
 ) -> dict:
     """
     Tier 3 benchmark: goodness-of-fit for a single observational spectrum.
 
     Parameters
     ----------
-    grid_name : str or None
+    grid_name : str
         Grid identifier (e.g. ``speculate_cv_bl_grid_v87f``) used to select
-        the correct Sirocco template for .pf export.  If None, .pf export
-        is skipped.
+        the correct Sirocco template for .pf export. Strict Tier 3 runs require
+        this value before inference starts.
     output_dir : str or None
-        Directory for exported .pf files.  Defaults to ``exports/``.
+        Per-observation artifact directory.  Defaults to ``exports/``.
+    wl_range : tuple or None
+        Observation fitting window in Angstrom.  When None, Tier 3 fits over
+        the selected emulator's wavelength coverage.  Explicit ranges must sit
+        inside that coverage to avoid spline extrapolation.
+    sirocco_cpus : int
+        Number of CPUs to use when launching Sirocco.  Values above 1 use
+        ``mpirun -np N sirocco <pf>``.
+    require_sirocco : bool
+        If True, missing runtime commands or failed Sirocco runs raise.
+    run_sirocco : bool
+        If True, run Sirocco after exporting the posterior-mean .pf file.
+    mle_iteration_callback, mcmc_iteration_callback, sirocco_progress_callback : callable or None
+        Optional progress callbacks forwarded to the MLE, MCMC, and Sirocco
+        stages. The benchmark viewer uses these to show restart, evaluation,
+        sampling-step, and radiative-transfer cycle progress during long Tier 3 fits.
 
     Returns
     -------
-    dict with keys: 'reduced_chi2', 'ppc_coverage', 'mle_params',
-                    'mcmc_summary', 'obs_file', and optionally 'pf_path'.
+    dict with compact JSON-safe metrics and artifact path references.
     """
-    from Starfish.spectrum import Spectrum
-    from Starfish.models import SpectrumModel
+    t0 = time.time()
+    obs_stem = _safe_artifact_stem(obs_csv)
+    artifact_dir = Path(output_dir or "exports")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    wl_range = _resolve_tier3_wl_range(emu, wl_range)
+
+    if grid_name is None and (require_sirocco or run_sirocco):
+        raise ValueError("Tier 3 Sirocco workflow requires a grid_name for .pf export.")
+    if require_sirocco or run_sirocco:
+        runtime = check_sirocco_runtime(sirocco_cpus)
+        if not runtime["ok"]:
+            missing = ", ".join(runtime["missing"])
+            raise RuntimeError(f"Tier 3 requires Sirocco runtime command(s): {missing}")
 
     # Load observation
     df = pd.read_csv(obs_csv)
@@ -1558,119 +2199,283 @@ def run_tier3_single(
 
     mask = (wl >= wl_range[0]) & (wl <= wl_range[1])
     wl, flux, sigma = wl[mask], flux[mask], sigma[mask]
+    if len(wl) < 2:
+        raise ValueError(
+            f"Only {len(wl)} wavelength point(s) remain after filtering "
+            f"{obs_csv} to wl_range={wl_range}."
+        )
 
     # MLE — run_mle_single handles flux_scale transforms internally;
     # applying them here as well would double-scale the data.
-    mle = run_mle_single(emu, wl, flux, sigma, flux_scale=flux_scale,
-                          max_iter=max_mle_iter, freeze_av=False)
+    if mle_iteration_callback is not None:
+        mle_iteration_callback(0, max_mle_iter, np.nan, 0.0, 1, mle_restarts)
+    mle = run_mle_single(
+        emu, wl, flux, sigma,
+        flux_scale=flux_scale,
+        max_iter=max_mle_iter,
+        freeze_av=False,
+        n_restarts=mle_restarts,
+        iteration_callback=mle_iteration_callback,
+    )
     model = mle["model"]
     priors = mle["priors"]
 
-    # Reduced chi^2
-    try:
-        model_flux, model_cov = model()
-        residuals = flux - model_flux
-        n_dof = len(flux) - len(model.labels)
-        chi2 = float(np.sum((residuals / sigma) ** 2))
-        reduced_chi2 = chi2 / max(n_dof, 1)
-    except Exception:
-        reduced_chi2 = np.nan
-
     # MCMC
-    try:
-        mcmc = run_mcmc_single(
-            model, priors,
-            nwalkers=mcmc_walkers, nsteps=mcmc_steps, burnin=mcmc_burnin,
-            freeze_nuisance=True,
-        )
-    except Exception as e:
-        log.warning(f"MCMC failed for {obs_csv}: {e}")
-        return {
-            "obs_file": os.path.basename(obs_csv),
-            "reduced_chi2": reduced_chi2,
-            "ppc_coverage": np.nan,
-            "mle_params": mle["grid_params"],
-        }
+    if mcmc_iteration_callback is not None:
+        mcmc_iteration_callback(0, mcmc_steps, 0.0)
+    mcmc = run_mcmc_single(
+        model, priors,
+        nwalkers=mcmc_walkers, nsteps=mcmc_steps, burnin=mcmc_burnin,
+        freeze_nuisance=True,
+        iteration_callback=mcmc_iteration_callback,
+    )
+    friendly_labels = mcmc.get("labels", [])
+    internal_labels = mcmc.get("internal_labels", friendly_labels)
 
     # Posterior Predictive Check (PPC)
     # Draw random posterior samples, evaluate the model flux at each one, and
     # check what fraction of the observed data falls within the 2.5–97.5%
     # envelope of the predicted flux.  A well-calibrated model should cover
     # ~95% of the data points.
-    ppc_in = 0
+    ppc_in = np.nan
     n_ppc = min(n_ppc_draws, mcmc["samples"].shape[0])
-    indices = np.random.choice(mcmc["samples"].shape[0], size=n_ppc, replace=False)
     envelopes = np.zeros((n_ppc, len(flux)))
 
-    _mcmc_labels = mcmc["labels"]
-    for j, idx in enumerate(indices):
-        _sample_dict = dict(zip(_mcmc_labels, mcmc["samples"][idx]))
-        model.set_param_dict(_sample_dict)
-        try:
-            pred, _ = model()
-            envelopes[j] = pred
-        except Exception:
-            envelopes[j] = np.nan
+    if n_ppc > 0:
+        indices = np.random.choice(mcmc["samples"].shape[0], size=n_ppc, replace=False)
+        for j, idx in enumerate(indices):
+            _sample_dict = dict(zip(internal_labels, mcmc["samples"][idx]))
+            model.set_param_dict(_sample_dict)
+            try:
+                pred, _ = model()
+                if hasattr(pred, "detach"):
+                    pred = pred.detach().cpu().numpy()
+                envelopes[j] = pred
+            except Exception:
+                envelopes[j] = np.nan
 
     valid = ~np.any(np.isnan(envelopes), axis=1)
     if valid.sum() > 1:
         env_lo = np.percentile(envelopes[valid], 2.5, axis=0)
         env_hi = np.percentile(envelopes[valid], 97.5, axis=0)
-        ppc_in = float(np.mean((flux >= env_lo) & (flux <= env_hi)))
+        data_for_ppc = np.asarray(model.data.flux, dtype=np.float64)
+        ppc_in = float(np.mean((data_for_ppc >= env_lo) & (data_for_ppc <= env_hi)))
     else:
+        env_lo = np.full(len(model.data.wave), np.nan)
+        env_hi = np.full(len(model.data.wave), np.nan)
         ppc_in = np.nan
 
     # Set model back to posterior mean for export
     mcmc_means = {}
-    for i, label in enumerate(mcmc["labels"]):
+    for i, label in enumerate(internal_labels):
         mcmc_means[label] = float(np.mean(mcmc["samples"][:, i]))
     model.set_param_dict(mcmc_means)
+
+    try:
+        model_flux, model_cov = model()
+        if hasattr(model_flux, "detach"):
+            model_flux = model_flux.detach().cpu().numpy()
+        if hasattr(model_cov, "detach"):
+            model_cov = model_cov.detach().cpu().numpy()
+        model_cov = np.asarray(model_cov)
+        bestfit_spec = {
+            "wavelength": np.asarray(model.data.wave).tolist(),
+            "data_flux": np.asarray(model.data.flux).tolist(),
+            "model_flux": np.asarray(model_flux).tolist(),
+            "model_cov_diag": np.diag(model_cov).tolist() if model_cov.ndim == 2 else model_cov.tolist(),
+        }
+    except Exception:
+        bestfit_spec = mcmc.get("bestfit_spec", {})
+
+    try:
+        _bf_data = np.asarray(bestfit_spec.get("data_flux", []), dtype=np.float64)
+        _bf_model = np.asarray(bestfit_spec.get("model_flux", []), dtype=np.float64)
+        _model_sigma = np.asarray(model.data.sigma, dtype=np.float64)
+        _n = min(len(_bf_data), len(_bf_model), len(_model_sigma))
+        residuals = _bf_data[:_n] - _bf_model[:_n]
+        n_dof = _n - len(internal_labels)
+        chi2 = float(np.sum((residuals / np.maximum(_model_sigma[:_n], 1e-30)) ** 2))
+        reduced_chi2 = chi2 / max(n_dof, 1)
+    except Exception:
+        reduced_chi2 = np.nan
+
+    exact_inclination = _extract_posterior_mean_inclination(
+        emu, mcmc["samples"], friendly_labels
+    )
 
     result = {
         "obs_file": os.path.basename(obs_csv),
         "reduced_chi2": reduced_chi2,
         "ppc_coverage": ppc_in,
         "mle_params": mle["grid_params"],
+        "mle_all_params": mle.get("all_params", {}),
         "mcmc_summary": mcmc["summary"],
         "mcmc_converged": mcmc["converged"],
-        "model": model,
-        "samples": mcmc["samples"],
-        "labels": mcmc["labels"],
+        "n_effective": mcmc.get("n_effective"),
+        "labels": friendly_labels,
+        "exact_inclination": exact_inclination,
+        "export_dir": str(artifact_dir),
+        "wl_range": [float(wl_range[0]), float(wl_range[1])],
+        "emulator_wl_range": list(_emulator_wavelength_bounds(emu)),
+        "tier3_time_s": None,
     }
 
     # Export a Sirocco .pf file from the posterior-mean parameters
     if grid_name is not None:
-        try:
-            _out = output_dir or "exports"
-            _obs_stem = os.path.splitext(os.path.basename(obs_csv))[0]
-            _pf_path = os.path.join(_out, f"tier3_{_obs_stem}.pf")
+        _pf_path = artifact_dir / f"tier3_{obs_stem}.pf"
 
-            _n_grid = len(emu.param_names)
-            _grid_means = np.mean(mcmc["samples"][:, :_n_grid], axis=0)
+        _grid_means = []
+        _uncertainties = {}
+        _friendly_grid = internal_to_friendly(emu.param_names)
+        for _pn, _friendly in zip(emu.param_names, _friendly_grid):
+            if _pn not in internal_labels:
+                raise ValueError(f"MCMC samples do not contain required grid parameter {_pn}")
+            _col = list(internal_labels).index(_pn)
+            _grid_means.append(float(np.mean(mcmc["samples"][:, _col])))
+            _lo = float(np.percentile(mcmc["samples"][:, _col], 16))
+            _hi = float(np.percentile(mcmc["samples"][:, _col], 84))
+            _uncertainties[_friendly] = (_lo, _hi)
 
-            _uncertainties = {}
-            _friendly = internal_to_friendly(emu.param_names)
-            for _i, _label in enumerate(_friendly):
-                _lo = np.percentile(mcmc["samples"][:, _i], 16)
-                _hi = np.percentile(mcmc["samples"][:, _i], 84)
-                _uncertainties[_label] = (_lo, _hi)
+        _global = {}
+        for _i, _label in enumerate(internal_labels):
+            if not str(_label).startswith("param"):
+                _global[str(_label)] = float(np.mean(mcmc["samples"][:, _i]))
 
-            _global = {}
-            for _i in range(_n_grid, mcmc["samples"].shape[1]):
-                _global[mcmc["labels"][_i]] = float(
-                    np.mean(mcmc["samples"][:, _i])
-                )
+        export_pf_template(
+            emu, np.asarray(_grid_means), str(_pf_path),
+            uncertainties=_uncertainties,
+            global_params=_global,
+            grid_name=grid_name,
+            observer_angles=[exact_inclination],
+        )
+        result["pf_path"] = str(_pf_path)
+        log.info(f"Tier 3 exported .pf to {_pf_path}")
 
-            export_pf_template(
-                emu, _grid_means, _pf_path,
-                uncertainties=_uncertainties,
-                global_params=_global,
-                grid_name=grid_name,
+    sirocco_plot = {"wavelength": [], "flux": []}
+    sirocco_reduced_chi2 = np.nan
+    emulator_sirocco_frac_rmse = np.nan
+    sirocco_transforms = _extract_spectrum_nuisance_transforms(model)
+    sirocco_transform_label = _format_sirocco_transform_label(sirocco_transforms)
+
+    if run_sirocco:
+        sirocco_meta = run_sirocco_pf(
+            result["pf_path"],
+            cpus=sirocco_cpus,
+            progress_callback=sirocco_progress_callback,
+        )
+        native_spec_path = Path(sirocco_meta["spec_files"][0])
+        reduced_dir = artifact_dir / "reduced_spec"
+        from Speculate_addons.lighten_spec_files import reduce_spec_files
+
+        reduced_paths = reduce_spec_files(
+            str(artifact_dir),
+            output_dir=str(reduced_dir),
+            show_progress=False,
+            strict=True,
+        )
+        if not reduced_paths:
+            raise FileNotFoundError(f"No reduced .spec files were written in {_repo_relative(reduced_dir)}")
+        reduced_spec_path = next(
+            (Path(path) for path in reduced_paths if Path(path).name == native_spec_path.name),
+            Path(reduced_paths[0]),
+        )
+
+        sirocco_wl, sirocco_flux = _load_single_observer_sirocco_spectrum(
+            reduced_spec_path, wl_range
+        )
+        sirocco_flux_plot = _transform_flux_for_scale(
+            sirocco_wl,
+            sirocco_flux,
+            flux_scale,
+            reference_wl=wl,
+            reference_flux=flux,
+        )
+        sirocco_flux_plot = _apply_spectrum_nuisance_transforms(
+            sirocco_wl,
+            sirocco_flux_plot,
+            flux_scale,
+            sirocco_transforms,
+        )
+        sirocco_plot = {
+            "wavelength": sirocco_wl,
+            "flux": sirocco_flux_plot,
+            "label": sirocco_transform_label,
+        }
+
+        _bf_wl = np.asarray(bestfit_spec.get("wavelength", []), dtype=np.float64)
+        _bf_data = np.asarray(bestfit_spec.get("data_flux", []), dtype=np.float64)
+        _bf_model = np.asarray(bestfit_spec.get("model_flux", []), dtype=np.float64)
+        _model_sigma = np.asarray(model.data.sigma, dtype=np.float64)
+        if len(_bf_wl) and len(_bf_data) and len(_model_sigma):
+            sirocco_interp_plot = np.interp(_bf_wl, sirocco_wl, sirocco_flux_plot)
+            _n_sirocco = min(len(_bf_data), len(_model_sigma), len(sirocco_interp_plot))
+            n_dof_sirocco = _n_sirocco - len(internal_labels)
+            sirocco_reduced_chi2 = float(
+                np.sum(
+                    ((_bf_data[:_n_sirocco] - sirocco_interp_plot[:_n_sirocco])
+                     / np.maximum(_model_sigma[:_n_sirocco], 1e-30)) ** 2
+                ) / max(n_dof_sirocco, 1)
             )
-            result["pf_path"] = _pf_path
-            log.info(f"Tier 3 exported .pf to {_pf_path}")
-        except Exception as e:
-            log.warning(f"Tier 3 .pf export failed for {obs_csv}: {e}")
+        if len(_bf_wl) and len(_bf_data) and len(_bf_model):
+            sirocco_interp_plot = np.interp(_bf_wl, sirocco_wl, sirocco_flux_plot)
+            denom = np.maximum(np.abs(_bf_data), 1e-30)
+            emulator_sirocco_frac_rmse = float(
+                np.sqrt(np.nanmean(((_bf_model - sirocco_interp_plot) / denom) ** 2))
+            )
+
+        result.update({
+            "sirocco_command": sirocco_meta.get("command"),
+            "sirocco_log_path": sirocco_meta.get("run_log_path"),
+            "sirocco_setup_log_path": sirocco_meta.get("setup_log_path"),
+            "sirocco_signal_log_path": sirocco_meta.get("signal_log_path"),
+            "sirocco_spec_path": str(native_spec_path),
+            "sirocco_reduced_spec_path": str(reduced_spec_path),
+            "sirocco_transform_params": sirocco_transforms,
+            "sirocco_transform_label": sirocco_transform_label,
+        })
+    elif require_sirocco:
+        raise RuntimeError("Tier 3 was configured to require Sirocco but run_sirocco=False.")
+
+    result["sirocco_reduced_chi2"] = sirocco_reduced_chi2
+    result["emulator_sirocco_frac_rmse"] = emulator_sirocco_frac_rmse
+    result["sirocco_transform_params"] = sirocco_transforms
+    result["sirocco_transform_label"] = sirocco_transform_label
+
+    ppc_envelope = {
+        "wavelength": np.asarray(model.data.wave, dtype=np.float64),
+        "low": env_lo,
+        "high": env_hi,
+    }
+    artifact_summary = {
+        "obs_file": result["obs_file"],
+        "labels": friendly_labels,
+        "mcmc_summary": mcmc["summary"],
+        "mle_params": result["mle_params"],
+        "mle_all_params": result.get("mle_all_params", {}),
+        "mcmc_converged": result["mcmc_converged"],
+        "exact_inclination": exact_inclination,
+        "wl_range": result["wl_range"],
+        "emulator_wl_range": result["emulator_wl_range"],
+        "sirocco_transform_params": sirocco_transforms,
+        "sirocco_transform_label": sirocco_transform_label,
+        "metrics": {
+            "reduced_chi2": reduced_chi2,
+            "ppc_coverage": ppc_in,
+            "sirocco_reduced_chi2": sirocco_reduced_chi2,
+            "emulator_sirocco_frac_rmse": emulator_sirocco_frac_rmse,
+        },
+    }
+    artifacts = _save_tier3_artifacts(
+        artifact_dir,
+        obs_stem,
+        mcmc,
+        bestfit_spec,
+        ppc_envelope,
+        sirocco_plot,
+        artifact_summary,
+    )
+    result["artifacts"] = artifacts
+    result["tier3_time_s"] = time.time() - t0
 
     return result
 
@@ -1687,6 +2492,7 @@ def export_pf_template(
     uncertainties: Optional[dict] = None,
     global_params: Optional[dict] = None,
     grid_name: Optional[str] = None,
+    observer_angles: Optional[Sequence[float]] = None,
 ):
     """
     Export a Sirocco .pf file by updating a full template with emulator results.
@@ -1705,8 +2511,13 @@ def export_pf_template(
     grid_name : str or None
         Grid identifier (e.g. ``speculate_cv_bl_grid_v87f``).  Used to select
         the correct Sirocco template.  If None, falls back to a minimal export.
+    observer_angles : sequence of float or None
+        Optional replacement observer angles for ``Spectrum.angle(0=pole)``.
     """
     from exports.templates.speculate_pf_exporter import write_pf
+
+    if grid_name is None:
+        raise ValueError("grid_name is required for Sirocco .pf template export")
 
     physical = emulator_to_physical(emu.param_names, param_values)
 
@@ -1735,6 +2546,7 @@ def export_pf_template(
         physical_params=physical,
         output_path=output_path,
         header_lines=header,
+        observer_angles=list(observer_angles) if observer_angles is not None else None,
     )
 
     log.info(f"Exported .pf template to {output_path}")
@@ -1891,8 +2703,32 @@ def build_report_card(
                 "ppc_coverage": r.get("ppc_coverage", None),
                 "mcmc_converged": r.get("mcmc_converged", None),
             }
-            if "pf_path" in r:
-                entry["pf_path"] = r["pf_path"]
+            for key in (
+                "n_effective",
+                "exact_inclination",
+                "mle_params",
+                "mle_all_params",
+                "mcmc_summary",
+                "labels",
+                "wl_range",
+                "emulator_wl_range",
+                "export_dir",
+                "pf_path",
+                "sirocco_command",
+                "sirocco_log_path",
+                "sirocco_setup_log_path",
+                "sirocco_signal_log_path",
+                "sirocco_spec_path",
+                "sirocco_reduced_spec_path",
+                "sirocco_transform_params",
+                "sirocco_transform_label",
+                "sirocco_reduced_chi2",
+                "emulator_sirocco_frac_rmse",
+                "artifacts",
+                "tier3_time_s",
+            ):
+                if key in r:
+                    entry[key] = r[key]
             t3_summaries.append(entry)
         report["tier3"] = t3_summaries
 

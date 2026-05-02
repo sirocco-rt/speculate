@@ -192,6 +192,9 @@ def _(mo):
     # flat samples, labels, ground-truth values, and summary stats so the
     # interactive corner-plot explorer can render any spectrum post-run.
     get_tier2_posteriors, set_tier2_posteriors = mo.state(None)
+    # tier3_posteriors – compact per-observation Tier 3 records with paths to
+    # external posterior/plot artifacts saved under exports/<benchmark-run>/.
+    get_tier3_posteriors, set_tier3_posteriors = mo.state(None)
     return (
         get_comparison_reports,
         get_emulator,
@@ -199,12 +202,14 @@ def _(mo):
         get_status_msg,
         get_tier1_arrays,
         get_tier2_posteriors,
+        get_tier3_posteriors,
         set_comparison_reports,
         set_emulator,
         set_report,
         set_status_msg,
         set_tier1_arrays,
         set_tier2_posteriors,
+        set_tier3_posteriors,
     )
 
 
@@ -258,6 +263,7 @@ def _(
     set_report,
     set_tier1_arrays,
     set_tier2_posteriors,
+    set_tier3_posteriors,
     upload_btn,
 ):
     def _reconstruct_posteriors(report):
@@ -301,6 +307,13 @@ def _(
             posteriors.append(entry)
         return posteriors if posteriors else None
 
+    def _reconstruct_tier3_posteriors(report):
+        """Return compact Tier 3 observation records from a loaded report."""
+        records = report.get("tier3", [])
+        if not records:
+            return None
+        return list(records)
+
     # Each button mutates notebook state only when clicked; the returned state is
     # then consumed by the rendering cells below.
     if load_btn.value:
@@ -314,6 +327,7 @@ def _(
             set_tier1_arrays(None)
             # Reconstruct posteriors from embedded data (if present)
             set_tier2_posteriors(_reconstruct_posteriors(_loaded))
+            set_tier3_posteriors(_reconstruct_tier3_posteriors(_loaded))
 
     if upload_btn.value:
         # Accept the first uploaded JSON file and treat it the same way as a
@@ -323,6 +337,7 @@ def _(
             set_report(_loaded)
             set_tier1_arrays(None)
             set_tier2_posteriors(_reconstruct_posteriors(_loaded))
+            set_tier3_posteriors(_reconstruct_tier3_posteriors(_loaded))
             break
 
     if compare_btn.value:
@@ -1319,15 +1334,35 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
         _t3_items = []
         _t3_items.append(mo.md("## Tier 3 — Observational Spectra"))
 
+        def _fmt_t3(value, fmt):
+            try:
+                return format(float(value), fmt)
+            except Exception:
+                return "nan"
+
         _obs_rows = []
         for _r in _t3:
             _obs_rows.append({
                 "Observation": _r.get("obs_file", "?"),
-                "Reduced chi2": f"{_r.get('reduced_chi2', float('nan')):.2f}",
-                "PPC Coverage": f"{_r.get('ppc_coverage', float('nan')):.2f}",
+                "Reduced chi2": _fmt_t3(_r.get('reduced_chi2'), ".2f"),
+                "Sirocco chi2": _fmt_t3(_r.get('sirocco_reduced_chi2'), ".2f"),
+                "PPC Coverage": _fmt_t3(_r.get('ppc_coverage'), ".2f"),
+                "Inclination": _fmt_t3(_r.get('exact_inclination'), ".2f"),
                 "Converged": "yes" if _r.get("mcmc_converged") else "no",
             })
         _t3_items.append(mo.ui.table(_obs_rows, label="Observational Results"))
+
+        _artifact_rows = []
+        for _r in _t3:
+            _artifact_rows.append({
+                "Observation": _r.get("obs_file", "?"),
+                "PF": _r.get("pf_path", ""),
+                "Signal Log": _r.get("sirocco_signal_log_path", ""),
+                "Reduced .spec": _r.get("sirocco_reduced_spec_path", ""),
+                "Plot Data": (_r.get("artifacts") or {}).get("plot_data_npz", ""),
+                "Posterior": (_r.get("artifacts") or {}).get("posterior_npz", ""),
+            })
+        _t3_items.append(mo.ui.table(_artifact_rows, label="Tier 3 Artifacts"))
 
         try:
             _obs_names = [_r.get("obs_file", f"#{_i}") for _i, _r in enumerate(_t3)]
@@ -1338,6 +1373,7 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                 {
                     "Observation": _name,
                     "Reduced chi2": float(_row.get("reduced_chi2", float("nan"))),
+                    "Sirocco Reduced chi2": float(_row.get("sirocco_reduced_chi2", float("nan"))),
                     "PPC Coverage": float(_row.get("ppc_coverage", float("nan"))),
                 }
                 for _name, _row in zip(_obs_names, _t3)
@@ -1663,6 +1699,202 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
     mo.vstack([
         mo.md("#### Best-Fit Spectrum (MCMC Posterior Mean)"),
         _fig,
+    ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(get_tier3_posteriors, mo):
+    _posteriors = get_tier3_posteriors()
+    mo.stop(
+        _posteriors is None or len(_posteriors) == 0,
+        mo.md("*Run a Tier 3 benchmark to view per-observation Sirocco diagnostics.*"),
+    )
+    _n = len(_posteriors)
+    t3_observation_slider = mo.ui.slider(
+        start=0, stop=_n - 1, value=0, step=1, show_value=True,
+        label="Observation index", full_width=True,
+    )
+    mo.vstack([
+        mo.md("## Tier 3 — Per-Observation Explorer"),
+        mo.md(f"Browse **{_n}** completed observation(s)."),
+        t3_observation_slider,
+    ])
+    return (t3_observation_slider,)
+
+
+@app.cell(hide_code=True)
+def _(get_tier3_posteriors, mo, np, os, render_fixed_matplotlib, t3_observation_slider):
+    import corner as _corner
+
+    _posteriors = get_tier3_posteriors()
+    mo.stop(_posteriors is None or len(_posteriors) == 0)
+
+    _post = _posteriors[t3_observation_slider.value]
+    _artifacts = _post.get("artifacts") or {}
+    _posterior_path = _artifacts.get("posterior_npz")
+    mo.stop(
+        not _posterior_path or not os.path.isfile(_posterior_path),
+        mo.md("*Tier 3 posterior artifact is not available for this observation.*"),
+    )
+
+    with np.load(_posterior_path, allow_pickle=False) as _npz:
+        _samples = np.array(_npz["samples"])
+        _labels = [str(_x) for _x in _npz["labels"].tolist()]
+
+    mo.stop(
+        _samples.size == 0 or len(_labels) == 0,
+        mo.md("*Tier 3 posterior artifact has no samples to plot.*"),
+    )
+
+    _fig = _corner.corner(
+        _samples,
+        labels=_labels,
+        show_titles=True,
+        quantiles=[0.16, 0.5, 0.84],
+        levels=[0.6827, 0.9545, 0.9973],
+        title_fmt=".4f",
+    )
+
+    def _fmt_metric(_value, _fmt):
+        try:
+            return format(float(_value), _fmt)
+        except Exception:
+            return "nan"
+
+    _summary = _post.get("mcmc_summary", {})
+    _rows = []
+    for _idx, _label in enumerate(_labels):
+        _s = _summary.get(_label, {})
+        _vals = _samples[:, _idx]
+        _rows.append({
+            "Parameter": _label,
+            "Mean": f"{float(_s.get('mean', np.mean(_vals))):.4f}",
+            "Std": f"{float(_s.get('std', np.std(_vals))):.4f}",
+            "Median": f"{float(_s.get('median', np.median(_vals))):.4f}",
+            "HDI 3%": f"{float(_s.get('hdi_3', np.percentile(_vals, 3))):.4f}",
+            "HDI 97%": f"{float(_s.get('hdi_97', np.percentile(_vals, 97))):.4f}",
+        })
+
+    _metrics = [{
+        "Metric": "Reduced chi2",
+        "Value": _fmt_metric(_post.get("reduced_chi2"), ".4f"),
+        "Description": "Emulator best fit vs data; about 1 is ideal.",
+    }, {
+        "Metric": "Sirocco reduced chi2",
+        "Value": _fmt_metric(_post.get("sirocco_reduced_chi2"), ".4f"),
+        "Description": "Transformed Sirocco vs data; about 1 is ideal.",
+    }, {
+        "Metric": "PPC coverage",
+        "Value": _fmt_metric(_post.get("ppc_coverage"), ".4f"),
+        "Description": "Fraction inside 95% posterior band; ideal is 0.95.",
+    }, {
+        "Metric": "Emulator-Sirocco fractional RMSE",
+        "Value": _fmt_metric(_post.get("emulator_sirocco_frac_rmse"), ".4f"),
+        "Description": "Relative model disagreement; 0 is perfect.",
+    }]
+
+    _inc_display = _fmt_metric(_post.get("exact_inclination"), ".2f")
+    mo.vstack([
+        mo.md(f"### {_post.get('obs_file', '?')} @ {_inc_display} deg"),
+        mo.ui.table(_metrics, label="Fit Metrics", selection=None),
+        mo.ui.table(_rows, label="Posterior Summary", selection=None),
+        render_fixed_matplotlib(mo, _fig, width_px=920),
+    ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_observation_slider):
+    _posteriors = get_tier3_posteriors()
+    mo.stop(_posteriors is None or len(_posteriors) == 0)
+
+    _post = _posteriors[t3_observation_slider.value]
+    _artifacts = _post.get("artifacts") or {}
+    _plot_path = _artifacts.get("plot_data_npz")
+    mo.stop(
+        not _plot_path or not os.path.isfile(_plot_path),
+        mo.md("*Tier 3 plot-data artifact is not available for this observation.*"),
+    )
+
+    with np.load(_plot_path, allow_pickle=False) as _npz:
+        _wl = np.array(_npz["wavelength"])
+        _data_flux = np.array(_npz["data_flux"])
+        _model_flux = np.array(_npz["model_flux"])
+        _model_cov_diag = np.array(_npz["model_cov_diag"])
+        _ppc_wl = np.array(_npz["ppc_wavelength"])
+        _ppc_low = np.array(_npz["ppc_low"])
+        _ppc_high = np.array(_npz["ppc_high"])
+        _sirocco_wl = np.array(_npz["sirocco_wavelength"])
+        _sirocco_flux = np.array(_npz["sirocco_flux"])
+        _sirocco_label = "Sirocco Model"
+        if "sirocco_label" in _npz.files:
+            _sirocco_label = str(_npz["sirocco_label"][0])
+
+    _sirocco_label = _post.get("sirocco_transform_label") or _sirocco_label
+
+    _extra = []
+    if len(_sirocco_wl) and len(_sirocco_flux):
+        _extra.append({
+            "wavelength": _sirocco_wl,
+            "flux": _sirocco_flux,
+            "label": _sirocco_label,
+            "color": "#9467bd",
+            "dash": [6, 3],
+        })
+
+    _bestfit = build_bestfit_spectrum_altair(
+        alt,
+        wavelength=_wl,
+        data_flux=_data_flux,
+        model_flux=_model_flux,
+        model_cov_diag=_model_cov_diag,
+        title=f"Tier 3 Best Fit — {_post.get('obs_file', '?')}",
+        zoom_name=f"tier3_bestfit_zoom_{t3_observation_slider.value}",
+        extra_flux_series=_extra,
+    )
+
+    _ppc_values = []
+    for _w, _d, _lo, _hi in zip(_ppc_wl, _data_flux, _ppc_low, _ppc_high):
+        _ppc_values.append({
+            "Wavelength": float(_w),
+            "Data": float(_d),
+            "Lower": float(_lo),
+            "Upper": float(_hi),
+        })
+    _ppc_band = alt.Chart(alt.Data(values=_ppc_values)).mark_area(
+        color="#54a24b", opacity=0.24,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (A)"),
+        y=alt.Y("Lower:Q", title="Flux", scale=alt.Scale(zero=False)),
+        y2="Upper:Q",
+        tooltip=[
+            alt.Tooltip("Wavelength:Q", title="Wavelength", format=".1f"),
+            alt.Tooltip("Lower:Q", title="PPC 2.5%", format=".4e"),
+            alt.Tooltip("Upper:Q", title="PPC 97.5%", format=".4e"),
+        ],
+    )
+    _ppc_data = alt.Chart(alt.Data(values=_ppc_values)).mark_line(
+        color="#4c78a8", strokeWidth=1.2,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (A)"),
+        y=alt.Y("Data:Q", title="Flux", scale=alt.Scale(zero=False)),
+        tooltip=[
+            alt.Tooltip("Wavelength:Q", title="Wavelength", format=".1f"),
+            alt.Tooltip("Data:Q", title="Data", format=".4e"),
+        ],
+    )
+    _ppc_chart = (_ppc_band + _ppc_data).properties(
+        width=760,
+        height=300,
+        title="Posterior Predictive Envelope",
+    ).interactive()
+
+    mo.vstack([
+        mo.md("#### Best-Fit Spectrum with Sirocco Overlay"),
+        _bestfit,
+        mo.md("#### Posterior Predictive Check"),
+        _ppc_chart,
     ])
     return
 
@@ -2254,11 +2486,16 @@ def _(glob, mo, os):
     )
     mcmc_steps_slider = mo.ui.slider(
         start=100, stop=5000, value=2500, step=100, show_value=True,
-        label="MCMC steps",
+        label="MCMC steps (Tier 2/3)",
     )
     mle_restarts_slider = mo.ui.slider(
-        start=1, stop=10, value=3, step=1, show_value=True,
-        label="MLE restarts",
+        start=1, stop=10, value=5, step=1, show_value=True,
+        label="MLE restarts (Tier 2/3)",
+    )
+    _cpu_total = max(1, os.cpu_count() or 1)
+    sirocco_cpu_slider = mo.ui.slider(
+        start=1, stop=_cpu_total, value=max(1, _cpu_total // 2), step=1,
+        show_value=True, label="Sirocco CPUs (Tier 3)", full_width=True,
     )
 
     # Inclination selector for Tier 2: which viewing angle column to read from
@@ -2282,6 +2519,7 @@ def _(glob, mo, os):
         mcmc_steps_slider,
         mle_restarts_slider,
         obs_picker,
+        sirocco_cpu_slider,
         tier_picker,
     )
 
@@ -2382,6 +2620,7 @@ def _(
     mle_restarts_slider,
     mo,
     obs_picker,
+    sirocco_cpu_slider,
     tier_picker,
 ):
     mo.vstack([
@@ -2390,8 +2629,41 @@ def _(
         emu_grid_info,
         mo.hstack([obs_picker], gap=1),
         mo.hstack([tier_picker, max_spectra_slider, mcmc_steps_slider, mle_restarts_slider, inclination_picker], gap=1),
+        sirocco_cpu_slider,
     ])
     return
+
+
+@app.cell(hide_code=True)
+def _(mo, sirocco_cpu_slider, tier_picker):
+    _selected_tiers = set(tier_picker.value or [])
+    if 3 not in _selected_tiers and "Tier 3" not in _selected_tiers:
+        tier3_sirocco_status = {"ok": True, "missing": []}
+        mo.stop(True)
+
+    from Speculate_addons.speculate_benchmark import check_sirocco_runtime
+
+    tier3_sirocco_status = check_sirocco_runtime(sirocco_cpu_slider.value)
+    _env_info = tier3_sirocco_status.get("environment") or {}
+    _env_msg = ""
+    if _env_info.get("configured") and _env_info.get("sirocco_root"):
+        _env_msg = f" Auto-configured Sirocco from `{_env_info['sirocco_root']}`."
+    if tier3_sirocco_status["ok"]:
+        _msg = (
+            f"Sirocco runtime ready. Tier 3 will use "
+            f"{tier3_sirocco_status['cpus']} CPU(s).{_env_msg}"
+        )
+        mo.callout(mo.md(_msg), kind="success")
+    else:
+        _missing = ", ".join(tier3_sirocco_status["missing"])
+        mo.callout(
+            mo.md(
+                "Tier 3 requires Sirocco before the benchmark can run. "
+                f"Missing command(s): `{_missing}`.{_env_msg}"
+            ),
+            kind="danger",
+        )
+    return (tier3_sirocco_status,)
 
 
 @app.cell(hide_code=True)
@@ -2497,6 +2769,8 @@ def _(
     set_status_msg,
     set_tier1_arrays,
     set_tier2_posteriors,
+    set_tier3_posteriors,
+    sirocco_cpu_slider,
     tier2_mcmc_freeze,
     tier2_mle_freeze,
     tier_picker,
@@ -2518,6 +2792,7 @@ def _(
         from Speculate_addons.speculate_benchmark import (
             run_tier1 as _run_tier1,
             run_tier3_single as _run_tier3_single,
+            check_sirocco_runtime as _check_sirocco_runtime,
             build_report_card as _build_report_card,
             build_tier2_freeze_defaults as _build_tier2_freeze_defaults,
             save_report as _save_report,
@@ -2554,13 +2829,28 @@ def _(
         # partial reruns cannot inherit stale Tier 1 or Tier 2 diagnostics.
         set_tier1_arrays(None)
         set_tier2_posteriors(None)
+        set_tier3_posteriors(None)
 
         # The picker stores numeric tier ids; keep the selected run isolated to
         # this execution so later reactive reruns do not reuse stale results.
         _tiers = [_v for _v in (tier_picker.value or [])]
+        _ts = time.strftime("%Y%m%d_%H%M%S")
+        _run_stem = f"benchmark_report_live_{_ts}"
+        _out_path = f"benchmark_results/{_run_stem}.json"
+        _tier3_export_dir = os.path.join("exports", _run_stem)
+        os.makedirs("benchmark_results", exist_ok=True)
+
+        if 3 in _tiers:
+            _runtime = _check_sirocco_runtime(sirocco_cpu_slider.value)
+            if not _runtime["ok"]:
+                _missing = ", ".join(_runtime["missing"])
+                set_status_msg(f"Error: Tier 3 requires missing Sirocco command(s): {_missing}")
+                mo.stop(True)
+
         # Resolve the shared flux-scaling mode once so both Tier 2 and Tier 3
         # use the same setting even if only one tier is selected.
         _flux_scale = flux_scale_picker.value
+        _tier3_wl_range = (float(_np.nanmin(_emu.wl)), float(_np.nanmax(_emu.wl)))
         _tier2_defaults = _build_tier2_freeze_defaults(_emu.param_names)
         _tier2_mle_freeze_settings = dict(tier2_mle_freeze.value or _tier2_defaults["mle"])
         _tier2_mcmc_freeze_settings = dict(tier2_mcmc_freeze.value or _tier2_defaults["mcmc"])
@@ -2630,6 +2920,8 @@ def _(
             _n_not_converged = 0
             _failure_log = []
             _mcmc_steps_val = mcmc_steps_slider.value
+            _mcmc_walkers_val = 64
+            _mcmc_burnin_val = 500
 
             # Resume: load any previously checkpointed results
             if os.path.exists(_checkpoint_path):
@@ -2835,9 +3127,9 @@ def _(
                         try:
                             _mcmc = _run_mcmc(
                                 _mle["model"], _mle["priors"],
-                                nwalkers=64,
+                                nwalkers=_mcmc_walkers_val,
                                 nsteps=_mcmc_steps_val,
-                                burnin=500,
+                                burnin=_mcmc_burnin_val,
                                 iteration_callback=_mcmc_cb,
                                 freeze_params=_tier2_mcmc_freeze_settings,
                             )
@@ -2880,7 +3172,7 @@ def _(
                         # Full posterior for corner-plot explorer on resume
                         "full_samples": _mcmc["samples"].tolist(),
                         "full_chain": _mcmc["full_chain"].tolist(),
-                        "burnin_used": _mcmc.get("burnin_used", 500),
+                        "burnin_used": _mcmc.get("burnin_used", _mcmc_burnin_val),
                         "full_labels": _mcmc.get("labels", []),
                         "full_summary": {
                             k: {sk: sv for sk, sv in v.items()}
@@ -2940,7 +3232,7 @@ def _(
                         "inclination": _inc,
                         "samples": _mcmc["samples"],  # (N, ndim) burnt+thinned flat samples
                         "full_chain": _mcmc["full_chain"],  # (nsteps, nwalkers, ndim) full chain
-                        "burnin_used": _mcmc.get("burnin_used", 500),
+                        "burnin_used": _mcmc.get("burnin_used", _mcmc_burnin_val),
                         "labels": _mcmc_labels,
                         "summary": _mcmc["summary"],
                         "converged": _mcmc["converged"],
@@ -2981,9 +3273,9 @@ def _(
                 spec_files_count=_n_t2,
                 failures=_failures,
                 failure_log=_failure_log,
-                mcmc_walkers=64,
+                mcmc_walkers=_mcmc_walkers_val,
                 mcmc_steps=_mcmc_steps_val,
-                mcmc_burnin=500,
+                mcmc_burnin=_mcmc_burnin_val,
                 elapsed=time.time() - _t2_t0,
                 n_not_converged=_n_not_converged,
                 mle_freeze_params=_tier2_mle_freeze_settings,
@@ -3005,6 +3297,7 @@ def _(
         if 3 in _tiers and obs_picker.value:
             _obs_list = obs_picker.value
             _tier3_results = []
+            os.makedirs(_tier3_export_dir, exist_ok=True)
             with mo.status.progress_bar(
                 total=len(_obs_list),
                 title="Tier 3 — Observational Spectra",
@@ -3022,19 +3315,73 @@ def _(
                 if "_emu_" in _emu_base:
                     _grid_stem = _emu_base.split("_emu_")[0]
 
-                for _obs_path in _obs_list:
+                for _obs_i, _obs_path in enumerate(_obs_list, start=1):
+                    _obs_name = os.path.basename(_obs_path)
+                    _obs_stem = os.path.splitext(os.path.basename(_obs_path))[0]
+                    _safe_obs_stem = "".join(
+                        _ch if _ch.isalnum() or _ch in "-_" else "_"
+                        for _ch in _obs_stem
+                    ).strip("_") or "observation"
+                    _obs_export_dir = os.path.join(_tier3_export_dir, _safe_obs_stem)
+                    _obs_progress = f"{_obs_name} ({_obs_i}/{len(_obs_list)})"
+
+                    def _t3_mle_cb(it, mx, best_nll, elapsed, restart=1, n_rst=1):
+                        _rst_info = f"Restart {restart}/{n_rst} | " if n_rst > 1 else ""
+                        try:
+                            _best_value = float(best_nll)
+                            _best_info = f"Best NLL: {_best_value:.2f} | " if _np.isfinite(_best_value) else ""
+                        except Exception:
+                            _best_info = ""
+                        _t3_bar.update(
+                            increment=0,
+                            subtitle=(
+                                f"MLE {_obs_progress} | "
+                                f"{_rst_info}"
+                                f"Eval {it}/{mx} | "
+                                f"{_best_info}"
+                                f"Time: {elapsed:.1f}s"
+                            ),
+                        )
+
+                    def _t3_mcmc_cb(step, total, elapsed):
+                        _t3_bar.update(
+                            increment=0,
+                            subtitle=(
+                                f"MCMC {_obs_progress} | "
+                                f"Step {step}/{total} | "
+                                f"Time: {elapsed:.1f}s"
+                            ),
+                        )
+
+                    def _t3_sirocco_cb(event):
+                        _message = event.get("message") or event.get("line") or "Simulation running"
+                        _t3_bar.update(
+                            increment=0,
+                            subtitle=f"Sirocco {_obs_progress} | {_message}",
+                        )
+
                     # Tier 3 reports are independent, so the loop only needs to append
                     # each completed result and advance the progress bar.
                     _t3_bar.update(
                         increment=0,
-                        subtitle=f"Fitting {os.path.basename(_obs_path)}…",
+                        subtitle=f"Starting MLE {_obs_progress}…",
                     )
                     _r = _run_tier3_single(
                         _emu, _obs_path,
                         flux_scale=_flux_scale,
+                        wl_range=_tier3_wl_range,
+                        mle_restarts=mle_restarts_slider.value,
+                        mcmc_walkers=_mcmc_walkers_val,
                         mcmc_steps=mcmc_steps_slider.value,
+                        mcmc_burnin=_mcmc_burnin_val,
                         grid_name=_grid_stem,
-                        output_dir="exports",
+                        output_dir=_obs_export_dir,
+                        sirocco_cpus=sirocco_cpu_slider.value,
+                        require_sirocco=True,
+                        run_sirocco=True,
+                        mle_iteration_callback=_t3_mle_cb,
+                        mcmc_iteration_callback=_t3_mcmc_cb,
+                        sirocco_progress_callback=_t3_sirocco_cb,
                     )
                     _tier3_results.append(_r)
                     _pf_status = ""
@@ -3042,8 +3389,9 @@ def _(
                         _pf_status = f" → {os.path.basename(_r['pf_path'])}"
                     _t3_bar.update(
                         increment=1,
-                        subtitle=f"✓ {os.path.basename(_obs_path)} complete{_pf_status}",
+                        subtitle=f"✓ {_obs_name} complete{_pf_status}",
                     )
+            set_tier3_posteriors(_tier3_results if _tier3_results else None)
 
         # Store the execution settings alongside the benchmark outputs so a saved
         # report still records which emulator, grid, and limits produced it.
@@ -3052,9 +3400,14 @@ def _(
             "grid": matched_grid_path,
             "test_grid": matched_testgrid_path,
             "tiers": _tiers,
+            "mcmc_walkers": _mcmc_walkers_val,
             "mcmc_steps": mcmc_steps_slider.value,
+            "mcmc_burnin": _mcmc_burnin_val,
             "mle_restarts": mle_restarts_slider.value,
             "max_spectra": max_spectra_slider.value,
+            "sirocco_cpus": sirocco_cpu_slider.value,
+            "tier3_export_dir": _tier3_export_dir if 3 in _tiers else None,
+            "tier3_wl_range": list(_tier3_wl_range) if 3 in _tiers else None,
             "tier2_mle_freeze": dict(_tier2_mle_freeze_settings),
             "tier2_mcmc_freeze": dict(_tier2_mcmc_freeze_settings),
         }
@@ -3064,9 +3417,6 @@ def _(
         )
 
         # Save each live run under a timestamped filename to avoid clobbering earlier reports.
-        os.makedirs("benchmark_results", exist_ok=True)
-        _ts = time.strftime("%Y%m%d_%H%M%S")
-        _out_path = f"benchmark_results/benchmark_report_live_{_ts}.json"
         _save_report(_report, _out_path)
 
         set_report(_report)
