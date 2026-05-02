@@ -280,6 +280,24 @@ def _():
 
 
 @app.cell
+def _():
+    # Parameter IDs 9-11 encode inclination as trainable grid axes.  If no such
+    # axis is selected, Quick Fit trains against one fixed inclination column.
+    _qf_inclination_param_ids = {9, 10, 11}
+    qf_fixed_inclination_values = list(range(30, 90, 5))
+
+    def qf_has_trainable_inclination(param_values):
+        """Return whether selected Quick Fit parameters include inclination."""
+        return any(int(param_value) in _qf_inclination_param_ids for param_value in (param_values or []))
+
+    def qf_fixed_inclination_to_usecols(base_usecols, inclination):
+        """Map a fixed inclination angle to the grid-interface flux column."""
+        return (base_usecols[0], int(2 + (float(inclination) - 30.0) / 5.0))
+
+    return qf_fixed_inclination_to_usecols, qf_fixed_inclination_values, qf_has_trainable_inclination
+
+
+@app.cell
 def _(hf_mode_switch, is_hf_space_nav):
     # Determine whether we are running in HuggingFace Space mode.
     # In HF mode, training is disabled — only pre-trained model inference is available.
@@ -569,6 +587,36 @@ def _(
 
 
 @app.cell
+def _(
+    mo,
+    qf_fixed_inclination_values,
+    qf_has_trainable_inclination,
+    qf_is_hf_mode,
+    qf_params_selector,
+    qf_pretrained_selector,
+):
+    qf_fixed_inclination_selector = None
+    _pretrained_active = bool(qf_pretrained_selector.value and qf_pretrained_selector.value != "")
+
+    # The fixed-inclination selector only belongs to the local training path;
+    # pre-trained models carry their own inclination metadata into Stage 3.
+    if (
+        not qf_is_hf_mode
+        and not _pretrained_active
+        and qf_params_selector is not None
+        and qf_params_selector.value
+        and not qf_has_trainable_inclination(qf_params_selector.value)
+    ):
+        qf_fixed_inclination_selector = mo.ui.dropdown(
+            options={f"{value}°": value for value in qf_fixed_inclination_values},
+            value="55°",
+            label="Fixed Inclination:",
+        )
+
+    return (qf_fixed_inclination_selector,)
+
+
+@app.cell
 def _(mo):
     # Stage 1 configuration widgets for training.
     # These are all defined in one cell so marimo creates them in a single pass.
@@ -641,13 +689,25 @@ def _(mo):
 
 
 @app.cell
-def _(np, os, qf_grid_selector, qf_is_hf_mode, qf_params_selector, qf_scale_selector, qf_use_smoothing, qf_wl_max, qf_wl_min):
+def _(
+    np,
+    os,
+    qf_fixed_inclination_selector,
+    qf_grid_selector,
+    qf_has_trainable_inclination,
+    qf_is_hf_mode,
+    qf_params_selector,
+    qf_scale_selector,
+    qf_use_smoothing,
+    qf_wl_max,
+    qf_wl_min,
+):
     # Grid data loader: finds and loads the processed .npz grid file that
     # matches the user's current configuration (grid, params, scale,
     # smoothing AND wavelength range).
     #
     # Filename convention:
-    #   {grid_name}_grid_{param_digits}_{scale}[_smooth]_{wl_lo}-{wl_hi}AA.npz
+    #   {grid_name}_grid_{param_digits}_{scale}[_smooth][_{inc}inc]_{wl_lo}-{wl_hi}AA.npz
     #
     # The NPZ contains: grid_points (N×D), flux_data (dict of spectra keyed by
     # parameter combination), wl (wavelength array), and param_names.
@@ -664,14 +724,18 @@ def _(np, os, qf_grid_selector, qf_is_hf_mode, qf_params_selector, qf_scale_sele
         if qf_params_selector is not None and qf_params_selector.value:
             _selected_indices = sorted([int(v) for v in qf_params_selector.value])
 
+        _inclination_fixed = bool(_selected_indices) and not qf_has_trainable_inclination(_selected_indices)
+        _fixed_inc = int(qf_fixed_inclination_selector.value) if qf_fixed_inclination_selector is not None else 55
+        _fixed_inc_suffix = f"_{_fixed_inc}inc" if _inclination_fixed else ""
+
         # Build the EXACT expected filename so only a grid with the same params,
-        # scale, smoothing AND wavelength range can match.
+        # scale, smoothing, fixed inclination AND wavelength range can match.
         _param_tag = "".join(str(i) for i in _selected_indices) if _selected_indices else ""
         _scale = qf_scale_selector.value
         _smooth_suffix = "_smooth" if qf_use_smoothing.value else ""
         _wl_lo_tag = int(round(qf_wl_min.value))
         _wl_hi_tag = int(round(qf_wl_max.value))
-        _expected_file = f"{_grid_name}_grid_{_param_tag}_{_scale}{_smooth_suffix}_{_wl_lo_tag}-{_wl_hi_tag}AA.npz"
+        _expected_file = f"{_grid_name}_grid_{_param_tag}_{_scale}{_smooth_suffix}{_fixed_inc_suffix}_{_wl_lo_tag}-{_wl_hi_tag}AA.npz"
 
         # Load only if the exact file exists
         _path = os.path.join(_emu_dir, _expected_file) if _param_tag else ""
@@ -698,6 +762,7 @@ def _(
     get_qf_pca_result,
     mo,
     qf_ensemble_checkbox,
+    qf_fixed_inclination_selector,
     qf_grid_selector,
     qf_is_hf_mode,
     qf_model_type,
@@ -749,10 +814,18 @@ def _(
     _pretrained_active = bool(qf_pretrained_selector.value and qf_pretrained_selector.value != "")
     if not qf_is_hf_mode and not _pretrained_active:
         _elements.append(mo.md("---"))
-        _elements.append(
-            qf_params_selector if qf_params_selector is not None
-            else mo.md("*Select a grid first*")
-        )
+        if qf_params_selector is None:
+            _param_controls = mo.md("*Select a grid first*")
+        elif qf_fixed_inclination_selector is not None:
+            _param_controls = mo.hstack(
+                [qf_params_selector, qf_fixed_inclination_selector],
+                justify="start",
+                align="end",
+                gap=1,
+            )
+        else:
+            _param_controls = qf_params_selector
+        _elements.append(_param_controls)
 
         _elements.append(mo.md("---"))
         _model_type_row = [qf_model_type]
@@ -834,8 +907,11 @@ def _(
     mo,
     np,
     os,
+    qf_fixed_inclination_selector,
+    qf_fixed_inclination_to_usecols,
     qf_grid_configs,
     qf_grid_selector,
+    qf_has_trainable_inclination,
     qf_is_hf_mode,
     qf_n_components,
     qf_params_selector,
@@ -862,11 +938,14 @@ def _(
         _grid_name = qf_grid_selector.value
         _param_indices = sorted([int(v) for v in qf_params_selector.value])
         _param_tag = "".join(str(i) for i in _param_indices)
+        _inclination_fixed = not qf_has_trainable_inclination(_param_indices)
+        _fixed_inc = int(qf_fixed_inclination_selector.value) if qf_fixed_inclination_selector is not None else 55
+        _fixed_inc_suffix = f"_{_fixed_inc}inc" if _inclination_fixed else ""
         _scale = qf_scale_selector.value
         _smooth_suffix = "_smooth" if qf_use_smoothing.value else ""
         _wl_lo_tag = int(round(qf_wl_min.value))
         _wl_hi_tag = int(round(qf_wl_max.value))
-        _grid_file = f"{_grid_name}_grid_{_param_tag}_{_scale}{_smooth_suffix}_{_wl_lo_tag}-{_wl_hi_tag}AA.npz"
+        _grid_file = f"{_grid_name}_grid_{_param_tag}_{_scale}{_smooth_suffix}{_fixed_inc_suffix}_{_wl_lo_tag}-{_wl_hi_tag}AA.npz"
         _grid_path = os.path.join("Grid-Emulator_Files", _grid_file)
 
         _grid_ready = True
@@ -876,9 +955,13 @@ def _(
             try:
                 _config = qf_grid_configs[_grid_name]
                 _wl_range = (qf_wl_min.value, qf_wl_max.value)
+                _usecols = (
+                    qf_fixed_inclination_to_usecols(_config["usecols"], _fixed_inc)
+                    if _inclination_fixed else _config["usecols"]
+                )
                 _iface = _config["class"](
                     path=str(qf_sirocco_grids_path / _grid_name) + "/",
-                    usecols=_config["usecols"],
+                    usecols=_usecols,
                     wl_range=_wl_range,
                     model_parameters=tuple(_param_indices),
                     scale=_scale,
@@ -1038,9 +1121,12 @@ def _(
     os,
     pd,
     qf_ensemble_checkbox,
+    qf_fixed_inclination_selector,
+    qf_fixed_inclination_to_usecols,
     qf_grid_configs,
     qf_grid_data,
     qf_grid_selector,
+    qf_has_trainable_inclination,
     qf_live_plot,
     qf_max_train_iter,
     qf_model_type,
@@ -1082,11 +1168,14 @@ def _(
         _grid_name = qf_grid_selector.value
         _param_indices = sorted([int(v) for v in qf_params_selector.value])
         _param_tag = "".join(str(i) for i in _param_indices)
+        _inclination_fixed_for_build = not qf_has_trainable_inclination(_param_indices)
+        _fixed_inc_for_build = int(qf_fixed_inclination_selector.value) if qf_fixed_inclination_selector is not None else 55
+        _fixed_inc_suffix = f"_{_fixed_inc_for_build}inc" if _inclination_fixed_for_build else ""
         _scale = qf_scale_selector.value
         _smooth_suffix = "_smooth" if qf_use_smoothing.value else ""
         _wl_lo_tag = int(round(qf_wl_min.value))
         _wl_hi_tag = int(round(qf_wl_max.value))
-        _grid_file = f"{_grid_name}_grid_{_param_tag}_{_scale}{_smooth_suffix}_{_wl_lo_tag}-{_wl_hi_tag}AA.npz"
+        _grid_file = f"{_grid_name}_grid_{_param_tag}_{_scale}{_smooth_suffix}{_fixed_inc_suffix}_{_wl_lo_tag}-{_wl_hi_tag}AA.npz"
         _grid_path = os.path.join("Grid-Emulator_Files", _grid_file)
 
         if not os.path.exists(_grid_path):
@@ -1094,9 +1183,13 @@ def _(
                 try:
                     _config = qf_grid_configs[_grid_name]
                     _wl_range = (qf_wl_min.value, qf_wl_max.value)
+                    _usecols = (
+                        qf_fixed_inclination_to_usecols(_config["usecols"], _fixed_inc_for_build)
+                        if _inclination_fixed_for_build else _config["usecols"]
+                    )
                     _iface = _config["class"](
                         path=str(qf_sirocco_grids_path / _grid_name) + "/",
-                        usecols=_config["usecols"],
+                        usecols=_usecols,
                         wl_range=_wl_range,
                         model_parameters=tuple(_param_indices),
                         scale=_scale,
@@ -1142,6 +1235,12 @@ def _(
         _param_names = _qf_grid_data_local["param_names"]
 
         _selected_param_indices = [int(v) for v in qf_params_selector.value]
+        _fixed_inclination_value = (
+            float(qf_fixed_inclination_selector.value)
+            if (not qf_has_trainable_inclination(_selected_param_indices)
+                and qf_fixed_inclination_selector is not None)
+            else None
+        )
 
         # Map param column names (e.g. "param1", "param3") to their integer indices.
         # Then filter X_grid to only the user-selected parameter columns.
@@ -1269,6 +1368,7 @@ def _(
             "smoothing": qf_use_smoothing.value,
             "source_grid_file": qf_grid_selector.value,
             "selected_param_indices": _selected_param_indices,
+            "fixed_inclination": _fixed_inclination_value,
         }
 
     # ── Shared setup ─────────────────────────────────────────────────────
@@ -2332,15 +2432,16 @@ def _(
     #   - For NN: state dicts + architecture config for each ensemble member
     #   - For Grid Interp: grid_points + weights (enough to rebuild interpolators)
     # Filename convention:
-    #   NN (single):   {grid_name}_qfnn_{param_tag}_{scale}[_smooth]_{wlmin}-{wlmax}AA_{n}PCA.npz
-    #   NN (ensemble): {grid_name}_qfnn-ensemble_{param_tag}_{scale}[_smooth]_{wlmin}-{wlmax}AA_{n}PCA.npz
-    #   Grid Interp:   {grid_name}_qfgi_{param_tag}_{scale}[_smooth]_{wlmin}-{wlmax}AA_{n}PCA.npz
+    #   NN (single):   {grid_name}_qfnn_{param_tag}_{scale}[_smooth][_{inc}inc]_{wlmin}-{wlmax}AA_{n}PCA.npz
+    #   NN (ensemble): {grid_name}_qfnn-ensemble_{param_tag}_{scale}[_smooth][_{inc}inc]_{wlmin}-{wlmax}AA_{n}PCA.npz
+    #   Grid Interp:   {grid_name}_qfgi_{param_tag}_{scale}[_smooth][_{inc}inc]_{wlmin}-{wlmax}AA_{n}PCA.npz
     if qf_trained_models is None or qf_train_info is None or qf_pca_data is None:
         mo.stop(True, mo.md(""))
 
     _source = qf_train_info["source"]
 
     def _build_save_dict():
+        _fixed_inclination = qf_pca_data.get("fixed_inclination")
         _save_dict = {
             "model_type": _source,
             "best_hparams": json.dumps(qf_best_hparams or {}),
@@ -2356,6 +2457,7 @@ def _(
             "scale": qf_pca_data["scale"],
             "smoothing": qf_pca_data["smoothing"],
             "selected_param_indices": qf_pca_data["selected_param_indices"],
+            "fixed_inclination": np.nan if _fixed_inclination is None else float(_fixed_inclination),
             "input_scaler_min": qf_input_scaler["min"],
             "input_scaler_max": qf_input_scaler["max"],
             "input_scaler_range": qf_input_scaler["range"],
@@ -2393,10 +2495,12 @@ def _(
     _param_digits = "".join(str(i) for i in sorted(qf_pca_data["selected_param_indices"]))
     _scale = qf_pca_data["scale"]
     _smooth_suffix = "_smooth" if qf_pca_data["smoothing"] else ""
+    _fixed_inclination = qf_pca_data.get("fixed_inclination")
+    _fixed_inc_suffix = "" if _fixed_inclination is None else f"_{int(round(_fixed_inclination))}inc"
     _wl_arr = qf_pca_data["wl"]
     _wl_lo, _wl_hi = int(round(_wl_arr.min())), int(round(_wl_arr.max()))
     _n_pca = int(qf_pca_data["n_components"])
-    _out_name = f"{_grid_base}_{_tag}_{_param_digits}_{_scale}{_smooth_suffix}_{_wl_lo}-{_wl_hi}AA_{_n_pca}PCA.npz"
+    _out_name = f"{_grid_base}_{_tag}_{_param_digits}_{_scale}{_smooth_suffix}{_fixed_inc_suffix}_{_wl_lo}-{_wl_hi}AA_{_n_pca}PCA.npz"
     _out_path = os.path.join(_emu_dir, _out_name)
 
     # Auto-save when running locally (not on HuggingFace)
@@ -2460,25 +2564,39 @@ def _(get_qf_inf_refresh, mo, os, qf_hf_model_cache_result, qf_pretrained_select
                 _tag = "NN-Ensemble" if "_qfnn-ensemble_" in _f else ("NN" if "_qfnn_" in _f else "GridInterp")
                 _qf_files[f"[{_tag}] {_f}"] = _f
 
-    _qf_options = {"— None (select a trained model) —": ""}
-    _qf_options.update(_qf_files)
-
-    # If a pre-trained model was selected in Stage 1, auto-select it here.
-    _default = "— None (select a trained model) —"
     _pre = qf_pretrained_selector.value if qf_pretrained_selector is not None else ""
     if _pre and _pre != "":
+        # Stage 1 is authoritative for pre-trained inference.  Keep a hidden
+        # dropdown-shaped value for downstream loader compatibility, but render
+        # only a read-only status so the user cannot pick a conflicting model.
+        _pre_label = _pre
         for _label, _val in _qf_files.items():
             if _val == _pre:
-                _default = _label
+                _pre_label = _label
                 break
+        qf_inf_model_selector = mo.ui.dropdown(
+            options={_pre_label: _pre},
+            value=_pre_label,
+            label="Selected Quick Fit Model:",
+            full_width=True,
+        )
+        qf_inf_model_picker = mo.callout(
+            mo.md(f"**Quick Fit model:** `{_pre}`"),
+            kind="neutral",
+        )
+    else:
+        _qf_options = {"— None (select a trained model) —": ""}
+        _qf_options.update(_qf_files)
 
-    qf_inf_model_selector = mo.ui.dropdown(
-        options=_qf_options,
-        value=_default,
-        label="Select Trained Quick Fit Model:",
-        full_width=True,
-    )
-    return (qf_inf_model_selector,)
+        qf_inf_model_selector = mo.ui.dropdown(
+            options=_qf_options,
+            value="— None (select a trained model) —",
+            label="Select Trained Quick Fit Model:",
+            full_width=True,
+        )
+        qf_inf_model_picker = qf_inf_model_selector
+
+    return qf_inf_model_picker, qf_inf_model_selector
 
 
 @app.cell
@@ -2514,6 +2632,42 @@ def _(
         try:
             _npz = np.load(_path, allow_pickle=True)
             _model_type = str(_npz.get("model_type", "nn"))
+            _param_names = list(_npz["param_names"])
+
+            def _param_index(param_name):
+                """Extract the numeric parameter ID from saved names like param11."""
+                _raw = param_name.decode() if isinstance(param_name, bytes) else str(param_name)
+                _digits = "".join(_ch for _ch in _raw if _ch.isdigit())
+                return int(_digits) if _digits else None
+
+            # New exports store selected_param_indices explicitly.  Older files
+            # only have param_names, so infer the same IDs from those labels.
+            if "selected_param_indices" in _npz.files:
+                _selected_param_indices = [int(_v) for _v in np.array(_npz["selected_param_indices"]).ravel()]
+            else:
+                _selected_param_indices = [
+                    _idx for _idx in (_param_index(_name) for _name in _param_names)
+                    if _idx is not None
+                ]
+            _has_trainable_inclination = any(_idx in {9, 10, 11} for _idx in _selected_param_indices)
+
+            # fixed_inclination is optional for legacy files.  Missing metadata
+            # means trainable inclination when an inclination axis is present;
+            # otherwise preserve the old fixed-55-degree convention unless the
+            # filename already carries an explicit _NNinc suffix.
+            if "fixed_inclination" in _npz.files:
+                _fixed_inclination = float(np.array(_npz["fixed_inclination"]).item())
+                if not np.isfinite(_fixed_inclination):
+                    _fixed_inclination = None
+            elif _has_trainable_inclination:
+                _fixed_inclination = None
+            else:
+                _stem = os.path.splitext(os.path.basename(qf_inf_model_selector.value))[0]
+                _fixed_inclination = 55.0
+                for _part in _stem.split("_"):
+                    if _part.endswith("inc") and _part[:-3].isdigit():
+                        _fixed_inclination = float(_part[:-3])
+                        break
 
             # Extract PCA reconstruction data and grid metadata.
             # These are shared by both NN and Grid Interp models.
@@ -2524,11 +2678,13 @@ def _(
                 "flux_mean": np.array(_npz["flux_mean"]),
                 "flux_std": np.array(_npz["flux_std"]),
                 "wl": np.array(_npz["wl"]),
-                "param_names": list(_npz["param_names"]),
+                "param_names": _param_names,
                 "min_params": np.array(_npz["grid_points"]).min(axis=0),
                 "max_params": np.array(_npz["grid_points"]).max(axis=0),
                 "source_file": qf_inf_model_selector.value,
                 "scale": str(_npz.get("scale", "linear")),
+                "selected_param_indices": _selected_param_indices,
+                "fixed_inclination": _fixed_inclination,
             }
 
             # Restore input parameter scaler (min-max normalisation).
@@ -2775,6 +2931,7 @@ def _(
     os,
     qf_inf_emu_data,
     qf_inf_is_grid_interp,
+    qf_inf_model_picker,
     qf_inf_model_selector,
     qf_inf_models,
     qf_inf_wl_slider,
@@ -2831,7 +2988,7 @@ def _(
         )
 
     mo.vstack([
-        qf_inf_model_selector,
+        qf_inf_model_picker,
         _model_status,
         mo.md("---"),
         qf_obs_selector,
@@ -2986,6 +3143,7 @@ def _(
     _min_p = qf_inf_emu_data["min_params"]
     _max_p = qf_inf_emu_data["max_params"]
     _param_names = qf_inf_emu_data["param_names"]
+    _fixed_inclination = qf_inf_emu_data.get("fixed_inclination")
     _n_params = len(_param_names)
 
     _fixed_toggles = []
@@ -3097,7 +3255,18 @@ def _(
         f"{mo.icon('lucide:sliders-horizontal')} Parameter Configuration": mo.vstack(_config_elements)
     }, lazy=True)
 
-    _config_accordion
+    if _fixed_inclination is not None:
+        _config_output = mo.vstack([
+            mo.callout(
+                mo.md(f"**Fixed Inclination:** {_fixed_inclination:g}°"),
+                kind="neutral",
+            ),
+            _config_accordion,
+        ])
+    else:
+        _config_output = _config_accordion
+
+    _config_output
     return (qf_param_config,)
 
 
@@ -3318,7 +3487,7 @@ def _(
 
             # Build chart
             _obs_df = pd.DataFrame({'Wavelength': _obs_wl_c, 'Flux': _obs_fl_c, 'Type': 'Observation'})
-            _emu_df = pd.DataFrame({'Wavelength': _emu_wl_c, 'Flux': _emu_fl_c, 'Type': 'Emulated (midpoint)'})
+            _emu_df = pd.DataFrame({'Wavelength': _emu_wl_c, 'Flux': _emu_fl_c, 'Type': 'Emulated'})
 
             if len(_obs_df) > 5000:
                 _obs_df = _obs_df.iloc[::max(1, len(_obs_df) // 5000)]
@@ -3326,17 +3495,24 @@ def _(
                 _emu_df = _emu_df.iloc[::max(1, len(_emu_df) // 5000)]
 
             _combined = pd.concat([_obs_df, _emu_df], ignore_index=True)
-            _color_scale = alt.Scale(domain=['Observation', 'Emulated (midpoint)'], range=['cyan', 'orange'])
+            _color_scale = alt.Scale(domain=['Observation', 'Emulated'], range=['cyan', 'orange'])
             _y_format = '.1e' if _scale_c == 'linear' else '.2f'
+            # Bind zoom/pan to wavelength only so inspecting a spectral window
+            # does not silently rescale the flux axis at the same time.
+            _zoom_x = alt.selection_interval(
+                name="qf_playground_x_zoom",
+                bind="scales",
+                encodings=["x"],
+            )
 
             _pg_chart = alt.Chart(_combined).mark_line(opacity=0.9).encode(
-                x=alt.X('Wavelength:Q', title='Wavelength (Å)'),
-                y=alt.Y('Flux:Q', title=f'Flux ({_scale_c})', axis=alt.Axis(format=_y_format)),
+                x=alt.X('Wavelength:Q', title='Wavelength (Å)', scale=alt.Scale(zero=False)),
+                y=alt.Y('Flux:Q', title=f'Flux ({_scale_c})', axis=alt.Axis(format=_y_format), scale=alt.Scale(zero=False)),
                 color=alt.Color('Type:N', scale=_color_scale),
                 tooltip=['Wavelength:Q', 'Flux:Q', 'Type:N'],
             ).properties(width="container", height=400,
-                         title=f"Playground: Emulated (midpoint) vs Observation [{_scale_c}]"
-            ).interactive()
+                         title=f"Playground: Emulated vs Observation [{_scale_c}]"
+            ).add_params(_zoom_x)
         except Exception as _e:
             _pg_chart = mo.callout(mo.md(f"Playground error: {_e}"), kind="danger")
 
@@ -4078,6 +4254,7 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
         mo.stop(True, mo.md(""))
 
     _src_file = qf_inf_emu_data.get("source_file", "unknown") if qf_inf_emu_data else "unknown"
+    _fixed_inclination = qf_inf_emu_data.get("fixed_inclination") if qf_inf_emu_data else None
 
     def _export_csv(_):
         _dir = "exports"
@@ -4094,7 +4271,15 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
             if _i in _active_idx:
                 _ai += 1
             _rows.append({"parameter": _name, "value": float(_best[_i]),
+                          "fixed": _i not in _active_idx,
                           "ensemble_1sigma": _ee})
+        if _fixed_inclination is not None and "Inclination" not in _labels:
+            _rows.append({
+                "parameter": "Inclination",
+                "value": float(_fixed_inclination),
+                "fixed": True,
+                "ensemble_1sigma": None,
+            })
 
         _df = pd.DataFrame(_rows)
         _path = os.path.join(_dir, f"quickfit_{_src_file}_params.csv")
@@ -4110,6 +4295,8 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
             "converged": bool(qf_mle_result["success"]),
             "parameters": {},
         }
+        if _fixed_inclination is not None:
+            _out["fixed_inclination"] = float(_fixed_inclination)
         _labels = qf_mle_result["labels"]
         _best = qf_mle_result["best_params"]
         _active_idx = qf_mle_result["active_idx"]
@@ -4121,6 +4308,11 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
                 _entry["ensemble_1sigma"] = float(_e_err[_ai]) if np.isfinite(_e_err[_ai]) else None
                 _ai += 1
             _out["parameters"][_name] = _entry
+        if _fixed_inclination is not None and "Inclination" not in _out["parameters"]:
+            _out["parameters"]["Inclination"] = {
+                "value": float(_fixed_inclination),
+                "fixed": True,
+            }
 
         _path = os.path.join(_dir, f"quickfit_{_src_file}_summary.json")
         with open(_path, 'w') as f:
@@ -4141,6 +4333,11 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
             _param_names = qf_inf_emu_data["param_names"]
 
             physical = emulator_to_physical(_param_names, _best[:_n_phys])
+            _observer_angle = None
+            if _fixed_inclination is not None:
+                _observer_angle = float(_fixed_inclination)
+            elif "Inclination" in physical:
+                _observer_angle = float(physical["Inclination"])
 
             # Determine grid name from source file
             _src = qf_inf_emu_data.get("source_file", "unknown")
@@ -4156,6 +4353,8 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
                 f"### Source model: {_src}",
                 "###",
             ]
+            if _observer_angle is not None:
+                header.insert(-1, f"### Observer inclination: {_observer_angle:.6f}")
 
             _nuisance = {}
             for _i in range(_n_phys, len(_labels)):
@@ -4173,6 +4372,7 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
                 physical_params=physical,
                 output_path=_pf_path,
                 header_lines=header,
+                observer_angles=[_observer_angle] if _observer_angle is not None else None,
             )
             mo.status.toast(f"Exported {_pf_path}", kind="success")
         except Exception as _e:
