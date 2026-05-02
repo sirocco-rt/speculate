@@ -2126,10 +2126,12 @@ def _(mo):
     get_mcmc_samples, set_mcmc_samples = mo.state(None)     # (n_samples, n_dim) array
     get_mcmc_labels, set_mcmc_labels = mo.state(None)       # friendly parameter names
     get_mcmc_summary_df, set_mcmc_summary_df = mo.state(None) # ArviZ summary table
+    get_mcmc_corner_meta, set_mcmc_corner_meta = mo.state(None) # corner-plot export metadata
     return (
         get_mle_model, get_mle_priors, set_mle_model, set_mle_priors,
         get_mcmc_samples, set_mcmc_samples,
         get_mcmc_labels, set_mcmc_labels,
+        get_mcmc_corner_meta, set_mcmc_corner_meta,
         get_mcmc_summary_df, set_mcmc_summary_df,
     )
 
@@ -2917,6 +2919,7 @@ def _(
     np,
     run_mcmc_btn,
     set_mcmc_labels,
+    set_mcmc_corner_meta,
     set_mcmc_samples,
     set_mcmc_summary_df,
     stats,
@@ -2940,6 +2943,11 @@ def _(
     mcmc_results = None
 
     if run_mcmc_btn.value:
+        set_mcmc_samples(None)
+        set_mcmc_labels(None)
+        set_mcmc_summary_df(None)
+        set_mcmc_corner_meta(None)
+
         _model = get_mle_model()
         _priors = get_mle_priors()
 
@@ -3141,6 +3149,9 @@ def _(
                 # ============================================================
                 # Stage 18: Corner plot
                 # ============================================================
+                _corner_quantiles = [0.16, 0.5, 0.84]
+                _corner_levels = [0.6827, 0.9545, 0.9973]
+
                 # Corner-plot truths are matched through the same friendly-name map
                 # used elsewhere, with all inclination variants collapsed onto the
                 # single lookup-table "Inclination" key.
@@ -3165,8 +3176,8 @@ def _(
                     _burn_samples,
                     labels=_friendly_labels,
                     show_titles=True,
-                    quantiles=[0.16, 0.5, 0.84],
-                    levels=[0.6827, 0.9545, 0.9973],
+                    quantiles=_corner_quantiles,
+                    levels=_corner_levels,
                     title_fmt=".4f",
                     truths=_truths
                 )
@@ -3189,8 +3200,8 @@ def _(
                         _burn_samples,
                         labels=_friendly_labels,
                         show_titles=True,
-                        quantiles=[0.16, 0.5, 0.84],
-                        levels=[0.6827, 0.9545, 0.9973],
+                        quantiles=_corner_quantiles,
+                        levels=_corner_levels,
                         title_fmt=".4f",
                         truths=_truths,
                         range=_safe_ranges,
@@ -3201,6 +3212,39 @@ def _(
                     })
                 else:
                     _corner_display = _fig_corner
+
+                set_mcmc_corner_meta({
+                    "source": "inference",
+                    "data_name": getattr(_model, "data_name", None),
+                    "internal_labels": list(_model.labels),
+                    "truths": list(_truths) if _truths is not None else None,
+                    "ground_truth": dict(ground_truth_params or {}),
+                    "prior_ranges": [
+                        list(_r) if _r is not None else None
+                        for _r in _prior_ranges
+                    ],
+                    "plot_variants": [
+                        "posterior_auto_range",
+                        "full_prior_range",
+                    ] if any(_r is not None for _r in _prior_ranges) else [
+                        "posterior_auto_range"
+                    ],
+                    "corner_settings": {
+                        "show_titles": True,
+                        "quantiles": list(_corner_quantiles),
+                        "levels": list(_corner_levels),
+                        "title_fmt": ".4f",
+                    },
+                    "mcmc": {
+                        "nsteps": int(_nsteps),
+                        "nwalkers": int(_nwalkers),
+                        "manual_burnin": int(_burnin_manual),
+                        "auto_burnin": int(_auto_burnin),
+                        "burnin_used": int(_burnin_used),
+                        "thin_used": int(_thin_used),
+                        "effective_samples": int(_burn_samples.shape[0]),
+                    },
+                })
 
                 # ============================================================
                 # Stage 19: Best-fit MCMC model plot
@@ -3327,6 +3371,7 @@ def _(mo):
 def _(
     emu,
     get_mcmc_labels,
+    get_mcmc_corner_meta,
     get_mcmc_samples,
     get_mcmc_summary_df,
     get_mle_model,
@@ -3344,6 +3389,7 @@ def _(
     # they were placed after it.
     export_pf_btn = mo.ui.run_button(label=f"{mo.icon('lucide:file-text')} Export .pf Template", kind="success")
     export_csv_btn = mo.ui.run_button(label=f"{mo.icon('lucide:chart-bar')} Export Posterior CSV", kind="success")
+    export_corner_btn = mo.ui.run_button(label=f"{mo.icon('lucide:download')} Export Cornerplot Data", kind="success")
     export_dir_input = mo.ui.text(value="exports", label="Output directory")
 
     # Gate the display (not the widget creation) behind a completed MCMC run.
@@ -3354,17 +3400,19 @@ def _(
 
     mo.vstack([
         mo.hstack([export_dir_input], gap=1),
-        mo.hstack([export_pf_btn, export_csv_btn], gap=1),
+        mo.hstack([export_pf_btn, export_csv_btn, export_corner_btn], gap=1),
     ])
-    return export_csv_btn, export_dir_input, export_pf_btn
+    return export_corner_btn, export_csv_btn, export_dir_input, export_pf_btn
 
 
 @app.cell
 def _(
     emu,
+    export_corner_btn,
     export_csv_btn,
     export_dir_input,
     export_pf_btn,
+    get_mcmc_corner_meta,
     get_mcmc_labels,
     get_mcmc_samples,
     get_mcmc_summary_df,
@@ -3378,11 +3426,25 @@ def _(
     _samples = get_mcmc_samples()
     _labels = get_mcmc_labels()
     _summary_df = get_mcmc_summary_df()
+    _corner_meta = get_mcmc_corner_meta()
     _model = get_mle_model()
     _out_dir = export_dir_input.value or "exports"
     _ts = _time.strftime("%Y%m%d_%H%M%S")
 
     _msg = ""
+
+    def _summary_to_dict(_df):
+        if _df is None:
+            return None
+        _summary = {}
+        for _idx_name in _df.index:
+            _row = _df.loc[_idx_name]
+            _summary[str(_idx_name)] = {
+                k: float(v) for k, v in _row.items() if np.isfinite(v)
+            }
+        return _summary
+
+    _summary_dict = _summary_to_dict(_summary_df)
 
     if export_pf_btn.value and _model is not None and _samples is not None:
         try:
@@ -3426,22 +3488,40 @@ def _(
 
             os.makedirs(_out_dir, exist_ok=True)
 
-            # Convert the ArviZ summary table back into a plain dict so the CSV
-            # export can append human-readable summary statistics as metadata.
-            _summary_dict = None
-            if _summary_df is not None:
-                _summary_dict = {}
-                for _idx_name in _summary_df.index:
-                    _row = _summary_df.loc[_idx_name]
-                    _summary_dict[str(_idx_name)] = {
-                        k: float(v) for k, v in _row.items() if np.isfinite(v)
-                    }
-
             _csv_path = os.path.join(_out_dir, f"speculate_posterior_{_ts}.csv")
             export_posterior_csv(_samples, _labels, _csv_path, summary=_summary_dict)
             _msg += f"{mo.icon('lucide:check-circle')} Posterior CSV exported to `{_csv_path}`\n\n"
         except Exception as _e:
             _msg += f"{mo.icon('lucide:x-circle')} CSV export failed: {_e}\n\n"
+
+    if export_corner_btn.value and _samples is not None:
+        try:
+            from Speculate_addons.speculate_benchmark import export_cornerplot_data
+
+            os.makedirs(_out_dir, exist_ok=True)
+            _corner_labels = _labels or [
+                f"param_{_i}" for _i in range(_samples.shape[1])
+            ]
+            _record = dict(_corner_meta or {})
+            _record.update({
+                "source": "inference",
+                "record_id": f"inference_{_ts}",
+                "samples": _samples,
+                "labels": _corner_labels,
+                "summary": _summary_dict,
+            })
+            _export = export_cornerplot_data(
+                _record,
+                _out_dir,
+                bundle_name=f"speculate_cornerplot_{_ts}",
+                manifest_metadata={"source": "inference"},
+            )
+            _msg += (
+                f"{mo.icon('lucide:check-circle')} Cornerplot data exported to "
+                f"`{_export['bundle_dir']}`\n\n"
+            )
+        except Exception as _e:
+            _msg += f"{mo.icon('lucide:x-circle')} Cornerplot export failed: {_e}\n\n"
 
     if _msg:
         mo.output.replace(mo.callout(mo.md(_msg), kind="success"))

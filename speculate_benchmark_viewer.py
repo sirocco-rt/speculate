@@ -1466,13 +1466,18 @@ def _(get_tier2_posteriors, mo):
         start=0, stop=_n - 1, value=0, step=1, show_value=True,
         label="Test spectrum index", full_width=True,
     )
+    t2_corner_export_btn = mo.ui.run_button(
+        label=f"{mo.icon('lucide:download')} Export Cornerplot Data",
+        kind="success",
+    )
     mo.vstack([
         mo.md("## Tier 2 — Per-Spectrum Posterior Explorer"),
         mo.md(f"Browse **{_n}** completed spectra. "
                "Each corner plot shows the MCMC posterior with ground-truth values (blue lines)."),
         t2_spectrum_slider,
+        t2_corner_export_btn,
     ])
-    return (t2_spectrum_slider,)
+    return t2_corner_export_btn, t2_spectrum_slider
 
 
 @app.cell(hide_code=True)
@@ -1583,6 +1588,129 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
         mo.ui.table(_summary_rows, label="Posterior Summary", selection=None),
         _corner_display,
     ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(get_tier2_posteriors, mo, np, os, t2_corner_export_btn, time):
+    mo.stop(not t2_corner_export_btn.value)
+
+    from Speculate_addons.speculate_benchmark import export_cornerplot_data as _export_cornerplot_data
+
+    _posteriors = get_tier2_posteriors()
+    mo.stop(
+        _posteriors is None or len(_posteriors) == 0,
+        mo.callout(mo.md("No Tier 2 posteriors are available to export."), kind="warn"),
+    )
+
+    _records = []
+    _skipped = []
+    _corner_settings = {
+        "show_titles": True,
+        "quantiles": [0.16, 0.5, 0.84],
+        "levels": [0.6827, 0.9545, 0.9973],
+        "title_fmt": ".4f",
+        "truth_color": "#ff4444",
+        "truth_kwargs": {"linewidth": 2},
+    }
+
+    for _idx, _post in enumerate(_posteriors):
+        try:
+            _samples = np.asarray(_post.get("samples"))
+            _labels = [str(_label) for _label in (_post.get("labels") or [])]
+            if _samples.ndim != 2 or len(_labels) != _samples.shape[1]:
+                raise ValueError("missing or mismatched samples/labels")
+
+            _gt = _post.get("truths") or {}
+            _truths = []
+            _has_truth = False
+            for _label in _labels:
+                _key = "Inclination" if "Inclination" in _label else _label
+                if _key in _gt:
+                    _truths.append(_gt[_key])
+                    _has_truth = True
+                else:
+                    _truths.append(None)
+
+            _prior_ranges = None
+            _pr_dict = _post.get("prior_ranges") or {}
+            if _pr_dict:
+                _prior_ranges = []
+                for _label in _labels:
+                    _key = "Inclination" if "Inclination" in _label else _label
+                    _raw_range = _pr_dict.get(_key)
+                    if (
+                        isinstance(_raw_range, (list, tuple, np.ndarray))
+                        and len(_raw_range) == 2
+                    ):
+                        _lo = float(_raw_range[0])
+                        _hi = float(_raw_range[1])
+                        if np.isfinite(_lo) and np.isfinite(_hi) and _hi > _lo:
+                            _prior_ranges.append([_lo, _hi])
+                            continue
+                    _prior_ranges.append(None)
+
+            _run = _post.get("run", _idx)
+            _filename = _post.get("filename", f"run{_run}.spec")
+            _records.append({
+                "source": "benchmark_tier2",
+                "tier": "Tier 2",
+                "record_id": f"tier2_{_filename}",
+                "spectrum_index": int(_idx),
+                "run": _run,
+                "filename": _filename,
+                "inclination": _post.get("inclination"),
+                "converged": bool(_post.get("converged", False)),
+                "samples": _samples,
+                "labels": _labels,
+                "summary": _post.get("summary", {}),
+                "truths": _truths if _has_truth else None,
+                "ground_truth": dict(_gt),
+                "prior_ranges": _prior_ranges,
+                "plot_variants": [
+                    "posterior_auto_range",
+                    "full_prior_range",
+                ] if _prior_ranges else ["posterior_auto_range"],
+                "corner_settings": dict(_corner_settings),
+                "mcmc": {
+                    "burnin_used": _post.get("burnin_used"),
+                    "effective_samples": int(_samples.shape[0]),
+                    "full_chain_available": _post.get("full_chain") is not None,
+                },
+                "mle_all_params": _post.get("mle_all_params", {}),
+                "mle_freeze_settings": _post.get("mle_freeze_settings", {}),
+                "mle_frozen_params": _post.get("mle_frozen_params", []),
+                "mcmc_freeze_settings": _post.get("mcmc_freeze_settings", {}),
+                "mcmc_frozen_params": _post.get("mcmc_frozen_params", []),
+                "mcmc_frozen_param_values": _post.get("mcmc_frozen_param_values", {}),
+            })
+        except Exception as _exc:
+            _skipped.append(f"#{_idx}: {_exc}")
+
+    mo.stop(
+        not _records,
+        mo.callout(mo.md("No valid Tier 2 cornerplot datasets were found."), kind="warn"),
+    )
+
+    _ts = time.strftime("%Y%m%d_%H%M%S")
+    _export = _export_cornerplot_data(
+        _records,
+        "exports",
+        bundle_name=f"benchmark_tier2_cornerplots_{_ts}",
+        manifest_metadata={
+            "source": "benchmark_tier2",
+            "requested_record_count": len(_posteriors),
+            "skipped": list(_skipped),
+        },
+    )
+    _msg = (
+        f"{mo.icon('lucide:check-circle')} Exported "
+        f"{_export['record_count']} Tier 2 cornerplot dataset(s) to "
+        f"`{_export['bundle_dir']}`"
+    )
+    if _skipped:
+        _msg += "\n\nSkipped records:\n" + "\n".join(f"- {_item}" for _item in _skipped)
+    mo.output.replace(mo.callout(mo.md(_msg), kind="success" if not _skipped else "warn"))
     return
 
 
@@ -1715,12 +1843,17 @@ def _(get_tier3_posteriors, mo):
         start=0, stop=_n - 1, value=0, step=1, show_value=True,
         label="Observation index", full_width=True,
     )
+    t3_corner_export_btn = mo.ui.run_button(
+        label=f"{mo.icon('lucide:download')} Export Cornerplot Data",
+        kind="success",
+    )
     mo.vstack([
         mo.md("## Tier 3 — Per-Observation Explorer"),
         mo.md(f"Browse **{_n}** completed observation(s)."),
         t3_observation_slider,
+        t3_corner_export_btn,
     ])
-    return (t3_observation_slider,)
+    return t3_corner_export_btn, t3_observation_slider
 
 
 @app.cell(hide_code=True)
@@ -1801,6 +1934,110 @@ def _(get_tier3_posteriors, mo, np, os, render_fixed_matplotlib, t3_observation_
         mo.ui.table(_rows, label="Posterior Summary", selection=None),
         render_fixed_matplotlib(mo, _fig, width_px=920),
     ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(get_tier3_posteriors, mo, np, os, t3_corner_export_btn, time):
+    mo.stop(not t3_corner_export_btn.value)
+
+    from Speculate_addons.speculate_benchmark import export_cornerplot_data as _export_cornerplot_data
+
+    _posteriors = get_tier3_posteriors()
+    mo.stop(
+        _posteriors is None or len(_posteriors) == 0,
+        mo.callout(mo.md("No Tier 3 posteriors are available to export."), kind="warn"),
+    )
+
+    _records = []
+    _skipped = []
+    _corner_settings = {
+        "show_titles": True,
+        "quantiles": [0.16, 0.5, 0.84],
+        "levels": [0.6827, 0.9545, 0.9973],
+        "title_fmt": ".4f",
+    }
+
+    for _idx, _post in enumerate(_posteriors):
+        try:
+            _artifacts = _post.get("artifacts") or {}
+            _posterior_path = _artifacts.get("posterior_npz")
+            if not _posterior_path or not os.path.isfile(_posterior_path):
+                raise FileNotFoundError(_posterior_path or "missing posterior_npz")
+
+            with np.load(_posterior_path, allow_pickle=False) as _npz:
+                _samples = np.array(_npz["samples"])
+                _labels = [str(_label) for _label in _npz["labels"].tolist()]
+                _internal_labels = (
+                    [str(_label) for _label in _npz["internal_labels"].tolist()]
+                    if "internal_labels" in _npz
+                    else []
+                )
+                _burnin_used = (
+                    int(np.array(_npz["burnin_used"]).ravel()[0])
+                    if "burnin_used" in _npz
+                    else None
+                )
+
+            if _samples.ndim != 2 or len(_labels) != _samples.shape[1]:
+                raise ValueError("missing or mismatched samples/labels")
+
+            _obs_file = _post.get("obs_file", f"observation_{_idx}")
+            _records.append({
+                "source": "benchmark_tier3",
+                "tier": "Tier 3",
+                "record_id": f"tier3_{_obs_file}",
+                "observation_index": int(_idx),
+                "obs_file": _obs_file,
+                "exact_inclination": _post.get("exact_inclination"),
+                "converged": bool(_post.get("mcmc_converged", False)),
+                "samples": _samples,
+                "labels": _labels,
+                "internal_labels": _internal_labels,
+                "summary": _post.get("mcmc_summary", {}),
+                "truths": None,
+                "prior_ranges": None,
+                "plot_variants": ["posterior_auto_range"],
+                "corner_settings": dict(_corner_settings),
+                "metrics": {
+                    "reduced_chi2": _post.get("reduced_chi2"),
+                    "sirocco_reduced_chi2": _post.get("sirocco_reduced_chi2"),
+                    "ppc_coverage": _post.get("ppc_coverage"),
+                    "emulator_sirocco_frac_rmse": _post.get("emulator_sirocco_frac_rmse"),
+                },
+                "artifacts": dict(_artifacts),
+                "mcmc": {
+                    "burnin_used": _burnin_used,
+                    "effective_samples": int(_samples.shape[0]),
+                },
+            })
+        except Exception as _exc:
+            _skipped.append(f"#{_idx}: {_exc}")
+
+    mo.stop(
+        not _records,
+        mo.callout(mo.md("No valid Tier 3 cornerplot datasets were found."), kind="warn"),
+    )
+
+    _ts = time.strftime("%Y%m%d_%H%M%S")
+    _export = _export_cornerplot_data(
+        _records,
+        "exports",
+        bundle_name=f"benchmark_tier3_cornerplots_{_ts}",
+        manifest_metadata={
+            "source": "benchmark_tier3",
+            "requested_record_count": len(_posteriors),
+            "skipped": list(_skipped),
+        },
+    )
+    _msg = (
+        f"{mo.icon('lucide:check-circle')} Exported "
+        f"{_export['record_count']} Tier 3 cornerplot dataset(s) to "
+        f"`{_export['bundle_dir']}`"
+    )
+    if _skipped:
+        _msg += "\n\nSkipped records:\n" + "\n".join(f"- {_item}" for _item in _skipped)
+    mo.output.replace(mo.callout(mo.md(_msg), kind="success" if not _skipped else "warn"))
     return
 
 
@@ -2557,32 +2794,33 @@ def _(emu_picker, glob, mo, os, re):
         # grid and test-grid without asking the user to pick three separate paths.
         _grid_stem = _emu_base.split("_emu_")[0]  # e.g. speculate_cv_bl_grid_v87f
 
-        # Extract the parameter-scale tag from the emulator filename so the
-        # lookup lands on the matching processed grid NPZ.
+        # Extract the processed-grid tag from the emulator filename so the
+        # lookup lands on the NPZ created with the same params/scale/smoothing,
+        # fixed inclination, and wavelength range.
         _after_emu = _emu_base.split("_emu_")[1]  # 1234_linear_55inc_850-...
-        # Try several delimiters in order of specificity:
-        #   1. Inclination segment:  _XXinc_
-        #   2. Wavelength range:     _NNNN-NNNNAA_  (always present)
-        _tag_match = re.match(r"(.+?)_\d+inc_", _after_emu)
-        if not _tag_match:
-            _tag_match = re.match(r"(.+?)_\d+-\d+AA_", _after_emu)
-        if _tag_match:
-            _param_tag = _tag_match.group(1)
+        _grid_tag_match = re.match(r"(.+?)_\d+PCA(?:\.npz)?$", _after_emu)
+        if _grid_tag_match:
+            _grid_tag = _grid_tag_match.group(1)
         else:
-            # Fallback for older filenames that predate the stricter pattern.
-            _param_tag = _after_emu.split("_850")[0].split("_1000")[0]
+            # Fallback for filenames that do not end cleanly in _NNPCA.
+            _grid_tag = _after_emu.rsplit("_", 1)[0]
 
-        # Extract the wavelength range tag (e.g. "850-1850AA") from the emulator
-        # filename so we find the grid that was processed with the same range.
-        _wl_tag_match = re.search(r"(\d+-\d+AA)", _after_emu)
-        _wl_tag = _wl_tag_match.group(1) if _wl_tag_match else "*"
+        # New fixed-inclination grid files include _NNinc in the processed-grid
+        # filename.  Keep a legacy fallback for cached grids created before that
+        # tag was added to grid filenames.
+        _grid_tags = [_grid_tag]
+        _legacy_grid_tag = re.sub(r"_(\d+)inc_(\d+-\d+AA)$", r"_\2", _grid_tag)
+        if _legacy_grid_tag != _grid_tag:
+            _grid_tags.append(_legacy_grid_tag)
 
         # Tier 1 consumes the processed NPZ grid, while Tier 2 consumes the raw
         # test-grid directory that contains individual .spec files.
-        _grid_pattern = f"Grid-Emulator_Files/{_grid_stem}_grid_{_param_tag}_{_wl_tag}.npz"
-        _grid_matches = sorted(glob.glob(_grid_pattern))
-        if _grid_matches:
-            matched_grid_path = _grid_matches[0]
+        for _candidate_grid_tag in _grid_tags:
+            _grid_pattern = f"Grid-Emulator_Files/{_grid_stem}_grid_{_candidate_grid_tag}.npz"
+            _grid_matches = sorted(glob.glob(_grid_pattern))
+            if _grid_matches:
+                matched_grid_path = _grid_matches[0]
+                break
 
         # The test-grid stem mirrors the training-grid stem with a name swap.
         _testgrid_stem = _grid_stem.replace("_grid_", "_testgrid_")
@@ -2653,16 +2891,17 @@ def _(mo, sirocco_cpu_slider, tier_picker):
             f"Sirocco runtime ready. Tier 3 will use "
             f"{tier3_sirocco_status['cpus']} CPU(s).{_env_msg}"
         )
-        mo.callout(mo.md(_msg), kind="success")
+        _runtime_status_ui = mo.callout(mo.md(_msg), kind="success")
     else:
         _missing = ", ".join(tier3_sirocco_status["missing"])
-        mo.callout(
+        _runtime_status_ui = mo.callout(
             mo.md(
                 "Tier 3 requires Sirocco before the benchmark can run. "
                 f"Missing command(s): `{_missing}`.{_env_msg}"
             ),
             kind="danger",
         )
+    _runtime_status_ui
     return (tier3_sirocco_status,)
 
 

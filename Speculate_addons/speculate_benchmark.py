@@ -2584,6 +2584,152 @@ def export_posterior_csv(
     log.info(f"Exported posterior samples to {output_path}")
 
 
+def _cornerplot_json_safe(value):
+    """Convert numpy/path values into JSON-serialisable Python values."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _cornerplot_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_cornerplot_json_safe(v) for v in value]
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _safe_cornerplot_stem(value, fallback: str) -> str:
+    """Return a compact filesystem-safe identifier for one export record."""
+    raw = str(value or fallback)
+    stem = Path(raw).stem if raw else fallback
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stem)
+    return safe.strip("_") or fallback
+
+
+def export_cornerplot_data(
+    records: Union[dict, Sequence[dict]],
+    output_dir: Union[str, Path],
+    bundle_name: Optional[str] = None,
+    manifest_metadata: Optional[dict] = None,
+) -> dict:
+    """
+    Export raw MCMC samples and metadata needed to recreate corner plots.
+
+    The bundle layout is intentionally simple for downstream plotting tools:
+    each record gets a ``samples.csv`` with stable ``param_000`` columns and a
+    ``metadata.json`` that maps those columns back to display labels, truth
+    values, prior ranges, summaries, and plot settings.  The top-level
+    ``manifest.json`` lists every exported record.
+    """
+    if isinstance(records, dict):
+        record_list = [records]
+    else:
+        record_list = list(records or [])
+
+    if not record_list:
+        raise ValueError("No cornerplot records were provided for export.")
+
+    bundle = bundle_name or f"cornerplot_data_{time.strftime('%Y%m%d_%H%M%S')}"
+    root = Path(output_dir or ".") / _safe_cornerplot_stem(bundle, "cornerplot_data")
+    if root.exists():
+        base = root
+        suffix = 1
+        while root.exists():
+            root = Path(f"{base}_{suffix:02d}")
+            suffix += 1
+    root.mkdir(parents=True, exist_ok=False)
+
+    manifest_records = []
+    for idx, record in enumerate(record_list, start=1):
+        samples = np.asarray(record.get("samples"))
+        if samples.ndim != 2:
+            raise ValueError(f"Cornerplot record {idx} samples must be a 2D array.")
+
+        labels = [str(label) for label in record.get("labels", [])]
+        if len(labels) != samples.shape[1]:
+            raise ValueError(
+                f"Cornerplot record {idx} has {samples.shape[1]} sample columns "
+                f"but {len(labels)} labels."
+            )
+
+        record_id = str(
+            record.get("record_id")
+            or record.get("id")
+            or record.get("filename")
+            or record.get("obs_file")
+            or f"record_{idx:03d}"
+        )
+        record_stem = _safe_cornerplot_stem(record_id, f"record_{idx:03d}")
+        record_dir = root / f"{idx:03d}_{record_stem}"
+        record_dir.mkdir(parents=False, exist_ok=False)
+
+        sample_columns = [f"param_{col:03d}" for col in range(samples.shape[1])]
+        samples_path = record_dir / "samples.csv"
+        pd.DataFrame(samples, columns=sample_columns).to_csv(
+            samples_path,
+            index=False,
+            float_format="%.17g",
+        )
+
+        metadata = {
+            key: value
+            for key, value in record.items()
+            if key not in {"samples", "full_chain"}
+        }
+        metadata.update({
+            "format": "speculate.cornerplot_record.v1",
+            "record_index": idx,
+            "record_id": record_id,
+            "sample_shape": [int(samples.shape[0]), int(samples.shape[1])],
+            "sample_columns": [
+                {"index": col, "column": column, "label": labels[col]}
+                for col, column in enumerate(sample_columns)
+            ],
+            "labels": labels,
+            "samples_file": "samples.csv",
+        })
+
+        metadata_path = record_dir / "metadata.json"
+        with open(metadata_path, "w") as metadata_file:
+            json.dump(_cornerplot_json_safe(metadata), metadata_file, indent=2)
+
+        manifest_records.append({
+            "record_index": idx,
+            "record_id": record_id,
+            "source": record.get("source"),
+            "samples_csv": str(samples_path.relative_to(root)),
+            "metadata_json": str(metadata_path.relative_to(root)),
+            "n_samples": int(samples.shape[0]),
+            "n_parameters": int(samples.shape[1]),
+            "labels": labels,
+        })
+
+    manifest = {
+        "format": "speculate.cornerplot_bundle.v1",
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "bundle_name": root.name,
+        "record_count": len(manifest_records),
+        "metadata": _cornerplot_json_safe(manifest_metadata or {}),
+        "records": manifest_records,
+    }
+    manifest_path = root / "manifest.json"
+    with open(manifest_path, "w") as manifest_file:
+        json.dump(_cornerplot_json_safe(manifest), manifest_file, indent=2)
+
+    log.info(f"Exported {len(manifest_records)} cornerplot dataset(s) to {root}")
+    return {
+        "bundle_dir": str(root),
+        "manifest_path": str(manifest_path),
+        "record_count": len(manifest_records),
+        "records": manifest_records,
+    }
+
+
 # ======================================================================
 # Report Card
 # ======================================================================
