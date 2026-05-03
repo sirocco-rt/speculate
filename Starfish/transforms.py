@@ -164,52 +164,70 @@ def doppler_shift(wave, vz):
     return wave * dv
 
 
-def extinct(wave, flux, Av, Rv=3.1, law="ccm89"):
+def extinct(wave, flux, Av, Rv=3.1, law="fitzpatrick99", flux_scale="linear"):
     """
     Extinct a spectrum following one of many empirical extinction laws. This makes use
-    of the `extinction` package. In general, it follows the form
+    of the ``extinction`` package. In general, it follows the form
 
     .. math:: f \\cdot 10^{-0.4 A_V \\cdot A_\\lambda(R_V)}
+
+    When *flux_scale* is ``"log"``, the flux is assumed to be in log₁₀ space
+    and the extinction is applied additively:
+
+    .. math:: f_{\\log} + (-0.4 \\, A_\\lambda)
 
     Parameters
     ----------
     wave : array_like
         The input wavelengths in Angstrom
     flux : array_like
-        The input fluxes
+        The input fluxes (linear or log₁₀, controlled by *flux_scale*)
     Av : float
         The absolute attenuation
     Rv : float, optional
         The relative attenuation (the default is 3.1, which is the Milky Way average)
     law : str, optional
-        The extinction law to use. One of `{'ccm89', 'odonnell94', 'calzetti00',
-        'fitzpatrick99', 'fm07'}` (the default is 'ccm89')
+        The extinction law to use. One of ``{'ccm89', 'odonnell94', 'calzetti00',
+        'fitzpatrick99', 'fm07'}`` (the default is ``'fitzpatrick99'``)
+    flux_scale : str, optional
+        ``"linear"`` (default) for multiplicative extinction, ``"log"`` for
+        additive extinction in log₁₀ space.
 
     Raises
     ------
     ValueError
-        If `law` does not match one of the availabe laws
+        If *law* does not match one of the available laws
     ValueError
-        If Rv is not positive
+        If *Rv* is not positive
 
     Returns
     -------
     numpy.ndarray
         The extincted fluxes, with same shape as input fluxes.
     """
-
-    if law not in ["ccm89", "odonnell94", "calzetti00", "fitzpatrick99", "fm07"]:
-        raise ValueError("Invalid extinction law given")
+    _LAWS = {
+        "ccm89": extinction.ccm89,
+        "odonnell94": extinction.odonnell94,
+        "calzetti00": extinction.calzetti00,
+        "fitzpatrick99": extinction.fitzpatrick99,
+        "fm07": extinction.fm07,
+    }
+    if law not in _LAWS:
+        raise ValueError(
+            f"Invalid extinction law '{law}'. Must be one of {set(_LAWS)}"
+        )
     if Rv <= 0:
         raise ValueError("Rv must be positive")
 
-    law_fn = eval("extinction.{}".format(law))
+    law_fn = _LAWS[law]
     if law == "fm07":
         A_l = law_fn(wave.astype(np.double), Av)
     else:
         A_l = law_fn(wave.astype(np.double), Av, Rv)
-    flux_final = flux * 10 ** (-0.4 * A_l)
-    return flux_final
+
+    if flux_scale == "log":
+        return flux + (-0.4 * A_l)
+    return flux * 10 ** (-0.4 * A_l)
 
 
 def rescale(flux, scale):

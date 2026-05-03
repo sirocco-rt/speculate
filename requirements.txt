@@ -1,6 +1,7 @@
 # Core dependencies
-marimo>=0.19.6
+marimo>=0.23.1
 uvicorn[standard]
+openmpi
 
 # Add other dependencies below
 # HuggingFace integration
@@ -28,6 +29,11 @@ sigfig
 cuml-cu12; sys_platform == 'linux'
 torch
 torchvision
+
+# Optional optimizers
+cma
+optuna
+scikit-learn
 
 # Debugging and Profiling
 pyinstrument

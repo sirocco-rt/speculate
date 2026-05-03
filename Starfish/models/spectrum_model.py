@@ -141,6 +141,7 @@ class SpectrumModel:
         max_deque_len: int = 100,
         norm=False,
         name: str = "SpectrumModel",
+        flux_scale: str = "linear",
         **params,
     ):
         if isinstance(emulator, str):
@@ -161,11 +162,28 @@ class SpectrumModel:
         self.min_dv_wave = create_log_lam_grid(
             dv, self.emulator.wl.min(), self.emulator.wl.max()
         )["wl"]
+        # Pre-multiply ξ_k · ξ_σ on the emulator's native grid (Czekala 2015
+        # Eq. 53: X = ξ_σ · Ξ) BEFORE resampling and before any downstream
+        # multiplicative nuisance transform (extinct, chebyshev_correct,
+        # rotational_broaden).  The upstream Starfish stack
+        # [eigenspectra; μ; σ] caused these transforms to be applied to both
+        # the eigenspectra rows and the σ row, producing an Ext²/cheb²
+        # factor on the weight-sensitive component of the reconstructed
+        # spectrum and an Ext⁴/cheb⁴ factor on the propagated covariance.
+        # Storing [X_rows; μ] instead guarantees every transform acts once.
+        _emu_bulk = self.emulator.bulk_fluxes
+        _X_native = _emu_bulk[:-2] * _emu_bulk[-1]            # (m, N_emu)
+        _mu_native = _emu_bulk[-2][np.newaxis, :]             # (1, N_emu)
         self.bulk_fluxes = resample(
-            self.emulator.wl, self.emulator.bulk_fluxes, self.min_dv_wave
+            self.emulator.wl,
+            np.vstack([_X_native, _mu_native]),
+            self.min_dv_wave,
         )
 
         self.residuals = deque(maxlen=max_deque_len)
+        # Monotonic counter for throttling residual capture.  `len(self.residuals)`
+        # saturates at maxlen and cannot be used for this (see M-N10 review note).
+        self._residual_call_count = 0
 
         # manually handle cheb coeffs to offset index by 1
         if "cheb" in params:
@@ -177,6 +195,10 @@ class SpectrumModel:
         self.frozen = []
         self.name = name
         self.norm = norm
+
+        # The flux space the emulator was trained in ("linear", "log", etc.).
+        # When "log", nuisance transforms are applied in linear space.
+        self.flux_scale = flux_scale
 
         # Unpack the grid parameters
         self.n_grid_params = len(grid_params)
@@ -197,6 +219,19 @@ class SpectrumModel:
         self._cached_glob_cov_params = None    # (log_amp, log_ls) used to build cache
 
         self.log = logging.getLogger(self.__class__.__name__)
+
+    def _estimate_log_scale_from_log_flux(self, flux_log10: np.ndarray) -> float:
+        """Estimate ln(scale) by renormalising in linear-flux space."""
+        model_log = np.asarray(flux_log10, dtype=np.float64)
+        data_log = np.asarray(self.data.flux, dtype=np.float64)
+
+        model_lin = np.power(10.0, np.clip(model_log, -300.0, 300.0))
+        data_lin = np.power(10.0, np.clip(data_log, -300.0, 300.0))
+
+        scale = _get_renorm_factor(self.data.wave, model_lin, data_lin)
+        if not np.isfinite(scale) or scale <= 0:
+            return 0.0
+        return float(np.log(scale))
 
     @property
     def grid_params(self):
@@ -331,10 +366,13 @@ class SpectrumModel:
         else:
             fluxes = self._cached_resampled_fluxes
 
-        if "Av" in self.params:
-            fluxes = extinct(self.data.wave, fluxes, self.params["Av"])
+        # In log10 space, nuisance transforms are additive offsets applied
+        # AFTER PCA reconstruction, so skip pre-reconstruction bulk ops.
+        if "Av" in self.params and self.flux_scale != "log":
+            fluxes = extinct(self.data.wave, fluxes, self.params["Av"],
+                            Rv=self.params.get("Rv", 3.1))
 
-        if "cheb" in self.params:
+        if "cheb" in self.params and self.flux_scale != "log":
             # force constant term to be 1 to avoid degeneracy with log_scale
             coeffs = [1, *self.cheb]
             fluxes = chebyshev_correct(self.data.wave, fluxes, coeffs)
@@ -351,6 +389,10 @@ class SpectrumModel:
                 # If emulator returned numpy (fallback), switch to CPU mode
                 if not isinstance(weights, torch.Tensor):
                     using_gpu = False
+            except ValueError:
+                # Out-of-bounds or other model errors must propagate immediately
+                # so the caller (e.g. MCMC log_prob) can reject the sample.
+                raise
             except Exception as e:
                 self.log.warning(f"GPU acceleration failed in __call__: {e}. Falling back to CPU.")
                 using_gpu = False
@@ -366,41 +408,76 @@ class SpectrumModel:
             else:
                 fluxes_gpu = self._cached_fluxes_gpu
 
-            eigenspectra = fluxes_gpu[:-2]
-            flux_mean = fluxes_gpu[-2]
-            flux_std = fluxes_gpu[-1]
-            
-            # Reconstruction
-            X = eigenspectra * flux_std
-            flux = torch.matmul(weights, X) + flux_mean
-            
-            # optionally scale using absolute flux calibration
-            if self.norm:
-                norm = self.emulator.norm_factor(self.grid_params)
-            else:
-                norm = 1.0
+            # bulk_fluxes is stored as [X_rows; μ] (pre-multiplied at __init__),
+            # so Av/cheb/vsini transforms above acted on X and μ exactly once.
+            X = fluxes_gpu[:-1]                      # (m, N_pix) = X_paper^T
+            flux_mean = fluxes_gpu[-1]               # (N_pix,)   — ξ_μ
+            # Paper Eq. 52: M(w) = ξ_μ + X w  →  code: w^T X_code + ξ_μ
+            flux = torch.matmul(weights, X) + flux_mean  # (m,)@(m,N_pix) → (N_pix,)
 
-            # Renorm to data flux if no "log_scale" provided
-            if "log_scale" not in self.params:
-                flux_cpu = flux.detach().cpu().numpy()
-                scale = _get_renorm_factor(self.data.wave, flux_cpu * norm, self.data.flux)
-                self._log_scale = np.log(scale)
-                scale *= norm
-                self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
+            if self.flux_scale == "log":
+                # ── Log₁₀-space nuisance transforms (additive) ──────────
+                # In log₁₀ space, multiplicative nuisance ops become
+                # additive offsets and do NOT change the GP covariance.
+                _ln10 = np.log(10.0)
+                if "Av" in self.params:
+                    _ext_np = extinct(
+                        self.data.wave, np.zeros_like(self.data.wave),
+                        self.params["Av"], Rv=self.params.get("Rv", 3.1),
+                        flux_scale="log",
+                    )
+                    flux = flux + torch.from_numpy(_ext_np).to(flux.device, flux.dtype)
+                if "cheb" in self.params:
+                    coeffs_np = np.array([1, *self.cheb.tolist()])
+                    _sw = self.data.wave / self.data.wave.max()
+                    from numpy.polynomial.chebyshev import chebval as _chebval
+                    _cheb_poly = _chebval(_sw, coeffs_np)
+                    _cheb_poly = np.clip(_cheb_poly, 1e-30, None)
+                    flux = flux + torch.from_numpy(
+                        np.log10(_cheb_poly)
+                    ).to(flux.device, flux.dtype)
+                if "log_scale" in self.params:
+                    self._log_scale = self.params["log_scale"]
+                    flux = flux + self.params["log_scale"] / _ln10
+                else:
+                    _flux_np = flux.detach().cpu().numpy()
+                    self._log_scale = self._estimate_log_scale_from_log_flux(_flux_np)
+                    flux = flux + self._log_scale / _ln10
+                # X is NOT scaled — additive transforms don't change covariance
             else:
-                self._log_scale = self.params["log_scale"]
-                scale = np.exp(self.params["log_scale"]) * norm
+                # ── Linear-space nuisance transforms (original path) ─────
+                # optionally scale using absolute flux calibration
+                if self.norm:
+                    norm = self.emulator.norm_factor(self.grid_params)
+                else:
+                    norm = 1.0
+
+                # Renorm to data flux if no "log_scale" provided
+                if "log_scale" not in self.params:
+                    flux_cpu = flux.detach().cpu().numpy()
+                    scale = _get_renorm_factor(self.data.wave, flux_cpu * norm, self.data.flux)
+                    self._log_scale = np.log(scale)
+                    scale *= norm
+                    self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
+                else:
+                    self._log_scale = self.params["log_scale"]
+                    scale = np.exp(self.params["log_scale"]) * norm
+                
+                # Apply scale
+                flux = flux * scale
+                X = X * scale
             
-            # Apply scale
-            flux = flux * scale
-            X = X * scale
-            
-            # Covariance via Cholesky solve
-            L_weights = torch.linalg.cholesky(weights_cov)
-            Z = torch.linalg.solve_triangular(L_weights, X, upper=False)
-            Z = torch.linalg.solve_triangular(L_weights.T, Z, upper=True)
-            cov = torch.matmul(X.T, Z)
-            
+            # Paper Eq. 59: C' = X Σ_w X^T + C  where X is (N_pix, m) from Eq. 53.
+            # In code X_code = X_paper^T (m, N_pix), so:
+            #   C' = X_code^T Σ_w X_code + C    (N_pix,m)(m,m)(m,N_pix) → (N_pix,N_pix)
+            # Cholesky for numerical stability: Σ_w = LL^T
+            #   X_code^T Σ_w X_code = (L^T X_code)^T (L^T X_code)
+            # .mT = matrix transpose (last two dims); equivalent to .T for
+            # 2-D tensors but preferred in PyTorch (safe for batched >2-D).
+            L_weights = torch.linalg.cholesky(weights_cov)  # (m, m)
+            Y = torch.matmul(L_weights.mT, X)   # (m,m)@(m,N_pix) → (m, N_pix)
+            cov = torch.matmul(Y.mT, Y)          # (N_pix,m)@(m,N_pix) → (N_pix, N_pix)
+
             # Add trivial covariance — cache sigma on GPU
             if self._cached_data_sigma_gpu is None:
                 self._cached_data_sigma_gpu = torch.from_numpy(
@@ -470,33 +547,64 @@ class SpectrumModel:
         # CPU Fallback
         weights, weights_cov = self.emulator(self.grid_params)
 
-        # Decompose the bulk_fluxes (see emulator/emulator.py for the ordering)
-        *eigenspectra, flux_mean, flux_std = fluxes
-        # Complete the reconstruction
-        X = eigenspectra * flux_std
-        flux = weights @ X + flux_mean
+        # bulk_fluxes is stored as [X_rows; μ] (pre-multiplied at __init__),
+        # so Av/cheb/vsini transforms above acted on X and μ exactly once.
+        X = np.asarray(fluxes[:-1])    # (m, N_pix) = X_paper^T
+        flux_mean = fluxes[-1]         # (N_pix,)   — ξ_μ
+        # Paper Eq. 52: M(w) = ξ_μ + X w  →  code: w^T X_code + ξ_μ
+        flux = weights @ X + flux_mean  # (m,)@(m,N_pix) → (N_pix,)
 
-        # optionally scale using absolute flux calibration
-        if self.norm:
-            norm = self.emulator.norm_factor(self.grid_params)
+        if self.flux_scale == "log":
+            # ── Log₁₀-space nuisance transforms (additive) ──────────
+            _ln10 = np.log(10.0)
+            if "Av" in self.params:
+                flux = extinct(
+                    self.data.wave, flux, self.params["Av"],
+                    Rv=self.params.get("Rv", 3.1), flux_scale="log",
+                )
+            if "cheb" in self.params:
+                coeffs_np = np.array([1, *self.cheb.tolist()])
+                _sw = self.data.wave / self.data.wave.max()
+                from numpy.polynomial.chebyshev import chebval as _chebval
+                _cheb_poly = _chebval(_sw, coeffs_np)
+                _cheb_poly = np.clip(_cheb_poly, 1e-30, None)
+                flux = flux + np.log10(_cheb_poly)
+            if "log_scale" in self.params:
+                self._log_scale = self.params["log_scale"]
+                flux = flux + self.params["log_scale"] / _ln10
+            else:
+                self._log_scale = self._estimate_log_scale_from_log_flux(flux)
+                flux = flux + self._log_scale / _ln10
+            # X is NOT scaled — additive transforms don't change covariance
         else:
-            norm = 1
+            # ── Linear-space nuisance transforms (original path) ─────
+            # optionally scale using absolute flux calibration
+            if self.norm:
+                norm = self.emulator.norm_factor(self.grid_params)
+            else:
+                norm = 1
 
-        # Renorm to data flux if no "log_scale" provided
-        if "log_scale" not in self.params:
-            scale = _get_renorm_factor(self.data.wave, flux * norm, self.data.flux)
-            self._log_scale = np.log(scale)
-            scale *= norm
-            self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
-        else:
-            self._log_scale = self.params["log_scale"]
-            scale = np.exp(self.params["log_scale"]) * norm
+            # Renorm to data flux if no "log_scale" provided
+            if "log_scale" not in self.params:
+                scale = _get_renorm_factor(self.data.wave, flux * norm, self.data.flux)
+                self._log_scale = np.log(scale)
+                scale *= norm
+                self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
+            else:
+                self._log_scale = self.params["log_scale"]
+                scale = np.exp(self.params["log_scale"]) * norm
 
-        flux = rescale(flux, scale)
-        X = rescale(X, scale)
+            flux = rescale(flux, scale)
+            X = rescale(X, scale)
 
-        L, flag = cho_factor(weights_cov, overwrite_a=True)
-        cov = X.T @ cho_solve((L, flag), X)
+        # Paper Eq. 59: C' = X Σ_w X^T + C  where X is (N_pix, m) from Eq. 53.
+        # In code X_code = X_paper^T (m, N_pix), so:
+        #   C' = X_code^T Σ_w X_code + C    (N_pix,m)(m,m)(m,N_pix) → (N_pix,N_pix)
+        # Cholesky for numerical stability: Σ_w = LL^T
+        #   X_code^T Σ_w X_code = (L^T X_code)^T (L^T X_code)
+        L_w = np.linalg.cholesky(weights_cov)  # (m, m)
+        Y = L_w.T @ np.array(X)   # (m,m)@(m,N_pix) → (m, N_pix)
+        cov = Y.T @ Y              # (N_pix,m)@(m,N_pix) → (N_pix, N_pix)
 
         # Trivial covariance
         np.fill_diagonal(cov, cov.diagonal() + self.data.sigma**2)
@@ -553,7 +661,8 @@ class SpectrumModel:
         fluxes = resample(wave, fluxes, self.data.wave)
 
         if "Av" in self.params:
-            fluxes = extinct(self.data.wave, fluxes, self.params["Av"])
+            fluxes = extinct(self.data.wave, fluxes, self.params["Av"],
+                            Rv=self.params.get("Rv", 3.1))
 
         if "cheb" in self.params:
             # force constant term to be 1 to avoid degeneracy with log_scale
@@ -562,10 +671,10 @@ class SpectrumModel:
 
         weights, weights_cov = self.emulator(self.grid_params)
 
-        # Decompose the bulk_fluxes (see emulator/emulator.py for the ordering)
-        *eigenspectra, flux_mean, flux_std = fluxes
-        # Complete the reconstruction
-        X = eigenspectra * flux_std
+        # bulk_fluxes is stored as [X_rows; μ] (pre-multiplied at __init__),
+        # so Av/cheb/vsini transforms above acted on X and μ exactly once.
+        X = np.asarray(fluxes[:-1])
+        flux_mean = fluxes[-1]
         flux = weights @ X + flux_mean
 
         # optionally scale using absolute flux calibration
@@ -592,6 +701,10 @@ class SpectrumModel:
     def log_likelihood(self, priors: Optional[dict] = None) -> float:
         """
         Returns the log probability of a multivariate normal distribution
+
+        Note: returns the unnormalised log-likelihood (the -n/2 ln(2π) constant
+        is omitted, following standard GP convention). This has no effect on
+        optimisation or MCMC sampling since n is fixed for a given observation.
 
         Parameters
         ----------
@@ -624,8 +737,11 @@ class SpectrumModel:
         
         if PYTORCH_AVAILABLE and isinstance(cov, torch.Tensor):
             # GPU Path
-            # Add jitter for stability
-            cov.diagonal().add_(1e-50)
+            # Purely relative jitter for Cholesky stability (~1e-6 × max(diag)).
+            # The floor must be tiny (1e-35) so it never dominates the actual
+            # covariance entries — physical-unit spectra have C_ii ~ 1e-26.
+            _jitter = max(1e-35, 1e-6 * cov.diagonal().max().item())
+            cov.diagonal().add_(_jitter)
             
             try:
                 # Cholesky decomposition
@@ -639,9 +755,12 @@ class SpectrumModel:
                     self._cached_data_flux_gpu = torch.from_numpy(
                         self.data.flux).to(cov.device, DTYPE)
                 R = flux - self._cached_data_flux_gpu
-                
-                # Store residuals (only periodically to avoid GPU sync stalls)
-                if len(self.residuals) == 0 or len(self.residuals) % 50 == 0:
+
+                # Store residuals only periodically to avoid GPU→CPU sync
+                # stalls.  `len(self.residuals)` saturates at maxlen, so it
+                # cannot drive the throttle (M-N10 fix).
+                self._residual_call_count += 1
+                if self._residual_call_count % 50 == 1:
                     self.residuals.append(R.detach().cpu().numpy())
                 
                 # Mahalanobis distance via Cholesky triangular solves
@@ -660,11 +779,19 @@ class SpectrumModel:
                 return -np.inf
         else:
             # CPU Path
-            np.fill_diagonal(cov, cov.diagonal() + 1e-50) # Austen edit 1e-10 -> 1e-30
-            factor, flag = cho_factor(cov, overwrite_a=True)
+            _jitter = max(1e-35, 1e-6 * np.max(cov.diagonal()))
+            np.fill_diagonal(cov, cov.diagonal() + _jitter)
+            try:
+                factor, flag = cho_factor(cov, overwrite_a=True)
+            except np.linalg.LinAlgError:
+                return -np.inf
             logdet = 2 * np.sum(np.log(factor.diagonal()))
             R = flux - self.data.flux
-            self.residuals.append(R)
+            # Match GPU-path throttle (every 50th call) to avoid unnecessary
+            # per-call allocation churn into the deque.
+            self._residual_call_count += 1
+            if self._residual_call_count % 50 == 1:
+                self.residuals.append(R)
             sqmah = R @ cho_solve((factor, flag), R)
             self._lnprob = -(logdet + sqmah) / 2
 
@@ -1027,7 +1154,7 @@ class SpectrumModel:
         resid_params = {"lw": 0.3}
         resid_params.update(resid_kwargs)
         ax = axes[1]
-        ax.plot(self.data.wave, R, c="k", label="Data - Model", **resid_params)
+        ax.plot(self.data.wave, R, c="g", label="Data - Model", **resid_params)
         ax.fill_between(
             self.data.wave, -std, std, color="C2", alpha=0.6, label=r"$\sigma$"
         )
@@ -1046,7 +1173,7 @@ class SpectrumModel:
         # Relative Error plot
         R_f = R / self.data.flux
         ax = axes[2]
-        ax.plot(self.data.wave, R_f, label="Data - Model", c="k", **resid_params)
+        ax.plot(self.data.wave, R_f, label="Data - Model", c="r", **resid_params)
         ax.set_xlabel(r"$\lambda$ [$\AA$]")
         ax.set_ylabel(r"$\Delta f_\lambda / f_\lambda$")
         ax.yaxis.tick_right()

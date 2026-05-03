@@ -46,79 +46,139 @@ def _():
 
 @app.cell
 def _(mo):
-    mo.md("""
+    title_col = mo.vstack([mo.md(
+    """
     # Grid Inspector
-
+    """), mo.md(
+    """
     Visualize and analyse the sirocco spectral grid data interactively.
-    """)
+    """)])
+
+    mo._runtime.context.get_context().marimo_config["runtime"]["output_max_bytes"] = 10_000_000_000
+    logo_path = "assets/logos/Speculate_logo2.png"
+
+    # Right column: Logo with link
+    # Using flex-end to align it to the right
+    logo_col = mo.vstack([
+        mo.image(src=logo_path, width=400, height=95),
+        mo.md('<p style="text-align: center; font-size: 0.8em;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
+    ], align="center")
+
+    # Combine in horizontal stack
+    mo.hstack([title_col, logo_col], justify="space-between", align="center")
     return
 
 
 @app.cell
 def _(mo):
-    # Static sidebar - always shows all options
-    mo.sidebar(
-        mo.vstack([
-            mo.md("# 🔭 Speculate"),
-            mo.md(" "),
+    _is_hf = __import__('os').environ.get("SPACE_ID") is not None
+    if _is_hf:
+        hf_mode_switch = None
+        is_hf_space_nav = True
+    else:
+        hf_mode_switch = mo.ui.switch(value=False, label="🤗 HuggingFace Space Mode")
+        is_hf_space_nav = False
+    return hf_mode_switch, is_hf_space_nav
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    usage_toggle = mo.ui.switch(value=False, label=f"{mo.icon('lucide:activity')} System Resources")
+    usage_refresh = mo.ui.refresh(default_interval="10s", label="")
+    return usage_refresh, usage_toggle
+
+
+@app.cell(hide_code=True)
+def _(mo, usage_refresh, usage_toggle):
+    from Speculate_addons.speculate_usage_bars import get_usage_html
+    if usage_toggle.value:
+        usage_refresh
+        _html = get_usage_html()
+        usage_bars = mo.vstack([usage_toggle, mo.Html(_html), mo.hstack([usage_refresh], justify="center")])
+    else:
+        usage_bars = usage_toggle
+    return (usage_bars,)
+
+
+@app.cell
+def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
+    if is_hf_space_nav:
+        _mode = "HuggingFace Space"
+    elif hf_mode_switch is not None and hf_mode_switch.value:
+        _mode = "HuggingFace Space"
+    else:
+        _mode = "Local Machine"
+
+    IS_HUGGINGFACE_SPACE = (_mode == "HuggingFace Space")
+
+    _items = [mo.md(f"#Speculate {mo.icon('lucide:telescope')}")]
+    _items.extend([mo.md(" "), mo.md("---"), mo.md(" ")])
+
+    if _mode == "HuggingFace Space":
+        _items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+        }, orientation="vertical"))
+        _items.extend([
             mo.md(" "),
             mo.md("---"),
-            mo.md("---"),
-            mo.md(" "),
-            mo.md(" "),
-            mo.nav_menu({
-                "/": f"###{mo.icon('lucide:home')} Home",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.md("---"),
-            mo.nav_menu({
+            mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
+            mo.md("Install Speculate Locally"), mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:download')} Model Downloader"), mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:brain')} Training Tool"), mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:sparkles')} Inference Tool"), mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:test-tubes')} Benchmark Suite"),
+        ])
+    else:
+        _items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/downloader": f"###{mo.icon('lucide:download')} Model Downloader",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/training": f"###{mo.icon('lucide:brain')} Training Tool",
+            "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+            "/benchmark": f"###{mo.icon('lucide:test-tubes')} Benchmark Suite",
+        }, orientation="vertical"))
+
+    _items.extend([
+        mo.md(" "), mo.md("---"),
+        mo.nav_menu({
             "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
             "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.nav_menu({
+        }, orientation="vertical"),
+        mo.md(" "), mo.md("---"),
+        mo.nav_menu({
             "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
-            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs"
-            }, orientation="vertical")
-        ])
-    )
-    return
+            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs",
+        }, orientation="vertical"),
+        mo.md("---"),
+    ])
+    if hf_mode_switch is not None:
+        _items.extend([hf_mode_switch])
 
-
-@app.cell
-def _(mo):
-    # Add logo using marimo's image display
-    import pathlib
-
-    logo_path = pathlib.Path("assets/logos/Speculate_logo2.png")
-
-    logo = mo.image(src=str(logo_path), width=400, height=95)
-    link = mo.md('<p style="text-align: center;">Powered by <a href="https://github.com/sirocco-rt" target="_blank">Sirocco-rt</a></p>')
-    mo.vstack([mo.md("---"), logo, link], align="center")
-    return
+    _items.extend([mo.md("---"), usage_bars])
+    mo.sidebar(mo.vstack(_items))
+    return (IS_HUGGINGFACE_SPACE,)
 
 
 @app.cell
 def _():
-    # ── Core data-science imports ──
-    # VegaFusion is enabled because a single spectrum can have thousands of
-    # wavelength points and Altair’s default inline limit is 5 000 rows.
     import os
+    import importlib
     import numpy as np
     import pandas as pd
     from pathlib import Path
     import altair as alt
+    from Speculate_addons import Spec_functions as spec_functions
 
-    # Enable VegaFusion for large datasets
+    if not hasattr(spec_functions, "enable_speculate_altair_theme"):
+        spec_functions = importlib.reload(spec_functions)
+    spec_functions.enable_speculate_altair_theme(alt)
+    fit_power_law_continuum = spec_functions.fit_power_law_continuum
+
     alt.data_transformers.enable("vegafusion")
-
-    # Detect environment
-    # When running on HuggingFace Spaces the grid files are fetched over
-    # HTTP; locally they are read straight from the filesystem.
-    IS_HUGGINGFACE_SPACE = os.environ.get("SPACE_ID") is not None
-    return IS_HUGGINGFACE_SPACE, Path, alt, np, os, pd
+    return Path, alt, fit_power_law_continuum, np, os, pd
 
 
 @app.cell
@@ -133,9 +193,9 @@ def _(mo):
 def _(IS_HUGGINGFACE_SPACE, mo):
     # Environment mode display
     if IS_HUGGINGFACE_SPACE:
-        env_badge = mo.md("🌐 **Running on HuggingFace Space** - Streaming data from cloud")
+        env_badge = mo.md(f"{mo.icon('lucide:globe')} **Running on HuggingFace Space** - Streaming data from cloud")
     else:
-        env_badge = mo.md("💻 **Running Locally** - Using pre-downloaded grid files")
+        env_badge = mo.md(f"{mo.icon('lucide:monitor')} **Running Locally** - Using pre-downloaded grid files")
 
     env_badge
     return
@@ -178,7 +238,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, mo):
             )
         else:
             grid_selector = None
-            mo.md("⚠️ **No grids found in `sirocco_grids/` directory**\n\nPlease download grids using the Grid Downloader tool first.")
+            mo.md(f"{mo.icon('lucide:triangle-alert')} **No grids found in `sirocco_grids/` directory**\n\nPlease download grids using the Model Downloader tool first.")
 
     grid_selector
     return (grid_selector,)
@@ -214,7 +274,7 @@ def _(IS_HUGGINGFACE_SPACE, cache_tracker_state, grid_selector, mo):
             set_cache_check(set())
 
             if cleared > 0:
-                mo.md(f"🧹 Cleared {cleared} cached spectra from previous grid")
+                mo.md(f"{mo.icon('lucide:trash')} Cleared {cleared} cached spectra from previous grid")
 
         # Remember the active dataset for the next rerun.
         if current_grid:
@@ -222,7 +282,7 @@ def _(IS_HUGGINGFACE_SPACE, cache_tracker_state, grid_selector, mo):
 
     # Only proceed if grid is selected
     if grid_selector is None or grid_selector.value is None:
-        mo.md("Please download a grid first using the Grid Downloader tool.")
+        mo.md("Please download a grid first using the Model Downloader tool.")
         mo.stop()
     return
 
@@ -299,7 +359,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
                 grid_mode = "huggingface"
 
             except Exception as e:
-                mo.md(f"❌ Error loading grid from HuggingFace: {e}")
+                mo.md(f"{mo.icon('lucide:x-circle')} Error loading grid from HuggingFace: {e}")
                 mo.stop()
 
         else:
@@ -307,14 +367,14 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
             grid_path = Path("sirocco_grids") / selected_grid
 
             if not grid_path.exists():
-                mo.md(f"❌ Grid directory not found: {grid_path}")
+                mo.md(f"{mo.icon('lucide:x-circle')} Grid directory not found: {grid_path}")
                 mo.stop()
 
             # Find all .spec files
             spec_files = sorted(grid_path.glob("run*.spec"))
 
             if not spec_files:
-                mo.md(f"❌ No .spec files found in {grid_path}")
+                mo.md(f"{mo.icon('lucide:x-circle')} No .spec files found in {grid_path}")
                 mo.stop()
 
             # Try to load lookup table - download from HuggingFace if not present
@@ -327,7 +387,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
                     ORG_ID = "sirocco-rt"
                     local_repo_id = f"{ORG_ID}/{selected_grid}"
 
-                    mo.md("📥 Lookup table not found locally. Downloading from HuggingFace...")
+                    mo.md(f"{mo.icon('lucide:download')} Lookup table not found locally. Downloading from HuggingFace...")
 
                     downloaded_path = local_hf_download(
                         repo_id=local_repo_id,
@@ -338,7 +398,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
                     )
                     lookup_path = Path(downloaded_path)
                 except Exception as e:
-                    mo.md(f"⚠️ No lookup table found locally and failed to download from HuggingFace: {e}")
+                    mo.md(f"{mo.icon('lucide:triangle-alert')} No lookup table found locally and failed to download from HuggingFace: {e}")
                     mo.stop()
 
             # Load lookup table
@@ -384,7 +444,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
         num_inclinations = len(inclination_angles)
 
     mo.md(f"""
-    ✅ **Grid loaded successfully**
+    {mo.icon('lucide:check-circle')} **Grid loaded successfully**
     - **Grid**: `{selected_grid}`
     - **Mode**: `{grid_mode}`
     - **Run Files**: {num_runs:,}
@@ -418,7 +478,14 @@ def _(mo):
 
 
 @app.cell
-def _(get_run_index, inclination_angles, mo, num_runs, set_run_index):
+def _(
+    get_run_index,
+    inclination_angles,
+    mo,
+    num_runs,
+    set_run_index,
+    wavelengths,
+):
     # Run file selector slider with built-in editable input
     # Synced with shared state
 
@@ -445,22 +512,6 @@ def _(get_run_index, inclination_angles, mo, num_runs, set_run_index):
         label="Inclination Angle:"
     )
 
-    mo.vstack([
-        run_slider,
-        inclination_selector
-    ])
-    return inclination_selector, run_slider
-
-
-@app.cell
-def _(run_slider):
-    # Use slider value directly - the built-in input is already integrated
-    current_run_index = run_slider.value
-    return (current_run_index,)
-
-
-@app.cell
-def _(mo, wavelengths):
     # Wavelength range selector - exclude first and last 10 Å to avoid Sirocco artifacts
     wl_min_limit = float(wavelengths.min() + 10)
     wl_max_limit = float(wavelengths.max() - 10)
@@ -474,8 +525,32 @@ def _(mo, wavelengths):
         show_value=True
     )
 
-    wavelength_range
-    return (wavelength_range,)
+
+    flux_scale_selector = mo.ui.dropdown(
+        options=["linear", "log", "continuum-normalised"],
+        value="linear",
+        label="Flux Scale:"
+    )
+
+    mo.hstack([
+        run_slider,
+        wavelength_range,
+        inclination_selector, 
+        flux_scale_selector
+    ], justify='space-between')
+    return (
+        flux_scale_selector,
+        inclination_selector,
+        run_slider,
+        wavelength_range,
+    )
+
+
+@app.cell
+def _(run_slider):
+    # Use slider value directly - the built-in input is already integrated
+    current_run_index = run_slider.value
+    return (current_run_index,)
 
 
 @app.cell
@@ -488,7 +563,7 @@ def _(mo):
     use_smoothing = mo.ui.checkbox(value=True, label="Smooth Data (Boxcar=5)")
     show_grid = mo.ui.checkbox(value=True, label="Show Grid")
 
-    mo.hstack([show_current, show_fixed, show_obs, use_dimensionless, use_smoothing, show_grid], justify="start", gap=0)
+    mo.hstack([show_current, show_fixed, show_obs, use_dimensionless, use_smoothing, show_grid], justify="space-between")
     return (
         show_current,
         show_fixed,
@@ -544,12 +619,12 @@ def _(
 
     # Create buttons with on_click callbacks
     add_spectrum_btn = mo.ui.button(
-        label="➕ Pin Grid Spectrum", 
+        label=f"{mo.icon('lucide:plus-circle')} Pin Grid Spectrum", 
         kind="success",
         on_click=lambda _: add_current_spectrum()
     )
     clear_spectra_btn = mo.ui.button(
-        label="🗑️ Clear All", 
+        label=f"{mo.icon('lucide:trash-2')} Clear All", 
         kind="danger",
         on_click=lambda _: clear_all_spectra()
     )
@@ -567,7 +642,7 @@ def _(get_pinned_spectra, mo):
     # Display status message
     if num_pinned > 0:
         pinned_labels = [f"run{run}@{inc}°" for run, inc in pinned_spectra_indices]
-        status_msg = mo.md(f"📌 **Pinned Spectra**: {num_pinned} ({', '.join(pinned_labels)})")
+        status_msg = mo.md(f"{mo.icon('lucide:pin')} **Pinned Spectra**: {num_pinned} ({', '.join(pinned_labels)})")
     else:
         status_msg = mo.md("_No pinned spectra_")
 
@@ -696,8 +771,11 @@ def _(
     alt,
     current_flux,
     current_run_index,
+    fit_power_law_continuum,
+    flux_scale_selector,
     inclination_selector,
     load_spectrum,
+    np,
     obs_file_selector,
     os,
     pd,
@@ -726,6 +804,17 @@ def _(
             return pd.Series(flux_array).rolling(window=5, center=True, min_periods=1).mean().values
         return flux_array
 
+    # Apply the selected flux-scale transformation to an already-smoothed spectrum.
+    _scale_mode = flux_scale_selector.value
+    def apply_scale(flux_array, wl_array):
+        if _scale_mode == 'log':
+            safe = np.where(flux_array > 0, flux_array, 1e-30)
+            return np.log10(safe)
+        elif _scale_mode == 'continuum-normalised':
+            continuum, _ = fit_power_law_continuum(wl_array, flux_array)
+            return flux_array / np.where(continuum > 0, continuum, 1.0)
+        return flux_array  # linear
+
     # Collect each visible series as a dataframe and concatenate them into the
     # long-form layout Altair expects for layered categorical plotting.
     plot_data_list = []
@@ -740,6 +829,12 @@ def _(
                 # Apply smoothing
                 pinned_flux_plot = smooth_flux(pinned_flux)
 
+                # Crop to selected wavelength range BEFORE continuum fitting
+                pinned_flux_plot = pinned_flux_plot[wl_mask]
+
+                # Apply flux scale transform on the cropped range
+                pinned_flux_plot = apply_scale(pinned_flux_plot, filtered_wavelengths)
+
                 # Dimensionless mode removes absolute scaling so pinned spectra can
                 # be compared by shape rather than by flux level.
                 if use_dimensionless.value:
@@ -749,7 +844,7 @@ def _(
 
                 pinned_df = pd.DataFrame({
                     'Wavelength': filtered_wavelengths,
-                    'Flux': pinned_flux_plot[wl_mask],
+                    'Flux': pinned_flux_plot,
                     'Spectrum': f'run{run_idx}@{inclination}°',
                     'Type': 'Pinned'
                 })
@@ -764,6 +859,12 @@ def _(
         # Apply smoothing
         current_flux_plot = smooth_flux(current_flux_plot)
 
+        # Crop to selected wavelength range BEFORE continuum fitting
+        current_flux_plot = current_flux_plot[wl_mask]
+
+        # Apply flux scale transform on the cropped range
+        current_flux_plot = apply_scale(current_flux_plot, filtered_wavelengths)
+
         # Apply the same shape-only normalization as the pinned spectra so the
         # current run remains directly comparable when that mode is active.
         if use_dimensionless.value:
@@ -773,7 +874,7 @@ def _(
 
         current_df = pd.DataFrame({
             'Wavelength': filtered_wavelengths,
-            'Flux': current_flux_plot[wl_mask],
+            'Flux': current_flux_plot,
             'Spectrum': f'run{current_run_index}@{inclination_selector.value}°',
             'Type': 'Current'
         })
@@ -801,6 +902,9 @@ def _(
 
                 if not obs_data.empty:
                     obs_flux = obs_data['FLUX'].values
+
+                    # Apply the same flux-scale transform as model spectra
+                    obs_flux = apply_scale(obs_flux, obs_data['WAVELENGTH'].values)
 
                     # Use the same normalization rule here so observations can be
                     # overplotted directly against model spectra by shape.
@@ -832,7 +936,9 @@ def _(
                    scale=alt.Scale(zero=False),
                    axis=alt.Axis(grid=show_grid.value)),
             y=alt.Y('Flux:Q', 
-                    title='Flux' if not use_dimensionless.value else 'Normalized Flux',
+                    title=('Flux' if _scale_mode == 'linear'
+                           else 'log₁₀(Flux)' if _scale_mode == 'log'
+                           else 'Flux / Continuum') if not use_dimensionless.value else 'Normalized Flux',
                     scale=alt.Scale(zero=False),
                     axis=alt.Axis(format='~e', grid=show_grid.value)),
             color=alt.condition(
@@ -851,20 +957,20 @@ def _(
                 {"test": alt.datum.Type == 'Observational', "value": 1.0}
             ])
         ).properties(
-            width=1000,
-            height=600,
+            width=850,
+            height=500,
             title=f'Spectral Data Exploration - {selected_grid}',
             background='white'
         ).configure_axis(
             labelColor='black',
             titleColor='black',
-            labelFontSize=14,
-            titleFontSize=16
+            labelFontSize=16,
+            titleFontSize=18
         ).configure_legend(
             labelColor='black',
             titleColor='black',
-            labelFontSize=14,
-            titleFontSize=16
+            labelFontSize=16,
+            titleFontSize=18
         ).configure_title(
             color='black',
             fontSize=20
@@ -874,8 +980,8 @@ def _(
             x='x:Q',
             y='y:Q'
         ).properties(
-            width=900,
-            height=400,
+            width=850,
+            height=500,
             title='No spectra to display'
         )
 
@@ -979,7 +1085,7 @@ def _(
     dropdown_list = list(param_dropdowns.values())
 
     mo.vstack([
-        mo.md("⚠️ **Warning**: All grid values shown but not all combinations are available."),
+        mo.md(f"{mo.icon('lucide:triangle-alert')} **Warning**: All grid values shown but not all combinations are available."),
         *dropdown_list
     ])
     return
@@ -994,8 +1100,8 @@ def _(mo):
     ### Navigation
     - **Slider**: Drag to browse through spectra sequentially
     - **Index Input**: Jump directly to a specific spectrum by index
-    - **➕ Add Spectrum**: Pin the current spectrum for comparison
-    - **🗑️ Clear All**: Remove all pinned spectra
+    - **Pin Spectrum**: Pin the current spectrum for comparison
+    - **Clear All**: Remove all pinned spectra
 
     ### Display Options
     - **Show Current Spectrum**: Toggle visibility of the active spectrum
@@ -1049,7 +1155,7 @@ def _(mo, obs_file_uploader, os, set_obs_refresh):
             save_path = os.path.join(save_dir, file.name)
             with open(save_path, "wb") as file_handle:
                 file_handle.write(file.contents)
-            mo.md(f"✅ Uploaded `{file.name}` to `{save_dir}`")
+            mo.md(f"{mo.icon('lucide:check-circle')} Uploaded `{file.name}` to `{save_dir}`")
 
         # Trigger refresh of the file list
         set_obs_refresh(lambda v: v + 1)
@@ -1110,7 +1216,7 @@ def _(mo, obs_file_selector, os, set_obs_refresh):
                     pass
 
     delete_obs_btn = mo.ui.button(
-        label="🗑️ Delete Selected",
+        label=f"{mo.icon('lucide:trash-2')} Delete Selected",
         kind="danger",
         on_click=lambda _: delete_selected_file()
     )
@@ -1121,7 +1227,7 @@ def _(mo, obs_file_selector, os, set_obs_refresh):
 def _(delete_obs_btn, mo, obs_file_selector, obs_file_uploader):
     # Select observational spectrum - Layout
     mo.vstack([
-        mo.md("### Observational Data"),
+        mo.md("## Observational Data:"),
         mo.hstack([obs_file_selector, delete_obs_btn], align="end"),
         obs_file_uploader,
         mo.md("Data must be in CSV format with 'Wavelength', then 'Flux' columns.")

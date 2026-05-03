@@ -14,6 +14,480 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Slider, CheckButtons, Button
 from Starfish.transforms import rescale, _get_renorm_factor
 
+
+# Fixed once from the offline study in regression_tests/calibrate_sirocco_sigma.py.
+# This is not recomputed at runtime.
+SYNTHETIC_SIROCCO_SIGMA_EPSILON = 0.02
+DEFAULT_OBSERVATION_SIGMA_EPSILON = 0.05
+
+ALT_THEME_NAME = "speculate_shared"
+ALT_THEME_SIZES = {
+    "axis_label": 14,
+    "axis_title": 14,
+    "legend_label": 14,
+    "legend_title": 14,
+    "header_label": 12,
+    "header_title": 14,
+    "chart_title": 14,
+    "chart_subtitle": 12,
+    "text": 12,
+}
+
+
+def fit_power_law_continuum(wl, flux, sigma_clip=3.0, max_iter=5, poly_deg=2):
+    """Fit a smooth continuum to a spectrum using iterative sigma-clipping.
+
+    The fit is a polynomial of degree *poly_deg* in log-log space
+    (log10(λ) vs log10(F)).  A degree-1 polynomial corresponds to a pure
+    power law F = A·λ^α; higher degrees capture curvature in the continuum.
+    Iterative sigma-clipping rejects emission/absorption line outliers so
+    they do not bias the fit.
+
+    Parameters
+    ----------
+    wl : array_like
+        Wavelength array (Å).
+    flux : array_like
+        Flux array (same length as *wl*).
+    sigma_clip : float, optional
+        Number of standard deviations for clipping (default 3.0).
+    max_iter : int, optional
+        Maximum number of clip-and-refit iterations (default 5).
+    poly_deg : int, optional
+        Degree of the polynomial fitted in log-log space (default 2).
+
+    Returns
+    -------
+    continuum : ndarray
+        Smooth continuum evaluated at every wavelength in *wl*
+        (linear-space flux units).
+    params : dict
+        ``{'coeffs': array of polynomial coefficients (highest degree first),
+        'poly_deg': degree used, 'n_masked': number of pixels rejected}``.
+    """
+    wl = np.asarray(wl, dtype=np.float64)
+    flux = np.asarray(flux, dtype=np.float64)
+
+    # Only fit where both wl and flux are strictly positive (required for log)
+    valid = (wl > 0) & (flux > 0) & np.isfinite(flux)
+    log_wl = np.log10(wl[valid])
+    log_flux = np.log10(flux[valid])
+
+    # Ensure we have enough points for the requested degree
+    min_pts = poly_deg + 1
+    mask = np.ones(log_wl.shape, dtype=bool)  # True = included in fit
+
+    for _ in range(max_iter):
+        if mask.sum() < min_pts:
+            break
+        coeffs = np.polyfit(log_wl[mask], log_flux[mask], deg=poly_deg)
+        residuals = log_flux - np.polyval(coeffs, log_wl)
+        std = np.std(residuals[mask])
+        if std < 1e-10:
+            break  # residuals are at numerical noise level — fit has converged
+        new_mask = np.abs(residuals) <= sigma_clip * std
+        if np.array_equal(new_mask, mask):
+            break  # converged
+        mask = new_mask
+
+    # Final fit on converged mask
+    if mask.sum() >= min_pts:
+        coeffs = np.polyfit(log_wl[mask], log_flux[mask], deg=poly_deg)
+
+    # Evaluate continuum over the full (original) wavelength array
+    safe_wl = np.where(wl > 0, wl, 1.0)
+    continuum = 10.0 ** np.polyval(coeffs, np.log10(safe_wl))
+    # Zero the continuum where original wavelength was non-positive
+    continuum = np.where(wl > 0, continuum, 0.0)
+
+    params = {
+        'coeffs': coeffs,
+        'poly_deg': poly_deg,
+        'n_masked': int((~mask).sum()),
+    }
+    return continuum, params
+
+
+def build_continuum_fractional_sigma(
+    wl,
+    flux,
+    epsilon,
+    min_sigma=1e-30,
+):
+    """Build a continuum-anchored fallback sigma array.
+
+    The returned sigma is defined in native linear-flux units as
+    ``sigma(lambda) = epsilon * continuum(lambda)``.  This treats the fallback
+    as an observational uncertainty tied to the smooth continuum level
+    rather than to the raw pixel flux, so deep lines no longer drive sigma
+    toward zero.
+
+    Parameters
+    ----------
+    wl : array_like
+        Wavelength array in Angstrom.
+    flux : array_like
+        Native linear-flux spectrum.
+    epsilon : float, optional
+        Fractional continuum error used for the fallback sigma.
+    min_sigma : float, optional
+        Absolute lower bound to keep sigma strictly positive.
+
+    Returns
+    -------
+    sigma : ndarray
+        Positive sigma array in the same units as ``flux``.
+    continuum : ndarray
+        Smooth continuum estimate used to construct ``sigma``.
+    """
+    wl = np.asarray(wl, dtype=np.float64)
+    flux = np.asarray(flux, dtype=np.float64)
+
+    positive_flux = np.abs(flux[np.isfinite(flux)])
+    positive_flux = positive_flux[positive_flux > 0]
+    fallback_level = (
+        float(np.nanmedian(positive_flux)) if positive_flux.size > 0 else 1.0
+    )
+
+    try:
+        continuum, _ = fit_power_law_continuum(wl, flux)
+    except Exception:
+        continuum = np.full_like(flux, fallback_level, dtype=np.float64)
+
+    continuum = np.asarray(continuum, dtype=np.float64)
+    continuum = np.where(np.isfinite(continuum) & (continuum > 0), continuum, fallback_level)
+    sigma = np.maximum(epsilon * continuum, float(min_sigma))
+    return sigma.astype(np.float64), continuum.astype(np.float64)
+
+
+def build_synthetic_sirocco_sigma(
+    wl,
+    flux,
+    epsilon=SYNTHETIC_SIROCCO_SIGMA_EPSILON,
+    min_sigma=1e-30,
+):
+    """Build the fixed offline-calibrated fallback sigma for Sirocco spectra.
+
+    This helper does not estimate ``epsilon`` at runtime.  It applies the
+    frozen continuum-relative constant chosen from the offline study in
+    ``regression_tests/calibrate_sirocco_sigma.py``.
+    """
+    return build_continuum_fractional_sigma(
+        wl,
+        flux,
+        epsilon=epsilon,
+        min_sigma=min_sigma,
+    )
+
+
+def build_default_observation_sigma(
+    wl,
+    flux,
+    epsilon=DEFAULT_OBSERVATION_SIGMA_EPSILON,
+    min_sigma=1e-30,
+):
+    """Build the generic fallback sigma for uploaded spectra without errors.
+
+    This path is intentionally separate from the Sirocco-specific calibration.
+    For arbitrary user-provided spectra with no uncertainty column, we keep a
+    more conservative continuum-relative fallback.
+    """
+    return build_continuum_fractional_sigma(
+        wl,
+        flux,
+        epsilon=epsilon,
+        min_sigma=min_sigma,
+    )
+
+
+def enable_speculate_altair_theme(alt):
+    """Enable the shared Speculate Altair theme.
+
+    This is intentionally safe to call repeatedly from marimo cells that may be
+    rerun while the Python module cache persists.
+    """
+
+    if ALT_THEME_NAME not in alt.theme.names():
+        @alt.theme.register(ALT_THEME_NAME, enable=False)
+        def _speculate_altair_theme():
+            return alt.theme.ThemeConfig({
+                "config": {
+                    "axis": {
+                        "labelFontSize": ALT_THEME_SIZES["axis_label"],
+                        "titleFontSize": ALT_THEME_SIZES["axis_title"],
+                    },
+                    "axisX": {
+                        "labelFontSize": ALT_THEME_SIZES["axis_label"],
+                        "titleFontSize": ALT_THEME_SIZES["axis_title"],
+                    },
+                    "axisY": {
+                        "labelFontSize": ALT_THEME_SIZES["axis_label"],
+                        "titleFontSize": ALT_THEME_SIZES["axis_title"],
+                    },
+                    "header": {
+                        "labelFontSize": ALT_THEME_SIZES["header_label"],
+                        "titleFontSize": ALT_THEME_SIZES["header_title"],
+                    },
+                    "legend": {
+                        "labelFontSize": ALT_THEME_SIZES["legend_label"],
+                        "titleFontSize": ALT_THEME_SIZES["legend_title"],
+                    },
+                    "text": {
+                        "fontSize": ALT_THEME_SIZES["text"],
+                    },
+                    "title": {
+                        "fontSize": ALT_THEME_SIZES["chart_title"],
+                        "subtitleFontSize": ALT_THEME_SIZES["chart_subtitle"],
+                    },
+                }
+            })
+
+    alt.theme.enable(ALT_THEME_NAME)
+
+
+def build_bestfit_spectrum_altair(
+    alt,
+    wavelength,
+    data_flux,
+    model_flux,
+    model_cov_diag,
+    title,
+    zoom_name="bestfit_zoom",
+    main_width=560,
+    right_width=450,
+    main_height=460,
+    panel_height=190,
+    flux_axis_title="Flux",
+    residual_title="Residuals and Model Uncertainty",
+    relative_title="Relative Error",
+    y_axis_format=".2e",
+    extra_flux_series=None,
+):
+    """Build the shared three-panel best-fit spectrum Altair chart.
+
+    Parameters
+    ----------
+    alt : module
+        The Altair module to build the chart with.
+    wavelength, data_flux, model_flux : array_like
+        One-dimensional spectral arrays on a shared wavelength grid.
+    model_cov_diag : array_like
+        Either the covariance diagonal or the full covariance matrix.
+    title : str
+        Chart title shown above the main spectrum panel.
+    extra_flux_series : dict, list of dict, or None
+        Optional additional spectra to overlay on the main panel.  Each dict may
+        contain ``wavelength``, ``flux``, ``label``, ``color``, and ``dash``.
+    """
+    wl = np.asarray(wavelength, dtype=np.float64)
+    data_flux = np.asarray(data_flux, dtype=np.float64)
+    model_flux = np.asarray(model_flux, dtype=np.float64)
+    cov_input = np.asarray(model_cov_diag, dtype=np.float64)
+
+    if cov_input.ndim == 2:
+        cov_diag = np.diag(cov_input)
+    else:
+        cov_diag = cov_input.reshape(-1)
+
+    n_pix = min(len(wl), len(data_flux), len(model_flux), len(cov_diag))
+    wl = wl[:n_pix]
+    data_flux = data_flux[:n_pix]
+    model_flux = model_flux[:n_pix]
+    cov_diag = cov_diag[:n_pix]
+
+    std = np.sqrt(np.maximum(np.abs(cov_diag), 0.0))
+    residual = data_flux - model_flux
+    residual_frac = residual / np.where(np.abs(data_flux) > 0, data_flux, 1.0)
+    x_domain = [float(np.min(wl)), float(np.max(wl))]
+    y_axis = alt.Axis(format=y_axis_format)
+    x_scale = alt.Scale(domain={"param": zoom_name})
+
+    main_values = []
+    shared_zoom = alt.selection_interval(
+        name=zoom_name,
+        value={"x": x_domain},
+        bind="scales",
+        encodings=["x"],
+    )
+    for wavelength_value, flux_value in zip(wl, data_flux):
+        main_values.append({
+            "Wavelength": float(wavelength_value),
+            "Flux": float(flux_value),
+            "Series": "Input Data",
+        })
+    for wavelength_value, flux_value in zip(wl, model_flux):
+        main_values.append({
+            "Wavelength": float(wavelength_value),
+            "Flux": float(flux_value),
+            "Series": "Emulated Model",
+        })
+
+    series_order = ["Input Data", "Emulated Model"]
+    series_colors = ["#000000", "#0072B2"]
+    series_dashes = [[], []]
+    if extra_flux_series:
+        if isinstance(extra_flux_series, dict):
+            extra_flux_series = [extra_flux_series]
+        default_colors = ["#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"]
+        for idx, series in enumerate(extra_flux_series):
+            extra_wl = np.asarray(series.get("wavelength", wl), dtype=np.float64)
+            extra_flux = np.asarray(series.get("flux", []), dtype=np.float64)
+            n_extra = min(len(extra_wl), len(extra_flux))
+            if n_extra == 0:
+                continue
+            label = str(series.get("label", f"Comparison {idx + 1}"))
+            color = series.get("color", default_colors[idx % len(default_colors)])
+            dash = series.get("dash", [6, 3])
+            series_order.append(label)
+            series_colors.append(color)
+            series_dashes.append(dash)
+            for wavelength_value, flux_value in zip(extra_wl[:n_extra], extra_flux[:n_extra]):
+                main_values.append({
+                    "Wavelength": float(wavelength_value),
+                    "Flux": float(flux_value),
+                    "Series": label,
+                })
+
+    main_chart = alt.Chart(alt.Data(values=main_values)).mark_line(
+        strokeWidth=1.4,
+    ).encode(
+        x=alt.X(
+            "Wavelength:Q",
+            title="Wavelength (Å)",
+            scale=x_scale,
+        ),
+        y=alt.Y(
+            "Flux:Q",
+            title=flux_axis_title,
+            scale=alt.Scale(zero=False),
+            axis=y_axis,
+        ),
+        color=alt.Color(
+            "Series:N",
+            title="Series",
+            scale=alt.Scale(domain=series_order, range=series_colors),
+            legend=alt.Legend(orient="top"),
+        ),
+        strokeDash=alt.StrokeDash(
+            "Series:N",
+            scale=alt.Scale(domain=series_order, range=series_dashes),
+            legend=None,
+        ),
+        tooltip=[
+            alt.Tooltip("Series:N", title="Series"),
+            alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+            alt.Tooltip("Flux:Q", title="Flux", format=".4e"),
+        ],
+    ).properties(
+        width=main_width,
+        height=main_height,
+        title=title,
+    ).add_params(shared_zoom)
+
+    resid_values = []
+    band_1sigma = []
+    band_2sigma = []
+    band_3sigma = []
+    rel_values = []
+    for wavelength_value, residual_value, sigma_value, relative_value in zip(
+        wl, residual, std, residual_frac
+    ):
+        wavelength_value = float(wavelength_value)
+        sigma_value = float(sigma_value)
+        resid_values.append({
+            "Wavelength": wavelength_value,
+            "Residual": float(residual_value),
+        })
+        band_1sigma.append({
+            "Wavelength": wavelength_value,
+            "Lower": -sigma_value,
+            "Upper": sigma_value,
+        })
+        band_2sigma.append({
+            "Wavelength": wavelength_value,
+            "Lower": -2.0 * sigma_value,
+            "Upper": 2.0 * sigma_value,
+        })
+        band_3sigma.append({
+            "Wavelength": wavelength_value,
+            "Lower": -3.0 * sigma_value,
+            "Upper": 3.0 * sigma_value,
+        })
+        rel_values.append({
+            "Wavelength": wavelength_value,
+            "Relative Error": float(relative_value),
+        })
+
+    resid_band_3 = alt.Chart(alt.Data(values=band_3sigma)).mark_area(
+        color="#54a24b",
+        opacity=0.12,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=x_scale),
+        y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False), axis=y_axis),
+        y2="Upper:Q",
+    )
+    resid_band_2 = alt.Chart(alt.Data(values=band_2sigma)).mark_area(
+        color="#54a24b",
+        opacity=0.20,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=x_scale),
+        y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False), axis=y_axis),
+        y2="Upper:Q",
+    )
+    resid_band_1 = alt.Chart(alt.Data(values=band_1sigma)).mark_area(
+        color="#54a24b",
+        opacity=0.30,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=x_scale),
+        y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False), axis=y_axis),
+        y2="Upper:Q",
+    )
+    resid_zero = alt.Chart(alt.Data(values=[{"Zero": 0.0}])).mark_rule(
+        color="grey",
+        strokeDash=[4, 4],
+        opacity=0.7,
+    ).encode(y="Zero:Q")
+    resid_line = alt.Chart(alt.Data(values=resid_values)).mark_line(
+        color="#2ca02c",
+        strokeWidth=1.2,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=x_scale),
+        y=alt.Y("Residual:Q", title="Residual", scale=alt.Scale(zero=False), axis=y_axis),
+        tooltip=[
+            alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+            alt.Tooltip("Residual:Q", title="Data - Model", format=".4e"),
+        ],
+    )
+    resid_chart = (resid_band_3 + resid_band_2 + resid_band_1 + resid_zero + resid_line).properties(
+        width=right_width,
+        height=panel_height,
+        title=residual_title,
+    )
+
+    rel_zero = alt.Chart(alt.Data(values=[{"Zero": 0.0}])).mark_rule(
+        color="grey",
+        strokeDash=[4, 4],
+        opacity=0.7,
+    ).encode(y="Zero:Q")
+    rel_line = alt.Chart(alt.Data(values=rel_values)).mark_line(
+        color="#e45756",
+        strokeWidth=1.2,
+    ).encode(
+        x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=x_scale),
+        y=alt.Y("Relative Error:Q", title="Relative Error", scale=alt.Scale(zero=False), axis=y_axis),
+        tooltip=[
+            alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+            alt.Tooltip("Relative Error:Q", title="Relative Error", format=".4e"),
+        ],
+    )
+    rel_chart = (rel_line + rel_zero).properties(
+        width=right_width,
+        height=panel_height,
+        title=relative_title,
+    )
+
+    return main_chart | alt.vconcat(resid_chart, rel_chart, spacing=14)
+
 def plot_emulator(emulator, grid, not_fixed, fixed):
     
     """Takes the emulator and given the emulator's inputed model parameters, 

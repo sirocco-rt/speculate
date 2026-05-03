@@ -7,9 +7,15 @@ Usage:
     python run.py --port 7860  # Custom port (HuggingFace default)
 """
 import sys
+import socket
 import webbrowser
 import threading
 import time
+import numpy as np
+
+def is_port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("localhost", port)) == 0
 
 def open_browser(port):
     """Open browser after a short delay to ensure server is ready"""
@@ -17,7 +23,10 @@ def open_browser(port):
     webbrowser.open(f"http://localhost:{port}")
 
 if __name__ == "__main__":
-    port = 8080
+    port = 8080  # Default port
+    # if port in use, choose random port between 8000 and 8800
+    if is_port_in_use(port):
+        port = np.random.randint(8000, 8800)  # Default random port
     
     # Check if port is specified
     if "--port" in sys.argv:

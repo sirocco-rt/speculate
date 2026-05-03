@@ -231,5 +231,6 @@ speculate_dev/
 raw_scripts_of_notebooks/
 old_scripts/
 benchmark_results/*
+papers/
 
 

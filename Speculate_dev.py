@@ -83,7 +83,7 @@ wl_range = (850, 1850)       # Wavelength range of your emulator grid space.
                               # Later becomes truncated +/-10Angstom
                               
 scale = 'linear'              # Transformation scaling for flux data. 'linear'
-                              # 'log' or 'scaled'. scale not implemented yet.
+                              # or 'log'.
 
 grid_file_name = 'test'  # If Builds fast, file save unnessary.
 process_grid = False           # Turn off if planning to use existing grid file.
@@ -206,7 +206,7 @@ model_parameters_str = ''.join(str(i) for i in model_parameters)
 if speculate_cv_no_bl_grid_v87f == 1:
     base_name = 'speculate_cv_no-bl_grid_v87f_'
     # saved grid file name
-    grid_file_name = base_name + 'grid_' + model_parameters_str
+    grid_file_name = base_name + 'grid_' + model_parameters_str + f'_{wl_range[0]}-{wl_range[1]}AA'
     # Can change inclination inclination angle
     inclination_angle = 55  # degrees: 30,35,40,45,50,55,60,65,70,75,80,85
     inclination_column = int(2 + (inclination_angle - 30) / 5) #(30°->2, 35°->3, ..., 85°->13)
@@ -228,7 +228,7 @@ if speculate_cv_no_bl_grid_v87f == 1:
 if speculate_cv_bl_grid_v87f == 1:
     base_name = 'speculate_cv_bl_grid_v87f_'
     # saved grid file name
-    grid_file_name = base_name + 'grid_' + model_parameters_str
+    grid_file_name = base_name + 'grid_' + model_parameters_str + f'_{wl_range[0]}-{wl_range[1]}AA'
     # Can change inclination inclination angle
     inclination_angle = 55  # degrees: 30,35,40,45,50,55,60,65,70,75,80,85
     inclination_column = int(2 + (inclination_angle - 30) / 5) #(30°->2, 35°->3, ..., 85°->13)
@@ -543,8 +543,6 @@ wl_range_data = (wl_range[0] + 10, wl_range[1] - 10)  # Truncation
 if scale == 'log':
     fluxes = [np.log10(i) for i in fluxes]  # log
     fluxes = np.array(fluxes)  # log
-if scale == 'scaled':
-    fluxes /= np.mean(fluxes)
 indexes = np.where((waves >= wl_range_data[0]) & (waves <= wl_range_data[1]))  # Truncation + next 2 lines
 waves = waves[indexes[0]]
 fluxes = fluxes[indexes[0]]
@@ -643,7 +641,7 @@ print(file)
 # plt.plot(waves, fit, color='purple', label='Quadratic fit', linewidth=0.5)
 # plt.plot(waves, smooth_flux, color='green',
 #          label='Smoothened/High Pass Filter')
-# if scale == 'linear' or scale == 'scaled':
+# if scale == 'linear':
 #     plt.plot(
 #         waves,
 #         adj_flux,

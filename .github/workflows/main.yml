@@ -17,7 +17,29 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
+      - name: Prepare Hugging Face README
+        run: |
+          frontmatter_file="assets/logos/HF_Frontmatter.txt"
+          readme_file="README.md"
+          tmp_readme="$(mktemp)"
+          trap 'rm -f "$tmp_readme"' EXIT
+
+          if [ "$(head -n 1 "$readme_file")" = "---" ] && head -n 20 "$readme_file" | grep -q "^sdk: docker$"; then
+            echo "README.md already contains Hugging Face Space frontmatter."
+          else
+            cat "$frontmatter_file" > "$tmp_readme"
+            printf '\n\n' >> "$tmp_readme"
+            cat "$readme_file" >> "$tmp_readme"
+            mv "$tmp_readme" "$readme_file"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$readme_file"
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: prepare Hugging Face README [skip ci]"
+          fi
       - name: Push to hub
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: git push --force https://AustenWallis:$HF_TOKEN@huggingface.co/spaces/Sirocco-rt/Speculate main
+        run: git push --force https://AustenWallis:$HF_TOKEN@huggingface.co/spaces/Sirocco-rt/Speculate HEAD:main

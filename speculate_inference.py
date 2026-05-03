@@ -43,6 +43,23 @@ def _():
     from Starfish.models import SpectrumModel
     import pathlib
     import scipy.stats as stats
+    import importlib
+    from Speculate_addons import Spec_functions as spec_functions
+
+    # Marimo can keep an older helper module cached across notebook reloads.
+    # If a newly added helper is missing, reload the module before binding names.
+    if (
+        not hasattr(spec_functions, "build_default_observation_sigma")
+        or not hasattr(spec_functions, "build_bestfit_spectrum_altair")
+        or not hasattr(spec_functions, "enable_speculate_altair_theme")
+    ):
+        spec_functions = importlib.reload(spec_functions)
+
+    spec_functions.enable_speculate_altair_theme(alt)
+    build_bestfit_spectrum_altair = spec_functions.build_bestfit_spectrum_altair
+    build_default_observation_sigma = spec_functions.build_default_observation_sigma
+    build_synthetic_sirocco_sigma = spec_functions.build_synthetic_sirocco_sigma
+    fit_power_law_continuum = spec_functions.fit_power_law_continuum
     logo_path = "assets/logos/Speculate_logo2.png"
 
 
@@ -65,39 +82,203 @@ def _():
 
     # Combine in horizontal stack
     mo.hstack([title_col, logo_col], justify="space-between", align="center")
-    return Emulator, Spectrum, SpectrumModel, alt, mo, np, os, pd, re, stats
+    return (
+        Emulator,
+        Spectrum,
+        SpectrumModel,
+        alt,
+        build_bestfit_spectrum_altair,
+        build_default_observation_sigma,
+        build_synthetic_sirocco_sigma,
+        fit_power_law_continuum,
+        mo,
+        np,
+        os,
+        pd,
+        re,
+        stats,
+    )
 
 
 @app.cell
 def _(mo):
-    # Static sidebar - always shows all options
-    mo.sidebar(
-        mo.vstack([
-            mo.md("# 🔭 Speculate"),
-            mo.md(" "),
+    # The selected emulator filename is cheap UI state; the loaded Emulator
+    # object can materialise V11/Cholesky caches on the GPU, so it lives behind
+    # an explicit Load button instead of being rebuilt on every dropdown change.
+    get_loaded_emu, set_loaded_emu = mo.state(None)
+    get_loaded_emu_filename, set_loaded_emu_filename = mo.state(None)
+    get_selected_grid, set_selected_grid = mo.state(None)
+    get_selected_emu_filename, set_selected_emu_filename = mo.state(None)
+    return (
+        get_loaded_emu,
+        get_loaded_emu_filename,
+        get_selected_emu_filename,
+        get_selected_grid,
+        set_loaded_emu,
+        set_loaded_emu_filename,
+        set_selected_emu_filename,
+        set_selected_grid,
+    )
+
+
+@app.cell
+def _(
+    get_loaded_emu,
+    get_loaded_emu_filename,
+    set_loaded_emu,
+    set_loaded_emu_filename,
+    set_selected_emu_filename,
+    set_selected_grid,
+):
+    def clear_loaded_emu_cache(_value=None, *, force=False):
+        """Drop the loaded Emulator and ask PyTorch to release cached GPU memory.
+
+        The Emulator may attach large GPU tensors lazily during load and first
+        inference, including V11, iPhiPhi, Cholesky factors, and block-wise
+        memory-efficient caches.  This helper is used as a widget on_change
+        callback and before explicit loads, so it accepts and ignores the UI
+        callback value.
+        """
+        _emu = get_loaded_emu()
+        _had_emu = _emu is not None or get_loaded_emu_filename() is not None
+
+        if _emu is not None:
+            # Ignore attributes that are not present on this Emulator version.
+            for _attr in (
+                "_v11_gpu",
+                "_iPhiPhi_gpu",
+                "_dots_inv_diag_gpu",
+                "_grid_points_gpu",
+                "_w_hat_gpu",
+                "_variances_gpu",
+                "_lengthscales_gpu",
+                "_L_gpu",
+                "_alpha_gpu",
+                "_L_gpu_source_id",
+                "_mem_eff_L_blocks",
+                "_mem_eff_alpha_blocks",
+                "_v11",
+                "_iPhiPhi",
+            ):
+                if hasattr(_emu, _attr):
+                    try:
+                        setattr(_emu, _attr, None)
+                    except Exception:
+                        pass
+
+        if _emu is not None:
+            set_loaded_emu(None)
+        if get_loaded_emu_filename() is not None:
+            set_loaded_emu_filename(None)
+
+        if force or _had_emu:
+            try:
+                from Starfish.emulator.kernels import clear_kernel_cache as _clear_kernel_cache
+                _clear_kernel_cache()
+            except Exception:
+                pass
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+                    try:
+                        _torch.cuda.ipc_collect()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                import gc as _gc
+                _gc.collect()
+            except Exception:
+                pass
+
+    def on_grid_select(value):
+        """Persist the selected grid while clearing any stale loaded emulator."""
+        set_selected_grid(value)
+        set_selected_emu_filename(None)
+        clear_loaded_emu_cache()
+
+    def on_emulator_select(value):
+        """Persist the selected emulator filename while clearing stale caches."""
+        set_selected_emu_filename(value)
+        clear_loaded_emu_cache()
+
+    return clear_loaded_emu_cache, on_emulator_select, on_grid_select
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    usage_toggle = mo.ui.switch(value=False, label=f"{mo.icon('lucide:activity')} System Resources")
+    usage_refresh = mo.ui.refresh(default_interval="10s", label="")
+    return usage_refresh, usage_toggle
+
+
+@app.cell(hide_code=True)
+def _(mo, usage_refresh, usage_toggle):
+    from Speculate_addons.speculate_usage_bars import get_usage_html
+    if usage_toggle.value:
+        usage_refresh
+        _html = get_usage_html()
+        usage_bars = mo.vstack([usage_toggle, mo.Html(_html)])
+    else:
+        usage_bars = usage_toggle
+    return (usage_bars,)
+
+
+@app.cell
+def _(mo, os, usage_bars):
+    _is_hf = os.environ.get("SPACE_ID") is not None
+
+    _items = [mo.md(f"#Speculate {mo.icon('lucide:telescope')}")]
+    _items.extend([mo.md(" "), mo.md("---"), mo.md(" ")])
+
+    if _is_hf:
+        _items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+        }, orientation="vertical"))
+        _items.extend([
             mo.md(" "),
             mo.md("---"),
-            mo.md("---"),
+            mo.md(f"### {mo.icon('lucide:lock')} Locked Tools:"),
+            mo.md("Install Speculate Locally"),
             mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:download')} Model Downloader"),
             mo.md(" "),
-            mo.nav_menu({
-                "/": f"###{mo.icon('lucide:home')} Home",
-            }, orientation="vertical"),
+            mo.md(f"###{mo.icon('lucide:brain')} Training Tool"),
             mo.md(" "),
-            mo.md("---"),
-            mo.md("---"),
-            mo.nav_menu({
+            mo.md(f"###{mo.icon('lucide:sparkles')} Inference Tool"),
+            mo.md(" "),
+            mo.md(f"###{mo.icon('lucide:test-tubes')} Benchmark Suite"),
+        ])
+    else:
+        _items.append(mo.nav_menu({
+            "/": f"###{mo.icon('lucide:home')} Home",
+            "/downloader": f"###{mo.icon('lucide:download')} Model Downloader",
+            "/inspector": f"###{mo.icon('lucide:chart-spline')} Grid Inspector",
+            "/training": f"###{mo.icon('lucide:brain')} Training Tool",
+            "/inference": f"###{mo.icon('lucide:sparkles')} Inference Tool",
+            "/quickfit": f"###{mo.icon('lucide:zap')} Quick Fit",
+            "/benchmark": f"###{mo.icon('lucide:test-tubes')} Benchmark Suite",
+        }, orientation="vertical"))
+
+    _items.extend([
+        mo.md(" "), mo.md("---"),
+        mo.nav_menu({
             "https://github.com/sirocco-rt/speculate": f"###{mo.icon('lucide:github')} Speculate Github",
             "https://github.com/sirocco-rt/speculate/wiki": f"###{mo.icon('lucide:book-open')} Speculate Docs",
-            }, orientation="vertical"),
-            mo.md(" "),
-            mo.md("---"),
-            mo.nav_menu({
+        }, orientation="vertical"),
+        mo.md(" "), mo.md("---"),
+        mo.nav_menu({
             "https://github.com/sirocco-rt/sirocco": f"###{mo.icon('lucide:wind')} Sirocco Github",
-            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs"
-            }, orientation="vertical")
-        ])
-    )
+            "https://sirocco-rt.readthedocs.io/en/latest/": f"###{mo.icon('lucide:wind')} Sirocco Docs",
+        }, orientation="vertical"),
+        mo.md("---"),
+    ])
+    _items.extend([mo.md("---"), usage_bars])
+    mo.sidebar(mo.vstack(_items))
     return
 
 
@@ -110,15 +291,15 @@ def _(mo):
         gpu_name = torch.cuda.get_device_name(0)
         try:
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            gpu_text = f"**🟢 GPU Active:** {gpu_name} ({vram_gb:.1f} GB VRAM)"
+            gpu_text = f"**{mo.icon('lucide:cpu')} GPU Active:** {gpu_name} ({vram_gb:.1f} GB VRAM)"
         except:
-            gpu_text = f"**🟢 GPU Active:** {gpu_name}"
+            gpu_text = f"**{mo.icon('lucide:cpu')} GPU Active:** {gpu_name}"
 
         status_widget = mo.callout(mo.md(gpu_text), kind="success")
 
     else:
         status_widget = mo.callout(
-            mo.md("## 🟠 No NVIDIA GPU Detected\n*Performance will be slower on CPU.*"), 
+            mo.md(f"## {mo.icon('lucide:cpu')} No NVIDIA GPU Detected\n*Performance will be slower on CPU.*"), 
             kind="warn"
         )
 
@@ -146,26 +327,27 @@ def _():
     # Indices 7-8  : Boundary-layer emission (only in "bl" grids).
     # Indices 9-11 : Observer inclination at increasing angular resolution.
     #
-    # In emulator space param1 and param5 are stored in log10.
+    # In emulator space param1, param3, and param5 are stored in log10.
     # param2 (wind.mdot) is stored as the ratio wind/disk mass-loss rate.
+    # Tuple: (friendly_name, default_min, default_max, is_log10)
     param_map_db = {
-        1: ("disk.mdot", 0.0, 1.0),              # log10(Msol/yr)
-        2: ("wind.mdot", 0.0, 1.0),              # ratio: wind / disk
-        3: ("KWD.d", 0.0, 1.0),                  # wind launch radius (r_star)
-        4: ("KWD.mdot_r_exponent", 0.0, 1.0),    # radial mdot power law
-        5: ("KWD.acceleration_length", 0.0, 1.0), # log10(cm)
-        6: ("KWD.acceleration_exponent", 0.0, 1.0),
-        7: ("Boundary_layer.luminosity", 0.0, 1.0),
-        8: ("Boundary_layer.temp", 0.0, 1.0),
-        9: ("Inclination (Sparse)", 30.0, 80.0),  # 3 angles (30, 55, 80)
-        10: ("Inclination (Mid)", 30.0, 80.0),    # 6 angles
-        11: ("Inclination (Full)", 30.0, 80.0),   # 12 angles
+        1: ("disk.mdot", 0.0, 1.0, True),              # log10(Msol/yr)
+        2: ("wind.mdot", 0.0, 1.0, False),              # ratio: wind / disk
+        3: ("KWD.d", 0.0, 1.0, True),                  # log10(wind launch radius / r_star)
+        4: ("KWD.mdot_r_exponent", 0.0, 1.0, False),    # radial mdot power law
+        5: ("KWD.acceleration_length", 0.0, 1.0, True), # log10(cm)
+        6: ("KWD.acceleration_exponent", 0.0, 1.0, False),
+        7: ("Boundary_layer.luminosity", 0.0, 1.0, True),  # log10(erg/s)
+        8: ("Boundary_layer.temp", 0.0, 1.0, True),        # log10(K)
+        9: ("Inclination (Sparse)", 30.0, 80.0, False),  # 3 angles (30, 55, 80)
+        10: ("Inclination (Mid)", 30.0, 80.0, False),    # 6 angles
+        11: ("Inclination (Full)", 30.0, 80.0, False),   # 12 angles
     }
     return (param_map_db,)
 
 
 @app.cell
-def _(mo, os):
+def _(get_loaded_emu_filename, get_selected_grid, mo, on_grid_select, os):
     # --- Grid Selection ---
     # Scan the Grid-Emulator_Files directory for .npz emulator files and
     # extract unique grid stem names (everything before "_emu_").  The stem
@@ -196,24 +378,37 @@ def _(mo, os):
     _sorted_grids = sorted(list(_unique_grids))
 
     if _sorted_grids:
+        _preferred_grid = "speculate_cv_no-bl_grid_v87f"
+        _initial_grid = _preferred_grid if _preferred_grid in _sorted_grids else _sorted_grids[0]
+        _selected_grid = get_selected_grid()
+        _loaded_filename = get_loaded_emu_filename()
+        if _selected_grid in _sorted_grids:
+            _initial_grid = _selected_grid
+        elif _loaded_filename and "_emu_" in _loaded_filename:
+            _loaded_grid = _loaded_filename.split("_emu_")[0]
+            if _loaded_grid in _sorted_grids:
+                _initial_grid = _loaded_grid
+
         grid_selector = mo.ui.dropdown(
             options=_sorted_grids,
-            value=_sorted_grids[0],
+            value=_initial_grid,
             label="Select Grid Dataset:",
-            full_width=True
+            full_width=True,
+            on_change=on_grid_select,
         )
     else:
         grid_selector = mo.ui.dropdown(
             options=[],
             #disabled=True,
             label="No Grids Found",
-            full_width=True
+            full_width=True,
+            on_change=on_grid_select,
         )
     return (grid_selector,)
 
 
 @app.cell
-def _(grid_selector, mo, os, param_map_db, re):
+def _(get_loaded_emu_filename, get_selected_emu_filename, grid_selector, mo, on_emulator_select, os, param_map_db, re):
     # --- Emulator Selection (Dependent on Grid) ---
     # Filter the .npz files to those matching the selected grid stem and
     # discover which parameter indices this grid supports.  Indices are
@@ -256,19 +451,34 @@ def _(grid_selector, mo, os, param_map_db, re):
     _filtered_emus = sorted(_filtered_emus)
 
     if _filtered_emus:
+        _initial_emu = _filtered_emus[0]
+        _selected_emu = get_selected_emu_filename()
+        _loaded_emu = get_loaded_emu_filename()
+        if _selected_emu in _filtered_emus:
+            _initial_emu = _selected_emu
+        elif _loaded_emu in _filtered_emus:
+            _initial_emu = _loaded_emu
+
         emulator_selector = mo.ui.dropdown(
             options=_filtered_emus,
-            value=_filtered_emus[0],
+            value=_initial_emu,
             label="Select Trained Emulator:",
-            full_width=True
+            full_width=True,
+            on_change=on_emulator_select,
         )
     else:
         emulator_selector = mo.ui.dropdown(
             options=[],
             #disabled=True,
             label="No Emulators for this Grid",
-            full_width=True
+            full_width=True,
+            on_change=on_emulator_select,
         )
+
+    emulator_load_button = mo.ui.run_button(
+        label=f"{mo.icon('lucide:download')} Load Emulator",
+        kind="neutral",
+    )
 
     # Valid Parameters Accordion
     _param_lookup_info = []
@@ -284,9 +494,9 @@ def _(grid_selector, mo, os, param_map_db, re):
         _param_lookup_info.append("No parameters detected from filenames.")
 
     param_info_accordion = mo.accordion({
-        "🔑 Parameter Key": mo.md("\n".join([f"- {s}" for s in _param_lookup_info]))
+        f"{mo.icon('lucide:key-round')} Parameter Key": mo.md("\n".join([f"- {s}" for s in _param_lookup_info]))
     })
-    return emulator_selector, grid_indices, param_info_accordion
+    return emulator_load_button, emulator_selector, grid_indices, param_info_accordion
 
 
 @app.cell
@@ -300,8 +510,8 @@ def _(mo):
 
     # Source Type Selector: Observation vs Test Grid
     data_source_selector = mo.ui.dropdown(
-        options=["📁 Observation File", "🧪 Test Grid (Validation)"],
-        value="📁 Observation File",
+        options=["Observation File", "Test Grid (Validation)"],
+        value="Observation File",
         label="Data Source:",
         full_width=True
     )
@@ -346,9 +556,9 @@ def _(mo, obs_file_uploader, os, set_obs_refresh):
             # Force refresh of the file list
             set_obs_refresh(lambda v: v + 1)
 
-            mo.status.toast(f"✅ Uploaded {uploaded_file.name}")
+            mo.status.toast(f"{mo.icon('lucide:check-circle')} Uploaded {uploaded_file.name}")
         except Exception as e:
-             mo.status.toast(f"❌ Upload failed: {str(e)}")
+             mo.status.toast(f"{mo.icon('lucide:x-circle')} Upload failed: {str(e)}")
     return
 
 
@@ -444,12 +654,12 @@ def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
                 if os.path.exists(file_path):
                     os.remove(file_path)
                     set_obs_refresh(lambda v: v + 1)
-                    mo.status.toast(f"🗑️ Deleted {obs_file_selector.value}")
+                    mo.status.toast(f"{mo.icon('lucide:trash-2')} Deleted {obs_file_selector.value}")
             except Exception as e:
                 mo.status.toast(f"Error deleting file: {e}")
 
     delete_obs_btn = mo.ui.button(
-        label="🗑️",
+        label=f"{mo.icon('lucide:trash-2')}",
         kind="danger",
         tooltip="Delete selected file",
         on_click=lambda _: delete_selected_file()
@@ -471,29 +681,75 @@ def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
 
 
 @app.cell
-def _(Emulator, emulator_selector, mo):
-    # Load the selected emulator eagerly so later cells can stop early if the
-    # model file is missing or incompatible.
+def _(
+    Emulator,
+    clear_loaded_emu_cache,
+    emulator_load_button,
+    emulator_selector,
+    get_loaded_emu,
+    get_loaded_emu_filename,
+    mo,
+    set_loaded_emu,
+    set_loaded_emu_filename,
+    set_selected_emu_filename,
+    set_selected_grid,
+):
+    # The dropdown only selects a file.  The expensive Emulator.load call is
+    # deliberately gated behind this run button because load can allocate V11
+    # and Cholesky caches large enough to exhaust GPU/CPU memory.  Note that
+    # the heaviest GPU caches (Cholesky blocks, V11) are populated lazily on
+    # the first inference call, not at load time, so a successful Load is
+    # itself a relatively light memory event.
+    emu = get_loaded_emu()
+    _loaded_name = get_loaded_emu_filename()
+    _selected_name = emulator_selector.value
+    emulator_load_status = mo.md("")
 
-    emu = None
-    stop_computation = False
+    if emu is not None and _loaded_name != _selected_name:
+        clear_loaded_emu_cache()
+        emu = None
+        _loaded_name = None
 
-    if emulator_selector.value:
-        try:
-             with mo.status.spinner(title=f"Loading emulator {emulator_selector.value}..."):
-                emu_path = f"Grid-Emulator_Files/{emulator_selector.value}"
-                emu = Emulator.load(emu_path)
-        except Exception as e:
-            mo.output.replace(mo.callout(mo.md(f"❌ Error loading emulator: {e}"), kind="danger"))
-            stop_computation = True
+    if emulator_load_button.value:
+        if not _selected_name:
+            emulator_load_status = mo.callout(
+                mo.md("Select an emulator before loading."),
+                kind="warn",
+            )
+        else:
+            clear_loaded_emu_cache(force=True)
+            try:
+                with mo.status.spinner(title=f"Loading emulator {_selected_name}..."):
+                    emu_path = f"Grid-Emulator_Files/{_selected_name}"
+                    emu = Emulator.load(emu_path)
+                set_loaded_emu(emu)
+                set_loaded_emu_filename(_selected_name)
+                set_selected_emu_filename(_selected_name)
+                if "_emu_" in _selected_name:
+                    set_selected_grid(_selected_name.split("_emu_")[0])
+                emulator_load_status = mo.callout(
+                    mo.md(f"{mo.icon('lucide:check-circle')} Loaded `{_selected_name}`."),
+                    kind="success",
+                )
+            except Exception as e:
+                emu = None
+                clear_loaded_emu_cache(force=True)
+                emulator_load_status = mo.callout(
+                    mo.md(f"{mo.icon('lucide:x-circle')} Error loading `{_selected_name}`: {e}"),
+                    kind="danger",
+                )
+    elif _selected_name and emu is None:
+        emulator_load_status = mo.callout(
+            mo.md(f"Selected `{_selected_name}`. Click **Load Emulator** to enable inference."),
+            kind="neutral",
+        )
 
-    if stop_computation:
-        mo.stop()
-    return (emu,)
+    return emu, emulator_load_status
 
 
 @app.cell
 def _(
+    build_synthetic_sirocco_sigma,
     data_source_selector,
     emu,
     emulator_selector,
@@ -545,11 +801,14 @@ def _(
             fluxes = np.flip(data_raw[inc_col_idx])  # Selected inclination flux
 
             # Treat synthetic validation data like observations by attaching a
-            # simple fractional uncertainty column.
+            # continuum-anchored fallback uncertainty column in native units.
+            sigma, continuum = build_synthetic_sirocco_sigma(wavelengths, fluxes)
             obs_data = pd.DataFrame({
                 'wavelength': wavelengths,
                 'flux': fluxes,
-                'error': fluxes * 0.05  # Assume 5% error for test data
+                'error': sigma,
+                'continuum': continuum,
+                'sigma_source': 'synthetic_sirocco_continuum',
             })
 
             # Translate the lookup-table values into the emulator parameterisation:
@@ -562,7 +821,7 @@ def _(
                     ground_truth_params = {
                         'disk.mdot': np.log10(gt_row['Disk.mdot(msol/yr)'].values[0]),
                         'wind.mdot': gt_row['Wind.mdot(msol/yr)'].values[0] / gt_row['Disk.mdot(msol/yr)'].values[0],  # Ratio
-                        'KWD.d': gt_row['KWD.d(in_units_of_rstar)'].values[0],
+                        'KWD.d': np.log10(gt_row['KWD.d(in_units_of_rstar)'].values[0]),
                         'KWD.mdot_r_exponent': gt_row['KWD.mdot_r_exponent'].values[0],
                         'KWD.acceleration_length': np.log10(gt_row['KWD.acceleration_length(cm)'].values[0]),
                         'KWD.acceleration_exponent': gt_row['KWD.acceleration_exponent'].values[0],
@@ -572,7 +831,7 @@ def _(
             data_source_info = f"Test Grid: {test_run_selector.value} @ {inc_val}°"
 
         except Exception as e:
-            mo.output.replace(mo.callout(mo.md(f"❌ Error loading test grid: {e}"), kind="danger"))
+            mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Error loading test grid: {e}"), kind="danger"))
 
     elif obs_file_selector.value:
         # Observation mode accepts user-uploaded tabular data as long as it has
@@ -592,10 +851,10 @@ def _(
                 obs_data = df
                 data_source_info = f"Observation: {obs_file_selector.value}"
             else:
-                 mo.output.replace(mo.callout(mo.md("❌ Invalid file format. Metadata columns 'Wavelength' and 'Flux' not found."), kind="danger"))
+                 mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Invalid file format. Metadata columns 'Wavelength' and 'Flux' not found."), kind="danger"))
 
         except Exception as e:
-             mo.output.replace(mo.callout(mo.md(f"❌ Error reading file: {e}"), kind="danger"))
+             mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Error reading file: {e}"), kind="danger"))
 
     # Infer the most likely flux transform from the emulator filename so the UI
     # starts on the training scale, while still letting the user override it.
@@ -604,11 +863,11 @@ def _(
         _emu_name = emulator_selector.value.lower()
         if '_log_' in _emu_name:
             _detected_scale = "log"
-        elif '_scaled_' in _emu_name:
-            _detected_scale = "scaled"
+        elif '_continuum-normalised_' in _emu_name:
+            _detected_scale = "continuum-normalised"
 
     obs_flux_scale = mo.ui.dropdown(
-        options=["linear", "log", "scaled"],
+        options=["linear", "log", "continuum-normalised"],
         value=_detected_scale,
         label="Observation Flux Transform:",
         full_width=True,
@@ -647,7 +906,19 @@ def _(
 
 
 @app.cell
-def _(alt, data_source_info, mo, np, obs_data, obs_flux_scale, pd, wl_range_slider):
+def _(
+    alt,
+    build_default_observation_sigma,
+    build_synthetic_sirocco_sigma,
+    data_source_info,
+    fit_power_law_continuum,
+    mo,
+    np,
+    obs_data,
+    obs_flux_scale,
+    pd,
+    wl_range_slider,
+):
     # Rebuild the preview chart whenever the wavelength window or requested flux
     # transform changes, without mutating the underlying loaded dataframe.
     obs_chart = None
@@ -659,27 +930,80 @@ def _(alt, data_source_info, mo, np, obs_data, obs_flux_scale, pd, wl_range_slid
 
          _mask = (obs_data['wavelength'] >= _current_min) & (obs_data['wavelength'] <= _current_max)
          _plot_df = obs_data[_mask].copy()
+         _sigma_source = (
+             str(_plot_df['sigma_source'].iat[0]).strip().lower()
+             if 'sigma_source' in _plot_df.columns and len(_plot_df) > 0
+             else None
+         )
+         if _sigma_source == 'synthetic_sirocco_continuum':
+             _fallback_sigma_native, _ = build_synthetic_sirocco_sigma(
+                 np.array(_plot_df['wavelength']),
+                 np.array(_plot_df['flux']),
+             )
+         else:
+             _fallback_sigma_native, _ = build_default_observation_sigma(
+                 np.array(_plot_df['wavelength']),
+                 np.array(_plot_df['flux']),
+             )
+         if 'error' in _plot_df.columns:
+             _native_sigma = np.array(_plot_df['error'], dtype=float)
+             _native_sigma = np.where(
+                 np.isfinite(_native_sigma) & (_native_sigma > 0),
+                 _native_sigma,
+                 _fallback_sigma_native,
+             )
+         else:
+             _native_sigma = _fallback_sigma_native
 
          # Mirror the emulator training transform so the plotted data matches the
          # scale used during inference.
          _flux_vals = np.array(_plot_df['flux'])
+         _sigma_vals = None
+         _show_sigma_band = 'error' in _plot_df.columns
          _scale_label = obs_flux_scale.value
          if _scale_label == 'log':
              _flux_vals = np.where(_flux_vals > 0, np.log10(_flux_vals), np.log10(np.abs(_flux_vals) + 1e-30))
-         elif _scale_label == 'scaled':
-             _flux_mean = np.mean(_flux_vals)
-             if _flux_mean != 0:
-                 _flux_vals = _flux_vals / _flux_mean
+             if _show_sigma_band:
+                 _orig_flux = np.array(_plot_df['flux'])
+                 _sigma_vals = _native_sigma / (
+                     np.abs(_orig_flux) * np.log(10) + 1e-30
+                 )
+         elif _scale_label == 'continuum-normalised':
+             _continuum, _ = fit_power_law_continuum(
+                 np.array(_plot_df['wavelength']),
+                 _flux_vals,
+             )
+             _cont_safe = np.where(_continuum > 0, _continuum, 1.0)
+             _flux_vals = _flux_vals / _cont_safe
+             if _show_sigma_band:
+                 _sigma_vals = _native_sigma / _cont_safe
+         elif _show_sigma_band:
+             _sigma_vals = _native_sigma
 
+         if _sigma_vals is not None:
+             _sigma_vals = np.where(
+                 np.isfinite(_sigma_vals) & (_sigma_vals > 0),
+                 _sigma_vals,
+                 1e-30,
+             )
          _plot_df = pd.DataFrame({
              'Wavelength': _plot_df['wavelength'],
              'Flux': _flux_vals,
              'Type': 'Observation'
          })
+         _plot_band_df = None
+         if _sigma_vals is not None:
+             _plot_band_df = pd.DataFrame({
+                 'Wavelength': _plot_df['Wavelength'],
+                 'Lower': _plot_df['Flux'] - _sigma_vals,
+                 'Upper': _plot_df['Flux'] + _sigma_vals,
+             })
 
          # Downsample only for plotting so large spectra remain responsive in Altair.
          if len(_plot_df) > 5000:
              _plot_df = _plot_df.iloc[::int(len(_plot_df)/5000)]
+         if _plot_band_df is not None and len(_plot_band_df) > 5000:
+             _plot_band_df = _plot_band_df.iloc[::max(1, len(_plot_band_df) // 5000)]
 
          _y_title = f'Flux ({_scale_label})'
          _y_format = '.1e' if _scale_label == 'linear' else '.2f'
@@ -694,18 +1018,30 @@ def _(alt, data_source_info, mo, np, obs_data, obs_flux_scale, pd, wl_range_slid
          else:
              _y_scale = alt.Undefined
 
-         obs_chart = alt.Chart(_plot_df).mark_line(color='cyan').encode(
+         _obs_line = alt.Chart(_plot_df).mark_line(color='cyan').encode(
              x=alt.X('Wavelength', title='Wavelength (Å)'),
              y=alt.Y('Flux', title=_y_title, scale=_y_scale, axis=alt.Axis(format=_y_format)),
              tooltip=['Wavelength', 'Flux']
-         ).properties(
+         )
+
+         _obs_band = alt.LayerChart()
+         if _plot_band_df is not None:
+             _obs_band = alt.Chart(_plot_band_df).mark_area(
+                 opacity=0.10, color='cyan'
+             ).encode(
+                 x=alt.X('Wavelength:Q'),
+                 y=alt.Y('Lower:Q'),
+                 y2=alt.Y2('Upper:Q'),
+             )
+
+         obs_chart = (_obs_band + _obs_line).properties(
              width="container",
              height=400,
              title=f"{data_source_info} [{_scale_label}]" if data_source_info else "Spectrum"
          ).interactive()
 
     obs_plot_accordion = mo.accordion({
-        "📈 View Selected Spectrum": obs_chart if obs_chart else mo.md("No data loaded.")
+        f"{mo.icon('lucide:trending-up')} View Selected Spectrum": obs_chart if obs_chart else mo.md("No data loaded.")
     })
     return (obs_plot_accordion,)
 
@@ -716,6 +1052,8 @@ def _(
     data_source_selector,
     delete_obs_btn,
     emu,
+    emulator_load_button,
+    emulator_load_status,
     emulator_selector,
     file_upload_ui,
     grid_selector,
@@ -784,7 +1122,8 @@ def _(
     # Includes Grid Selector, Emulator Selector, and Parameter Key
     emu_row = mo.vstack([
         grid_selector,
-        emulator_selector,
+        mo.hstack([emulator_selector, emulator_load_button], align="end", widths=[6, 1]),
+        emulator_load_status,
         param_info_accordion
     ])
 
@@ -843,7 +1182,650 @@ def _(mo):
 
 
 @app.cell
-def _(emu, grid_indices, mo, param_map_db, re):
+def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_scale, param_map_db, re, wl_range_slider):
+    # ── Parameter Playground ──
+    # Interactive sliders for the nuisance/inference parameters and the
+    # physical grid axes so the user can visually explore how each shifts
+    # the emulated spectrum before committing to prior bounds.
+    #
+    # Slider ranges for log_scale and log_amp are auto-computed from the ratio
+    # of the emulator's midpoint flux to the (transformed) observation flux, so
+    # they stay sensible regardless of emmulator training transform.
+
+    _playground_ui = mo.md("*Load an emulator and observation data to use the playground.*")
+
+    if emu is not None:
+        # Midpoint physical parameters for preview
+        if hasattr(emu, 'min_params') and hasattr(emu, 'max_params'):
+            pg_mid_params = (np.array(emu.min_params) + np.array(emu.max_params)) / 2.0
+        else:
+            pg_mid_params = np.zeros(len(emu.param_names))
+
+        # --- Auto-compute log_scale and log_amp centres from data ---
+        # Reconstruct the emulator flux at the midpoint and compare with the
+        # transformed observation to estimate a sensible log_scale default.
+        _ls_centre = 0.0   # fallback
+        _la_centre = -5.0   # fallback
+        if obs_data is not None:
+            try:
+                _wl_lo, _wl_hi = wl_range_slider.value
+                # Emulator midpoint flux
+                _w, _c = emu(pg_mid_params)
+                _X = emu.eigenspectra * emu.flux_std
+                _emu_fl = (_w @ _X) + emu.flux_mean
+                _emu_wl = np.array(emu.wl)
+                _em = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
+                _emu_mean = np.mean(np.abs(_emu_fl[_em])) if _em.any() else 1.0
+
+                # Observation flux in the emulator's trained space
+                _om = (obs_data['wavelength'] >= _wl_lo) & (obs_data['wavelength'] <= _wl_hi)
+                _obs_fl = np.array(obs_data[_om]['flux'])
+                _obs_wl = np.array(obs_data[_om]['wavelength'])
+                _scale_label = obs_flux_scale.value
+                if _scale_label == 'log':
+                    _obs_fl = np.where(_obs_fl > 0, np.log10(_obs_fl),
+                                       np.log10(np.abs(_obs_fl) + 1e-30))
+                elif _scale_label == 'continuum-normalised':
+                    _ct, _ = fit_power_law_continuum(_obs_wl, _obs_fl)
+                    _ct_safe = np.where(_ct > 0, _ct, 1.0)
+                    _obs_fl = _obs_fl / _ct_safe
+
+                _obs_mean = np.mean(np.abs(_obs_fl)) if len(_obs_fl) > 0 else 1.0
+                # log_scale = ln(obs / emu) — but in log₁₀ space the raw
+                # means are negative, so compare linear-space means instead.
+                if _scale_label == 'log':
+                    _emu_mean_lin = np.mean(np.abs(10.0 ** _emu_fl[_em])) if _em.any() else 1.0
+                    _obs_mean_lin = np.mean(np.abs(np.array(obs_data[_om]['flux']))) if len(_obs_fl) > 0 else 1.0
+                    if _emu_mean_lin > 0 and _obs_mean_lin > 0:
+                        _ls_centre = float(np.log(_obs_mean_lin / _emu_mean_lin))
+                else:
+                    if _emu_mean > 0 and _obs_mean > 0:
+                        _ls_centre = float(np.log(_obs_mean / _emu_mean))
+                # log_amp centre: residual variance as starting estimate.
+                # Apply log_scale additively in log₁₀ space, multiplicatively
+                # otherwise.
+                _ln10 = np.log(10.0)
+                _n_cmp = min(len(_obs_fl), int(_em.sum()))
+                if _n_cmp > 0:
+                    if _scale_label == 'log':
+                        _resid = (_obs_fl[:_n_cmp]
+                                  - (_emu_fl[_em][:_n_cmp] + _ls_centre / _ln10))
+                    else:
+                        _resid = (_obs_fl[:_n_cmp]
+                                  - _emu_fl[_em][:_n_cmp] * np.exp(_ls_centre))
+                    _residual_var = float(np.mean(_resid ** 2))
+                else:
+                    _residual_var = 1e-5
+                _la_centre = float(np.log(max(_residual_var, 1e-30)))
+            except Exception:
+                pass  # keep fallback values
+
+        # Round for cleaner slider display
+        _ls_centre = round(_ls_centre, 1)
+        _la_centre = round(_la_centre, 1)
+
+        # Nuisance slider ranges centred on auto-detected values
+        pg_av_slider = mo.ui.slider(
+            start=0.0, stop=5.0, value=0.0, step=0.01,
+            label="Av (Extinction)", show_value=True, full_width=True,
+        )
+        pg_logscale_slider = mo.ui.slider(
+            start=_ls_centre - 10.0, stop=_ls_centre + 10.0,
+            value=_ls_centre, step=0.1,
+            label="log_scale (ln flux scaling)", show_value=True, full_width=True,
+        )
+        pg_cheb1_slider = mo.ui.slider(
+            start=-2.0, stop=2.0, value=0.0, step=0.01,
+            label="cheb_1 (continuum tilt)", show_value=True, full_width=True,
+        )
+        pg_logamp_slider = mo.ui.slider(
+            start=_la_centre - 15.0, stop=_la_centre + 15.0,
+            value=_la_centre, step=0.5,
+            label="log_amp (ln GP amplitude)", show_value=True, full_width=True,
+        )
+        pg_logls_slider = mo.ui.slider(
+            start=0.0, stop=15.0, value=4.5, step=0.1,
+            label="log_ls (ln GP length scale)", show_value=True, full_width=True,
+        )
+
+        # Midpoint physical parameters for preview
+        if hasattr(emu, 'min_params') and hasattr(emu, 'max_params'):
+            pg_mid_params = (np.array(emu.min_params) + np.array(emu.max_params)) / 2.0
+        else:
+            pg_mid_params = np.zeros(len(emu.param_names))
+
+        # ── Physical parameter sliders ──
+        # One slider per emulator axis so the user can reshape the emulated
+        # spectrum.  Ranges span the emulator's training grid; default values
+        # sit at the midpoint (matching pg_mid_params used for auto-centring).
+        # Labels are resolved through param_map_db so users see physical names
+        # (e.g. "disk.mdot") instead of generic "paramN" tags, and a log10()
+        # wrapper is added for parameters stored on a log10 axis.
+        _phys_sliders = []
+        _sorted_phys_idx = sorted(list(grid_indices)) if grid_indices else []
+        for _pi, _pname in enumerate(emu.param_names):
+            _lo = float(emu.min_params[_pi]) if hasattr(emu, 'min_params') else 0.0
+            _hi = float(emu.max_params[_pi]) if hasattr(emu, 'max_params') else 1.0
+            _mid = (_lo + _hi) / 2.0
+            _step = max((_hi - _lo) / 200.0, 1e-6)
+
+            # Prefer the grid_indices mapping when it lines up; otherwise
+            # fall back to parsing "paramN" directly from the axis name.
+            _db_idx = None
+            if len(_sorted_phys_idx) == len(emu.param_names):
+                _db_idx = _sorted_phys_idx[_pi]
+            else:
+                _m = re.search(r"param(\d+)", str(_pname))
+                if _m:
+                    _db_idx = int(_m.group(1))
+
+            if _db_idx is not None and _db_idx in param_map_db:
+                _base_name = param_map_db[_db_idx][0]
+                _is_log = (len(param_map_db[_db_idx]) > 3
+                           and bool(param_map_db[_db_idx][3]))
+                _label = f"log10({_base_name})" if _is_log else _base_name
+            else:
+                _label = str(_pname)
+
+            _phys_sliders.append(mo.ui.slider(
+                start=_lo, stop=_hi, value=_mid, step=_step,
+                label=_label, show_value=True, full_width=True,
+            ))
+        pg_phys_sliders = mo.ui.array(_phys_sliders)
+
+        _playground_ui = mo.md("")
+    else:
+        pg_av_slider = None
+        pg_logscale_slider = None
+        pg_cheb1_slider = None
+        pg_logamp_slider = None
+        pg_logls_slider = None
+        pg_mid_params = None
+        pg_phys_sliders = None
+
+    _playground_ui
+    return pg_av_slider, pg_cheb1_slider, pg_logamp_slider, pg_logls_slider, pg_logscale_slider, pg_mid_params, pg_phys_sliders
+
+
+@app.cell
+def _(
+    alt,
+    build_default_observation_sigma,
+    build_synthetic_sirocco_sigma,
+    emu,
+    fit_power_law_continuum,
+    mo,
+    np,
+    obs_data,
+    obs_flux_scale,
+    pd,
+    pg_av_slider,
+    pg_cheb1_slider,
+    pg_logamp_slider,
+    pg_logls_slider,
+    pg_logscale_slider,
+    pg_mid_params,
+    pg_nll_result,
+    pg_phys_sliders,
+    pg_test_nll_btn,
+    wl_range_slider,
+):
+    # ── Playground: Reactive Emulated vs Observed Spectrum Chart ──
+    # Generates the emulated spectrum at the user-selected physical parameters
+    # (from the Physical tab sliders) combined with the current nuisance
+    # slider values, then overlays it with the observation inside an
+    # interactive Altair chart.
+
+    _playground_chart = None
+
+    if (emu is not None and obs_data is not None
+            and pg_av_slider is not None and pg_mid_params is not None):
+        try:
+            from Starfish.transforms import extinct, resample
+
+            _wl_min = wl_range_slider.value[0]
+            _wl_max = wl_range_slider.value[1]
+
+            # Physical parameter vector — from sliders when available, otherwise
+            # fall back to the emulator training-grid midpoint.
+            if pg_phys_sliders is not None:
+                _phys_params = np.array(pg_phys_sliders.value, dtype=float)
+            else:
+                _phys_params = pg_mid_params
+
+            # --- Emulated spectrum reconstruction ---
+            weights, cov = emu(_phys_params)
+            X = emu.eigenspectra * emu.flux_std
+            emu_flux = (weights @ X) + emu.flux_mean
+            emu_wl = np.array(emu.wl)
+
+            # Crop to wavelength range
+            _emu_mask = (emu_wl >= _wl_min) & (emu_wl <= _wl_max)
+            emu_wl_crop = emu_wl[_emu_mask]
+            emu_flux_crop = emu_flux[_emu_mask]
+
+            _is_log = (obs_flux_scale.value == "log")
+            _ln10 = np.log(10.0)
+
+            if _is_log:
+                # ── Log₁₀-space nuisance transforms (additive) ──────
+                _av = pg_av_slider.value
+                if _av > 0:
+                    import extinction as _ext_mod
+                    _a_lambda = _ext_mod.fitzpatrick99(
+                        emu_wl_crop.astype(np.float64), _av, 3.1)
+                    emu_flux_crop = emu_flux_crop + (-0.4 * _a_lambda)
+
+                _cheb1 = pg_cheb1_slider.value
+                if _cheb1 != 0.0:
+                    from numpy.polynomial.chebyshev import chebval
+                    _scale_wl = emu_wl_crop / emu_wl_crop.max()
+                    _cheb_poly = chebval(_scale_wl, [1.0, _cheb1])
+                    _cheb_poly = np.clip(_cheb_poly, 1e-30, None)
+                    emu_flux_crop = emu_flux_crop + np.log10(_cheb_poly)
+
+                _log_scale = pg_logscale_slider.value
+                emu_flux_crop = emu_flux_crop + _log_scale / _ln10
+            else:
+                # ── Linear-space nuisance transforms (original) ──────
+                _av = pg_av_slider.value
+                if _av > 0:
+                    emu_flux_crop = extinct(emu_wl_crop, emu_flux_crop, Av=_av)
+
+                _cheb1 = pg_cheb1_slider.value
+                if _cheb1 != 0.0:
+                    from numpy.polynomial.chebyshev import chebval
+                    _scale_wl = emu_wl_crop / emu_wl_crop.max()
+                    _cheb_poly = chebval(_scale_wl, [1.0, _cheb1])
+                    emu_flux_crop = emu_flux_crop * _cheb_poly
+
+                _log_scale = pg_logscale_slider.value
+                emu_flux_crop = emu_flux_crop * np.exp(_log_scale)
+
+            # GP uncertainty envelope (±1σ from GP amplitude)
+            _log_amp = pg_logamp_slider.value
+            _gp_sigma = np.sqrt(np.exp(_log_amp))
+            emu_upper = emu_flux_crop + _gp_sigma
+            emu_lower = emu_flux_crop - _gp_sigma
+
+            # --- Observation data ---
+            _obs_mask = (
+                (obs_data['wavelength'] >= _wl_min)
+                & (obs_data['wavelength'] <= _wl_max)
+            )
+            _obs_sub = obs_data[_obs_mask].copy()
+            _sigma_source = (
+                str(_obs_sub['sigma_source'].iat[0]).strip().lower()
+                if 'sigma_source' in _obs_sub.columns and len(_obs_sub) > 0
+                else None
+            )
+            if _sigma_source == 'synthetic_sirocco_continuum':
+                _fallback_sigma_native, _ = build_synthetic_sirocco_sigma(
+                    np.array(_obs_sub['wavelength']),
+                    np.array(_obs_sub['flux']),
+                )
+            else:
+                _fallback_sigma_native, _ = build_default_observation_sigma(
+                    np.array(_obs_sub['wavelength']),
+                    np.array(_obs_sub['flux']),
+                )
+            if 'error' in _obs_sub.columns:
+                _native_sigma = np.array(_obs_sub['error'], dtype=float)
+                _native_sigma = np.where(
+                    np.isfinite(_native_sigma) & (_native_sigma > 0),
+                    _native_sigma,
+                    _fallback_sigma_native,
+                )
+            else:
+                _native_sigma = _fallback_sigma_native
+
+            # Transform observation flux to match the emulator's output space.
+            # The emulator already outputs in the trained space (e.g. continuum-
+            # normalised), so we only transform the observation — NOT the emulator.
+            _scale_label = obs_flux_scale.value
+            _obs_flux = np.array(_obs_sub['flux'])
+            _obs_sigma = None
+            _show_obs_sigma_band = 'error' in _obs_sub.columns
+            if _scale_label == 'log':
+                _obs_flux = np.where(
+                    _obs_flux > 0,
+                    np.log10(_obs_flux),
+                    np.log10(np.abs(_obs_flux) + 1e-30),
+                )
+                if _show_obs_sigma_band:
+                    _orig_flux = np.array(_obs_sub['flux'])
+                    _obs_sigma = _native_sigma / (
+                        np.abs(_orig_flux) * np.log(10) + 1e-30
+                    )
+            elif _scale_label == 'continuum-normalised':
+                _obs_cont, _ = fit_power_law_continuum(
+                    np.array(_obs_sub['wavelength']), _obs_flux
+                )
+                _obs_cont_safe = np.where(_obs_cont > 0, _obs_cont, 1.0)
+                _obs_flux = _obs_flux / _obs_cont_safe
+                if _show_obs_sigma_band:
+                    _obs_sigma = _native_sigma / _obs_cont_safe
+            elif _show_obs_sigma_band:
+                _obs_sigma = _native_sigma
+
+            if _obs_sigma is not None:
+                _obs_sigma = np.where(
+                    np.isfinite(_obs_sigma) & (_obs_sigma > 0),
+                    _obs_sigma,
+                    1e-30,
+                )
+
+            # --- Build Altair chart ---
+            _obs_df = pd.DataFrame({
+                'Wavelength': np.array(_obs_sub['wavelength']),
+                'Flux': _obs_flux,
+                'Type': 'Observation',
+            })
+            _emu_df = pd.DataFrame({
+                'Wavelength': emu_wl_crop,
+                'Flux': emu_flux_crop,
+                'Type': 'Emulated (midpoint)',
+            })
+            _band_df = pd.DataFrame({
+                'Wavelength': emu_wl_crop,
+                'Upper': emu_upper,
+                'Lower': emu_lower,
+            })
+            _obs_band_df = None
+            if _show_obs_sigma_band and _obs_sigma is not None:
+                _obs_band_df = pd.DataFrame({
+                    'Wavelength': np.array(_obs_sub['wavelength']),
+                    'Lower': _obs_flux - _obs_sigma,
+                    'Upper': _obs_flux + _obs_sigma,
+                })
+
+            # Downsample for responsiveness
+            if len(_obs_df) > 5000:
+                _obs_df = _obs_df.iloc[::max(1, len(_obs_df) // 5000)]
+            if len(_emu_df) > 5000:
+                _emu_df = _emu_df.iloc[::max(1, len(_emu_df) // 5000)]
+                _band_df = _band_df.iloc[::max(1, len(_band_df) // 5000)]
+            if _obs_band_df is not None and len(_obs_band_df) > 5000:
+                _obs_band_df = _obs_band_df.iloc[::max(1, len(_obs_band_df) // 5000)]
+
+            _combined = pd.concat([_obs_df, _emu_df], ignore_index=True)
+
+            _y_title = f'Flux ({_scale_label})'
+            _y_format = '.1e' if _scale_label == 'linear' else '.2f'
+
+            _color_scale = alt.Scale(
+                domain=['Observation', 'Emulated (midpoint)'],
+                range=['cyan', 'orange'],
+            )
+
+            _lines = alt.Chart(_combined).mark_line(opacity=0.9).encode(
+                x=alt.X('Wavelength:Q', title='Wavelength (Å)'),
+                y=alt.Y('Flux:Q', title=_y_title, axis=alt.Axis(format=_y_format)),
+                color=alt.Color('Type:N', scale=_color_scale, legend=alt.Legend(title="Spectrum")),
+                tooltip=['Wavelength:Q', 'Flux:Q', 'Type:N'],
+            )
+
+            _band = alt.Chart(_band_df).mark_area(
+                opacity=0.15, color='orange',
+            ).encode(
+                x=alt.X('Wavelength:Q'),
+                y=alt.Y('Lower:Q'),
+                y2=alt.Y2('Upper:Q'),
+            )
+
+            _obs_band = alt.LayerChart()
+            if _obs_band_df is not None:
+                _obs_band = alt.Chart(_obs_band_df).mark_area(
+                    opacity=0.10, color='cyan',
+                ).encode(
+                    x=alt.X('Wavelength:Q'),
+                    y=alt.Y('Lower:Q'),
+                    y2=alt.Y2('Upper:Q'),
+                )
+
+            _playground_chart = (_band + _obs_band + _lines).properties(
+                width="container",
+                height=400,
+                title=f"Playground: Emulated (midpoint params) vs Observation [{_scale_label}]",
+            ).interactive()
+
+        except Exception as _e:
+            _playground_chart = mo.callout(
+                mo.md(f"Playground error: {_e}"), kind="danger"
+            )
+
+    # Assemble everything inside the accordion: callout, sliders, then chart
+    if (pg_av_slider is not None and _playground_chart is not None):
+        _nuisance_tab = mo.vstack([
+            pg_av_slider,
+            pg_logscale_slider,
+            pg_cheb1_slider,
+            pg_logamp_slider,
+            pg_logls_slider,
+        ])
+        if pg_phys_sliders is not None and len(pg_phys_sliders) > 0:
+            _physical_tab = mo.vstack(list(pg_phys_sliders))
+        else:
+            _physical_tab = mo.md("*No physical parameters available.*")
+        _slider_tabs = mo.ui.tabs({
+            "Nuisance Parameters": _nuisance_tab,
+            "Physical Parameters": _physical_tab,
+        })
+        _pg_content = mo.vstack([
+            mo.callout(mo.md(
+                "**Parameter Playground - Find sensible prior settings**\n\n"
+                "Use the **Nuisance Parameters** tab to bring the emulated spectrum "
+                "to a similar scale and uncertainty as the observation, and the "
+                "**Physical Parameters** tab to reshape the emulated spectrum by "
+                "varying the grid axes.\n\n"
+                "- **Av** — Interstellar dust extinction (magnitudes). Reddens and dims the spectrum.\n"
+                "- **log_scale** — Natural log of the flux scaling factor. Shifts the spectrum up/down.\n"
+                "- **cheb_1** — Chebyshev c₁ coefficient. Applies a linear tilt to the continuum gradient.\n"
+                "- **log_amp** — GP covariance amplitude (affects uncertainty envelope, not the mean spectrum).\n"
+                "- **log_ls** — GP covariance length scale (affects uncertainty smoothness, not the mean spectrum)."
+            ), kind="neutral"),
+            _slider_tabs,
+            _playground_chart,
+            pg_test_nll_btn,
+            pg_nll_result,
+        ])
+    elif _playground_chart is not None:
+        _pg_content = mo.vstack([
+            _playground_chart,
+            pg_test_nll_btn,
+            pg_nll_result,
+        ])
+    else:
+        _pg_content = mo.md(
+            "*Load an emulator and observation to see the playground chart.*"
+        )
+
+    mo.accordion({
+        "Parameter Playground - Aid to find optimal prior settings": _pg_content
+    })
+    return
+
+
+@app.cell
+def _(mo):
+    # Run button for on-demand NLL evaluation from the playground sliders.
+    # Kept in its own cell so the evaluator cell below picks up click events
+    # reactively (a run_button's `.value` only flips in downstream cells).
+    pg_test_nll_btn = mo.ui.run_button(
+        label=f"{mo.icon('lucide:calculator')} Test NLL"
+    )
+    return (pg_test_nll_btn,)
+
+
+@app.cell
+def _(
+    alt,
+    build_bestfit_spectrum_altair,
+    build_default_observation_sigma,
+    Spectrum,
+    SpectrumModel,
+    build_synthetic_sirocco_sigma,
+    emu,
+    fit_power_law_continuum,
+    mo,
+    np,
+    obs_data,
+    obs_flux_scale,
+    pg_av_slider,
+    pg_cheb1_slider,
+    pg_logamp_slider,
+    pg_logls_slider,
+    pg_logscale_slider,
+    pg_phys_sliders,
+    pg_test_nll_btn,
+    stats,
+    wl_range_slider,
+):
+    # ── Test NLL ──
+    # On click, build a SpectrumModel at the current playground slider values
+    # and evaluate the negative log-likelihood — the same objective the MLE
+    # optimiser minimises — so the user can sanity-check whether their
+    # chosen prior region is close to a reasonable fit.  The result widget
+    # is rendered inside the playground accordion by the cell above.
+    pg_nll_result = mo.md("")
+
+    if pg_test_nll_btn.value:
+        if emu is None or obs_data is None or pg_phys_sliders is None:
+            pg_nll_result = mo.callout(
+                mo.md("Load an emulator and observation first."),
+                kind="warn",
+            )
+        else:
+            try:
+                _wl_lo, _wl_hi = wl_range_slider.value
+                _mask = ((obs_data['wavelength'] >= _wl_lo)
+                         & (obs_data['wavelength'] <= _wl_hi))
+                _sub = obs_data[_mask].copy()
+
+                _scale = obs_flux_scale.value
+                _raw_fl = np.array(_sub['flux'])
+                _cont_safe = None
+                if _scale == 'log':
+                    _raw_fl = np.where(
+                        _raw_fl > 0,
+                        np.log10(_raw_fl),
+                        np.log10(np.abs(_raw_fl) + 1e-30),
+                    )
+                elif _scale == 'continuum-normalised':
+                    _cont, _ = fit_power_law_continuum(
+                        np.array(_sub['wavelength']), _raw_fl
+                    )
+                    _cont_safe = np.where(_cont > 0, _cont, 1.0)
+                    _raw_fl = _raw_fl / _cont_safe
+                _sub['flux'] = _raw_fl
+
+                _sigma_source = (
+                    str(_sub['sigma_source'].iat[0]).strip().lower()
+                    if 'sigma_source' in _sub.columns and len(_sub) > 0
+                    else None
+                )
+                if _sigma_source == 'synthetic_sirocco_continuum':
+                    _fallback_sigma_native, _ = build_synthetic_sirocco_sigma(
+                        np.array(_sub['wavelength']),
+                        np.array(obs_data[_mask]['flux']),
+                    )
+                else:
+                    _fallback_sigma_native, _ = build_default_observation_sigma(
+                        np.array(_sub['wavelength']),
+                        np.array(obs_data[_mask]['flux']),
+                    )
+
+                if 'error' in _sub.columns:
+                    _sigma = np.array(_sub['error'], dtype=float)
+                    _sigma = np.where(
+                        np.isfinite(_sigma) & (_sigma > 0),
+                        _sigma,
+                        _fallback_sigma_native,
+                    )
+                    if _scale == 'log':
+                        _orig = np.array(obs_data[_mask]['flux'])
+                        _sigma = _sigma / (np.abs(_orig) * np.log(10) + 1e-30)
+                    elif _scale == 'continuum-normalised':
+                        _sigma = _sigma / _cont_safe
+                else:
+                    _sigma = _fallback_sigma_native
+                    if _scale == 'log':
+                        _orig = np.array(obs_data[_mask]['flux'])
+                        _sigma = _sigma / (np.abs(_orig) * np.log(10) + 1e-30)
+                    elif _scale == 'continuum-normalised':
+                        _sigma = _sigma / _cont_safe
+                _sigma = np.where(
+                    np.isfinite(_sigma) & (_sigma > 0),
+                    _sigma,
+                    1e-30,
+                )
+
+                _spec = Spectrum(
+                    np.array(_sub['wavelength']),
+                    np.array(_sub['flux']),
+                    sigmas=_sigma,
+                )
+
+                _phys = np.array(pg_phys_sliders.value, dtype=float)
+                _global = {
+                    'Av': float(pg_av_slider.value),
+                    'log_scale': float(pg_logscale_slider.value),
+                    'cheb': [float(pg_cheb1_slider.value)],
+                    'global_cov': {
+                        'log_amp': float(pg_logamp_slider.value),
+                        'log_ls': float(pg_logls_slider.value),
+                    },
+                }
+                _model = SpectrumModel(
+                    emulator=emu,
+                    data=_spec,
+                    grid_params=list(_phys),
+                    flux_scale=_scale,
+                    **_global,
+                )
+
+                # Flat (uniform) priors spanning the slider ranges so the
+                # prior contribution is constant and NLL reflects only the
+                # data-likelihood term at the chosen slider point.
+                _priors = {}
+                for _pi, _pname in enumerate(emu.param_names):
+                    _lo = float(emu.min_params[_pi])
+                    _hi = float(emu.max_params[_pi])
+                    if _hi > _lo:
+                        _priors[_pname] = stats.uniform(loc=_lo, scale=_hi - _lo)
+                _priors['Av'] = stats.uniform(loc=0.0, scale=5.0)
+                _priors['log_scale'] = stats.uniform(
+                    loc=pg_logscale_slider.start,
+                    scale=pg_logscale_slider.stop - pg_logscale_slider.start,
+                )
+                _priors['cheb:1'] = stats.uniform(loc=-2.0, scale=4.0)
+                _priors['global_cov:log_amp'] = stats.uniform(
+                    loc=pg_logamp_slider.start,
+                    scale=pg_logamp_slider.stop - pg_logamp_slider.start,
+                )
+                _priors['global_cov:log_ls'] = stats.uniform(loc=0.0, scale=15.0)
+
+                _ll = float(_model.log_likelihood(_priors))
+                _nll = -_ll
+                pg_nll_result = mo.callout(
+                    mo.md(
+                        f"**NLL = {_nll:.4f}** "
+                        f"(log-likelihood = {_ll:.4f})\n\n"
+                        f"Evaluated at current playground slider values."
+                    ),
+                    kind="success" if np.isfinite(_nll) else "danger",
+                )
+            except Exception as _e:
+                pg_nll_result = mo.callout(
+                    mo.md(f"NLL evaluation failed: `{_e}`"),
+                    kind="danger",
+                )
+
+    return (pg_nll_result,)
+
+
+@app.cell
+def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_scale, param_map_db, re, wl_range_slider):
     # ── Stage 2: Prior & Parameter Setup ──
     # Build per-parameter UI widgets (fixed/free toggle, value, min, max) that
     # drive the prior construction in Stage 3.  Parameters fall into two groups:
@@ -863,6 +1845,7 @@ def _(emu, grid_indices, mo, param_map_db, re):
     param_names = []
     defaults = {}
     bounds = {}
+    log10_params = set()  # names of params whose values are log10-scaled
 
     # Parameter Mapping Dictionary
     if emu is not None:
@@ -877,6 +1860,8 @@ def _(emu, grid_indices, mo, param_map_db, re):
                  if idx in param_map_db:
                      _p_name = param_map_db[idx][0]
                      current_names.append(_p_name)
+                     if param_map_db[idx][3]:
+                         log10_params.add(_p_name)
                  else:
                      current_names.append(f"Param {idx} (Unknown)")
         else:
@@ -887,6 +1872,8 @@ def _(emu, grid_indices, mo, param_map_db, re):
                     idx = int(match.group(1))
                     if idx in param_map_db:
                         current_names.append(param_map_db[idx][0])
+                        if param_map_db[idx][3]:
+                            log10_params.add(param_map_db[idx][0])
                     else:
                         current_names.append(f"Param {idx}")
                 else:
@@ -917,6 +1904,7 @@ def _(emu, grid_indices, mo, param_map_db, re):
     inf_params = [
         'Av',        # Extinction (magnitudes)
         'log_scale', # Log Flux Scaling Factor (natural log)
+        'cheb_1',    # Chebyshev c1 coefficient (continuum tilt)
         'log_amp',   # GP Global Covariance Amplitude (natural log)
         'log_ls'     # GP Global Covariance Length Scale (natural log)
     ] 
@@ -930,15 +1918,70 @@ def _(emu, grid_indices, mo, param_map_db, re):
         defaults['Av'] = 0.0
 
         # log_scale: natural log of flux scaling factor
-        # Typically auto-calculated if not set, but can be optimized
-        # Tighter range centred on typical linear-scale values
-        bounds['log_scale'] = [-30.0, -20.0]
-        defaults['log_scale'] = -25.0
+        # Auto-detect sensible centre from emulator/observation flux ratio.
+        _ls_default = 0.0
+        _la_default = -5.0
+        if obs_data is not None:
+            try:
+                _wl_lo, _wl_hi = wl_range_slider.value
+                _w_tmp, _ = emu(np.array([(lo + hi) / 2 for lo, hi in
+                    zip(emu.min_params, emu.max_params)]))
+                _X_tmp = emu.eigenspectra * emu.flux_std
+                _efl = (_w_tmp @ _X_tmp) + emu.flux_mean
+                _ewl = np.array(emu.wl)
+                _em_tmp = (_ewl >= _wl_lo) & (_ewl <= _wl_hi)
+                _emu_avg = np.mean(np.abs(_efl[_em_tmp])) if _em_tmp.any() else 1.0
+
+                _om_tmp = (obs_data['wavelength'] >= _wl_lo) & (obs_data['wavelength'] <= _wl_hi)
+                _ofl = np.array(obs_data[_om_tmp]['flux'])
+                _owl = np.array(obs_data[_om_tmp]['wavelength'])
+                _sc = obs_flux_scale.value
+                if _sc == 'log':
+                    _ofl = np.where(_ofl > 0, np.log10(_ofl),
+                                    np.log10(np.abs(_ofl) + 1e-30))
+                elif _sc == 'continuum-normalised':
+                    _ct2, _ = fit_power_law_continuum(_owl, _ofl)
+                    _ct2s = np.where(_ct2 > 0, _ct2, 1.0)
+                    _ofl = _ofl / _ct2s
+
+                _obs_avg = np.mean(np.abs(_ofl)) if len(_ofl) > 0 else 1.0
+                if _sc == 'log':
+                    _emu_avg_lin = np.mean(np.abs(10.0 ** _efl[_em_tmp])) if _em_tmp.any() else 1.0
+                    _obs_avg_lin = np.mean(np.abs(np.array(obs_data[_om_tmp]['flux']))) if len(_ofl) > 0 else 1.0
+                    if _emu_avg_lin > 0 and _obs_avg_lin > 0:
+                        _ls_default = float(np.log(_obs_avg_lin / _emu_avg_lin))
+                else:
+                    if _emu_avg > 0 and _obs_avg > 0:
+                        _ls_default = float(np.log(_obs_avg / _emu_avg))
+                _n = min(len(_ofl), int(_em_tmp.sum()))
+                _ln10 = np.log(10.0)
+                if _n > 0:
+                    if _sc == 'log':
+                        _resid = _ofl[:_n] - (_efl[_em_tmp][:_n] + _ls_default / _ln10)
+                    else:
+                        _resid = _ofl[:_n] - _efl[_em_tmp][:_n] * np.exp(_ls_default)
+                    _resid_var = float(np.mean(_resid ** 2))
+                else:
+                    _resid_var = 1e-5
+                _la_default = float(np.log(max(_resid_var, 1e-30)))
+            except Exception:
+                pass
+        _ls_default = round(_ls_default, 1)
+        _la_default = round(_la_default, 1)
+
+        bounds['log_scale'] = [_ls_default - 5.0, _ls_default + 5.0]
+        defaults['log_scale'] = _ls_default
+
+        # cheb_1: Chebyshev c1 coefficient – linear continuum tilt
+        # Multiplies the model by a Chebyshev polynomial; c0 is fixed to 1.
+        # Small values nudge the continuum gradient without changing lines.
+        bounds['cheb_1'] = [-0.5, 0.5]
+        defaults['cheb_1'] = 0.0
 
         # log_amp: GP global covariance amplitude (natural log)
         # Normal prior: center ± 2σ defines the bounds displayed in the UI
-        bounds['log_amp'] = [-60.0, -50.0]
-        defaults['log_amp'] = -55.0
+        bounds['log_amp'] = [_la_default - 5.0, _la_default + 5.0]
+        defaults['log_amp'] = _la_default
 
         # log_ls: GP global covariance length scale (natural log)
         bounds['log_ls'] = [1.0, 8.0]
@@ -964,11 +2007,11 @@ def _(emu, grid_indices, mo, param_map_db, re):
     # Wrap in mo.ui.dictionary for Marimo reactivity
     w_fix = mo.ui.dictionary(_fix_dict) if _fix_dict else mo.ui.dictionary({})
     w_val = mo.ui.dictionary(_val_dict) if _val_dict else mo.ui.dictionary({})
-    return bounds, param_names, w_fix, w_max, w_min, w_val
+    return bounds, log10_params, param_names, w_fix, w_max, w_min, w_val
 
 
 @app.cell(hide_code=True)
-def _(bounds, mo, param_names, w_fix, w_max, w_min, w_val):
+def _(bounds, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
     # Render Parameter UI
     if not param_names:
          param_settings = mo.md("*Load an emulator to see parameters.*")
@@ -979,6 +2022,7 @@ def _(bounds, mo, param_names, w_fix, w_max, w_min, w_val):
         # Friendly display names
         _label_map = {
             'log_scale': 'Log Scale (ln)',
+            'cheb_1': 'Continuum Tilt (c₁)',
             'log_amp': 'GP Log Amp (ln)',
             'log_ls': 'GP Log Length (ln)',
         }
@@ -995,8 +2039,11 @@ def _(bounds, mo, param_names, w_fix, w_max, w_min, w_val):
         for _name in param_names:
             is_fixed = _fix_values.get(_name, False)
             display_name = _label_map.get(_name, _name)
+            # Wrap log10-scaled parameters so the user knows the value is a logarithm
+            if _name in log10_params and not display_name.startswith('log'):
+                display_name = f"log10({display_name})"
             _mn, _mx = bounds.get(_name, [0.0, 1.0])
-            is_global = _name in ('Av', 'log_scale', 'log_amp', 'log_ls')
+            is_global = _name in ('Av', 'log_scale', 'cheb_1', 'log_amp', 'log_ls')
 
             # Fix toggle — access the individual checkbox widget from w_fix
             _fix_widget = w_fix.elements[_name]
@@ -1005,7 +2052,7 @@ def _(bounds, mo, param_names, w_fix, w_max, w_min, w_val):
                 # FIXED: show value input + locked indicator
                 _prior_col = mo.hstack([
                     _val_elements[_name],
-                    mo.md(f"<span style='color: orange;'>🔒 Fixed</span>"),
+                    mo.md(f"<span style='color: orange;'>{mo.icon('lucide:lock')} Fixed</span>"),
                 ], widths=[3, 2], align="center")
             else:
                 # FREE: show prior distribution controls
@@ -1079,10 +2126,12 @@ def _(mo):
     get_mcmc_samples, set_mcmc_samples = mo.state(None)     # (n_samples, n_dim) array
     get_mcmc_labels, set_mcmc_labels = mo.state(None)       # friendly parameter names
     get_mcmc_summary_df, set_mcmc_summary_df = mo.state(None) # ArviZ summary table
+    get_mcmc_corner_meta, set_mcmc_corner_meta = mo.state(None) # corner-plot export metadata
     return (
         get_mle_model, get_mle_priors, set_mle_model, set_mle_priors,
         get_mcmc_samples, set_mcmc_samples,
         get_mcmc_labels, set_mcmc_labels,
+        get_mcmc_corner_meta, set_mcmc_corner_meta,
         get_mcmc_summary_df, set_mcmc_summary_df,
     )
 
@@ -1090,21 +2139,62 @@ def _(mo):
 @app.cell
 def _(mo):
     # Inference Control
-    run_mle_btn = mo.ui.run_button(label="🚀 Run MLE", kind="success")
+    mle_method = mo.ui.dropdown(
+        options=["CMA-ES", "Nelder-Mead", "L-BFGS-B"],
+        value="CMA-ES",
+        label="Optimization Method:",
+    )
+    mle_max_iter = mo.ui.number(
+        start=100, stop=100000, value=10000, step=100,
+        label="Max Iterations:",
+    )
+    mle_restarts = mo.ui.number(
+        start=1, stop=10, value=3, step=1,
+        label="Restarts:",
+    )
+    run_mle_btn = mo.ui.run_button(label=f"{mo.icon('lucide:rocket')} Run MLE", kind="success")
+
+    _method_info = mo.accordion({
+        f"{mo.icon('lucide:info')} Optimizer Details": mo.md("""
+        | Method | Type | Best For |
+        |--------|------|----------|
+        | **CMA-ES** | Evolutionary strategy | **Recommended default** — robust in multi-modal, high-dimensional landscapes |
+        | **Nelder-Mead** | Derivative-free simplex | Fast for low-dimensional problems; can stall in >6 dimensions |
+        | **L-BFGS-B** | Quasi-Newton (gradient) | Fast convergence when the likelihood surface is smooth |
+
+        **CMA-ES** is population-based and adapts its search covariance — best for 7+ dimensional spectral fitting.
+        **Nelder-Mead** uses an adaptive simplex spanning the prior volume.
+        **L-BFGS-B** uses box constraints derived from your priors and finite-difference gradients.
+
+        **Restarts** runs the optimiser multiple times from different random starting
+        points and keeps the best result, greatly reducing the chance of local-minimum trapping.
+        """)
+    })
 
     mo.vstack([
         mo.md("Run Maximum Likelihood Estimation (MLE) to find the best fit parameters."),
-        run_mle_btn
+        mo.hstack([mle_method, mle_max_iter, mle_restarts], justify="start", gap=1),
+        _method_info,
+        run_mle_btn,
     ])
-    return (run_mle_btn,)
+    return (mle_max_iter, mle_method, mle_restarts, run_mle_btn,)
 
 
 @app.cell
 def _(
+    alt,
+    build_bestfit_spectrum_altair,
+    build_default_observation_sigma,
     Spectrum,
     SpectrumModel,
+    build_synthetic_sirocco_sigma,
     emu,
+    fit_power_law_continuum,
     ground_truth_params,
+    log10_params,
+    mle_max_iter,
+    mle_method,
+    mle_restarts,
     mo,
     np,
     obs_data,
@@ -1121,20 +2211,7 @@ def _(
     wl_range_slider,
 ):
     # ── Stage 3: Maximum Likelihood Estimation (MLE) ──
-    # Workflow:
-    #  1. Crop observation to the wavelength window and apply the emulator’s
-    #     flux transform (linear / log10 / mean-scaled).
-    #  2. Build a SpectrumModel from the emulator + transformed observation.
-    #  3. Translate Stage 2 UI state into frozen scipy prior objects; freeze
-    #     any parameters the user locked.
-    #  4. Construct an initial simplex that spans the full prior volume so
-    #     Nelder-Mead starts from a sensible region (not a single point).
-    #  5. Bootstrap log_scale at each simplex vertex via one model evaluation.
-    #  6. Run adaptive Nelder-Mead on the negative log-posterior with a live
-    #     spinner reporting iteration count, best NLL, and elapsed time.
-    #  7. Store the fitted model + priors in reactive state for Stage 4.
-    #  8. Render the best-fit overlay, NLL convergence curve, and a result
-    #     table with optional ground-truth comparison.
+    # Supports Nelder-Mead, L-BFGS-B, and CMA-ES optimizers.
     fit_status = None
     fit_results = None
 
@@ -1159,33 +2236,56 @@ def _(
 
                 # Apply exactly the same flux transform used during emulator training.
                 _flux_scale = obs_flux_scale.value
-                _raw_flux = np.array(_data_subset['flux'])
+                _native_flux = np.array(_data_subset['flux'], dtype=float)
+                _sigma_source = (
+                    str(_data_subset['sigma_source'].iat[0]).strip().lower()
+                    if 'sigma_source' in _data_subset.columns and len(_data_subset) > 0
+                    else None
+                )
+                if _sigma_source == 'synthetic_sirocco_continuum':
+                    _fallback_sigma_native, _ = build_synthetic_sirocco_sigma(
+                        np.array(_data_subset['wavelength']),
+                        _native_flux,
+                    )
+                else:
+                    _fallback_sigma_native, _ = build_default_observation_sigma(
+                        np.array(_data_subset['wavelength']),
+                        _native_flux,
+                    )
+
+                if 'error' in _data_subset.columns:
+                    _native_sigma = np.array(_data_subset['error'], dtype=float)
+                    _native_sigma = np.where(
+                        np.isfinite(_native_sigma) & (_native_sigma > 0),
+                        _native_sigma,
+                        _fallback_sigma_native,
+                    )
+                else:
+                    _native_sigma = _fallback_sigma_native
+
+                _raw_flux = _native_flux.copy()
                 if _flux_scale == 'log':
                     # Guard against non-positive values
                     _raw_flux = np.where(_raw_flux > 0, np.log10(_raw_flux), np.log10(np.abs(_raw_flux) + 1e-30))
-                elif _flux_scale == 'scaled':
-                    _flux_mean = np.mean(_raw_flux)
-                    if _flux_mean != 0:
-                        _raw_flux = _raw_flux / _flux_mean
+                    _sigma = _native_sigma / (np.abs(_native_flux) * np.log(10) + 1e-30)
+                elif _flux_scale == 'continuum-normalised':
+                    _cont, _ = fit_power_law_continuum(
+                        np.array(_data_subset['wavelength']), _native_flux
+                    )
+                    _cont_safe = np.where(_cont > 0, _cont, 1.0)
+                    _raw_flux = _native_flux / _cont_safe
+                    _sigma = _native_sigma / _cont_safe
+                else:
+                    _sigma = _native_sigma
                 # else: linear (no transform)
                 _data_subset['flux'] = _raw_flux
 
-                # Respect provided uncertainties when present; otherwise use a simple
-                # fractional-error model so SpectrumModel always receives sigmas.
-                if 'error' in _data_subset.columns:
-                    _sigma = np.array(_data_subset['error'])
-                    # Propagate uncertainties through the same transform applied to flux.
-                    if _flux_scale == 'log':
-                        # Propagate error through log10: sigma_log = sigma / (val * ln(10))
-                        _orig_flux = np.array(obs_data[_mask]['flux'])
-                        _sigma = _sigma / (np.abs(_orig_flux) * np.log(10) + 1e-30)
-                    elif _flux_scale == 'scaled':
-                        _sigma = _sigma / _flux_mean if _flux_mean != 0 else _sigma
-                else:
-                    _sigma = np.abs(_raw_flux) * 0.05
-
-                # Ensure no zero/negative sigmas
-                _sigma = np.maximum(_sigma, np.abs(_data_subset['flux'].values) * 0.01)
+                # Ensure no zero/negative sigmas after propagation.
+                _sigma = np.where(
+                    np.isfinite(_sigma) & (_sigma > 0),
+                    _sigma,
+                    1e-30,
+                )
 
                 spec_data = Spectrum(
                     np.array(_data_subset['wavelength']),
@@ -1215,6 +2315,11 @@ def _(
                         'log_ls': w_val.value['log_ls']
                     }
 
+                # Handle Chebyshev continuum tilt (cheb_1)
+                # SpectrumModel expects cheb=[c1, c2, ...] (c0=1 is enforced internally)
+                if 'cheb_1' in param_names:
+                    global_params['cheb'] = [w_val.value['cheb_1']]
+
                 # Handle log_scale (flux scaling)
                 # If user has fixed log_scale, use their value
                 # If free, let Starfish auto-calculate initially, then optimize
@@ -1226,6 +2331,7 @@ def _(
                        emulator=emu, 
                        data=spec_data, 
                        grid_params=grid_params_init,
+                       flux_scale=_flux_scale,
                        **global_params
                 )
 
@@ -1299,10 +2405,19 @@ def _(
                         and w_fix.value['log_amp'] and w_fix.value['log_ls']):
                     _model.freeze('global_cov')
 
-                # 4. Build Initial Simplex
-                # Spans the prior space for ALL active parameters (grid + hyperparams)
-                # so Nelder-Mead starts from a sensible region instead of a single point.
-                _spinner.update("Building initial simplex...")
+                # E. Chebyshev continuum tilt (cheb_1 -> internal key cheb:1)
+                if 'cheb_1' in param_names:
+                    if w_fix.value['cheb_1']:
+                        _model['cheb:1'] = w_val.value['cheb_1']
+                        _model.freeze('cheb')
+                    else:
+                        _mn = w_min['cheb_1'].value
+                        _mx = w_max['cheb_1'].value
+                        _priors['cheb:1'] = stats.uniform(loc=_mn, scale=_mx - _mn)
+
+                # 4. Build Initial Simplex / Bounds
+                _spinner.update("Preparing optimizer...")
+                _opt_method = mle_method.value
 
                 _active_labels = list(_model.labels)
                 _N = len(_active_labels)
@@ -1319,107 +2434,258 @@ def _(
                     else:
                         return kwds.get('loc', 0.0), kwds.get('scale', 1.0)
 
-                def _simplex_column_uniform(loc, scale, N):
-                    """Evenly spaced points across a truncated uniform range."""
-                    mn = loc
-                    mx = loc + scale
-                    rng = mx - mn
-                    margin = rng / 20  # 5% inset on each end
-                    t_mn, t_mx = mn + margin, mx - margin
-                    interval = (t_mx - t_mn) / N
-                    return [t_mn + interval * k for k in range(N + 1)]
-
-                def _simplex_column_norm(mean, std, N):
-                    """Evenly spaced points across ±2σ of a normal prior."""
-                    mn = mean - 2 * std
-                    mx = mean + 2 * std
-                    interval = (mx - mn) / N
-                    return [mn + interval * k for k in range(N + 1)]
-
-                _simplex = np.zeros((_N + 1, _N))
-                _simplex_info = []
-
-                for _col_idx, _label in enumerate(_active_labels):
+                # Derive per-parameter bounds from the priors (used by all methods).
+                _lo_bounds = []
+                _hi_bounds = []
+                for _label in _active_labels:
                     if _label in _priors:
                         _dist = _priors[_label]
                         _loc, _sc = _get_loc_scale(_dist)
                         if _dist.dist.name == 'uniform':
-                            _col = _simplex_column_uniform(_loc, _sc, _N)
+                            _lo_bounds.append(_loc)
+                            _hi_bounds.append(_loc + _sc)
                         elif _dist.dist.name == 'norm':
-                            _col = _simplex_column_norm(_loc, _sc, _N)
+                            _lo_bounds.append(_loc - 4 * _sc)
+                            _hi_bounds.append(_loc + 4 * _sc)
                         else:
-                            # Fallback: small perturbation around current value
-                            _cv = _model.get_param_vector()[_col_idx]
-                            _col = [_cv + (_cv * 0.01 * k) for k in range(_N + 1)]
+                            _cv = _model.get_param_vector()[_active_labels.index(_label)]
+                            _lo_bounds.append(_cv - abs(_cv) * 0.5)
+                            _hi_bounds.append(_cv + abs(_cv) * 0.5)
                     else:
-                        # Parameter is active but has no explicit prior — use current value
-                        _cv = _model.get_param_vector()[_col_idx]
-                        _col = [_cv] * (_N + 1)
+                        _cv = _model.get_param_vector()[_active_labels.index(_label)]
+                        _lo_bounds.append(_cv - abs(_cv) * 0.5 - 1e-6)
+                        _hi_bounds.append(_cv + abs(_cv) * 0.5 + 1e-6)
 
-                    _simplex[:, _col_idx] = _col
-                    _simplex_info.append(
-                        f"  {_label}: [{min(_col):.4f} .. {max(_col):.4f}]")
+                _simplex = None
+                if _opt_method == "Nelder-Mead":
+                    # Build an initial simplex spanning the prior volume.
+                    def _simplex_column_uniform(loc, scale, N):
+                        mn = loc
+                        mx = loc + scale
+                        rng = mx - mn
+                        margin = rng / 20
+                        t_mn, t_mx = mn + margin, mx - margin
+                        interval = (t_mx - t_mn) / N
+                        return [t_mn + interval * k for k in range(N + 1)]
 
-                    # Roll each column by its index so rows are offset from each other
-                    _simplex[:, _col_idx] = np.roll(
-                        _simplex[:, _col_idx], _col_idx)
+                    def _simplex_column_norm(mean, std, N):
+                        mn = mean - 2 * std
+                        mx = mean + 2 * std
+                        interval = (mx - mn) / N
+                        return [mn + interval * k for k in range(N + 1)]
 
-                # --- Bootstrap log_scale into the simplex ---
-                # Evaluate the model at each simplex vertex to auto-calculate
-                # the appropriate log_scale, giving the optimizer a head start.
-                if 'log_scale' in _active_labels:
-                    _ls_idx = _active_labels.index('log_scale')
-                    for _row in range(_N + 1):
+                    _simplex = np.zeros((_N + 1, _N))
+                    _simplex_info = []
+
+                    for _col_idx, _label in enumerate(_active_labels):
+                        if _label in _priors:
+                            _dist = _priors[_label]
+                            _loc, _sc = _get_loc_scale(_dist)
+                            if _dist.dist.name == 'uniform':
+                                _col = _simplex_column_uniform(_loc, _sc, _N)
+                            elif _dist.dist.name == 'norm':
+                                _col = _simplex_column_norm(_loc, _sc, _N)
+                            else:
+                                _cv = _model.get_param_vector()[_col_idx]
+                                _col = [_cv + (_cv * 0.01 * k) for k in range(_N + 1)]
+                        else:
+                            _cv = _model.get_param_vector()[_col_idx]
+                            _col = [_cv] * (_N + 1)
+
+                        _simplex[:, _col_idx] = _col
+                        _simplex_info.append(
+                            f"  {_label}: [{min(_col):.4f} .. {max(_col):.4f}]")
+                        _simplex[:, _col_idx] = np.roll(
+                            _simplex[:, _col_idx], _col_idx)
+
+                    # Bootstrap log_scale into the simplex
+                    if 'log_scale' in _active_labels:
+                        _ls_idx = _active_labels.index('log_scale')
+                        for _row in range(_N + 1):
+                            try:
+                                _model.set_param_vector(_simplex[_row])
+                                _ = _model()
+                                if (_model._log_scale is not None
+                                        and np.isfinite(_model._log_scale)):
+                                    _simplex[_row, _ls_idx] = _model._log_scale
+                            except Exception:
+                                pass
+
+                    _centroid = _simplex.mean(axis=0)
+                    _model.set_param_vector(_centroid)
+                else:
+                    # L-BFGS-B / CMA-ES: bootstrap log_scale at the starting point
+                    if 'log_scale' in _active_labels:
                         try:
-                            _model.set_param_vector(_simplex[_row])
-                            _ = _model()  # triggers auto log_scale calc
-                            if (_model._log_scale is not None
-                                    and np.isfinite(_model._log_scale)):
-                                _simplex[_row, _ls_idx] = _model._log_scale
+                            _ = _model()
+                            if _model._log_scale is not None and np.isfinite(_model._log_scale):
+                                _model.params['log_scale'] = _model._log_scale
                         except Exception:
-                            pass  # keep the prior-based value
+                            pass
 
-                # Restore model to the centroid of the simplex
-                _centroid = _simplex.mean(axis=0)
-                _model.set_param_vector(_centroid)
+                # 5. Run MLE Optimization
+                # Warm up emulator caches (Cholesky factorisation etc.)
+                # before starting the optimizer timer, so the first eval
+                # isn't artificially slow.
+                _spinner.update("Building emulator cache (one-time)...")
+                try:
+                    _ = _model()
+                except Exception:
+                    pass
 
-                # 5. Run Training (MLE) with Progress Tracking
-                _spinner.update("Running MLE Optimization...")
+                _spinner.update(f"Running {_opt_method} optimisation...")
 
-                # Track optimization progress
                 _nll_history = []
                 _iter_count = [0]
                 _start_time = _time.time()
-                _max_iter = 10000
+                _max_iter = int(mle_max_iter.value)
+                _n_restarts = max(1, int(mle_restarts.value))
+
+                _global_best_f = [float("inf")]  # mutable for callback
+                _cur_restart = [0]
 
                 def _nll_with_callback(P):
                     _model.set_param_vector(P)
-                    nll = -_model.log_likelihood(_priors)
+                    # Fast bounds check — skip expensive GPU eval for out-of-range proposals
+                    _gp = np.array(_model.grid_params)
+                    if (np.any(_gp < _model.emulator.min_params) or
+                            np.any(_gp > _model.emulator.max_params)):
+                        nll = 1e30
+                    else:
+                        try:
+                            nll = -_model.log_likelihood(_priors)
+                        except (ValueError, np.linalg.LinAlgError):
+                            nll = 1e30
                     _nll_history.append(nll)
                     _iter_count[0] += 1
-
-                    # Update spinner every 50 iterations
                     if _iter_count[0] % 50 == 0:
                         _elapsed = _time.time() - _start_time
-                        _best_nll = min(_nll_history) if _nll_history else nll
                         _spinner.update(
-                            f"MLE Iteration {_iter_count[0]}/{_max_iter} | "
-                            f"Best NLL: {_best_nll:.2f} | "
+                            f"{_opt_method} Restart {_cur_restart[0]}/{_n_restarts} | "
+                            f"Eval {_iter_count[0]} | "
+                            f"Best NLL: {_global_best_f[0]:.10f} | "
                             f"Time: {_elapsed:.1f}s"
                         )
                     return nll
 
                 _p0 = _model.get_param_vector()
-                _soln = scipy_minimize(
-                    _nll_with_callback, 
-                    _p0, 
-                    method="Nelder-Mead",
-                    options=dict(
-                        maxiter=_max_iter,
-                        disp=False,
-                        adaptive=True,
-                        initial_simplex=_simplex,
+                _lo_arr = np.array(_lo_bounds)
+                _hi_arr = np.array(_hi_bounds)
+
+                # Generate starting points: first = bootstrapped x0, rest = random
+                _start_points = [_p0.copy()]
+                if _n_restarts > 1:
+                    np.random.seed(None)
+                    for _ in range(_n_restarts - 1):
+                        _rnd = _lo_arr + np.random.rand(_N) * (_hi_arr - _lo_arr)
+                        # Bootstrap log_scale for random starts too
+                        if 'log_scale' in _active_labels:
+                            _ls_idx = _active_labels.index('log_scale')
+                            try:
+                                _model.set_param_vector(_rnd)
+                                _ = _model()
+                                if _model._log_scale is not None and np.isfinite(_model._log_scale):
+                                    _rnd[_ls_idx] = _model._log_scale
+                            except Exception:
+                                pass
+                        _start_points.append(_rnd)
+
+                _global_best_x = _p0.copy()
+                _global_best_nit = 0
+
+                for _restart_idx, _x0 in enumerate(_start_points):
+                    _cur_restart[0] = _restart_idx + 1
+                    _iter_count[0] = 0  # reset eval counter per restart
+                    _spinner.update(
+                        f"{_opt_method} | Restart {_cur_restart[0]}/{_n_restarts} | "
+                        f"Starting... | {_time.time() - _start_time:.1f}s"
                     )
+                    _model.set_param_vector(_x0)
+
+                    if _opt_method == "Nelder-Mead":
+                        # For restart 0 use the pre-built simplex; for later
+                        # restarts use adaptive simplex from the random x0.
+                        _nm_opts = dict(maxiter=_max_iter, disp=False, adaptive=True)
+                        if _restart_idx == 0 and _simplex is not None:
+                            _nm_opts["initial_simplex"] = _simplex
+                        _run_soln = scipy_minimize(
+                            _nll_with_callback,
+                            _x0,
+                            method="Nelder-Mead",
+                            options=_nm_opts,
+                        )
+
+                    elif _opt_method == "L-BFGS-B":
+                        _bounds_list = list(zip(_lo_bounds, _hi_bounds))
+                        _run_soln = scipy_minimize(
+                            _nll_with_callback,
+                            _x0,
+                            method="L-BFGS-B",
+                            bounds=_bounds_list,
+                            options=dict(
+                                maxiter=_max_iter,
+                                ftol=1e-15,
+                                gtol=1e-12,
+                                eps=1e-5,
+                            ),
+                        )
+
+                    elif _opt_method == "CMA-ES":
+                        try:
+                            import cma
+                        except ImportError:
+                            raise ImportError(
+                                "CMA-ES requires the 'cma' package. "
+                                "Install it with: pip install cma"
+                            )
+                        _cma_bounds = [_lo_bounds, _hi_bounds]
+                        _p0_cma = np.clip(
+                            _x0,
+                            _lo_arr + 1e-8,
+                            _hi_arr - 1e-8,
+                        )
+                        _cma_stds = [0.2 * (hi - lo) for lo, hi in zip(_lo_bounds, _hi_bounds)]
+                        _popsize = 2 * (4 + int(3 * np.log(_N)))
+                        _es = cma.CMAEvolutionStrategy(
+                            _p0_cma.tolist(), 1.0,
+                            {
+                                "bounds": _cma_bounds,
+                                "CMA_stds": _cma_stds,
+                                "popsize": _popsize,
+                                "maxfevals": _max_iter,
+                                "verbose": -9,
+                                "tolfun": 1e-10,
+                            },
+                        )
+                        _run_best_x, _run_best_f = _x0.copy(), float("inf")
+                        while not _es.stop():
+                            _solutions = _es.ask()
+                            _fits = [_nll_with_callback(np.array(s)) for s in _solutions]
+                            _es.tell(_solutions, _fits)
+                            _gen_best = min(_fits)
+                            if _gen_best < _run_best_f:
+                                _run_best_f = _gen_best
+                                _run_best_x = np.array(_solutions[_fits.index(_gen_best)])
+                            if _run_best_f < _global_best_f[0]:
+                                _global_best_f[0] = _run_best_f
+                        from types import SimpleNamespace
+                        _run_soln = SimpleNamespace(
+                            x=_run_best_x, fun=_run_best_f, success=True,
+                            message="CMA-ES terminated",
+                            nit=_es.result.iterations,
+                        )
+
+                    # Keep global best across restarts
+                    if _run_soln.fun <= _global_best_f[0]:
+                        _global_best_f[0] = _run_soln.fun
+                        _global_best_x = _run_soln.x.copy()
+                        _global_best_nit = getattr(_run_soln, 'nit', 0)
+
+                from types import SimpleNamespace
+                _soln = SimpleNamespace(
+                    x=_global_best_x, fun=_global_best_f[0], success=True,
+                    message=f"Best of {_n_restarts} restart(s)",
+                    nit=_global_best_nit,
                 )
 
                 if _soln.success:
@@ -1430,16 +2696,28 @@ def _(
                 set_mle_priors(_priors)
 
                 _elapsed_total = _time.time() - _start_time
+                _restart_msg = f" ({_n_restarts} restart{'s' if _n_restarts > 1 else ''})" if _n_restarts > 1 else ""
                 fit_status = mo.callout(
-                    mo.md(f"✅ MLE Complete! ({_iter_count[0]} iterations, {_elapsed_total:.1f}s)"),
+                    mo.md(f"{mo.icon('lucide:check-circle')} MLE Complete via {_opt_method}{_restart_msg}! ({_iter_count[0]} iterations, {_elapsed_total:.1f}s)"),
                     kind="success"
                 )
 
                 # 6. Plotting
                 import matplotlib.pyplot as _plt
-                _model.plot(yscale="linear")
-                _fig = _plt.gcf()
-                _fig.tight_layout()
+                _plot_flux, _plot_cov = _model()
+                if hasattr(_plot_flux, 'detach'):
+                    _plot_flux = _plot_flux.detach().cpu().numpy()
+                if hasattr(_plot_cov, 'detach'):
+                    _plot_cov = _plot_cov.detach().cpu().numpy()
+                _fig = build_bestfit_spectrum_altair(
+                    alt,
+                    wavelength=_model.data.wave,
+                    data_flux=_model.data.flux,
+                    model_flux=_plot_flux,
+                    model_cov_diag=_plot_cov,
+                    title=f"Best-Fit Model — {_model.data_name}",
+                    zoom_name="inference_mle_bestfit_zoom",
+                )
 
                 # 6b. Loss curve plot
                 if len(_nll_history) > 10:
@@ -1482,10 +2760,17 @@ def _(
 
                 for _i, _p in enumerate(phys_names):
                     fitted_val = res_grid[_i]
-                    _results_md += f"| **{_p}** | {fitted_val:.4f} | "
+                    _display_p = f"log10({_p})" if _p in log10_params else _p
+                    _results_md += f"| **{_display_p}** | {fitted_val:.4f} | "
 
-                    if ground_truth_params and _p in ground_truth_params:
-                        _gt_val = ground_truth_params[_p]
+                    # Resolve ground-truth key: inclination variants all map
+                    # to the single 'Inclination' entry in ground_truth_params.
+                    _gt_key = _p
+                    if 'Inclination' in _gt_key:
+                        _gt_key = 'Inclination'
+
+                    if ground_truth_params and _gt_key in ground_truth_params:
+                        _gt_val = ground_truth_params[_gt_key]
                         delta = fitted_val - _gt_val
                         _results_md += f"{_gt_val:.4f} | {delta:+.4f} |\n"
                     elif ground_truth_params:
@@ -1493,24 +2778,28 @@ def _(
                     else:
                         _results_md += "\n"
 
-                # Add Global Params
-                _results_md += "\n**Global Parameters:**\n"
-                if 'Av' in res_global: 
-                    _results_md += f"- **Av**: {res_global['Av']:.4f}\n"
-                if 'log_scale' in res_global: 
-                    _results_md += f"- **log_scale**: {res_global['log_scale']:.4f}\n"
+                # Global parameters in a separate table for side-by-side layout
+                _global_md = "### Global Parameters\n\n"
+                _global_md += "| Parameter | Fitted |\n"
+                _global_md += "|-----------|--------|\n"
+                if 'Av' in res_global:
+                    _global_md += f"| **Av** | {res_global['Av']:.4f} |\n"
+                if 'log_scale' in res_global:
+                    _global_md += f"| **ln(scale)** | {res_global['log_scale']:.4f} |\n"
                 elif hasattr(_model, '_log_scale') and _model._log_scale is not None:
-                    _results_md += f"- **log_scale (auto)**: {_model._log_scale:.4f}\n"
+                    _global_md += f"| **ln(scale) (auto)** | {_model._log_scale:.4f} |\n"
+                if 'cheb:1' in res_global:
+                    _global_md += f"| **cheb₁** | {res_global['cheb:1']:.4f} |\n"
                 if 'global_cov:log_amp' in res_global:
-                    _results_md += f"- **log_amp**: {res_global['global_cov:log_amp']:.4f}\n"
+                    _global_md += f"| **ln(GP amp)** | {res_global['global_cov:log_amp']:.4f} |\n"
                 if 'global_cov:log_ls' in res_global:
-                    _results_md += f"- **log_ls**: {res_global['global_cov:log_ls']:.4f}\n"
+                    _global_md += f"| **ln(GP length)** | {res_global['global_cov:log_ls']:.4f} |\n"
 
                 # Keep the result view as a single stack so the fit summary, loss
                 # curve, and model figure stay coupled during reactive reruns.
                 _result_elements = [
                     fit_status,
-                    mo.md(_results_md),
+                    mo.hstack([mo.md(_results_md), mo.md(_global_md)], align="start", gap="2rem"),
                 ]
                 if _fig_loss is not None:
                     _result_elements.extend([
@@ -1527,7 +2816,7 @@ def _(
             except Exception as _e:
                 import traceback as _traceback
                 _tb = _traceback.format_exc()
-                fit_status = mo.callout(mo.md(f"❌ MLE Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
+                fit_status = mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} MLE Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
                 fit_results = fit_status
                 set_mle_model(None)
                 set_mle_priors(None)
@@ -1553,17 +2842,17 @@ def _(emu, get_mle_model, mo, param_names, re):
     # optionally freezes select parameters at their MLE values so the
     # sampler explores a reduced subspace.  Defaults were chosen for a
     # reasonable balance of speed vs. posterior quality:
-    #   32 walkers  – twice the typical active-parameter count
-    #   1000 steps  – gives ~30 000 post-burn samples at thin=1
-    #   200 burn-in – conservative; the auto-burn heuristic may override
+    #   64 walkers  – twice the typical active-parameter count
+    #   2500 steps  – gives ~30 000 post-burn samples at thin=1
+    #   500 burn-in – conservative; the auto-burn heuristic may override
     _model = get_mle_model()
 
-    mcmc_nwalkers = mo.ui.number(value=32, label="Walkers", step=4, start=8)
-    mcmc_nsteps = mo.ui.number(value=1000, label="Steps", step=100, start=100)
-    mcmc_burnin = mo.ui.number(value=200, label="Burn-in", step=50, start=0)
+    mcmc_nwalkers = mo.ui.number(value=64, label="Walkers", step=4, start=8)
+    mcmc_nsteps = mo.ui.number(value=2500, label="Steps", step=100, start=100)
+    mcmc_burnin = mo.ui.number(value=500, label="Min Burn-in (floor)", step=50, start=0)
 
     run_mcmc_btn = mo.ui.run_button(
-        label="🎲 Run MCMC", 
+        label=f"{mo.icon('lucide:shuffle')} Run MCMC", 
         kind="warn",
     )
 
@@ -1578,6 +2867,7 @@ def _(emu, get_mle_model, mo, param_names, re):
         # Map global/nuisance params to friendly names
         mcmc_label_map['Av'] = 'Av'
         mcmc_label_map['log_scale'] = 'log_scale'
+        mcmc_label_map['cheb:1'] = 'cheb_1'
         mcmc_label_map['global_cov:log_amp'] = 'GP log_amp'
         mcmc_label_map['global_cov:log_ls'] = 'GP log_ls'
 
@@ -1591,14 +2881,15 @@ def _(emu, get_mle_model, mo, param_names, re):
     mcmc_freeze = mo.ui.dictionary(_freeze_dict) if _freeze_dict else mo.ui.dictionary({})
 
     if _model is None:
-        mcmc_config_ui = mo.callout(mo.md("⚠️ Run MLE first before MCMC"), kind="warn")
+        mcmc_config_ui = mo.callout(mo.md(f"{mo.icon('lucide:triangle-alert')} Run MLE first before MCMC"), kind="warn")
     else:
         # Show friendly names in the active params list
         _friendly_labels = [mcmc_label_map.get(l, l) for l in _model.labels]
+
         mcmc_config_ui = mo.vstack([
             mo.md(f"**Active Parameters:** {', '.join(_friendly_labels)}"),
             mo.hstack([mcmc_nwalkers, mcmc_nsteps, mcmc_burnin], justify="start"),
-            mo.md("### 🔒 Freeze Parameters for MCMC"),
+            mo.md(f"### {mo.icon('lucide:lock')} Freeze Parameters for MCMC"),
             mo.callout(mo.md(
                 "Tick parameters to **freeze** them at their MLE best-fit values. "
                 "Frozen parameters will not be sampled by MCMC. "
@@ -1614,6 +2905,8 @@ def _(emu, get_mle_model, mo, param_names, re):
 
 @app.cell
 def _(
+    alt,
+    build_bestfit_spectrum_altair,
     get_mle_model,
     get_mle_priors,
     ground_truth_params,
@@ -1626,8 +2919,10 @@ def _(
     np,
     run_mcmc_btn,
     set_mcmc_labels,
+    set_mcmc_corner_meta,
     set_mcmc_samples,
     set_mcmc_summary_df,
+    stats,
 ):
     # ── Stage 4: MCMC Posterior Exploration ──
     # Steps:
@@ -1648,6 +2943,11 @@ def _(
     mcmc_results = None
 
     if run_mcmc_btn.value:
+        set_mcmc_samples(None)
+        set_mcmc_labels(None)
+        set_mcmc_summary_df(None)
+        set_mcmc_corner_meta(None)
+
         _model = get_mle_model()
         _priors = get_mle_priors()
 
@@ -1656,7 +2956,12 @@ def _(
 
         # Apply the optional MCMC-only freezes to the already-fit model so the
         # sampler explores only the subset of parameters the user left thawed.
+        # First, thaw every param that the MCMC checkboxes cover.  This
+        # prevents freezes from a previous MCMC run accumulating when the
+        # user re-runs with a different freeze selection.
         _freeze_values = mcmc_freeze.value  # {internal_name: bool}
+        for _key in _freeze_values:
+            _model.thaw(_key)
         _frozen_list = []
         for _key, _is_frozen in _freeze_values.items():
             if _is_frozen:
@@ -1686,36 +2991,59 @@ def _(
                 # Define log probability function
                 def _log_prob(P, model, priors):
                     model.set_param_vector(P)
-                    return model.log_likelihood(priors)
+                    # Reject proposals outside the emulator training grid.
+                    # Without this, walkers that wander beyond the grid get
+                    # garbage likelihood values instead of being rejected,
+                    # causing them to diffuse across the full prior volume.
+                    gp = np.array(model.grid_params)
+                    if np.any(gp < model.emulator.min_params) or np.any(gp > model.emulator.max_params):
+                        return -np.inf
+                    try:
+                        return model.log_likelihood(priors)
+                    except (ValueError, np.linalg.LinAlgError):
+                        return -np.inf
 
-                # The proposal ball is keyed by both internal and display labels so
-                # sampling stays stable even when Stage 2 renamed parameters.
-                _default_scales = {
-                    "disk.mdot": 0.05, "wind.mdot": 0.02, "KWD.d": 0.1,
-                    "KWD.mdot_r_exponent": 0.05, "KWD.acceleration_length": 0.1,
-                    "KWD.acceleration_exponent": 0.1,
-                    "Boundary_layer.luminosity": 0.05, "Boundary_layer.temp": 0.05,
-                    "Inclination (Sparse)": 2.0, "Inclination (Mid)": 2.0,
-                    "Inclination (Full)": 1.0,
-                    "param1": 0.05, "param2": 0.02, "param3": 0.1,
-                    "param4": 0.05, "param5": 0.1, "param6": 0.1,
-                    "param7": 0.05, "param8": 0.05, "param9": 2.0,
-                    "param10": 2.0, "param11": 1.0,
-                    "global_cov:log_amp": 1.0, "global_cov:log_ls": 0.5,
-                    "GP log_amp": 1.0, "GP log_ls": 0.5,
-                    "Av": 0.1, "log_scale": 0.5
-                }
-
-                _ball = np.random.randn(_nwalkers, _ndim)
+                # Initialise walkers in a truncated-normal ball around the MLE.
+                # For Normal priors: σ = the distribution's own std (1σ).
+                # For Uniform / other priors: σ = _INIT_FRAC × prior width.
+                # Truncated normal avoids edge pile-up at the prior edges
+                # when the MLE sits near a bound.
+                _INIT_FRAC = 0.15  # σ as a fraction of prior width
+                _ball = np.empty((_nwalkers, _ndim))
                 for _i, _key in enumerate(_model.labels):
-                    # Try internal name first, then friendly name
-                    _scale = _default_scales.get(_key, _default_scales.get(_friendly(_key), 0.1))
-                    _ball[:, _i] *= _scale
-                    _ball[:, _i] += _model[_key]
+                    _pr = _priors.get(_key)
+                    _mle_val = _model[_key]
+                    if _pr is not None and hasattr(_pr, 'interval'):
+                        _lo, _hi = _pr.interval(1.0)
+                        # Use the distribution's native σ only for Normal-family
+                        # priors; for Uniform (and anything else) use a controlled
+                        # fraction of the prior width.
+                        _is_normal = getattr(getattr(_pr, 'dist', None), 'name', '') in ('norm', 'truncnorm')
+                        if _is_normal:
+                            _sigma = _pr.std()          # Normal prior
+                        else:
+                            _sigma = _INIT_FRAC * (_hi - _lo)  # Uniform prior
+                        _a = (_lo - _mle_val) / _sigma  # lower bound in std units
+                        _b = (_hi - _mle_val) / _sigma  # upper bound in std units
+                        _ball[:, _i] = stats.truncnorm.rvs(
+                            _a, _b, loc=_mle_val, scale=_sigma, size=_nwalkers
+                        )
+                    else:
+                        # No prior registered (shouldn't happen for thawed
+                        # params) — fall back to small absolute jitter.
+                        _ball[:, _i] = _mle_val + 0.1 * np.random.randn(_nwalkers)
 
-                # Create sampler
+                # Create sampler — use DEMove + DESnookerMove for better
+                # performance in ≥5D (Ter Braak 2006; Nelson et al. 2014).
+                # The default StretchMove becomes increasingly inefficient
+                # above ~5 dimensions.
+                _moves = [
+                    (_emcee.moves.DEMove(), 0.8),
+                    (_emcee.moves.DESnookerMove(), 0.2),
+                ]
                 _sampler = _emcee.EnsembleSampler(
-                    _nwalkers, _ndim, _log_prob, args=(_model, _priors)
+                    _nwalkers, _ndim, _log_prob, args=(_model, _priors),
+                    moves=_moves,
                 )
 
                 # Run with progress bar
@@ -1756,7 +3084,7 @@ def _(
                     _tau_valid = False
 
                 if _tau_valid:
-                    _auto_burnin = int(_tau.max())
+                    _auto_burnin = int(2 * _tau.max())  # 2×τ (Foreman-Mackey 2013)
                     _auto_thin = max(1, int(0.3 * np.min(_tau)))
                     _burnin_used = max(_burnin_manual, _auto_burnin)
                 else:
@@ -1821,6 +3149,9 @@ def _(
                 # ============================================================
                 # Stage 18: Corner plot
                 # ============================================================
+                _corner_quantiles = [0.16, 0.5, 0.84]
+                _corner_levels = [0.6827, 0.9545, 0.9973]
+
                 # Corner-plot truths are matched through the same friendly-name map
                 # used elsewhere, with all inclination variants collapsed onto the
                 # single lookup-table "Inclination" key.
@@ -1845,10 +3176,75 @@ def _(
                     _burn_samples,
                     labels=_friendly_labels,
                     show_titles=True,
-                    quantiles=[0.16, 0.5, 0.84],
+                    quantiles=_corner_quantiles,
+                    levels=_corner_levels,
                     title_fmt=".4f",
                     truths=_truths
                 )
+
+                # Prior-range corner plot: axes span the full prior support so
+                # the user can judge posterior breadth relative to the prior.
+                _prior_ranges = []
+                for _label in _model.labels:
+                    _pr = _priors.get(_label)
+                    if _pr is not None and hasattr(_pr, 'interval'):
+                        _lo, _hi = _pr.interval(1.0)
+                        _prior_ranges.append((_lo, _hi))
+                    else:
+                        _prior_ranges.append(None)
+                # Only build the second plot if we resolved at least one range
+                if any(_r is not None for _r in _prior_ranges):
+                    # Replace None entries with auto-range sentinel (corner uses 0.999 quantile)
+                    _safe_ranges = [_r if _r is not None else (1.0,) for _r in _prior_ranges]
+                    _fig_corner_prior = _corner.corner(
+                        _burn_samples,
+                        labels=_friendly_labels,
+                        show_titles=True,
+                        quantiles=_corner_quantiles,
+                        levels=_corner_levels,
+                        title_fmt=".4f",
+                        truths=_truths,
+                        range=_safe_ranges,
+                    )
+                    _corner_display = mo.ui.tabs({
+                        "Posterior (Auto Range)": _fig_corner,
+                        "Full Prior Range": _fig_corner_prior,
+                    })
+                else:
+                    _corner_display = _fig_corner
+
+                set_mcmc_corner_meta({
+                    "source": "inference",
+                    "data_name": getattr(_model, "data_name", None),
+                    "internal_labels": list(_model.labels),
+                    "truths": list(_truths) if _truths is not None else None,
+                    "ground_truth": dict(ground_truth_params or {}),
+                    "prior_ranges": [
+                        list(_r) if _r is not None else None
+                        for _r in _prior_ranges
+                    ],
+                    "plot_variants": [
+                        "posterior_auto_range",
+                        "full_prior_range",
+                    ] if any(_r is not None for _r in _prior_ranges) else [
+                        "posterior_auto_range"
+                    ],
+                    "corner_settings": {
+                        "show_titles": True,
+                        "quantiles": list(_corner_quantiles),
+                        "levels": list(_corner_levels),
+                        "title_fmt": ".4f",
+                    },
+                    "mcmc": {
+                        "nsteps": int(_nsteps),
+                        "nwalkers": int(_nwalkers),
+                        "manual_burnin": int(_burnin_manual),
+                        "auto_burnin": int(_auto_burnin),
+                        "burnin_used": int(_burnin_used),
+                        "thin_used": int(_thin_used),
+                        "effective_samples": int(_burn_samples.shape[0]),
+                    },
+                })
 
                 # ============================================================
                 # Stage 19: Best-fit MCMC model plot
@@ -1859,10 +3255,20 @@ def _(
                     _mcmc_means[_label] = float(np.mean(_burn_samples[:, _i]))
                 _model.set_param_dict(_mcmc_means)
 
-                _model.plot(yscale="linear")
-                _fig_bestfit = _plt.gcf()
-                _fig_bestfit.suptitle("Best-Fit Model (MCMC Posterior Mean)", y=1.02)
-                _fig_bestfit.tight_layout()
+                _plot_flux, _plot_cov = _model()
+                if hasattr(_plot_flux, 'detach'):
+                    _plot_flux = _plot_flux.detach().cpu().numpy()
+                if hasattr(_plot_cov, 'detach'):
+                    _plot_cov = _plot_cov.detach().cpu().numpy()
+                _fig_bestfit = build_bestfit_spectrum_altair(
+                    alt,
+                    wavelength=_model.data.wave,
+                    data_flux=_model.data.flux,
+                    model_flux=_plot_flux,
+                    model_cov_diag=_plot_cov,
+                    title=f"Best-Fit Model (MCMC Posterior Mean) — {_model.data_name}",
+                    zoom_name="inference_mcmc_bestfit_zoom",
+                )
 
                 # ============================================================
                 # Results table with ground truth comparison
@@ -1904,7 +3310,7 @@ def _(
                 _frozen_info = f", frozen: {', '.join(_frozen_list)}" if _frozen_list else ""
                 _status_callout = mo.callout(
                     mo.md(
-                        f"✅ MCMC Complete! ({_nsteps} steps, "
+                        f"{mo.icon('lucide:check-circle')} MCMC Complete! ({_nsteps} steps, "
                         f"{_nwalkers} walkers, burn-in {_burnin_used}, thin {_thin_used}"
                         f"{_frozen_info})"
                     ),
@@ -1912,18 +3318,18 @@ def _(
                 )
 
                 _chain_accordion = mo.accordion({
-                    "🔗 Raw MCMC Chains (Full)": mo.vstack([
+                    f"{mo.icon('lucide:link')} Raw MCMC Chains (Full)": mo.vstack([
                         mo.md("Walker traces for all parameters before burn-in removal."),
                         _fig_full_chain
                     ]),
-                    "🔥 Burnt MCMC Chains (Post Burn-in)": mo.vstack([
+                    f"{mo.icon('lucide:flame')} Burnt MCMC Chains (Post Burn-in)": mo.vstack([
                         mo.md(_burnin_info),
                         _fig_burn_chain
                     ]),
-                    "📊 Posterior Distributions": mo.vstack([
+                    f"{mo.icon('lucide:chart-bar')} Posterior Distributions": mo.vstack([
                         _fig_post
                     ]),
-                    "📋 Arviz Summary Statistics": mo.vstack([
+                    f"{mo.icon('lucide:clipboard-list')} Arviz Summary Statistics": mo.vstack([
                         mo.md(_summary_md)
                     ]),
                 })
@@ -1933,7 +3339,7 @@ def _(
                     mo.md(_results_md),
                     _chain_accordion,
                     mo.md("### Corner Plot"),
-                    _fig_corner,
+                    _corner_display,
                     mo.md("### Best-Fit Model (MCMC Posterior Mean)"),
                     _fig_bestfit,
                 ])
@@ -1941,7 +3347,7 @@ def _(
             except Exception as _e:
                 import traceback as _traceback
                 _tb = _traceback.format_exc()
-                mcmc_results = mo.callout(mo.md(f"❌ MCMC Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
+                mcmc_results = mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} MCMC Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
 
     mcmc_results if mcmc_results else mo.md("*Configure and run MCMC after MLE*")
     return
@@ -1965,60 +3371,80 @@ def _(mo):
 def _(
     emu,
     get_mcmc_labels,
+    get_mcmc_corner_meta,
     get_mcmc_samples,
     get_mcmc_summary_df,
     get_mle_model,
     mo,
     np,
     os,
-    time,
 ):
     _samples = get_mcmc_samples()
     _labels = get_mcmc_labels()
     _summary_df = get_mcmc_summary_df()
     _model = get_mle_model()
 
-    # Gate export behind a completed MCMC run so the buttons only appear when the
-    # notebook already has the posterior samples needed to write files.
+    # Widgets must be defined unconditionally so the downstream export cell never
+    # receives an undefined reference — mo.stop() would prevent their creation if
+    # they were placed after it.
+    export_pf_btn = mo.ui.run_button(label=f"{mo.icon('lucide:file-text')} Export .pf Template", kind="success")
+    export_csv_btn = mo.ui.run_button(label=f"{mo.icon('lucide:chart-bar')} Export Posterior CSV", kind="success")
+    export_corner_btn = mo.ui.run_button(label=f"{mo.icon('lucide:download')} Export Cornerplot Data", kind="success")
+    export_dir_input = mo.ui.text(value="exports", label="Output directory")
+
+    # Gate the display (not the widget creation) behind a completed MCMC run.
     mo.stop(
         _samples is None or _model is None,
         mo.callout(mo.md("Run MCMC first to enable export."), kind="neutral"),
     )
 
-    export_pf_btn = mo.ui.run_button(label="📄 Export .pf Template", kind="success")
-    export_csv_btn = mo.ui.run_button(label="📊 Export Posterior CSV", kind="success")
-    export_dir_input = mo.ui.text(value="benchmark_results/exports", label="Output directory")
-
     mo.vstack([
         mo.hstack([export_dir_input], gap=1),
-        mo.hstack([export_pf_btn, export_csv_btn], gap=1),
+        mo.hstack([export_pf_btn, export_csv_btn, export_corner_btn], gap=1),
     ])
-    return export_csv_btn, export_dir_input, export_pf_btn
+    return export_corner_btn, export_csv_btn, export_dir_input, export_pf_btn
 
 
 @app.cell
 def _(
     emu,
+    export_corner_btn,
     export_csv_btn,
     export_dir_input,
     export_pf_btn,
+    get_mcmc_corner_meta,
     get_mcmc_labels,
     get_mcmc_samples,
     get_mcmc_summary_df,
     get_mle_model,
+    grid_selector,
     mo,
     np,
     os,
-    time,
 ):
+    import time as _time
     _samples = get_mcmc_samples()
     _labels = get_mcmc_labels()
     _summary_df = get_mcmc_summary_df()
+    _corner_meta = get_mcmc_corner_meta()
     _model = get_mle_model()
-    _out_dir = export_dir_input.value or "benchmark_results/exports"
-    _ts = time.strftime("%Y%m%d_%H%M%S")
+    _out_dir = export_dir_input.value or "exports"
+    _ts = _time.strftime("%Y%m%d_%H%M%S")
 
     _msg = ""
+
+    def _summary_to_dict(_df):
+        if _df is None:
+            return None
+        _summary = {}
+        for _idx_name in _df.index:
+            _row = _df.loc[_idx_name]
+            _summary[str(_idx_name)] = {
+                k: float(v) for k, v in _row.items() if np.isfinite(v)
+            }
+        return _summary
+
+    _summary_dict = _summary_to_dict(_summary_df)
 
     if export_pf_btn.value and _model is not None and _samples is not None:
         try:
@@ -2050,10 +3476,11 @@ def _(
                 emu, _grid_means, _pf_path,
                 uncertainties=_uncertainties,
                 global_params=_global,
+                grid_name=grid_selector.value,
             )
-            _msg += f"✅ .pf template exported to `{_pf_path}`\n\n"
+            _msg += f"{mo.icon('lucide:check-circle')} .pf template exported to `{_pf_path}`\n\n"
         except Exception as _e:
-            _msg += f"❌ .pf export failed: {_e}\n\n"
+            _msg += f"{mo.icon('lucide:x-circle')} .pf export failed: {_e}\n\n"
 
     if export_csv_btn.value and _samples is not None:
         try:
@@ -2061,22 +3488,40 @@ def _(
 
             os.makedirs(_out_dir, exist_ok=True)
 
-            # Convert the ArviZ summary table back into a plain dict so the CSV
-            # export can append human-readable summary statistics as metadata.
-            _summary_dict = None
-            if _summary_df is not None:
-                _summary_dict = {}
-                for _idx_name in _summary_df.index:
-                    _row = _summary_df.loc[_idx_name]
-                    _summary_dict[str(_idx_name)] = {
-                        k: float(v) for k, v in _row.items() if np.isfinite(v)
-                    }
-
             _csv_path = os.path.join(_out_dir, f"speculate_posterior_{_ts}.csv")
             export_posterior_csv(_samples, _labels, _csv_path, summary=_summary_dict)
-            _msg += f"✅ Posterior CSV exported to `{_csv_path}`\n\n"
+            _msg += f"{mo.icon('lucide:check-circle')} Posterior CSV exported to `{_csv_path}`\n\n"
         except Exception as _e:
-            _msg += f"❌ CSV export failed: {_e}\n\n"
+            _msg += f"{mo.icon('lucide:x-circle')} CSV export failed: {_e}\n\n"
+
+    if export_corner_btn.value and _samples is not None:
+        try:
+            from Speculate_addons.speculate_benchmark import export_cornerplot_data
+
+            os.makedirs(_out_dir, exist_ok=True)
+            _corner_labels = _labels or [
+                f"param_{_i}" for _i in range(_samples.shape[1])
+            ]
+            _record = dict(_corner_meta or {})
+            _record.update({
+                "source": "inference",
+                "record_id": f"inference_{_ts}",
+                "samples": _samples,
+                "labels": _corner_labels,
+                "summary": _summary_dict,
+            })
+            _export = export_cornerplot_data(
+                _record,
+                _out_dir,
+                bundle_name=f"speculate_cornerplot_{_ts}",
+                manifest_metadata={"source": "inference"},
+            )
+            _msg += (
+                f"{mo.icon('lucide:check-circle')} Cornerplot data exported to "
+                f"`{_export['bundle_dir']}`\n\n"
+            )
+        except Exception as _e:
+            _msg += f"{mo.icon('lucide:x-circle')} Cornerplot export failed: {_e}\n\n"
 
     if _msg:
         mo.output.replace(mo.callout(mo.md(_msg), kind="success"))

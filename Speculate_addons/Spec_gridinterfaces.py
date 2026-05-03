@@ -2,7 +2,8 @@ import os
 import fnmatch
 import numpy as np
 from Starfish.grid_tools import GridInterface
-import sigfig        
+import sigfig
+from Speculate_addons.Spec_functions import fit_power_law_continuum        
         
 class Speculate_cv_bl_grid_v87f(GridInterface):
     """
@@ -66,7 +67,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             param_points_2 = np.array([0.03, 0.1, 0.3])
             points.append(param_points_2)
         if 3 in model_parameters:
-            param_points_3 = np.array([0.55, 5.5, 55.0])
+            param_points_3 = np.log10(np.array([0.55, 5.5, 55.0]))
             points.append(param_points_3)
         if 4 in model_parameters:
             param_points_4 = np.array([0.0, 0.25, 1.0])
@@ -142,7 +143,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         # Parameter definitions for both file lookup (1-8) and full space (1-10)
         param1_name = np.log10([3e-9, 1e-08, 3e-08]) # Disk.mdot
         param2_name = [0.03, 0.1, 0.3] # wind.mdot (Disk.mdot)
-        param3_name = [0.55, 5.5, 55.0] # KWD.d
+        param3_name = np.log10([0.55, 5.5, 55.0]) # KWD.d
         param4_name = [0.0, 0.25, 1.0] # KWD.mdot_r_exponent
         param5_name = np.log10([7.25182e+08, 7.25182e+09, 7.25182e+10]) # KWD.acceleration_length (cm)
         param6_name = [0.5, 1.5, 4.5] # KWD.acceleration_exponent
@@ -238,7 +239,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             norm (bool): Whether to normalise the return flux (left unimplemented)
         
             scale (str): Change this default too if changing the flux scale. 
-                Define the scale for your data and emulator grid space. 'linear', 'log' or 'scaled'
+                Define the scale for your data and emulator grid space. 'linear', 'log' or 'continuum-normalised'
                 
         Returns:
             ndarray: List of fluxes in the wavelength range specified on initialisation
@@ -278,8 +279,10 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         if self.scale == 'log':
             flux = np.where(flux > 0, flux, 1e-30)  # Floor non-positive values to avoid log10(0) = -inf
             flux = np.log10(flux) # logged 10 
-        if self.scale == 'scaled': # to values near order of magnitude 10^0. 
-            flux = flux/np.mean(flux)
+        if self.scale == 'continuum-normalised':
+            wl_sel = self.wl_full[:len(flux)][self.ind]
+            continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])
+            flux[self.ind] = flux[self.ind] / np.where(continuum > 0, continuum, 1.0)
         
         # TODO: Implement header if doing to use
         hdr = {'inclination_column': inclination_column} # Header constructed 
@@ -351,7 +354,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             param_points_2 = np.array([0.03, 0.1, 0.3])
             points.append(param_points_2)
         if 3 in model_parameters:
-            param_points_3 = np.array([0.55, 5.5, 55.0])
+            param_points_3 = np.log10(np.array([0.55, 5.5, 55.0]))
             points.append(param_points_3)
         if 4 in model_parameters:
             param_points_4 = np.array([0.0, 0.25, 1.0])
@@ -421,7 +424,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         # Parameter definitions for both file lookup (1-8) and full space (1-10)
         param1_name = np.log10([3e-9, 1e-08, 3e-08]) # Disk.mdot
         param2_name = [0.03, 0.1, 0.3] # wind.mdot (Disk.mdot)
-        param3_name = [0.55, 5.5, 55.0] # KWD.d
+        param3_name = np.log10([0.55, 5.5, 55.0]) # KWD.d
         param4_name = [0.0, 0.25, 1.0] # KWD.mdot_r_exponent
         param5_name = np.log10([7.25182e+08, 7.25182e+09, 7.25182e+10]) # KWD.acceleration_length (cm)
         param6_name = [0.5, 1.5, 4.5] # KWD.acceleration_exponent
@@ -514,7 +517,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             norm (bool): Whether to normalise the return flux (left unimplemented)
         
             scale (str): Change this default too if changing the flux scale. 
-                Define the scale for your data and emulator grid space. 'linear', 'log' or 'scaled'
+                Define the scale for your data and emulator grid space. 'linear', 'log' or 'continuum-normalised'
                 
         Returns:
             ndarray: List of fluxes in the wavelength range specified on initialisation
@@ -554,8 +557,10 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         if self.scale == 'log':
             flux = np.where(flux > 0, flux, 1e-30)  # Floor non-positive values to avoid log10(0) = -inf
             flux = np.log10(flux) # logged 10 
-        if self.scale == 'scaled': # to values near order of magnitude 10^0. 
-            flux = flux/np.mean(flux)
+        if self.scale == 'continuum-normalised':
+            wl_sel = self.wl_full[:len(flux)][self.ind]
+            continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])
+            flux[self.ind] = flux[self.ind] / np.where(continuum > 0, continuum, 1.0)
         
         # TODO: Implement header if doing to use
         hdr = {'inclination_column': inclination_column} # Header constructed 

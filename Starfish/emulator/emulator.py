@@ -6,7 +6,7 @@ from typing import Sequence, Optional, Union, Tuple
 import numpy as np
 from scipy.interpolate import LinearNDInterpolator, RegularGridInterpolator
 from scipy.linalg import cho_factor, cho_solve
-from scipy.optimize import minimize
+from scipy.optimize import minimize, minimize_scalar
 
 # from pyinstrument import Profiler
 
@@ -50,11 +50,23 @@ try:
         GPU_PCA = False
         if PYTORCH_AVAILABLE:
             print('CUDA not available - using CPU for PCA')
+
+    def _get_v11_jitter(variance):
+        """Variance-scaled jitter for V11 diagonal stabilisation.
+
+        Keeps jitter/diagonal ~ 1e-6, giving a condition-number ceiling
+        of ~1e6 regardless of the kernel variance magnitude.  The floor
+        of 1e-5 protects components with very small learned variances.
+
+        Must be used in *every* V11 construction path (training, inference,
+        LOO, set_param_dict) to guarantee train/predict consistency.
+        """
+        return max(1e-5, 1e-6 * float(variance))
             
     def _memory_efficient_log_likelihood_gpu(
         grid_points_gpu, variances_gpu, lengthscales_gpu,
         dots_inv_diag_gpu, lambda_xi, w_hat_gpu, n_comp,
-        strict_weight_fit=False
+        strict_weight_fit=False, kernel_type="rbf"
     ):
         """Memory-efficient log likelihood: builds and factors V11 one block at a time.
         
@@ -89,20 +101,19 @@ try:
         
         for i in range(n_comp):
             # --- Build V11 block for component i ---
-            # Kernel: var_i * exp(-0.5 * ||x/ls - x'/ls||^2)
+            # Kernel: compute distance then apply kernel function
             X_scaled = grid_points_gpu / lengthscales_gpu[i]
             dist = torch.cdist(X_scaled, X_scaled, p=2.0)
-            dist.pow_(2)
-            dist.mul_(-0.5)
-            torch.exp(dist, out=dist)
-            dist.mul_(variances_gpu[i])
+            _apply_kernel_gpu_inplace(dist, variances_gpu[i], kernel_type)
             # dist is now K_i (M, M)
             
             # Add diagonal: iPhiPhi/lambda_xi + jitter
+            # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
+            jitter = _get_v11_jitter(variances_gpu[i].item())
             if strict_weight_fit:
-                dist.diagonal().add_(1e-5)
+                dist.diagonal().add_(jitter)
             else:
-                dist.diagonal().add_(dots_inv_diag_gpu[i].item() / lambda_xi + 1e-5)
+                dist.diagonal().add_(dots_inv_diag_gpu[i].item() / lambda_xi + jitter)
             
             # dist is now V11_i (M, M) — the complete block
             
@@ -197,7 +208,7 @@ except ImportError:
 from Starfish.grid_tools import NPZInterface
 from Starfish.grid_tools.utils import determine_chunk_log
 from Starfish.utils import calculate_dv
-from .kernels import batch_kernel, batch_kernel_cached, batch_kernel_auto, batch_kernel_pytorch_gpu_only, clear_kernel_cache, get_cache_size, rbf_kernel
+from .kernels import batch_kernel, batch_kernel_cached, batch_kernel_auto, batch_kernel_pytorch_gpu_only, clear_kernel_cache, get_cache_size, rbf_kernel, get_cpu_kernel_func, _apply_kernel_gpu_inplace
 from ._utils import get_phi_squared_optimized, get_phi_squared_pytorch, get_w_hat, PYTORCH_AVAILABLE as UTILS_PYTORCH_AVAILABLE
 log = logging.getLogger(__name__)
 
@@ -275,6 +286,59 @@ def _create_optimal_interpolator(grid_points, factors, logger=None):
     return interpolator
 
 
+def _infer_flux_scale_from_source(source) -> str:
+    """Best-effort flux-scale inference for grids and saved emulator names."""
+    if source is None:
+        return "linear"
+
+    for attr in ("flux_scale", "scale"):
+        value = getattr(source, attr, None)
+        if value is not None:
+            value = str(value)
+            if value:
+                return value
+
+    candidates = []
+    if isinstance(source, (str, os.PathLike)):
+        candidates.append(os.fspath(source))
+    for attr in ("filename", "name"):
+        value = getattr(source, attr, None)
+        if value is not None:
+            candidates.append(str(value))
+
+    for candidate in candidates:
+        text = candidate.lower()
+        if "continuum-normalised" in text or "continuum_normalised" in text:
+            return "continuum-normalised"
+        if any(token in text for token in ("_log_", "-log-", "/log/", "\\log\\", "scale=log")):
+            return "log"
+
+    return "linear"
+
+
+def _preprocess_flux_matrix(fluxes: np.ndarray, flux_scale: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply the per-spectrum preprocessing used before PCA."""
+    factors = fluxes.mean(axis=1)
+    if flux_scale == "log":
+        return fluxes - factors[:, np.newaxis], factors
+    safe_factors = np.where(np.abs(factors) > 0, factors, 1.0)
+    return fluxes / safe_factors[:, np.newaxis], safe_factors
+
+
+def _restore_flux_matrix(fluxes: np.ndarray, factors: np.ndarray, flux_scale: str) -> np.ndarray:
+    """Undo the per-spectrum preprocessing used before PCA."""
+    if flux_scale == "log":
+        return fluxes + factors[:, np.newaxis]
+    return fluxes * factors[:, np.newaxis]
+
+
+def _restore_flux_variance(variances: np.ndarray, factors: np.ndarray, flux_scale: str) -> np.ndarray:
+    """Propagate variance back to the raw display space."""
+    if flux_scale == "log":
+        return variances
+    return variances * np.square(factors[:, np.newaxis])
+
+
 class Emulator:
     """
     A Bayesian spectral emulator.
@@ -338,6 +402,11 @@ class Emulator:
         name: Optional[str] = None,
         block_diagonal: bool = False,
         strict_weight_fit: bool = False,
+        per_component: bool = False,
+        kernel: str = "rbf",
+        _param_min: Optional[np.ndarray] = None,
+        _param_range: Optional[np.ndarray] = None,
+        flux_scale: str = "linear",
         ):
         self.log = logging.getLogger(self.__class__.__name__)
         
@@ -351,14 +420,31 @@ class Emulator:
         self.factors = factors
         self.block_diagonal = block_diagonal
         self.strict_weight_fit = strict_weight_fit
+        self.per_component = per_component
+        self.kernel = kernel
+        self.flux_scale = flux_scale
+        
+        # Parameter normalization: scale grid_points to [0,1] for GP kernel operations
+        if _param_min is not None and _param_range is not None:
+            # Loaded from file — normalization params already known
+            self._param_min = _param_min
+            self._param_range = _param_range
+        else:
+            # Fresh construction — compute normalization from grid
+            self._param_min = grid_points.min(axis=0)
+            self._param_range = grid_points.max(axis=0) - self._param_min
+            self._param_range[self._param_range == 0] = 1.0
+        self._grid_points_norm = (grid_points - self._param_min) / self._param_range
         
         # Create optimal interpolator (RegularGrid if possible, LinearND fallback)
+        # Uses ORIGINAL-space grid_points for physical-space interpolation
         self.factor_interpolator = _create_optimal_interpolator(
             grid_points, factors, logger=self.log
         )
 
         self.dv = calculate_dv(wavelength)
         self.ncomps = eigenspectra.shape[0]
+        self.pca_explained_variance = None  # Set by from_grid(), persisted in save/load
 
         self.hyperparams = {}
         self.name = name
@@ -366,14 +452,15 @@ class Emulator:
         self.lambda_xi = lambda_xi
 
         self.variances = (
-            variances if variances is not None else 1e4 * np.ones(self.ncomps)
+            variances if variances is not None
+            else np.maximum(np.var(weights, axis=0), 1.0)
         )
 
-        unique = [sorted(np.unique(param_set)) for param_set in self.grid_points.T]
+        unique = [sorted(np.unique(param_set)) for param_set in self._grid_points_norm.T]
         self._grid_sep = np.array([np.diff(param).max() for param in unique])
 
         if lengthscales is None:
-            lengthscales = np.tile(3 * self._grid_sep, (self.ncomps, 1))
+            lengthscales = np.tile(2 * self._grid_sep, (self.ncomps, 1))
 
         self.lengthscales = lengthscales
 
@@ -400,40 +487,64 @@ class Emulator:
                 dots_inv_diag = torch.diagonal(dots_inv) # (n_comp,)
                 self._dots_inv_diag_gpu = dots_inv_diag # Store for training updates
                 
-                # Check if full V11 tensor would exceed GPU VRAM
+                # Check if full V11 tensor would fit in currently FREE GPU VRAM.
+                # Use free memory, not total, so other processes' allocations are respected.
                 v11_bytes = self.ncomps * M * M * 8  # float64
-                gpu_vram = torch.cuda.get_device_properties(0).total_memory
+                gpu_vram_free, gpu_vram_total = torch.cuda.mem_get_info(0)
                 # Need ~3× V11 for construction + kernel intermediates
-                if v11_bytes * 3 > gpu_vram:
+                if v11_bytes * 3 > gpu_vram_free:
                     # V11 won't fit — defer construction to memory-efficient training
-                    self.log.info(f"V11 ({v11_bytes / 1024**3:.1f} GB) exceeds GPU VRAM "
-                                  f"({gpu_vram / 1024**3:.1f} GB). Deferring V11 construction.")
+                    self.log.info(f"V11 ({v11_bytes / 1024**3:.1f} GB) exceeds free GPU VRAM "
+                                  f"({gpu_vram_free / 1024**3:.1f} GB free of {gpu_vram_total / 1024**3:.1f} GB). "
+                                  f"Deferring V11 construction.")
                     v11_gpu = None  # Will be built on-the-fly during training
                 else:
                     # V11 fits — build it now
                     eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
                     
                     if self.strict_weight_fit:
-                        v11_gpu = 1e-5 * eye_M.unsqueeze(0).expand(self.ncomps, -1, -1).clone()
+                        # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
+                        variances_t = torch.from_numpy(self.variances).to(device, TORCH_FLOAT64)
+                        jitter_t = torch.tensor([_get_v11_jitter(v) for v in self.variances],
+                                                device=device, dtype=TORCH_FLOAT64)
+                        v11_gpu = (jitter_t.view(-1, 1, 1) * eye_M.unsqueeze(0)).clone()
                     else:
                         v11_gpu = (dots_inv_diag.view(-1, 1, 1) * eye_M.unsqueeze(0)) / self.lambda_xi
+                        jitter_t = torch.tensor([_get_v11_jitter(v) for v in self.variances],
+                                                device=device, dtype=TORCH_FLOAT64)
+                        v11_gpu += jitter_t.view(-1, 1, 1) * eye_M.unsqueeze(0)
                     
                     # Add kernel to v11_gpu in-place
                     batch_kernel_pytorch_gpu_only(
-                        self.grid_points, self.grid_points, self.variances, self.lengthscales, 
-                        device='cuda', return_stacked=True, out=v11_gpu, add_to_out=True
+                        self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, 
+                        device='cuda', return_stacked=True, out=v11_gpu, add_to_out=True, kernel_type=self.kernel
                     )
             else:
                 self.log.info("Using Full Dense Matrix (Standard)")
+                # Guard against OOM when other processes are using GPU memory.
+                v11_bytes = self.ncomps * M * M * 8  # float64 (dense is ncomps*M × ncomps*M)
+                gpu_vram_free, gpu_vram_total = torch.cuda.mem_get_info(0)
+                if v11_bytes * 3 > gpu_vram_free:
+                    self.log.warning(
+                        f"Full V11 ({v11_bytes / 1024**3:.1f} GB est.) exceeds free GPU VRAM "
+                        f"({gpu_vram_free / 1024**3:.1f} GB free of {gpu_vram_total / 1024**3:.1f} GB). "
+                        f"Falling back to CPU for V11 construction."
+                    )
+                    raise torch.cuda.OutOfMemoryError(
+                        f"Insufficient free GPU VRAM for full V11 "
+                        f"({v11_bytes / 1024**3:.1f} GB needed, {gpu_vram_free / 1024**3:.1f} GB free)."
+                    )
                 eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
                 iPhiPhi_gpu = torch.kron(dots_inv.contiguous(), eye_M.contiguous())
                 
                 kernel_gpu = batch_kernel_pytorch_gpu_only(
-                    self.grid_points, self.grid_points, self.variances, self.lengthscales, device='cuda'
+                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, device='cuda', kernel_type=self.kernel
                 )
                 
                 if self.strict_weight_fit:
-                    v11_gpu = kernel_gpu + (1e-5 * torch.eye(M * self.ncomps, device=device, dtype=TORCH_FLOAT64))
+                    # Variance-scaled jitter: use max variance as conservative scalar
+                    _jit = _get_v11_jitter(float(self.variances.max()))
+                    v11_gpu = kernel_gpu + (_jit * torch.eye(M * self.ncomps, device=device, dtype=TORCH_FLOAT64))
                 else:
                     v11_gpu = iPhiPhi_gpu / self.lambda_xi + kernel_gpu
                 
@@ -474,20 +585,25 @@ class Emulator:
                 # or modify batch_kernel_auto. 
                 # Let's construct it manually to be safe and explicit.
                 kernel_cpu = np.zeros((self.ncomps, M, M))
-                from .kernels import rbf_kernel
+                _kfunc = get_cpu_kernel_func(self.kernel)
                 for i in range(self.ncomps):
-                    kernel_cpu[i] = rbf_kernel(
-                        self.grid_points, 
-                        self.grid_points, 
+                    kernel_cpu[i] = _kfunc(
+                        self._grid_points_norm, 
+                        self._grid_points_norm, 
                         self.variances[i], 
                         self.lengthscales[i]
                     )
                 
                 if self.strict_weight_fit:
+                    # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
                     eye_M_arr = np.eye(M)
-                    v11_cpu = kernel_cpu + (1e-5 * eye_M_arr)
+                    jitter_arr = np.array([_get_v11_jitter(v) for v in self.variances])
+                    v11_cpu = kernel_cpu + jitter_arr[:, None, None] * eye_M_arr
                 else:
+                    jitter_arr = np.array([_get_v11_jitter(v) for v in self.variances])
                     v11_cpu = iPhiPhi_cpu / self.lambda_xi + kernel_cpu
+                    eye_M_arr = np.eye(M)
+                    v11_cpu += jitter_arr[:, None, None] * eye_M_arr
                 
                 # Store as _v11 but note it is 3D
                 self._iPhiPhi = iPhiPhi_cpu
@@ -498,10 +614,11 @@ class Emulator:
                 phi_squared = get_phi_squared_optimized(eigenspectra_matrix, M)
                 self._iPhiPhi = np.linalg.inv(phi_squared)
                 kernel_auto = batch_kernel_auto(
-                    self.grid_points, self.grid_points, self.variances, self.lengthscales
+                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, kernel_type=self.kernel
                 )
                 if self.strict_weight_fit:
-                    self._v11 = kernel_auto + (1e-5 * np.eye(M * self.ncomps))
+                    _jit = _get_v11_jitter(float(self.variances.max()))
+                    self._v11 = kernel_auto + (_jit * np.eye(M * self.ncomps))
                 else:
                     self._v11 = self._iPhiPhi / self.lambda_xi + kernel_auto
             
@@ -523,8 +640,6 @@ class Emulator:
             self.log.info("PyTorch not available - using NumPy fallback")
         elif not torch.cuda.is_available():
             self.log.info("CUDA not available - using CPU")
-
-    
 
     @property
     def lambda_xi(self) -> float:
@@ -656,10 +771,25 @@ class Emulator:
         else:
             strict_weight_fit = False
         
+        # Load per_component flag if present (backward compatibility)
+        per_component = bool(data["per_component"]) if "per_component" in data else False
+        
+        # Load kernel type if present (backward compatibility: default to "rbf")
+        kernel = str(data["kernel"]) if "kernel" in data else "rbf"
+        
         if "name" in data:
             name = str(data["name"])
         else:
             name = ".".join(filename.split(".")[:-1])
+
+        if "flux_scale" in data:
+            flux_scale = str(data["flux_scale"])
+        else:
+            flux_scale = _infer_flux_scale_from_source(name)
+
+        # Load normalization params if present (backward compatibility)
+        _param_min = data["_param_min"] if "_param_min" in data else None
+        _param_range = data["_param_range"] if "_param_range" in data else None
 
         emulator = cls(
             grid_points=grid_points,
@@ -676,13 +806,22 @@ class Emulator:
             name=name,
             factors=factors,
             block_diagonal=block_diagonal,
-            strict_weight_fit=strict_weight_fit
+            strict_weight_fit=strict_weight_fit,
+            per_component=per_component,
+            kernel=kernel,
+            _param_min=_param_min,
+            _param_range=_param_range,
+            flux_scale=flux_scale,
         )
         emulator._trained = trained
         
         # Load loss history if available
         if "loss_history" in data:
             emulator.loss_history = list(data["loss_history"])
+
+        # Load true PCA explained variance if available
+        if "pca_explained_variance" in data:
+            emulator.pca_explained_variance = float(data["pca_explained_variance"])
             
         return emulator
 
@@ -714,7 +853,12 @@ class Emulator:
             "variances": self.variances,
             "lengthscales": self.lengthscales,
             "block_diagonal": self.block_diagonal,
-            "strict_weight_fit": self.strict_weight_fit
+            "strict_weight_fit": self.strict_weight_fit,
+            "per_component": self.per_component,
+            "kernel": self.kernel,
+            "flux_scale": self.flux_scale,
+            "_param_min": self._param_min,
+            "_param_range": self._param_range,
         }
         
         if self.name is not None:
@@ -723,6 +867,10 @@ class Emulator:
         # Save loss history if available (for plotting later)
         if hasattr(self, 'loss_history'):
             save_data["loss_history"] = self.loss_history
+
+        # Save true PCA explained variance if available
+        if self.pca_explained_variance is not None:
+            save_data["pca_explained_variance"] = self.pca_explained_variance
             
         np.savez_compressed(filename, **save_data)
         self.log.info("Saved file at {}".format(filename))
@@ -752,9 +900,8 @@ class Emulator:
             grid = NPZInterface(grid)
 
         fluxes = np.array(list(grid.fluxes))
-        # Normalize to an average of 1
-        norm_factors = fluxes.mean(1)
-        fluxes /= norm_factors[:, np.newaxis]
+        flux_scale = _infer_flux_scale_from_source(grid)
+        fluxes, norm_factors = _preprocess_flux_matrix(fluxes, flux_scale)
         # Center and whiten
         flux_mean = fluxes.mean(0)
         fluxes -= flux_mean
@@ -775,7 +922,7 @@ class Emulator:
         return exp_var, pca.n_components_
 
     @classmethod
-    def from_grid(cls, grid, block_diagonal=False, strict_weight_fit=False, **pca_kwargs):
+    def from_grid(cls, grid, block_diagonal=False, strict_weight_fit=False, per_component=False, kernel="rbf", **pca_kwargs):
         """
         Create an Emulator using PCA decomposition from a GridInterface.
 
@@ -801,14 +948,15 @@ class Emulator:
             grid = NPZInterface(grid)
 
         fluxes = np.array(list(grid.fluxes))
-        # Normalize to an average of 1 to remove uninteresting correlation
-        norm_factors = fluxes.mean(1)
-        fluxes /= norm_factors[:, np.newaxis]
+        flux_scale = _infer_flux_scale_from_source(grid)
+        fluxes, norm_factors = _preprocess_flux_matrix(fluxes, flux_scale)
         # Center and whiten
         flux_mean = fluxes.mean(0)
         fluxes -= flux_mean
-        flux_std = fluxes.std(0) 
-        fluxes /= flux_std 
+        flux_std = fluxes.std(0)
+        flux_std[flux_std == 0] = 1.0
+        fluxes /= flux_std
+        fluxes = np.nan_to_num(fluxes)
 
         # Perform PCA using sklearn
         default_pca_kwargs = dict(n_components=0.99, svd_solver="full") # PCA
@@ -824,9 +972,9 @@ class Emulator:
 
         # This is basically the mean square error of the reconstruction
         log.info(
-            f"PCA fit {exp_var:.2f}% of the variance with {pca.n_components_:d} components."
+            f"PCA fit {exp_var:.2f} of the variance with {pca.n_components_:d} components."
         )
-        print(f"PCA fit {exp_var:.2f}% of the variance with {pca.n_components_:d} components.")
+        print(f"PCA fit {exp_var:.2f} of the variance with {pca.n_components_:d} components.")
 
         w_hat = get_w_hat(eigenspectra, fluxes)
         print('Completed get_w_hat')
@@ -847,7 +995,11 @@ class Emulator:
             factors=norm_factors,
             block_diagonal=block_diagonal,
             strict_weight_fit=strict_weight_fit,
+            per_component=per_component,
+            kernel=kernel,
+            flux_scale=flux_scale,
         )
+        emulator.pca_explained_variance = float(exp_var)
         # profiler.stop()
         # profiler.print()
 
@@ -912,6 +1064,9 @@ class Emulator:
         if np.any(params < self.min_params) or np.any(params > self.max_params):
             raise ValueError("Querying emulator outside of original parameter range.", params, self.min_params)
         
+        # Normalize query params to [0,1] to match the normalized kernel space
+        params = (params - self._param_min) / self._param_range
+        
         # Try GPU path if requested and available
         if use_gpu and PYTORCH_AVAILABLE and torch.cuda.is_available() and self._v11_gpu is not None:
             try:
@@ -923,6 +1078,14 @@ class Emulator:
         if use_gpu and PYTORCH_AVAILABLE and torch.cuda.is_available() and self._v11_gpu is None and self.block_diagonal:
             try:
                 return self._call_gpu_memory_efficient(params, full_cov, reinterpret_batch, return_tensors=return_tensors)
+            except torch.cuda.OutOfMemoryError as e:
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    "Memory-efficient GPU inference ran out of VRAM while streaming a single "
+                    "component V11 block. CPU fallback is disabled for this large deferred "
+                    "emulator because it would build the full V11 on CPU. Free GPU memory, "
+                    "reduce the grid size/components, or run on a larger GPU."
+                ) from e
             except Exception as e:
                 self.log.warning(f"Memory-efficient GPU inference failed: {e}. Falling back to CPU.")
         
@@ -944,16 +1107,20 @@ class Emulator:
                 RuntimeWarning, stacklevel=2
             )
             kernel_cpu = np.zeros((self.ncomps, M, M))
+            _kfunc = get_cpu_kernel_func(self.kernel)
             for i in range(self.ncomps):
-                kernel_cpu[i] = rbf_kernel(self.grid_points, self.grid_points, self.variances[i], self.lengthscales[i])
+                kernel_cpu[i] = _kfunc(self._grid_points_norm, self._grid_points_norm, self.variances[i], self.lengthscales[i])
             if self.strict_weight_fit:
-                self._v11 = kernel_cpu + 1e-5 * np.eye(M)
+                eye_M = np.eye(M)
+                for i in range(self.ncomps):
+                    kernel_cpu[i] += _get_v11_jitter(self.variances[i]) * eye_M
+                self._v11 = kernel_cpu
             else:
                 dots = self.eigenspectra @ self.eigenspectra.T
                 dots_inv_diag = np.diag(np.linalg.inv(dots))
                 eye_M = np.eye(M)
                 for i in range(self.ncomps):
-                    kernel_cpu[i] += ((dots_inv_diag[i] / self.lambda_xi) + 1e-5) * eye_M
+                    kernel_cpu[i] += ((dots_inv_diag[i] / self.lambda_xi) + _get_v11_jitter(self.variances[i])) * eye_M
                 self._v11 = kernel_cpu
         
         return self._call_cpu(params, full_cov, reinterpret_batch)
@@ -975,11 +1142,12 @@ class Emulator:
             
             # 1. Compute stacked kernels
             # We loop because we don't have a stacked CPU kernel function yet
+            _kfunc = get_cpu_kernel_func(self.kernel)
             v12_list = []
             v22_list = []
             for i in range(self.ncomps):
-                v12_list.append(rbf_kernel(self.grid_points, params, self.variances[i], self.lengthscales[i]))
-                v22_list.append(rbf_kernel(params, params, self.variances[i], self.lengthscales[i]))
+                v12_list.append(_kfunc(self._grid_points_norm, params, self.variances[i], self.lengthscales[i]))
+                v22_list.append(_kfunc(params, params, self.variances[i], self.lengthscales[i]))
             
             v12_stacked = np.stack(v12_list) # (n_comp, M, n_query)
             v22_stacked = np.stack(v22_list) # (n_comp, n_query, n_query)
@@ -1016,8 +1184,8 @@ class Emulator:
                 
         else:
             # Recalculate V12, V21, and V22.
-            v12 = batch_kernel_auto(self.grid_points, params, self.variances, self.lengthscales)
-            v22 = batch_kernel_auto(params, params, self.variances, self.lengthscales)
+            v12 = batch_kernel_auto(self._grid_points_norm, params, self.variances, self.lengthscales, kernel_type=self.kernel)
+            v22 = batch_kernel_auto(params, params, self.variances, self.lengthscales, kernel_type=self.kernel)
             v21 = v12.T
 
             # Recalculate the covariance
@@ -1041,21 +1209,24 @@ class Emulator:
     ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[torch.Tensor, torch.Tensor]]:
         """
         Memory-efficient GPU inference for large grids where V11 won't fit in VRAM.
-        
-        On the FIRST call, builds V11 blocks one component at a time, Cholesky-
-        factors each, and caches L blocks + alpha. Peak construction VRAM:
-        cached_L_so_far + 2 × M² × 8 bytes (V11 temp + new L block).
-        
-        On SUBSEQUENT calls, reuses cached L and alpha for fast O(M²) solves.
-        This makes MCMC (32K+ calls) feasible: ~20s first call, <1s thereafter.
-        
+
+        Uses a hybrid policy.  If the full per-component Cholesky cache fits in
+        currently free VRAM, build and reuse it for fast repeated inference.
+        Otherwise mirror memory-efficient training: build one component's V11
+        block, Cholesky-factor it, use it for the current prediction, then
+        discard it before moving to the next component.
+
+        Cache-fit criterion: ``(n_comp + 2) * M^2 * 8 * 1.1 < free * 0.9``,
+        which the training notebook also reports so its callout agrees with
+        the runtime decision made here.
+
         Mathematically identical to _call_gpu — no approximations.
         """
         device = torch.device('cuda')
         
         # Ensure cached GPU tensors exist
         if self._grid_points_gpu is None:
-            self._grid_points_gpu = torch.from_numpy(self.grid_points).to(device, TORCH_FLOAT64)
+            self._grid_points_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)
         if self._w_hat_gpu is None:
             self._w_hat_gpu = torch.from_numpy(self.w_hat).to(device, TORCH_FLOAT64)
         if self._variances_gpu is None:
@@ -1068,97 +1239,119 @@ class Emulator:
         
         n_comp = self.ncomps
         M = self.grid_points.shape[0]
-        
-        # --- Build and cache Cholesky factors L on first call ---
-        if not hasattr(self, '_mem_eff_L_blocks') or self._mem_eff_L_blocks is None:
-            import time as _time
-            _t0 = _time.time()
-            self.log.info(f"Building Cholesky cache for {n_comp} components (M={M})...")
-            print(f"Building Cholesky cache ({n_comp} components, M={M})...")
-            
-            w_hat_reshaped = self._w_hat_gpu.view(n_comp, M).unsqueeze(-1)  # (n_comp, M, 1)
-            L_blocks = []
-            alpha_blocks = []
-            
-            for i in range(n_comp):
-                # Build V11 block for component i
-                X_scaled = self._grid_points_gpu / self._lengthscales_gpu[i]
-                dist = torch.cdist(X_scaled, X_scaled, p=2.0)
-                dist.pow_(2)
-                dist.mul_(-0.5)
-                torch.exp(dist, out=dist)
-                dist.mul_(self._variances_gpu[i])
-                
-                # Add diagonal (match training: dots_inv_diag/lambda_xi + 1e-5 jitter)
-                if self.strict_weight_fit:
-                    dist.diagonal().add_(1e-5)
-                else:
-                    dist.diagonal().add_(self._dots_inv_diag_gpu[i].item() / self.lambda_xi + 1e-5)
-                
-                # Cholesky factor — keep L, discard V11
-                L_i = torch.linalg.cholesky(dist)
-                del dist
-                
-                # Precompute alpha_i = V11^{-1} @ w_hat_i
-                alpha_i = torch.cholesky_solve(w_hat_reshaped[i], L_i)  # (M, 1)
-                
-                L_blocks.append(L_i)
-                alpha_blocks.append(alpha_i)
-                torch.cuda.empty_cache()
-            
-            self._mem_eff_L_blocks = L_blocks        # list of (M, M) tensors
-            self._mem_eff_alpha_blocks = alpha_blocks  # list of (M, 1) tensors
-            _elapsed = _time.time() - _t0
-            L_total_gb = n_comp * M * M * 8 / 1024**3
-            print(f"Cholesky cache ready ({_elapsed:.1f}s, {L_total_gb:.1f} GB)")
-        
-        # --- Fast inference using cached L and alpha ---
+        w_hat_reshaped = self._w_hat_gpu.view(n_comp, M).unsqueeze(-1)  # (n_comp, M, 1)
         params_gpu = torch.from_numpy(params).to(device, TORCH_FLOAT64)
-        n_query = params.shape[0]
-        
-        # Compute v12, v22 kernel blocks (small: M×n_query and n_query×n_query)
-        v12_gpu = batch_kernel_pytorch_gpu_only(
-            self._grid_points_gpu, params_gpu, 
-            self._variances_gpu, self._lengthscales_gpu,
-            device='cuda', return_stacked=True
-        )  # (n_comp, M, n_query)
-        
-        v22_gpu = batch_kernel_pytorch_gpu_only(
-            params_gpu, params_gpu, 
-            self._variances_gpu, self._lengthscales_gpu,
-            device='cuda', return_stacked=True
-        )  # (n_comp, n_query, n_query)
-        
-        v21_gpu = v12_gpu.transpose(-2, -1)  # (n_comp, n_query, M)
-        
+
+        def _build_v11_cholesky_for_component(i):
+            X_scaled = self._grid_points_gpu / self._lengthscales_gpu[i]
+            dist = torch.cdist(X_scaled, X_scaled, p=2.0)
+            _apply_kernel_gpu_inplace(dist, self._variances_gpu[i], self.kernel)
+
+            jitter = _get_v11_jitter(self._variances_gpu[i].item())
+            if self.strict_weight_fit:
+                dist.diagonal().add_(jitter)
+            else:
+                dist.diagonal().add_(self._dots_inv_diag_gpu[i].item() / self.lambda_xi + jitter)
+
+            L_i = torch.linalg.cholesky(dist)
+            del dist, X_scaled
+            alpha_i = torch.cholesky_solve(w_hat_reshaped[i], L_i)  # (M, 1)
+            return L_i, alpha_i
+
+        cache_ready = (
+            getattr(self, '_mem_eff_L_blocks', None) is not None
+            and getattr(self, '_mem_eff_alpha_blocks', None) is not None
+        )
+        if not cache_ready:
+            block_bytes = M * M * 8
+            cache_bytes = n_comp * block_bytes
+            workspace_bytes = 2 * block_bytes
+            try:
+                free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+            except TypeError:
+                free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
+
+            # The same shape estimate used by the training notebook: a cached
+            # inference path needs all component Cholesky blocks plus one
+            # component-sized working block during construction.  Keep a margin
+            # for PyTorch allocator fragmentation and small side tensors.
+            can_cache = (cache_bytes + workspace_bytes) * 1.1 < free_bytes * 0.9
+
+            if can_cache:
+                L_blocks = []
+                alpha_blocks = []
+                try:
+                    cache_gb = cache_bytes / 1024**3
+                    self.log.info(f"Building reusable Cholesky cache ({cache_gb:.1f} GB)...")
+                    print(f"Building reusable Cholesky cache ({cache_gb:.1f} GB)...")
+                    for i in range(n_comp):
+                        L_i, alpha_i = _build_v11_cholesky_for_component(i)
+                        L_blocks.append(L_i)
+                        alpha_blocks.append(alpha_i)
+                        torch.cuda.empty_cache()
+                    self._mem_eff_L_blocks = L_blocks
+                    self._mem_eff_alpha_blocks = alpha_blocks
+                    cache_ready = True
+                    print("Reusable Cholesky cache ready")
+                except torch.cuda.OutOfMemoryError:
+                    self._mem_eff_L_blocks = None
+                    self._mem_eff_alpha_blocks = None
+                    del L_blocks, alpha_blocks
+                    torch.cuda.empty_cache()
+                    self.log.warning("Cholesky cache did not fit; switching to streamed inference.")
+                    print("Cholesky cache did not fit; switching to streamed inference.")
+
         mu_list = []
         cov_list = []
-        
+
         for i in range(n_comp):
-            # mu_i = v21_i @ alpha_i  (cached alpha, O(M) matmul)
-            mu_i = torch.matmul(v21_gpu[i], self._mem_eff_alpha_blocks[i])  # (n_query, 1)
-            mu_list.append(mu_i.squeeze(-1))
-            
-            # cov_i = v22_i - v21_i @ L_i^{-T} L_i^{-1} @ v12_i  (Cholesky solve, O(M²))
-            v11_inv_v12_i = torch.cholesky_solve(v12_gpu[i], self._mem_eff_L_blocks[i])
-            cov_i = v22_gpu[i] - torch.matmul(v21_gpu[i], v11_inv_v12_i)
-            cov_list.append(cov_i)
-        
-        # Stack results
-        mu_gpu = torch.cat(mu_list)  # (n_comp * n_query,)
-        
-        if not full_cov:
-            cov_diag = torch.stack([c.diagonal() for c in cov_list])  # (n_comp, n_query)
+            X_scaled = self._grid_points_gpu / self._lengthscales_gpu[i]
+            params_scaled = params_gpu / self._lengthscales_gpu[i]
+
+            if cache_ready:
+                L_i = self._mem_eff_L_blocks[i]
+                alpha_i = self._mem_eff_alpha_blocks[i]
+            else:
+                # Build V11 for this component only, matching the training path.
+                L_i, alpha_i = _build_v11_cholesky_for_component(i)
+
+            v12_i = torch.cdist(X_scaled, params_scaled, p=2.0)
+            _apply_kernel_gpu_inplace(v12_i, self._variances_gpu[i], self.kernel)
+            v21_i = v12_i.transpose(-2, -1)
+
+            v22_i = torch.cdist(params_scaled, params_scaled, p=2.0)
+            _apply_kernel_gpu_inplace(v22_i, self._variances_gpu[i], self.kernel)
+
+            mu_i = torch.matmul(v21_i, alpha_i).squeeze(-1)
+            v11_inv_v12_i = torch.cholesky_solve(v12_i, L_i)
+            cov_i = v22_i - torch.matmul(v21_i, v11_inv_v12_i)
+
             if return_tensors:
-                return mu_gpu, cov_diag.flatten()
-            mu = mu_gpu.cpu().numpy()
-            cov = cov_diag.flatten().cpu().numpy()
+                mu_list.append(mu_i)
+                cov_list.append(cov_i if full_cov else cov_i.diagonal())
+            else:
+                mu_list.append(mu_i.detach().cpu())
+                cov_list.append((cov_i if full_cov else cov_i.diagonal()).detach().cpu())
+
+            del X_scaled, params_scaled, v12_i, v21_i, v22_i, v11_inv_v12_i, cov_i, mu_i
+            if not cache_ready:
+                del L_i, alpha_i
+                torch.cuda.empty_cache()
+
+        if return_tensors:
+            mu_gpu = torch.cat(mu_list)  # (n_comp * n_query,)
+            if full_cov:
+                cov_gpu = torch.block_diag(*cov_list)
+                mu, cov = mu_gpu, cov_gpu
+            else:
+                cov_diag = torch.stack(cov_list)  # (n_comp, n_query)
+                mu, cov = mu_gpu, cov_diag.flatten()
         else:
-            cov_gpu = torch.block_diag(*cov_list)
-            if return_tensors:
-                return mu_gpu, cov_gpu
-            mu = mu_gpu.cpu().numpy()
-            cov = cov_gpu.cpu().numpy()
+            mu = torch.cat(mu_list).numpy()
+            if full_cov:
+                cov = torch.block_diag(*cov_list).numpy()
+            else:
+                cov = torch.stack(cov_list).flatten().numpy()
         
         if reinterpret_batch:
             mu = mu.reshape(-1, self.ncomps, order="F").squeeze()
@@ -1184,7 +1377,7 @@ class Emulator:
         
         # Ensure cached GPU tensors exist
         if self._grid_points_gpu is None:
-            self._grid_points_gpu = torch.from_numpy(self.grid_points).to(device, TORCH_FLOAT64)
+            self._grid_points_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)
         if self._w_hat_gpu is None:
             self._w_hat_gpu = torch.from_numpy(self.w_hat).to(device, TORCH_FLOAT64)
         if self._variances_gpu is None:
@@ -1211,7 +1404,8 @@ class Emulator:
                 self._variances_gpu, 
                 self._lengthscales_gpu,
                 device='cuda',
-                return_stacked=True
+                return_stacked=True,
+                kernel_type=self.kernel
             ) # (n_comp, M, n_query)
             
             v22_gpu = batch_kernel_pytorch_gpu_only(
@@ -1220,7 +1414,8 @@ class Emulator:
                 self._variances_gpu, 
                 self._lengthscales_gpu,
                 device='cuda',
-                return_stacked=True
+                return_stacked=True,
+                kernel_type=self.kernel
             ) # (n_comp, n_query, n_query)
             
             v21_gpu = v12_gpu.transpose(-2, -1) # (n_comp, n_query, M)
@@ -1301,14 +1496,16 @@ class Emulator:
                 params_gpu, 
                 self._variances_gpu, 
                 self._lengthscales_gpu,
-                device='cuda'
+                device='cuda',
+                kernel_type=self.kernel
             )
             v22_gpu = batch_kernel_pytorch_gpu_only(
                 params_gpu, 
                 params_gpu, 
                 self._variances_gpu, 
                 self._lengthscales_gpu,
-                device='cuda'
+                device='cuda',
+                kernel_type=self.kernel
             )
             v21_gpu = v12_gpu.T
             
@@ -1376,7 +1573,11 @@ class Emulator:
         X = self.eigenspectra * self.flux_std
         flux = weights @ X + self.flux_mean
         if norm:
-            flux *= self.norm_factor(params)[:, np.newaxis]
+            factors = np.atleast_1d(self.norm_factor(params))
+            if self.flux_scale == "log":
+                flux += factors[:, np.newaxis]
+            else:
+                flux *= factors[:, np.newaxis]
         return np.squeeze(flux)
 
     # ==================================================================
@@ -1415,6 +1616,10 @@ class Emulator:
             'loo_std_resid'   : (ncomps, M) standardised residuals
             'loo_mse_per_comp': (ncomps,) MSE per component
             'loo_rmse_per_comp': (ncomps,) RMSE per component
+            'q2_per_comp'     : (ncomps,) per-component Q² (LOO R²)
+            'nlpd_per_comp'   : (ncomps,) LOO neg. log predictive density
+            'std_resid_mean'  : float, mean of all standardised residuals
+            'std_resid_var'   : float, variance of all standardised residuals
 
             If *grid* is supplied, extra keys:
             'pca_recon_rmse'  : (M,) per-spectrum PCA reconstruction RMSE
@@ -1424,6 +1629,9 @@ class Emulator:
             'loo_flux_rmse_median'  : float
             'loo_flux_rmse_95'      : float
             'max_fractional_resid'  : float
+            'pca_max_fractional_resid' : float, PCA-only worst-case
+            'pca_per_wl_rmse' : (P,) per-wavelength PCA RMSE
+            'loo_per_wl_rmse' : (P,) per-wavelength LOO RMSE
         """
         if not self._trained:
             warnings.warn(
@@ -1454,11 +1662,11 @@ class Emulator:
         )
 
         if use_gpu:
-            loo_mu, loo_var = self._loo_cv_gpu(w_hat_all, M)
+            loo_mu, loo_var, loo_decorr = self._loo_cv_gpu(w_hat_all, M)
         elif use_gpu_mem_eff:
-            loo_mu, loo_var = self._loo_cv_gpu_memory_efficient(w_hat_all, M)
+            loo_mu, loo_var, loo_decorr = self._loo_cv_gpu_memory_efficient(w_hat_all, M)
         else:
-            loo_mu, loo_var = self._loo_cv_cpu(w_hat_all, M)
+            loo_mu, loo_var, loo_decorr = self._loo_cv_cpu(w_hat_all, M)
 
         # -----------------------------------------------------------
         # Derived weight-space metrics (always on CPU/numpy)
@@ -1468,13 +1676,35 @@ class Emulator:
         loo_mse = np.mean(loo_residuals ** 2, axis=1)
         loo_rmse = np.sqrt(loo_mse)
 
+        # Per-component Q²_k (LOO R² per PCA component)
+        _w_var = np.var(w_hat_all, axis=1)  # (ncomps,)
+        q2_per_comp = 1.0 - loo_mse / np.maximum(_w_var, 1e-30)
+
+        # LOO Negative Log Predictive Density — proper scoring rule
+        # (Bastos & O'Hagan 2009; Gneiting & Raftery 2007)
+        _nlpd_pointwise = 0.5 * (
+            np.log(2.0 * np.pi * np.maximum(loo_var, 1e-30))
+            + loo_residuals ** 2 / np.maximum(loo_var, 1e-30)
+        )  # (ncomps, M)
+        nlpd_per_comp = np.mean(_nlpd_pointwise, axis=1)  # (ncomps,)
+
+        # Standardized residual summary statistics
+        _std_flat = loo_std_resid.ravel()
+        std_resid_mean = float(np.mean(_std_flat))
+        std_resid_var = float(np.var(_std_flat))
+
         results = {
             'loo_mu': loo_mu,
             'loo_var': loo_var,
             'loo_residuals': loo_residuals,
             'loo_std_resid': loo_std_resid,
+            'loo_decorr_resid': loo_decorr,
             'loo_mse_per_comp': loo_mse,
             'loo_rmse_per_comp': loo_rmse,
+            'q2_per_comp': q2_per_comp,
+            'nlpd_per_comp': nlpd_per_comp,
+            'std_resid_mean': std_resid_mean,
+            'std_resid_var': std_resid_var,
         }
 
         # -----------------------------------------------------------
@@ -1484,11 +1714,8 @@ class Emulator:
             if isinstance(grid, str):
                 grid = NPZInterface(grid)
 
-            # Original normalised spectra (same transform as from_grid:
-            # raw → divide by per-spectrum mean → we compare against this)
             fluxes_raw = np.array(list(grid.fluxes))
-            norm_factors = fluxes_raw.mean(1)
-            original = fluxes_raw / norm_factors[:, np.newaxis]
+            original, norm_factors = _preprocess_flux_matrix(fluxes_raw, self.flux_scale)
 
             # Inverse PCA transform:  flux = weights @ (eigenspectra * flux_std) + flux_mean
             # This matches load_flux() exactly — using the emulator's stored
@@ -1508,13 +1735,44 @@ class Emulator:
 
             # Max fractional residual across all spectra and wavelengths
             with np.errstate(divide='ignore', invalid='ignore'):
-                fractional = np.abs(loo_flux_err) / (np.abs(original) + 1e-30)
-            max_frac = float(np.nanmax(fractional))
+                loo_fractional = np.abs(loo_flux_err) / (np.abs(original) + 1e-30)
+                pca_fractional = np.abs(pca_recon_err) / (np.abs(original) + 1e-30)
+            max_frac = float(np.nanmax(loo_fractional))
+            pca_max_frac = float(np.nanmax(pca_fractional))
+
+            # Per-wavelength RMSE: aggregate over spectra (axis 0)
+            pca_per_wl_rmse = np.sqrt(np.mean(pca_recon_err ** 2, axis=0))  # (P,)
+            loo_per_wl_rmse = np.sqrt(np.mean(loo_flux_err ** 2, axis=0))    # (P,)
+
+            # c) LOO flux-space variance (propagate per-component GP
+            #    uncertainty through the PCA inverse transform).
+            #    flux_var[i, p] = sum_k  X[k,p]^2 * loo_var[k, i]
+            #    where X = eigenspectra * flux_std.  Each component is
+            #    independent so total variance is additive.
+            X2 = X ** 2                                     # (K, P)
+            loo_recon_var = loo_var.T @ X2                   # (M, P)
+            display_original = fluxes_raw
+            display_pca_recon = _restore_flux_matrix(
+                pca_recon, norm_factors, self.flux_scale
+            )
+            display_loo_recon = _restore_flux_matrix(
+                loo_recon, norm_factors, self.flux_scale
+            )
+            display_loo_recon_var = _restore_flux_variance(
+                loo_recon_var, norm_factors, self.flux_scale
+            )
 
             results.update({
                 'original_flux': original,          # (M, P) normalised grid spectra
                 'pca_recon_flux': pca_recon,         # (M, P) PCA truncation recon
                 'loo_recon_flux': loo_recon,          # (M, P) LOO GP recon
+                'loo_recon_var': loo_recon_var,       # (M, P) LOO flux-space variance
+                'display_original_flux': display_original,
+                'display_pca_recon_flux': display_pca_recon,
+                'display_loo_recon_flux': display_loo_recon,
+                'display_loo_recon_var': display_loo_recon_var,
+                'loo_mu': loo_mu,                    # (K, M) LOO predicted weights
+                'loo_var': loo_var,                   # (K, M) LOO predictive variances
                 'wavelength': self.wl,               # (P,)
                 'pca_recon_rmse': pca_recon_rmse,
                 'loo_flux_rmse': loo_flux_rmse,
@@ -1523,6 +1781,9 @@ class Emulator:
                 'loo_flux_rmse_median': float(np.median(loo_flux_rmse)),
                 'loo_flux_rmse_95': float(np.percentile(loo_flux_rmse, 95)),
                 'max_fractional_resid': max_frac,
+                'pca_max_fractional_resid': pca_max_frac,
+                'pca_per_wl_rmse': pca_per_wl_rmse,   # (P,)
+                'loo_per_wl_rmse': loo_per_wl_rmse,    # (P,)
             })
 
         return results
@@ -1552,6 +1813,7 @@ class Emulator:
 
         loo_mu_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
         loo_var_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
+        loo_decorr_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
         is_block_diagonal = (self._v11_gpu.dim() == 3)
 
         for k in range(self.ncomps):
@@ -1578,8 +1840,25 @@ class Emulator:
             loo_mu_gpu[k] = w_k - K_inv_w / K_inv_diag
             loo_var_gpu[k] = 1.0 / K_inv_diag
 
-        # Transfer results back to CPU (small: 2 × ncomps × M floats)
-        return loo_mu_gpu.cpu().numpy(), loo_var_gpu.cpu().numpy()
+            # Decorrelated residuals (Bastos & O'Hagan 2009, pivoted-Cholesky).
+            # R[i,j] = K_inv[i,j] / sqrt(K_inv[i,i]*K_inv[j,j]) is the
+            # correlation matrix of the LOO standardised residuals.
+            _isqd = 1.0 / torch.sqrt(torch.clamp(K_inv_diag, min=1e-30))
+            R_k = K_inv * (_isqd.unsqueeze(0) * _isqd.unsqueeze(1))
+            R_k.diagonal().add_(1e-8)  # stabilise Cholesky
+            try:
+                L_R = torch.linalg.cholesky(R_k)
+            except torch.linalg.LinAlgError:
+                R_k.diagonal().add_(1e-6)
+                L_R = torch.linalg.cholesky(R_k)
+            z_k = (w_k - loo_mu_gpu[k]) * torch.sqrt(torch.clamp(K_inv_diag, min=1e-30))
+            loo_decorr_gpu[k] = torch.linalg.solve_triangular(
+                L_R, z_k.unsqueeze(1), upper=False
+            ).squeeze(1)
+
+        # Transfer results back to CPU (small: 3 × ncomps × M floats)
+        return (loo_mu_gpu.cpu().numpy(), loo_var_gpu.cpu().numpy(),
+                loo_decorr_gpu.cpu().numpy())
 
     def _loo_cv_gpu_memory_efficient(self, w_hat_all: np.ndarray, M: int):
         """
@@ -1613,7 +1892,7 @@ class Emulator:
 
         # Ensure cached GPU tensors exist
         if self._grid_points_gpu is None:
-            self._grid_points_gpu = torch.from_numpy(self.grid_points).to(device, dtype)
+            self._grid_points_gpu = torch.from_numpy(self._grid_points_norm).to(device, dtype)
         if self._variances_gpu is None:
             self._variances_gpu = torch.from_numpy(self.variances).to(device, dtype)
         if self._lengthscales_gpu is None:
@@ -1627,6 +1906,7 @@ class Emulator:
 
         loo_mu_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
         loo_var_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
+        loo_decorr_gpu = torch.zeros(self.ncomps, M, device=device, dtype=dtype)
 
         self.log.info(f"Memory-efficient LOO-CV: building V11 blocks on-the-fly ({self.ncomps} components, M={M})")
 
@@ -1635,16 +1915,15 @@ class Emulator:
             X_scaled = self._grid_points_gpu / self._lengthscales_gpu[k]
             K_k = torch.cdist(X_scaled, X_scaled, p=2.0)
             del X_scaled
-            K_k.pow_(2)
-            K_k.mul_(-0.5)
-            torch.exp(K_k, out=K_k)
-            K_k.mul_(self._variances_gpu[k])
+            _apply_kernel_gpu_inplace(K_k, self._variances_gpu[k], self.kernel)
 
-            # Add diagonal (match training: dots_inv_diag/lambda_xi + 1e-5 jitter)
+            # Add diagonal (match training: dots_inv_diag/lambda_xi + jitter)
+            # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
+            jitter = _get_v11_jitter(self._variances_gpu[k].item())
             if self.strict_weight_fit:
-                K_k.diagonal().add_(1e-5)
+                K_k.diagonal().add_(jitter)
             else:
-                K_k.diagonal().add_(self._dots_inv_diag_gpu[k].item() / self.lambda_xi + 1e-5)
+                K_k.diagonal().add_(self._dots_inv_diag_gpu[k].item() / self.lambda_xi + jitter)
 
             # Cholesky → K_inv via solve
             try:
@@ -1653,7 +1932,17 @@ class Emulator:
                 K_inv = torch.cholesky_solve(eye_M, L)
                 del L
             except torch.linalg.LinAlgError:
-                K_k += 1e-8 * eye_M
+                # Rebuild K_k from scratch with 10x jitter for a clean retry
+                del K_k
+                X_scaled = self._grid_points_gpu / self._lengthscales_gpu[k]
+                K_k = torch.cdist(X_scaled, X_scaled, p=2.0)
+                del X_scaled
+                _apply_kernel_gpu_inplace(K_k, self._variances_gpu[k], self.kernel)
+                retry_jitter = 10.0 * jitter
+                if self.strict_weight_fit:
+                    K_k.diagonal().add_(retry_jitter)
+                else:
+                    K_k.diagonal().add_(self._dots_inv_diag_gpu[k].item() / self.lambda_xi + retry_jitter)
                 L = torch.linalg.cholesky(K_k)
                 del K_k
                 K_inv = torch.cholesky_solve(eye_M, L)
@@ -1666,10 +1955,26 @@ class Emulator:
             loo_mu_gpu[k] = w_k - K_inv_w / K_inv_diag
             loo_var_gpu[k] = 1.0 / K_inv_diag
 
+            # Decorrelated residuals (Bastos & O'Hagan 2009)
+            _isqd = 1.0 / torch.sqrt(torch.clamp(K_inv_diag, min=1e-30))
+            R_k = K_inv * (_isqd.unsqueeze(0) * _isqd.unsqueeze(1))
+            R_k.diagonal().add_(1e-8)
+            try:
+                L_R = torch.linalg.cholesky(R_k)
+            except torch.linalg.LinAlgError:
+                R_k.diagonal().add_(1e-6)
+                L_R = torch.linalg.cholesky(R_k)
+            z_k = (w_k - loo_mu_gpu[k]) * torch.sqrt(torch.clamp(K_inv_diag, min=1e-30))
+            loo_decorr_gpu[k] = torch.linalg.solve_triangular(
+                L_R, z_k.unsqueeze(1), upper=False
+            ).squeeze(1)
+            del R_k, L_R
+
             del K_inv
             torch.cuda.empty_cache()
 
-        return loo_mu_gpu.cpu().numpy(), loo_var_gpu.cpu().numpy()
+        return (loo_mu_gpu.cpu().numpy(), loo_var_gpu.cpu().numpy(),
+                loo_decorr_gpu.cpu().numpy())
 
     def _loo_cv_cpu(self, w_hat_all: np.ndarray, M: int):
         """
@@ -1690,6 +1995,7 @@ class Emulator:
 
         loo_mu = np.zeros((self.ncomps, M))
         loo_var = np.zeros((self.ncomps, M))
+        loo_decorr = np.zeros((self.ncomps, M))
 
         for k in range(self.ncomps):
             if self.block_diagonal:
@@ -1710,11 +2016,23 @@ class Emulator:
             loo_mu[k] = w_k - K_inv_w / K_inv_diag
             loo_var[k] = 1.0 / K_inv_diag
 
-        return loo_mu, loo_var
+            # Decorrelated residuals (Bastos & O'Hagan 2009)
+            _isqd = 1.0 / np.sqrt(np.maximum(K_inv_diag, 1e-30))
+            R_k = K_inv * np.outer(_isqd, _isqd)
+            R_k[np.diag_indices_from(R_k)] += 1e-8
+            try:
+                L_R = np.linalg.cholesky(R_k)
+            except np.linalg.LinAlgError:
+                R_k[np.diag_indices_from(R_k)] += 1e-6
+                L_R = np.linalg.cholesky(R_k)
+            z_k = (w_k - loo_mu[k]) * np.sqrt(np.maximum(K_inv_diag, 1e-30))
+            loo_decorr[k] = np.linalg.solve(L_R, z_k)
+
+        return loo_mu, loo_var, loo_decorr
 
     def norm_factor(self, params: Union[Sequence[float], np.ndarray]) -> float:
         """
-        Return the scaling factor for the absolute flux units in flux-normalized spectra
+        Return the stored per-spectrum preprocessing factor.
 
         Parameters
         ----------
@@ -1724,7 +2042,8 @@ class Emulator:
         Returns
         -------
         factor: float
-            The multiplicative factor to normalize a spectrum to the model's absolute flux units
+            The interpolated preprocessing factor. For non-log models this is
+            multiplicative; for log models it is additive.
         """
         _params = np.asarray(params)
         return self.factor_interpolator(_params)
@@ -1767,15 +2086,21 @@ class Emulator:
         self.wl = trunc_wavelength
         self.eigenspectra = self.eigenspectra[:, ind]
 
-    def train(self, **opt_kwargs):
+    def train(self, optimizer="nelder-mead", refine_lambda_xi=False, **opt_kwargs):
         """
-        Trains the emulator's hyperparameters using gradient descent. This is a light wrapper around `scipy.optimize.minimize`. If you are experiencing problems optimizing the emulator, consider implementing your own training loop, using this function as a template.
+        Trains the emulator's hyperparameters.
 
         Parameters
         ----------
+        optimizer : str
+            Optimization method. One of ``"nelder-mead"`` (default),
+            ``"l-bfgs-b"``, or ``"cma-es"``.
+        refine_lambda_xi : bool
+            If True and ``strict_weight_fit`` is False, run a 1-D bounded
+            refinement of lambda_xi after per-component training.
         **opt_kwargs
-            Any arguments to pass to the optimizer. By default, `method='Nelder-Mead'`
-            and `maxiter=10000`. Use train_fast() for L-BFGS-B.
+            Any arguments to pass to the optimizer. By default,
+            ``method='Nelder-Mead'`` and ``maxiter=10000``.
 
         See Also
         --------
@@ -1783,6 +2108,26 @@ class Emulator:
 
         """
         import time
+
+        optimizer = optimizer.lower()
+        valid_optimizers = {"nelder-mead", "l-bfgs-b", "cma-es"}
+        if optimizer not in valid_optimizers:
+            raise ValueError(
+                f"Unknown optimizer '{optimizer}'. Must be one of {valid_optimizers}"
+            )
+        if optimizer == "cma-es":
+            try:
+                import cma  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "CMA-ES optimizer requires the 'cma' package. "
+                    "Install it with: pip install cma"
+                )
+
+        # Per-component training: optimize each PCA component independently
+        if self.per_component and self.block_diagonal:
+            self._train_per_component(optimizer=optimizer, refine_lambda_xi=refine_lambda_xi, **opt_kwargs)
+            return
         
         if PYTORCH_AVAILABLE and torch.cuda.is_available():
             self._gpu_training_mode = True
@@ -1815,26 +2160,31 @@ class Emulator:
         self._last_progress_time = time.time()
         
         training_mode_str = "memory-efficient" if self._memory_efficient_training else "standard"
-        print(f"Started training (Nelder-Mead, {training_mode_str})")
+        print(f"Started training ({optimizer.upper()}, {training_mode_str})")
         print(f"Optimizing {len(self.get_param_vector())} hyperparameters")
         
         # Calculate maximum allowed variance based on data variance
-        # We allow the kernel variance to be up to 100x the data variance
-        # This prevents "runaway" optimization while allowing flexibility
+        # Cap at 100× empirical weight variance per component to prevent
+        # genuinely runaway GP variances (which flatten the MCMC likelihood
+        # via C_emu) while leaving the marginal-likelihood optimum essentially
+        # unrestricted in normal operation.  The paper (Czekala 2015, App. A)
+        # places no prior on a_int; the cap here is a pragmatic safety rail
+        # against numerical divergence during training, not a Bayesian prior.
         weights_variance = np.var(self.weights, axis=0) # (n_comp,)
-        # Use valid max_variance bounds (at least 1.0 to avoid too tight constraints on small components)
         max_variances = np.maximum(100.0 * weights_variance, 1.0)
         
         def nll(P, apply_penalty=True):
             if np.any(~np.isfinite(P)):
-                return np.inf
+                return 1e20
             self.set_param_vector(P)
             
-            # Check lengthscales
-            if np.any(self.lengthscales < 2 * self._grid_sep):
-                return np.inf
+            # Check lengthscales — return large finite penalty (not inf)
+            # so gradient-based optimizers can still compute useful gradients
+            if np.any(self.lengthscales < 0.5 * self._grid_sep):
+                violation = np.sum(np.maximum(0, 0.5 * self._grid_sep - self.lengthscales))
+                return 1e15 + 1e6 * violation
                 
-            # Check variances (prevent runaway)
+            # Check variances (prevent runaway) — only for unbounded optimizers
             current_variances = self.variances
             if apply_penalty and np.any(current_variances > max_variances):
                  # Soft penalty instead of hard cutoff for better optimization behavior
@@ -1866,75 +2216,133 @@ class Emulator:
         initial_loss = nll(P0.copy())
         print(f"Initial loss: {initial_loss:.2f}")
 
-        default_kwargs = {"method": "Nelder-Mead", "options": {"maxiter": 10000, "disp": True}}
+        default_kwargs = {"options": {"maxiter": 10000, "disp": True}}
         default_kwargs.update(opt_kwargs)
-        
-        # Auto-scale fatol if using Nelder-Mead (simulated relative tolerance)
-        if default_kwargs["method"] == "Nelder-Mead":
+        total_max_iter = default_kwargs.get("options", {}).get("maxiter", 10000)
+
+        # ── Build log-space bounds for the full param vector ──
+        # Layout matches get_param_vector() / hyperparams dict order:
+        #   [(log_lambda_xi),]  <-- first, only when not strict_weight_fit
+        #   log_var:0, ..., log_var:K-1,
+        #   log_ls:0:0, ..., log_ls:K-1:d-1
+        d = self._grid_points_norm.shape[1]
+        K = self.ncomps
+        ls_floor = 0.5 * self._grid_sep      # (d,)
+        ls_ceil  = 5.0 * np.ones(d)
+
+        var_lo  = np.full(K, -30.0)
+        _emp_var_j = np.var(self.weights, axis=0)  # (K,)
+        _var_ceil_j = np.maximum(_emp_var_j * 100.0, 1.0)
+        var_hi  = np.log(_var_ceil_j)
+        ls_lo   = np.tile(np.log(ls_floor), K)
+        ls_hi   = np.tile(np.log(ls_ceil),  K)
+        if self.strict_weight_fit:
+            joint_lo = np.concatenate([var_lo, ls_lo])
+            joint_hi = np.concatenate([var_hi, ls_hi])
+        else:
+            joint_lo = np.concatenate([[-30.0], var_lo, ls_lo])
+            joint_hi = np.concatenate([[ 30.0], var_hi, ls_hi])
+
+        if optimizer == "nelder-mead":
+            # ── Nelder-Mead path (with burn-in + auto-scaled fatol) ──
+            default_kwargs["method"] = "Nelder-Mead"
             options = default_kwargs.get("options", {})
             if "fatol" not in options:
-                # Check for a user-provided relative tolerance 'ftol' or default to 1e-4
-                # This makes the convergence criteria independent of the absolute loss value
-                rel_tol = options.pop("ftol", 1e-6) 
-                
-                # Problem: Initial loss can be orders of magnitude larger than the working regime 
-                # (e.g., 1e10 vs 1e5), making calculated fatol too large and causing early stopping.
-                # Solution: Run a short "burn-in" optimization to find a realistic loss baseline.
-                max_iter_total = options.get("maxiter", 1000)
-                
-                # Burn-in must be large enough to initialize simplex (N+1 evals) and take steps
-                # 99 params -> 100 evals just to start. Safe buffer: 200 + 100 steps.
-                n_params = len(P0)
-                # Burn-in: Short run to initialize simplex and find non-penalized region
+                rel_tol = options.pop("ftol", 1e-6)
                 burn_in_iter = 50
-                
+                max_iter_total = options.get("maxiter", 1000)
+
                 if max_iter_total > (burn_in_iter * 2):
                     self.log.info(f"Running burn-in phase ({burn_in_iter} iters) to calibrate convergence tolerance...")
                     print(f"Burn-in phase: {burn_in_iter} iterations")
-                    
-                    # Run burn-in with bare settings (REMOVE tolerances to prevent early stop)
+
                     burn_in_options = options.copy()
                     burn_in_options["maxiter"] = burn_in_iter
                     burn_in_options.pop("xatol", None)
                     burn_in_options.pop("fatol", None)
-                    burn_in_options.pop("ftol", None) 
-                    
+                    burn_in_options.pop("ftol", None)
+
                     burn_in_kwargs = default_kwargs.copy()
                     burn_in_kwargs["options"] = burn_in_options
-                    
-                    # Run minimization
-                    # Disable penalty during burn-in to find valid function range
-                    burn_in_soln = minimize(nll, P0, args=(False,), **burn_in_kwargs)
-                    
-                    # Update parameters for main run
+
+                    # apply_penalty=True: enforce the variance cap during
+                    # burn-in too, otherwise burn-in can settle inside the
+                    # penalty region and leave auto-fatol at ∼|1e15|, which
+                    # short-circuits main-phase convergence.
+                    burn_in_soln = minimize(nll, P0, args=(True,), **burn_in_kwargs)
                     P0 = burn_in_soln.x.copy()
                     current_loss = burn_in_soln.fun
-                    
+
                     print(f"Burn-in complete: Loss {initial_loss:.2e} -> {current_loss:.2e}")
-                    
-                    # Reset iteration count and history
                     self._iteration_count = 0
                     self.loss_history = []
-                    
-                    # Since burn-in was unpenalized, we trust its loss value for tolerance
-                    # even if it's high (though it should be ~3e5).
-                    # If P0 is still technically in penalty region, main run will handle it.
                     initial_loss = current_loss
-                    
-                    # Reduce remaining iterations? No, just let it run full amount to be safe.
-                    # options["maxiter"] = max_iter_total - burn_in_soln.nit
                     print(f"Main run max_iter: {options.get('maxiter')} (full allowance)")
 
-                # fatol = initial_loss * rel_tol
-                # Ensure fatol is at least 1e-8 to prevent issues if loss is near zero
                 calculated_fatol = max(1e-8, abs(initial_loss) * rel_tol)
                 options["fatol"] = calculated_fatol
                 print(f"Auto-scaled fatol: {calculated_fatol:.4f} (relative tolerance: {rel_tol})")
                 default_kwargs["options"] = options
+
+            soln = minimize(nll, P0, args=(True,), **default_kwargs)
+
+        elif optimizer == "l-bfgs-b":
+            # ── L-BFGS-B with box constraints ──
+            # Box bounds enforce constraints directly, so skip the soft penalty
+            # (apply_penalty=False) to avoid early-return before loss computation.
+            bounds_list = list(zip(joint_lo, joint_hi))
+            callback = default_kwargs.pop("callback", None)
+            soln = minimize(
+                nll, P0, args=(False,),
+                method="L-BFGS-B",
+                bounds=bounds_list,
+                callback=callback,
+                options={
+                    "maxiter": total_max_iter,
+                    "ftol": 1e-15,
+                    "gtol": 1e-12,
+                    "eps": 1e-5,
+                    "disp": False,
+                },
+            )
+
+        elif optimizer == "cma-es":
+            # ── CMA-ES (derivative-free, population-based) ──
+            # Box bounds enforce constraints; skip soft penalty (apply_penalty=False).
+            # Use maxfevals (not maxiter/generations) so the user's max_iter
+            # maps to total function evaluations as expected.
+            import cma
+            sigma0 = 0.5
+            callback = default_kwargs.pop("callback", None)
+            cma_bounds = [joint_lo.tolist(), joint_hi.tolist()]
+            es = cma.CMAEvolutionStrategy(
+                P0.tolist(), sigma0,
+                {
+                    "bounds": cma_bounds,
+                    "maxfevals": total_max_iter,
+                    "verbose": -9,
+                    "tolfun": 1e-8,
+                },
+            )
+            best_x, best_f = P0.copy(), initial_loss
+            while not es.stop():
+                solutions = es.ask()
+                fits = [nll(np.array(s), False) for s in solutions]
+                es.tell(solutions, fits)
+                gen_best = min(fits)
+                if gen_best < best_f:
+                    best_f = gen_best
+                    best_x = np.array(solutions[fits.index(gen_best)])
+                if callback is not None:
+                    callback(best_x)
+            # Wrap into a scipy-like result for the downstream code
+            from types import SimpleNamespace
+            soln = SimpleNamespace(
+                x=best_x, fun=best_f, success=True,
+                message="CMA-ES terminated", nit=es.result.iterations,
+            )
         
-        # Main run (with penalty enabled by default)
-        soln = minimize(nll, P0, args=(True,), **default_kwargs)
-        
+        print("\nRebuilding covariance matrix (V11)...", flush=True)
         if self._gpu_training_mode:
             was_memory_efficient = self._memory_efficient_training
             self._gpu_training_mode = False
@@ -1953,6 +2361,7 @@ class Emulator:
                 print("(Skipping V11 rebuild — memory-efficient inference will be used)")
             else:
                 self.set_param_dict(self.get_param_dict())  # Rebuild V11 normally
+                print("V11 rebuild complete.", flush=True)
         
         final_time = time.time()
         total_elapsed = final_time - self._training_start_time
@@ -1991,184 +2400,437 @@ class Emulator:
         self.log.info(self)
             
         # Clean up progress tracking variables
-        delattr(self, '_training_start_time')
         delattr(self, '_iteration_count')
         delattr(self, '_best_loss')
         delattr(self, '_last_progress_time')
-            
-    # def train_fast(self, **opt_kwargs):
-    #     """
-    #     Fast training using L-BFGS-B
-        
-    #     Parameters
-    #     ----------
-    #     **opt_kwargs
-    #         Any arguments to pass to the optimizer. By default, `method='L-BFGS-B'`
-    #         with tighter tolerances.
-    #     """
-    #     import time
-        
-    #     if PYTORCH_AVAILABLE and torch.cuda.is_available():
-    #         self._gpu_training_mode = True
-        
-    #     self._training_start_time = time.time()
-    #     self._iteration_count = 0
-    #     self._best_loss = np.inf
-    #     self._last_progress_time = time.time()
-        
-    #     print("Started training (L-BFGS-B)")
-    #     print(f"Optimizing {len(self.get_param_vector())} hyperparameters")
-        
-    #     def nll(P):
-    #         if np.any(~np.isfinite(P)):
-    #             return np.inf
-    #         self.set_param_vector(P)
-    #         if np.any(self.lengthscales < 2 * self._grid_sep):
-    #             return np.inf
-    #         loss = -self.log_likelihood()
-    #         self.log.debug(f"loss: {loss}")
-            
-    #         # Progress tracking
-    #         self._iteration_count += 1
-    #         current_time = time.time()
-            
-    #         # Update best loss
-    #         if loss < self._best_loss:
-    #             self._best_loss = loss
-            
-    #         # Show progress every 10 iterations or every 30 seconds
-    #         if (self._iteration_count % 10 == 0) or (current_time - self._last_progress_time > 30):
-    #             elapsed = current_time - self._training_start_time
-    #             print(f"  Iter {self._iteration_count:4d} | Loss: {loss:8.2f} | Best: {self._best_loss:8.2f} | Time: {elapsed:6.1f}s")
-    #             self._last_progress_time = current_time
-            
-    #         return loss
 
-    #     # Do the optimization
-    #     P0 = self.get_param_vector()
-    #     initial_loss = nll(P0.copy())
-    #     print(f"Initial loss: {initial_loss:.2f}")
+    def _train_per_component(self, optimizer="nelder-mead", refine_lambda_xi=False, **opt_kwargs):
+        """Train each PCA component's GP independently.
 
-    #     default_kwargs = {
-    #         "method": "L-BFGS-B", 
-    #         "options": {
-    #             "maxiter": 2000,        # More iterations
-    #             "ftol": 1e-12,          # Tighter function tolerance  
-    #             "gtol": 1e-10,          # Tighter gradient tolerance
-    #             "eps": 1e-10,           # Smaller step for finite differences
-    #             "disp": True            # Show progress
-    #         }
-    #     }
-    #     default_kwargs.update(opt_kwargs)
-        
-    #     print(f"Starting L-BFGS-B optimization with {default_kwargs['options']['maxiter']} max iterations...")
-    #     soln = minimize(nll, P0, **default_kwargs)
-        
-    #     if self._gpu_training_mode:
-    #         self._gpu_training_mode = False
-    #         self.set_param_dict(self.get_param_dict())
-        
-    #     final_time = time.time()
-    #     total_elapsed = final_time - self._training_start_time
-    #     print(f"\nOptimization complete")
-    #     print(f"Total time: {total_elapsed:.1f}s | Iterations: {self._iteration_count} | Final loss: {self._best_loss:.2f}")
+        In block_diagonal mode the negative log-likelihood decomposes into
+        K independent terms, one per component.  Instead of optimizing all
+        K*(1+d) parameters jointly (which puts Nelder-Mead in a very
+        high-dimensional space), we run K separate low-dimensional
+        optimizations (1 variance + d lengthscales each).
 
-    #     if not soln.success:
-    #         self.log.warning("Fast optimization did not succeed.")
-    #         self.log.info(soln.message)
-    #     else:
-    #         self.set_param_vector(soln.x)
-    #         self._trained = True
-    #         self.log.info("Finished fast optimization")
-    #         self.log.info(self)
-            
-    #     # Clean up progress tracking variables
-    #     delattr(self, '_training_start_time')
-    #     delattr(self, '_iteration_count')
-    #     delattr(self, '_best_loss')
-    #     delattr(self, '_last_progress_time')
-            
-    # def train_bfgs(self, **opt_kwargs):
-    #     """
-    #     Alternative training using BFGS
-        
-    #     Parameters
-    #     ----------
-    #     **opt_kwargs
-    #         Any arguments to pass to the optimizer. By default, `method='BFGS'`.
-    #     """
-    #     import time
-        
-    #     self._training_start_time = time.time()
-    #     self._iteration_count = 0
-    #     self._best_loss = np.inf
-    #     self._last_progress_time = time.time()
-        
-    #     print("Started training (BFGS)")
-    #     print(f"Optimizing {len(self.get_param_vector())} hyperparameters")
-        
-    #     def nll(P):
-    #         if np.any(~np.isfinite(P)):
-    #             return np.inf
-    #         self.set_param_vector(P)
-    #         if np.any(self.lengthscales < 2 * self._grid_sep):
-    #             return np.inf
-    #         loss = -self.log_likelihood()
-    #         self.log.debug(f"loss: {loss}")
-            
-    #         # Progress tracking
-    #         self._iteration_count += 1
-    #         current_time = time.time()
-            
-    #         # Update best loss
-    #         if loss < self._best_loss:
-    #             self._best_loss = loss
-            
-    #         # Show progress every 10 iterations or every 30 seconds
-    #         if (self._iteration_count % 10 == 0) or (current_time - self._last_progress_time > 30):
-    #             elapsed = current_time - self._training_start_time
-    #             print(f"  Iter {self._iteration_count:4d} | Loss: {loss:8.2f} | Best: {self._best_loss:8.2f} | Time: {elapsed:6.1f}s")
-    #             self._last_progress_time = current_time
-            
-    #         return loss
+        Parameters
+        ----------
+        optimizer : str
+            One of ``"nelder-mead"`` (default), ``"l-bfgs-b"``, or
+            ``"cma-es"``.
+        refine_lambda_xi : bool
+            If True and ``strict_weight_fit`` is False, run a 1-D
+            bounded refinement of lambda_xi after all components.
+        **opt_kwargs
+            Forwarded to the underlying minimizer.  ``maxiter`` is read
+            from ``options`` dict and used as the per-component budget.
+        """
+        import time
 
-    #     P0 = self.get_param_vector()
-    #     initial_loss = nll(P0.copy())
-    #     print(f"Initial loss: {initial_loss:.2f}")
+        optimizer = optimizer.lower()
+        valid_optimizers = {"nelder-mead", "l-bfgs-b", "cma-es"}
+        if optimizer not in valid_optimizers:
+            raise ValueError(
+                f"Unknown optimizer '{optimizer}'. Must be one of {valid_optimizers}"
+            )
 
-    #     default_kwargs = {
-    #         "method": "BFGS", 
-    #         "options": {
-    #             "maxiter": 2000,
-    #             "gtol": 1e-10,
-    #             "eps": 1e-10,
-    #             "disp": True
-    #         }
-    #     }
-    #     default_kwargs.update(opt_kwargs)
-        
-    #     soln = minimize(nll, P0, **default_kwargs)
-        
-    #     final_time = time.time()
-    #     total_elapsed = final_time - self._training_start_time
-    #     print(f"\nOptimization complete")
-    #     print(f"Total time: {total_elapsed:.1f}s | Iterations: {self._iteration_count} | Final loss: {self._best_loss:.2f}")
+        if optimizer == "cma-es":
+            try:
+                import cma  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "CMA-ES optimizer requires the 'cma' package. "
+                    "Install it with: pip install cma"
+                )
 
-    #     if not soln.success:
-    #         self.log.warning("BFGS optimization did not succeed.")
-    #         self.log.info(soln.message)
-    #     else:
-    #         self.set_param_vector(soln.x)
-    #         self._trained = True
-    #         self.log.info("Finished BFGS optimization")
-    #         self.log.info(self)
-            
-    #     # Clean up progress tracking variables
-    #     delattr(self, '_training_start_time')
-    #     delattr(self, '_iteration_count')
-    #     delattr(self, '_best_loss')
-    #     delattr(self, '_last_progress_time')
-            
+        self.loss_history = []
+        self._training_start_time = time.time()
+        self._iteration_count = 0
+        self._best_loss = np.inf
+        self._last_progress_time = time.time()
+
+        d = self._grid_points_norm.shape[1]  # number of grid parameters
+        M = self.grid_points.shape[0]
+
+        # Lengthscale bounds (in normalized [0,1] space)
+        ls_floor = 0.5 * self._grid_sep      # (d,) — minimum useful resolution
+        ls_ceil  = 5.0 * np.ones(d)           # (d,) — beyond this the GP is ~constant
+
+        # Log-space bounds for bounded optimizers (L-BFGS-B, CMA-ES).
+        # variance  (index 0): unbounded below, capped at 100× per-component
+        #                      empirical weight variance (runaway guard only;
+        #                      Czekala 2015 App. A imposes no prior on a_int).
+        # lengthscales (indices 1..d): [log(ls_floor), log(ls_ceil)]
+        # Per-component ceiling: each component k gets its own bound based on
+        # Var(w_k); using a single scalar (e.g. max over k) leaks the noisiest
+        # component's bound onto the quietest one.
+        _emp_var = np.var(self.weights, axis=0)              # (K,)
+        _var_ceil_k = np.maximum(_emp_var * 100.0, 1.0)      # (K,) per-component
+        log_var_ceil_k = np.log(_var_ceil_k)                 # (K,)
+        log_bounds_lower = np.concatenate([[-30.0], np.log(ls_floor)])
+        # log_bounds_upper is built per-component inside the loop below
+        # using log_var_ceil_k[k].
+
+        # Parse user options
+        default_kwargs = {
+            "method": "Nelder-Mead",
+            "options": {"maxiter": 10000, "disp": False},
+        }
+        default_kwargs.update(opt_kwargs)
+        total_max_iter = default_kwargs.get("options", {}).get("maxiter", 10000)
+        # Each component gets the FULL iteration budget
+        per_comp_max_iter = total_max_iter
+
+        print(f"Per-component training ({optimizer}): {self.ncomps} components × {1+d} params each")
+        print(f"  Per-component max_iter: {per_comp_max_iter}")
+        print(f"  Lengthscale bounds: floor={ls_floor}, ceil={ls_ceil}")
+
+        # Prepare GPU tensors once
+        use_gpu = PYTORCH_AVAILABLE and torch.cuda.is_available()
+        if use_gpu:
+            device = torch.device("cuda")
+            grid_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)
+            w_hat_reshaped = torch.from_numpy(
+                self.w_hat.reshape(self.ncomps, M)
+            ).to(device, TORCH_FLOAT64)
+            if not self.strict_weight_fit:
+                if hasattr(self, "_dots_inv_diag_gpu") and self._dots_inv_diag_gpu is not None:
+                    dots_inv_diag = self._dots_inv_diag_gpu
+                else:
+                    dots = self.eigenspectra @ self.eigenspectra.T
+                    dots_inv_diag = torch.from_numpy(
+                        np.diag(np.linalg.inv(dots))
+                    ).to(device, TORCH_FLOAT64)
+        else:
+            w_hat_reshaped_np = self.w_hat.reshape(self.ncomps, M)
+            if not self.strict_weight_fit:
+                dots = self.eigenspectra @ self.eigenspectra.T
+                dots_inv_diag_np = np.diag(np.linalg.inv(dots))
+
+        callback = opt_kwargs.pop("callback", None)
+
+        for k in range(self.ncomps):
+            comp_start = time.time()
+            comp_best_loss = np.inf
+            comp_best_P = None
+
+            # Initial parameter vector for component k: [log_var, log_ls_0, ..., log_ls_{d-1}]
+            p0 = np.empty(1 + d)
+            p0[0] = np.log(self.variances[k])
+            p0[1:] = np.log(self.lengthscales[k])
+
+            def nll_k(P, apply_penalty=True, _k=k):
+                if np.any(~np.isfinite(P)):
+                    return np.inf
+
+                log_var = P[0]
+                log_ls = P[1:]
+                var_k = np.exp(log_var)
+                ls_k = np.exp(log_ls)
+
+                # Per-component variance cap (runaway guard; see notes above).
+                # Large finite penalty — not np.inf — so Nelder-Mead retains
+                # gradient information about how far outside the cap we are.
+                if apply_penalty and var_k > _var_ceil_k[_k]:
+                    return 1e15 + (var_k - _var_ceil_k[_k])
+
+                # Lengthscale bounds
+                if np.any(ls_k < ls_floor) or np.any(ls_k > ls_ceil):
+                    return np.inf
+
+                # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
+                jitter = _get_v11_jitter(var_k)
+
+                if use_gpu:
+                    var_t = torch.tensor(var_k, device=device, dtype=TORCH_FLOAT64)
+                    ls_t = torch.from_numpy(ls_k).to(device, TORCH_FLOAT64)
+
+                    X_scaled = grid_gpu / ls_t
+                    dist = torch.cdist(X_scaled, X_scaled, p=2.0)
+                    _apply_kernel_gpu_inplace(dist, var_t, self.kernel)
+
+                    if self.strict_weight_fit:
+                        dist.diagonal().add_(jitter)
+                    else:
+                        dist.diagonal().add_(
+                            dots_inv_diag[_k].item() / self.lambda_xi + jitter
+                        )
+
+                    try:
+                        L = torch.linalg.cholesky(dist)
+                    except torch.linalg.LinAlgError:
+                        return np.inf
+                    del dist
+
+                    logdet = 2.0 * torch.sum(torch.log(L.diagonal())).item()
+
+                    z = torch.linalg.solve_triangular(
+                        L, w_hat_reshaped[_k].unsqueeze(-1), upper=False
+                    )
+                    solved = torch.linalg.solve_triangular(
+                        L.T, z, upper=True
+                    ).squeeze(-1)
+                    del L
+
+                    sqmah = torch.dot(w_hat_reshaped[_k], solved).item()
+                    del solved, z
+                else:
+                    # CPU path
+                    _kfunc = get_cpu_kernel_func(self.kernel)
+                    K = _kfunc(
+                        self._grid_points_norm, self._grid_points_norm,
+                        var_k, ls_k,
+                    )
+                    if self.strict_weight_fit:
+                        K[np.diag_indices_from(K)] += jitter
+                    else:
+                        K[np.diag_indices_from(K)] += (
+                            dots_inv_diag_np[_k] / self.lambda_xi + jitter
+                        )
+                    try:
+                        Lc, flag = cho_factor(K)
+                    except np.linalg.LinAlgError:
+                        return np.inf
+                    logdet = 2 * np.sum(np.log(Lc.diagonal()))
+                    solved = cho_solve((Lc, flag), w_hat_reshaped_np[_k])
+                    sqmah = np.dot(w_hat_reshaped_np[_k], solved)
+
+                loss = (logdet + sqmah) / 2.0
+                self.loss_history.append(loss)
+                self._iteration_count += 1
+
+                # Track best-ever params for this component
+                nonlocal comp_best_loss, comp_best_P
+                if loss < comp_best_loss:
+                    comp_best_loss = loss
+                    comp_best_P = P.copy()
+                if loss < self._best_loss:
+                    self._best_loss = loss
+
+                now = time.time()
+                if (self._iteration_count % 10 == 0) or (now - self._last_progress_time > 30):
+                    elapsed = now - self._training_start_time
+                    print(
+                        f"  Comp {_k+1:2d}/{self.ncomps} | "
+                        f"Iter {self._iteration_count:5d} | "
+                        f"Loss: {loss:10.2f} | Best(comp): {comp_best_loss:10.2f} | "
+                        f"Time: {elapsed:6.1f}s"
+                    )
+                    self._last_progress_time = now
+
+                # Invoke Marimo callback for live chart updates
+                if callback is not None and self._iteration_count % 10 == 0:
+                    callback(None)
+
+                return loss
+
+            # --- Optimizer dispatch per component ---
+            if optimizer == "nelder-mead":
+                # Burn-in for fatol calibration.  apply_penalty=True so the
+                # baseline loss reflects the capped region — without it,
+                # burn-in can settle inside a runaway and set fatol ∼ 1e9.
+                burn_in_iter = 50
+                burn_in_opts = {"maxiter": burn_in_iter, "disp": False}
+                burn_soln = minimize(
+                    nll_k, p0, args=(True,),
+                    method="Nelder-Mead", options=burn_in_opts,
+                    callback=callback,
+                )
+                p0 = burn_soln.x.copy()
+                baseline_loss = burn_soln.fun if np.isfinite(burn_soln.fun) else comp_best_loss
+                fatol = max(1e-8, abs(baseline_loss) * 1e-6)
+                print(f"  Comp {k+1:2d}/{self.ncomps} | Burn-in done: loss {baseline_loss:.2f} → fatol={fatol:.2e}")
+
+                comp_opts = {
+                    "maxiter": per_comp_max_iter,
+                    "fatol": fatol,
+                    "disp": False,
+                }
+                soln = minimize(
+                    nll_k, p0, args=(True,),
+                    method="Nelder-Mead", options=comp_opts,
+                    callback=callback,
+                )
+
+            elif optimizer == "l-bfgs-b":
+                # Per-component log-space box bounds (variance ceiling depends on k).
+                log_bounds_upper_k = np.concatenate([[log_var_ceil_k[k]], np.log(ls_ceil)])
+                bounds_list = list(zip(log_bounds_lower, log_bounds_upper_k))
+                # Box bounds enforce the variance cap structurally; skip the
+                # soft penalty to avoid early-return before loss computation.
+                soln = minimize(
+                    nll_k, p0, args=(False,),
+                    method="L-BFGS-B",
+                    bounds=bounds_list,
+                    callback=callback,
+                    options={
+                        "maxiter": per_comp_max_iter,
+                        "ftol": 1e-15,
+                        "gtol": 1e-12,
+                        "eps": 1e-5,
+                        "disp": False,
+                    },
+                )
+
+            elif optimizer == "cma-es":
+                import cma
+                # Per-component log-space box bounds (variance ceiling depends on k).
+                log_bounds_upper_k = np.concatenate([[log_var_ceil_k[k]], np.log(ls_ceil)])
+                # CMA-ES: population-based evolutionary strategy
+                sigma0 = 0.5  # initial step size in log-space
+                cma_opts = {
+                    "bounds": [log_bounds_lower.tolist(), log_bounds_upper_k.tolist()],
+                    "maxfevals": per_comp_max_iter,
+                    "verbose": -9,  # suppress CMA-ES internal output
+                    "tolfun": 1e-8,
+                }
+                es = cma.CMAEvolutionStrategy(p0, sigma0, cma_opts)
+                while not es.stop():
+                    solutions = es.ask()
+                    # Box bounds enforce cap structurally; skip soft penalty.
+                    fitnesses = [nll_k(x, apply_penalty=False) for x in solutions]
+                    es.tell(solutions, fitnesses)
+                    if callback is not None:
+                        callback(None)
+                # Build a minimal result-like object for uniform handling
+                soln = type("CMAResult", (), {
+                    "x": es.result.xbest,
+                    "fun": es.result.fbest,
+                })()
+                print(f"  Comp {k+1:2d}/{self.ncomps} | CMA-ES: {es.result.evaluations} fevals, sigma={es.sigma:.4f}")
+
+            # Restore best-ever parameters (soln.x is usually the best, but
+            # this guards against Nelder-Mead returning a non-optimal final simplex vertex)
+            best_P = comp_best_P if comp_best_P is not None else soln.x
+            self.hyperparams[f"log_variance:{k}"] = best_P[0]
+            for j in range(d):
+                self.hyperparams[f"log_lengthscale:{k}:{j}"] = best_P[1 + j]
+
+            comp_elapsed = time.time() - comp_start
+            print(
+                f"  Component {k+1}/{self.ncomps} done | "
+                f"Best loss: {comp_best_loss:.2f} | Time: {comp_elapsed:.1f}s | "
+                f"var={np.exp(best_P[0]):.4f} ls={np.exp(best_P[1:])}"
+            )
+
+        # --- lambda_xi refinement (non-strict mode only) ---
+        # After per-component training, optimize the shared lambda_xi scalar
+        # via 1D bounded minimization over the total NLL across all components.
+        if refine_lambda_xi and not self.strict_weight_fit:
+            print("\nRefining λ_ξ (1D Brent optimization)...", flush=True)
+            log_lam_init = np.log(self.lambda_xi)
+            _lam_eval_counter = [0]
+
+            def _total_nll_lambda(log_lam):
+                _lam_eval_counter[0] += 1
+                lam = np.exp(log_lam)
+                print(f"  λ_ξ eval {_lam_eval_counter[0]} | log(λ_ξ)={log_lam:.4f}", end="", flush=True)
+                total = 0.0
+                for kk in range(self.ncomps):
+                    var_kk = np.exp(self.hyperparams[f"log_variance:{kk}"])
+                    ls_kk = np.array([np.exp(self.hyperparams[f"log_lengthscale:{kk}:{j}"]) for j in range(d)])
+                    jitter_kk = _get_v11_jitter(var_kk)
+                    shift_kk = dots_inv_diag_val[kk] / lam + jitter_kk
+
+                    if use_gpu:
+                        var_t = torch.tensor(var_kk, device=device, dtype=TORCH_FLOAT64)
+                        ls_t = torch.from_numpy(ls_kk).to(device, TORCH_FLOAT64)
+                        X_sc = grid_gpu / ls_t
+                        dist_m = torch.cdist(X_sc, X_sc, p=2.0)
+                        _apply_kernel_gpu_inplace(dist_m, var_t, self.kernel)
+                        dist_m.diagonal().add_(shift_kk)
+                        try:
+                            Lm = torch.linalg.cholesky(dist_m)
+                        except torch.linalg.LinAlgError:
+                            return 1e30
+                        logdet = 2.0 * torch.sum(torch.log(Lm.diagonal())).item()
+                        z = torch.linalg.solve_triangular(Lm, w_hat_reshaped[kk].unsqueeze(-1), upper=False)
+                        solved = torch.linalg.solve_triangular(Lm.T, z, upper=True).squeeze(-1)
+                        sqmah = torch.dot(w_hat_reshaped[kk], solved).item()
+                        del dist_m, Lm, z, solved
+                    else:
+                        _kfunc = get_cpu_kernel_func(self.kernel)
+                        K = _kfunc(self._grid_points_norm, self._grid_points_norm, var_kk, ls_kk)
+                        K[np.diag_indices_from(K)] += shift_kk
+                        try:
+                            Lc, flag = cho_factor(K)
+                        except np.linalg.LinAlgError:
+                            return 1e30
+                        logdet = 2 * np.sum(np.log(Lc.diagonal()))
+                        solved = cho_solve((Lc, flag), w_hat_reshaped_np[kk])
+                        sqmah = np.dot(w_hat_reshaped_np[kk], solved)
+
+                    total += (logdet + sqmah) / 2.0
+                print(f" | NLL={total:.2f}", flush=True)
+                return total
+
+            # Precompute dots_inv_diag values for all components
+            if use_gpu:
+                if hasattr(self, "_dots_inv_diag_gpu") and self._dots_inv_diag_gpu is not None:
+                    dots_inv_diag_val = [self._dots_inv_diag_gpu[kk].item() for kk in range(self.ncomps)]
+                else:
+                    dots = self.eigenspectra @ self.eigenspectra.T
+                    dots_inv_diag_val = list(np.diag(np.linalg.inv(dots)))
+            else:
+                dots = self.eigenspectra @ self.eigenspectra.T
+                dots_inv_diag_val = list(np.diag(np.linalg.inv(dots)))
+
+            nll_before = _total_nll_lambda(log_lam_init)
+            lam_result = minimize_scalar(
+                _total_nll_lambda,
+                bounds=(log_lam_init - 5.0, log_lam_init + 5.0),
+                method="bounded",
+                options={"xatol": 1e-6},
+            )
+            nll_after = lam_result.fun
+            if nll_after < nll_before:
+                self.hyperparams["log_lambda_xi"] = lam_result.x
+                print(f"  λ_ξ: {np.exp(log_lam_init):.6f} → {np.exp(lam_result.x):.6f} | NLL: {nll_before:.2f} → {nll_after:.2f}")
+            else:
+                print(f"  λ_ξ refinement did not improve NLL ({nll_before:.2f} → {nll_after:.2f}), keeping original value.")
+
+        # --- Post-training housekeeping ---
+        # Check if V11 fits in memory; if so rebuild, otherwise leave for
+        # memory-efficient inference.
+        print("\nRebuilding covariance matrix (V11)...", flush=True)
+        if use_gpu:
+            v11_bytes = self.ncomps * M * M * 8 * 3
+            gpu_vram = torch.cuda.get_device_properties(0).total_memory
+            if v11_bytes > gpu_vram:
+                self._v11_gpu = None
+                self._v11 = None
+                self._L_gpu = None
+                self._alpha_gpu = None
+                self._L_gpu_source_id = None
+                self._mem_eff_L_blocks = None
+                self._mem_eff_alpha_blocks = None
+                print("(Skipping V11 rebuild — memory-efficient inference will be used)")
+            else:
+                self._gpu_training_mode = True
+                self.set_param_dict(self.get_param_dict())
+                self._gpu_training_mode = False
+                print("V11 rebuild complete.", flush=True)
+        else:
+            self.set_param_dict(self.get_param_dict())
+            print("V11 rebuild complete.", flush=True)
+
+        total_elapsed = time.time() - self._training_start_time
+        print(f"\nPer-component training complete")
+        print(
+            f"Total time: {total_elapsed:.1f}s | "
+            f"Total iters: {self._iteration_count} | "
+            f"Best total loss: {self._best_loss:.2f}"
+        )
+
+        self._trained = True
+        self.log.info(self)
+
+        # Clean up progress tracking variables
+        delattr(self, "_training_start_time")
+        delattr(self, "_iteration_count")
+        delattr(self, "_best_loss")
+        delattr(self, "_last_progress_time")
+
     def train_original(self, **opt_kwargs):
         """Original training method using Nelder-Mead"""
         print("Started training (Nelder-Mead)")
@@ -2245,7 +2907,7 @@ class Emulator:
             device = torch.device('cuda')
             
             if self._grid_points_gpu is None:
-                self._grid_points_gpu = torch.from_numpy(self.grid_points).to(device, TORCH_FLOAT64)
+                self._grid_points_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)
             if self._w_hat_gpu is None:
                 self._w_hat_gpu = torch.from_numpy(self.w_hat).to(device, TORCH_FLOAT64)
             
@@ -2265,11 +2927,15 @@ class Emulator:
                     eye_M = torch.eye(M, dtype=TORCH_FLOAT64, device=device)
                     
                     if self.strict_weight_fit:
-                        # Strict weight fit: skip iPhiPhi/lambda_xi noise matrix, just use jitter
-                        v11_gpu = 1e-5 * eye_M.unsqueeze(0).expand(self.ncomps, -1, -1).clone()
+                        # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
+                        jitter_t = torch.tensor([_get_v11_jitter(v) for v in self.variances.tolist()],
+                                                device=device, dtype=TORCH_FLOAT64)
+                        v11_gpu = (jitter_t.view(-1, 1, 1) * eye_M.unsqueeze(0)).clone()
                     else:
                         v11_gpu = (self._dots_inv_diag_gpu.view(-1, 1, 1) * eye_M.unsqueeze(0)) / self.lambda_xi
-                        v11_gpu += 1e-5 * eye_M.unsqueeze(0)
+                        jitter_t = torch.tensor([_get_v11_jitter(v) for v in self.variances.tolist()],
+                                                device=device, dtype=TORCH_FLOAT64)
+                        v11_gpu += jitter_t.view(-1, 1, 1) * eye_M.unsqueeze(0)
 
                     # Add kernel in-place
                     batch_kernel_pytorch_gpu_only(
@@ -2280,7 +2946,8 @@ class Emulator:
                         device='cuda',
                         return_stacked=True,
                         out=v11_gpu,
-                        add_to_out=True
+                        add_to_out=True,
+                        kernel_type=self.kernel
                     )
                     self._v11_gpu = v11_gpu
                 
@@ -2295,33 +2962,38 @@ class Emulator:
                     self._variances_gpu, 
                     self._lengthscales_gpu,
                     device='cuda',
-                    return_stacked=False
+                    return_stacked=False,
+                    kernel_type=self.kernel
                 )
                 
                 if self.strict_weight_fit:
                     M = kernel_gpu.shape[0]
-                    self._v11_gpu = kernel_gpu + (1e-5 * torch.eye(M, device=device, dtype=TORCH_FLOAT64))
+                    _jit = _get_v11_jitter(float(self.variances.max()))
+                    self._v11_gpu = kernel_gpu + (_jit * torch.eye(M, device=device, dtype=TORCH_FLOAT64))
                 else:
                     self._v11_gpu = self._iPhiPhi_gpu / self.lambda_xi + kernel_gpu
                     M = self._iPhiPhi_gpu.shape[0]
-                    self._v11_gpu += 1e-5 * torch.eye(M, device=device, dtype=TORCH_FLOAT64)
+                    self._v11_gpu += _get_v11_jitter(float(self.variances.max())) * torch.eye(M, device=device, dtype=TORCH_FLOAT64)
         else:
             if self.block_diagonal:
                 # Block-Diagonal CPU Update
                 M = self.grid_points.shape[0]
                 kernel_cpu = np.zeros((self.ncomps, M, M))
                 
+                _kfunc = get_cpu_kernel_func(self.kernel)
                 for i in range(self.ncomps):
-                    kernel_cpu[i] = rbf_kernel(
-                        self.grid_points, 
-                        self.grid_points, 
+                    kernel_cpu[i] = _kfunc(
+                        self._grid_points_norm, 
+                        self._grid_points_norm, 
                         self.variances[i], 
                         self.lengthscales[i]
                     )
                 
                 if self.strict_weight_fit:
+                    # Jitter ~ 1e-6 × variance stabilises Cholesky (see _get_v11_jitter)
                     eye_M = np.eye(M)
-                    self.v11 = kernel_cpu + (1e-5 * eye_M)
+                    jitter_arr = np.array([_get_v11_jitter(v) for v in self.variances])
+                    self.v11 = kernel_cpu + jitter_arr[:, None, None] * eye_M
                 else:
                     if self.iPhiPhi is None:
                         # Reconstruct diagonal scaling factors if iPhiPhi is missing (memory optimization)
@@ -2332,7 +3004,7 @@ class Emulator:
                         # Add (dots_inv_diag / lambda) * I to kernel and Jitter
                         eye_M = np.eye(M)
                         for i in range(self.ncomps):
-                            kernel_cpu[i] += ((dots_inv_diag[i] / self.lambda_xi) + 1e-5) * eye_M
+                            kernel_cpu[i] += ((dots_inv_diag[i] / self.lambda_xi) + _get_v11_jitter(self.variances[i])) * eye_M
                         self.v11 = kernel_cpu
                     else:
                         self.v11 = self.iPhiPhi / self.lambda_xi + kernel_cpu
@@ -2340,16 +3012,17 @@ class Emulator:
                         M = self.v11.shape[-1]
                         eye_M = np.eye(M)
                         for i in range(self.ncomps):
-                            self.v11[i] += 1e-5 * eye_M
+                            self.v11[i] += _get_v11_jitter(self.variances[i]) * eye_M
             else:
                 kernel_auto = batch_kernel_auto(
-                    self.grid_points, self.grid_points, self.variances, self.lengthscales
+                    self._grid_points_norm, self._grid_points_norm, self.variances, self.lengthscales, kernel_type=self.kernel
                 )
                 if self.strict_weight_fit:
-                    self.v11 = kernel_auto + (1e-5 * np.eye(kernel_auto.shape[0]))
+                    _jit = _get_v11_jitter(float(self.variances.max()))
+                    self.v11 = kernel_auto + (_jit * np.eye(kernel_auto.shape[0]))
                 else:
                     self.v11 = self.iPhiPhi / self.lambda_xi + kernel_auto
-                    self.v11 += 1e-5 * np.eye(self.v11.shape[0])
+                    self.v11 += _get_v11_jitter(float(self.variances.max())) * np.eye(self.v11.shape[0])
 
 
     def get_param_vector(self) -> np.ndarray:
@@ -2397,6 +3070,10 @@ class Emulator:
         Get the log likelihood of the emulator in its current state as calculated in
         the appendix of Czekala et al. (2015)
 
+        Note: returns the unnormalised log-likelihood (the -n/2 ln(2π) constant
+        is omitted, following standard GP convention). This has no effect on
+        training since the constant is independent of the hyperparameters.
+
         Returns
         -------
         float
@@ -2418,7 +3095,8 @@ class Emulator:
                         self.lambda_xi,
                         self._w_hat_gpu,
                         self.ncomps,
-                        strict_weight_fit=self.strict_weight_fit
+                        strict_weight_fit=self.strict_weight_fit,
+                        kernel_type=self.kernel
                     )
                     return result
                 except Exception as e:

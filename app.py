@@ -6,10 +6,11 @@ __generated_with = "0.17.7"
 server = (
     marimo.create_asgi_app()
     .with_app(path="/", root="speculate.py")
-    .with_app(path="/downloader", root="speculate_grid_downloader.py")
+    .with_app(path="/downloader", root="speculate_model_downloader.py")
     .with_app(path="/inspector", root="speculate_grid_inspector.py")
     .with_app(path="/training", root="speculate_training.py")
     .with_app(path="/inference", root="speculate_inference.py")
+    .with_app(path="/quickfit", root="speculate_quick_fit.py")
     .with_app(path="/benchmark", root="speculate_benchmark_viewer.py")
 )
 
