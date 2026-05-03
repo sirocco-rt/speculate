@@ -26,6 +26,7 @@ jobs:
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
+          token: ${{ secrets.SPECULATE_VERSIONING_BOT_TOKEN }}
 
       - name: Setup | Force release branch to be at workflow sha
         run: |
