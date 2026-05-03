@@ -1,0 +1,10 @@
+---
+title: Speculate
+emoji: 💨
+colorFrom: blue
+colorTo: yellow
+sdk: docker
+pinned: true
+license: gpl-3.0
+short_description: A sirocco emulator for windy astrophysical spectra
+---
