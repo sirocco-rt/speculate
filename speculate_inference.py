@@ -317,63 +317,51 @@ def _(mo):
 
 @app.cell
 def _():
-    # Parameter Mapping Dictionary
-    # Maps the 1-based parameter index used in emulator filenames to a
-    # (friendly_name, default_min, default_max) tuple.  Default bounds of
-    # (0, 1) are placeholders overridden once the emulator is loaded;
-    # inclination bounds are physical (degrees).
-    #
-    # Indices 1-6  : Knigge-Wood-Drew (KWD) accretion disc wind model.
-    # Indices 7-8  : Boundary-layer emission (only in "bl" grids).
-    # Indices 9-11 : Observer inclination at increasing angular resolution.
-    #
-    # In emulator space param1, param3, and param5 are stored in log10.
-    # param2 (wind.mdot) is stored as the ratio wind/disk mass-loss rate.
-    # Tuple: (friendly_name, default_min, default_max, is_log10)
-    param_map_db = {
-        1: ("disk.mdot", 0.0, 1.0, True),              # log10(Msol/yr)
-        2: ("wind.mdot", 0.0, 1.0, False),              # ratio: wind / disk
-        3: ("KWD.d", 0.0, 1.0, True),                  # log10(wind launch radius / r_star)
-        4: ("KWD.mdot_r_exponent", 0.0, 1.0, False),    # radial mdot power law
-        5: ("KWD.acceleration_length", 0.0, 1.0, True), # log10(cm)
-        6: ("KWD.acceleration_exponent", 0.0, 1.0, False),
-        7: ("Boundary_layer.luminosity", 0.0, 1.0, True),  # log10(erg/s)
-        8: ("Boundary_layer.temp", 0.0, 1.0, True),        # log10(K)
-        9: ("Inclination (Sparse)", 30.0, 80.0, False),  # 3 angles (30, 55, 80)
-        10: ("Inclination (Mid)", 30.0, 80.0, False),    # 6 angles
-        11: ("Inclination (Full)", 30.0, 80.0, False),   # 12 angles
-    }
-    return (param_map_db,)
+    from Speculate_addons.grid_registry import param_map_db as _registry_param_map_db
+
+    def inf_param_map_db_for_grid(grid_name=None):
+        """Return Inference Tool parameter labels/ranges from the registry."""
+        return _registry_param_map_db(grid_name)
+
+    param_map_db = inf_param_map_db_for_grid()
+    return inf_param_map_db_for_grid, param_map_db
 
 
 @app.cell
 def _(get_loaded_emu_filename, get_selected_grid, mo, on_grid_select, os):
     # --- Grid Selection ---
-    # Scan the Grid-Emulator_Files directory for .npz emulator files and
-    # extract unique grid stem names (everything before "_emu_").  The stem
-    # encodes the Sirocco grid version and physics variant (e.g.
-    # "speculate_cv_bl_grid_v87f").
+    # Discover grid families from local raw grids, processed grid files, and GP
+    # emulator files.  A grid can be present before a trained emulator exists;
+    # in that case the downstream emulator dropdown will simply show no matching
+    # GP emulators for that grid.
+    from Speculate_addons.grid_registry import GRID_REGISTRY as _GRID_REGISTRY, infer_grid_name as _infer_grid_name
 
     _emu_dir = "Grid-Emulator_Files"
+    _sirocco_grids_dir = "sirocco_grids"
     _unique_grids = set()
+
+    if os.path.exists(_sirocco_grids_dir):
+        _local_grid_dirs = {
+            _name
+            for _name in os.listdir(_sirocco_grids_dir)
+            if os.path.isdir(os.path.join(_sirocco_grids_dir, _name))
+        }
+        for _grid_name, _config in _GRID_REGISTRY.items():
+            if _grid_name in _local_grid_dirs or _config.get("test_grid_name") in _local_grid_dirs:
+                _unique_grids.add(_grid_name)
 
     if os.path.exists(_emu_dir):
         _files = [f for f in os.listdir(_emu_dir) if f.endswith(".npz")]
         for _f in _files:
-            # Parse grid name
-            # Pattern: {GRID}_emu_{INDICES}... OR {GRID}_grid_{INDICES}...
-            # We assume the grid name is everything before "_emu_" or "_grid_"
+            _grid_name = _infer_grid_name(_f)
+            if _grid_name is not None and ("_emu_" in _f or "_grid_" in _f):
+                _unique_grids.add(_grid_name)
+                continue
 
-            # Try splitting by _emu_ first (most common for emulators)
+            # Legacy fallback for emulator filenames from unregistered grids.
             _parts = _f.split("_emu_")
             if len(_parts) > 1:
                 _unique_grids.add(_parts[0])
-                continue
-
-            # Try splitting by _grid_
-            _parts = _f.split("_grid_")
-            if len(_parts) > 1:
-                pass
 
     _sorted_grids = sorted(list(_unique_grids))
 
@@ -408,19 +396,24 @@ def _(get_loaded_emu_filename, get_selected_grid, mo, on_grid_select, os):
 
 
 @app.cell
-def _(get_loaded_emu_filename, get_selected_emu_filename, grid_selector, mo, on_emulator_select, os, param_map_db, re):
+def _(get_loaded_emu_filename, get_selected_emu_filename, grid_selector, inf_param_map_db_for_grid, mo, on_emulator_select, os, re):
     # --- Emulator Selection (Dependent on Grid) ---
     # Filter the .npz files to those matching the selected grid stem and
-    # discover which parameter indices this grid supports.  Indices are
-    # parsed from the filename digits after "_emu_" or "_grid_", then
-    # augmented with known conventions for CV grids (e.g. inclination
-    # variants always present, boundary-layer params absent in "no_bl").
+    # discover which parameter indices this grid supports.  The registry gives
+    # the complete supported set for the selected grid, while filenames provide
+    # the specific parameter tag for saved emulators/grids.
 
     _emu_dir = "Grid-Emulator_Files"
     _filtered_emus = []
+    from Speculate_addons.grid_registry import get_grid_config as _get_grid_config, parse_param_tag as _parse_param_tag
 
-    # Grid Parameter Detection
+    # Grid Parameter Detection.  Prefer registry metadata so AGN and CV grids do
+    # not need separate filename heuristics for boundary-layer or inclination axes.
     grid_indices = set()
+    _param_map_db = inf_param_map_db_for_grid(grid_selector.value)
+    _grid_config = _get_grid_config(grid_selector.value)
+    if _grid_config is not None:
+        grid_indices.update(_grid_config.get("max_params", []))
 
     if grid_selector.value and os.path.exists(_emu_dir):
         _files = [f for f in os.listdir(_emu_dir) if f.endswith(".npz")]
@@ -431,22 +424,15 @@ def _(get_loaded_emu_filename, get_selected_emu_filename, grid_selector, mo, on_
                 if "_emu_" in _f:
                     _filtered_emus.append(_f)
 
-                # Check for parameters based on digits after _emu_ or _grid_
-                # Match _emu_(\d+) or _grid_(\d+)
-                _m = re.search(r"(_emu_|_grid_)(\d+)", _f)
+                # Check for parameters based on the tag after _emu_ or _grid_.
+                # parse_param_tag() uses the increasing-ID convention to
+                # disambiguate concatenated IDs such as 12391011.
+                _m = re.search(r"(_emu_|_grid_)([^_]+)", _f)
                 if _m:
-                    _digits = _m.group(2)
-                    for _d in _digits:
-                        grid_indices.add(int(_d))
-
-    # Force inclusion of specific parameters based on Grid Name conventions (cv)
-    if grid_selector.value and "cv" in grid_selector.value:
-         # Inclination variants (9, 10, 11) are present in the grid definition
-         grid_indices.update([9, 10, 11])
-
-         # 7, 8 are Boundary Layer, present unless specifically "no_bl"
-         if "_no_bl_" not in grid_selector.value and "_no-bl_" not in grid_selector.value:
-              grid_indices.update([7, 8])
+                    try:
+                        grid_indices.update(_parse_param_tag(_m.group(2)))
+                    except ValueError:
+                        pass
 
     _filtered_emus = sorted(_filtered_emus)
 
@@ -485,11 +471,11 @@ def _(get_loaded_emu_filename, get_selected_emu_filename, grid_selector, mo, on_
     if grid_indices:
         _sorted_ind = sorted(list(grid_indices))
         for _idx in _sorted_ind:
-            if _idx in param_map_db:
-                 _p_name = param_map_db[_idx][0]
-                 _param_lookup_info.append(f"**{_idx}** -> `{_p_name}`")
+            if _idx in _param_map_db:
+                _p_name = _param_map_db[_idx][0]
+                _param_lookup_info.append(f"**{_idx}** -> `{_p_name}`")
             else:
-                 _param_lookup_info.append(f"**{_idx}** -> `Unknown`")
+                _param_lookup_info.append(f"**{_idx}** -> `Unknown`")
     else:
         _param_lookup_info.append("No parameters detected from filenames.")
 
@@ -566,6 +552,7 @@ def _(mo, obs_file_uploader, os, set_obs_refresh):
 def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
     # Build the selectable observation-file list and, when possible, the paired
     # test-grid metadata derived from the currently selected emulator grid.
+    from Speculate_addons.grid_registry import get_grid_config as _get_grid_config
 
     # Trigger refresh on upload or delete
     _ = obs_file_uploader.value
@@ -587,10 +574,12 @@ def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
     test_grid_params_df = None
 
     if grid_selector.value:
-        # The emulator grids and validation test grids follow the same naming
-        # convention, with only the "_grid_" / "_testgrid_" token changing.
+        # The registry records the paired validation grid where available.  The
+        # string replacement is kept only as a backward-compatible fallback for
+        # older emulator names that predate the registry.
         _grid_name = grid_selector.value
-        _test_grid_name = _grid_name.replace("_grid_", "_testgrid_")
+        _grid_config = _get_grid_config(_grid_name)
+        _test_grid_name = _grid_config.get("test_grid_name") if _grid_config else _grid_name.replace("_grid_", "_testgrid_")
         test_grid_path = f"sirocco_grids/{_test_grid_name}"
 
         if os.path.exists(test_grid_path):
@@ -610,7 +599,8 @@ def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
 
 
 @app.cell
-def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
+def _(grid_selector, mo, obs_files, os, set_obs_refresh, test_grid_files):
+    from Speculate_addons.grid_registry import default_fixed_inclination as _default_fixed_inclination, inclination_values as _get_inclination_values
 
     # Dropdown for selecting observation file
     if obs_files:
@@ -665,10 +655,13 @@ def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
         on_click=lambda _: delete_selected_file()
     )
 
-    # Inclination selector for test grid (spec files have multiple angles)
+    # Inclination selector for test grids.  CV and AGN .spec files expose
+    # different angle sets, so both the options and default come from the registry.
+    _inclination_values = _get_inclination_values(grid_selector.value if grid_selector is not None else None)
+    _default_inclination = _default_fixed_inclination(grid_selector.value if grid_selector is not None else None)
     test_inclination_selector = mo.ui.dropdown(
-        options=["30", "35", "40", "45", "50", "55", "60", "65", "70", "75", "80", "85"],
-        value="55",
+        options=[str(value) for value in _inclination_values],
+        value=str(_default_inclination),
         label="Inclination (°):",
         full_width=True
     )
@@ -753,6 +746,7 @@ def _(
     data_source_selector,
     emu,
     emulator_selector,
+    grid_selector,
     mo,
     np,
     obs_file_selector,
@@ -765,6 +759,8 @@ def _(
     test_run_selector,
 ):
     # Load observation data (from file OR test grid)
+    from Speculate_addons.grid_registry import inclination_column as _inclination_column, lookup_row_to_emulator_values as _lookup_row_to_emulator_values
+
     obs_data = None
     ground_truth_params = None  # For test grid validation
     _obs_dir = "observation_files"
@@ -790,10 +786,10 @@ def _(
                     break
 
             # After frequency and wavelength, the remaining columns are fluxes at
-            # fixed viewing angles; map the selected angle onto that column index.
+            # fixed viewing angles.  Use the registry rather than CV-only column
+            # arithmetic because AGN has a different angle grid.
             inc_val = int(test_inclination_selector.value)
-            inc_options = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85]
-            inc_col_idx = inc_options.index(inc_val) + 2  # +2 for Freq, Lambda columns
+            inc_col_idx = _inclination_column(grid_selector.value if grid_selector is not None else None, inc_val)
 
             # Flip both arrays so wavelength increases left-to-right in the UI.
             data_raw = np.loadtxt(spec_path, skiprows=skiprows, unpack=True)
@@ -811,22 +807,18 @@ def _(
                 'sigma_source': 'synthetic_sirocco_continuum',
             })
 
-            # Translate the lookup-table values into the emulator parameterisation:
-            # some parameters are stored in log space and wind.mdot is recovered as
-            # the wind-to-disk mass-loss ratio rather than an absolute value.
+            # Translate lookup-table values into the active emulator
+            # parameterisation.  The registry handles the CV ratio/log transforms
+            # and the AGN Eddington-fraction/R_g-scaled transforms.
             if test_grid_params_df is not None:
                 run_num = int(test_run_selector.value.replace('run', '').replace('.spec', ''))
                 gt_row = test_grid_params_df[test_grid_params_df['Run Number'] == run_num]
                 if len(gt_row) > 0:
-                    ground_truth_params = {
-                        'disk.mdot': np.log10(gt_row['Disk.mdot(msol/yr)'].values[0]),
-                        'wind.mdot': gt_row['Wind.mdot(msol/yr)'].values[0] / gt_row['Disk.mdot(msol/yr)'].values[0],  # Ratio
-                        'KWD.d': np.log10(gt_row['KWD.d(in_units_of_rstar)'].values[0]),
-                        'KWD.mdot_r_exponent': gt_row['KWD.mdot_r_exponent'].values[0],
-                        'KWD.acceleration_length': np.log10(gt_row['KWD.acceleration_length(cm)'].values[0]),
-                        'KWD.acceleration_exponent': gt_row['KWD.acceleration_exponent'].values[0],
-                        'Inclination': inc_val
-                    }
+                    ground_truth_params = _lookup_row_to_emulator_values(
+                        grid_selector.value if grid_selector is not None else None,
+                        gt_row.iloc[0],
+                        inc_val,
+                    )
 
             data_source_info = f"Test Grid: {test_run_selector.value} @ {inc_val}°"
 
@@ -1182,7 +1174,7 @@ def _(mo):
 
 
 @app.cell
-def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_scale, param_map_db, re, wl_range_slider):
+def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
     # ── Parameter Playground ──
     # Interactive sliders for the nuisance/inference parameters and the
     # physical grid axes so the user can visually explore how each shifts
@@ -1195,6 +1187,7 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
     _playground_ui = mo.md("*Load an emulator and observation data to use the playground.*")
 
     if emu is not None:
+        _param_map_db = inf_param_map_db_for_grid(grid_selector.value if grid_selector is not None else None)
         # Midpoint physical parameters for preview
         if hasattr(emu, 'min_params') and hasattr(emu, 'max_params'):
             pg_mid_params = (np.array(emu.min_params) + np.array(emu.max_params)) / 2.0
@@ -1319,10 +1312,10 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
                 if _m:
                     _db_idx = int(_m.group(1))
 
-            if _db_idx is not None and _db_idx in param_map_db:
-                _base_name = param_map_db[_db_idx][0]
-                _is_log = (len(param_map_db[_db_idx]) > 3
-                           and bool(param_map_db[_db_idx][3]))
+            if _db_idx is not None and _db_idx in _param_map_db:
+                _base_name = _param_map_db[_db_idx][0]
+                _is_log = (len(_param_map_db[_db_idx]) > 3
+                           and bool(_param_map_db[_db_idx][3]))
                 _label = f"log10({_base_name})" if _is_log else _base_name
             else:
                 _label = str(_pname)
@@ -1825,7 +1818,7 @@ def _(
 
 
 @app.cell
-def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_scale, param_map_db, re, wl_range_slider):
+def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
     # ── Stage 2: Prior & Parameter Setup ──
     # Build per-parameter UI widgets (fixed/free toggle, value, min, max) that
     # drive the prior construction in Stage 3.  Parameters fall into two groups:
@@ -1849,6 +1842,7 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
 
     # Parameter Mapping Dictionary
     if emu is not None:
+        _param_map_db = inf_param_map_db_for_grid(grid_selector.value if grid_selector is not None else None)
         current_names = []
         sorted_indices = sorted(list(grid_indices)) if grid_indices else []
 
@@ -1857,10 +1851,10 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
         # otherwise fall back to parsing the internal paramX labels directly.
         if len(sorted_indices) == len(emu.param_names):
              for idx in sorted_indices:
-                 if idx in param_map_db:
-                     _p_name = param_map_db[idx][0]
+                 if idx in _param_map_db:
+                     _p_name = _param_map_db[idx][0]
                      current_names.append(_p_name)
-                     if param_map_db[idx][3]:
+                     if _param_map_db[idx][3]:
                          log10_params.add(_p_name)
                  else:
                      current_names.append(f"Param {idx} (Unknown)")
@@ -1870,10 +1864,10 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
                 match = re.search(r'param(\d+)', _p)
                 if match:
                     idx = int(match.group(1))
-                    if idx in param_map_db:
-                        current_names.append(param_map_db[idx][0])
-                        if param_map_db[idx][3]:
-                            log10_params.add(param_map_db[idx][0])
+                    if idx in _param_map_db:
+                        current_names.append(_param_map_db[idx][0])
+                        if _param_map_db[idx][3]:
+                            log10_params.add(_param_map_db[idx][0])
                     else:
                         current_names.append(f"Param {idx}")
                 else:

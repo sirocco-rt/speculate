@@ -2979,11 +2979,40 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(mo, run_btn, tier2_freeze_controls, tier_picker):
+def _(emu_picker, matched_grid_path, matched_testgrid_path, mo, run_btn, tier2_freeze_controls, tier_picker):
     _selected_tiers = set(tier_picker.value or [])
     _items = []
     if 2 in _selected_tiers or "Tier 2" in _selected_tiers:
         _items.append(tier2_freeze_controls)
+
+    # Pre-trained emulators can be downloaded before the matching processed
+    # Tier 1 grid or decompressed Tier 2 test grid exists locally.  Surface any
+    # inferred resource that is still shown as "not found" so a fresh install
+    # has an obvious path to make the affected benchmark tier runnable.
+    _emu_selected = bool(emu_picker.value)
+    _missing_messages = []
+    if _emu_selected and not matched_grid_path:
+        _missing_messages.append(
+            "**Grid (Tier 1)** is missing. To generate the grid file, go to the "
+            "Training notebook, select the emulator in the Load a pre-trained "
+            "emulator dropdown, and press the Test PCA button."
+        )
+    if _emu_selected and not matched_testgrid_path:
+        _missing_messages.append(
+            "**Test Grid (Tier 2)** is missing. To retrieve the test grid, "
+            "download and decompress the grid in the Model Downloader notebook."
+        )
+    if _missing_messages:
+        _items.append(
+            mo.callout(
+                mo.md(
+                    "### Missing benchmark input\n\n"
+                    + "\n\n".join(f"- {_message}" for _message in _missing_messages)
+                    + "\n\nOnly tiers that need a missing input are blocked when you run the benchmark."
+                ),
+                kind="warn",
+            )
+        )
     _items.append(run_btn)
     mo.vstack(_items)
     return
@@ -3073,6 +3102,15 @@ def _(
         # The picker stores numeric tier ids; keep the selected run isolated to
         # this execution so later reactive reruns do not reuse stale results.
         _tiers = [_v for _v in (tier_picker.value or [])]
+        _missing_run_inputs = []
+        if (1 in _tiers or "Tier 1" in _tiers) and not matched_grid_path:
+            _missing_run_inputs.append("Tier 1 grid")
+        if (2 in _tiers or "Tier 2" in _tiers) and not matched_testgrid_path:
+            _missing_run_inputs.append("Tier 2 test grid")
+        if _missing_run_inputs:
+            set_status_msg(f"Error: missing required benchmark input(s): {', '.join(_missing_run_inputs)}.")
+            mo.stop(True)
+
         _ts = time.strftime("%Y%m%d_%H%M%S")
         _run_stem = f"benchmark_report_live_{_ts}"
         _out_path = f"benchmark_results/{_run_stem}.json"

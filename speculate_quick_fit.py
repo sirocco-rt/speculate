@@ -258,43 +258,46 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
 
 @app.cell
 def _():
-    # Parameter database: maps Sirocco parameter index → (human-readable name, min, max, is_log).
-    # These are the physical parameters that define each grid spectrum.
-    # Params 1-6 are common to both no-BL and BL grids.
-    # Params 7-8 exist only in BL grids (boundary layer luminosity/temperature).
-    # Param 11 = viewing inclination angle (30°–85°), shared by both grids.
-    # Note: params 9, 10 were sparse/mid inclination options, now removed.
-    # is_log=True means the emulator-space value is log10 of the physical quantity.
-    param_map_db = {
-        1: ("disk.mdot", 0.0, 1.0, True),
-        2: ("wind.mdot", 0.0, 1.0, False),
-        3: ("KWD.d", 0.0, 1.0, True),
-        4: ("KWD.mdot_r_exponent", 0.0, 1.0, False),
-        5: ("KWD.acceleration_length", 0.0, 1.0, True),
-        6: ("KWD.acceleration_exponent", 0.0, 1.0, False),
-        7: ("Boundary_layer.luminosity", 0.0, 1.0, True),
-        8: ("Boundary_layer.temp", 0.0, 1.0, False),
-        11: ("Inclination", 30.0, 85.0, False),
-    }
-    return (param_map_db,)
+    from Speculate_addons.grid_registry import param_map_db as _registry_param_map_db
+
+    def qf_param_map_db_for_grid(grid_name=None):
+        """Return Quick Fit parameter labels/ranges from the shared registry."""
+        return _registry_param_map_db(grid_name)
+
+    param_map_db = qf_param_map_db_for_grid()
+    return param_map_db, qf_param_map_db_for_grid
 
 
 @app.cell
 def _():
-    # Parameter IDs 9-11 encode inclination as trainable grid axes.  If no such
-    # axis is selected, Quick Fit trains against one fixed inclination column.
-    _qf_inclination_param_ids = {9, 10, 11}
-    qf_fixed_inclination_values = list(range(30, 90, 5))
+    # Quick Fit uses the same inclination helpers as the Training Tool, but keeps
+    # qf_* wrappers so existing reactive cells do not need to know about registry
+    # argument ordering.
+    from Speculate_addons.grid_registry import (
+        default_fixed_inclination as _default_fixed_inclination,
+        format_param_tag,
+        has_trainable_inclination as _has_trainable_inclination,
+        inclination_to_usecols as _inclination_to_usecols,
+        inclination_values as _inclination_values,
+    )
 
-    def qf_has_trainable_inclination(param_values):
+    def qf_has_trainable_inclination(param_values, grid_name=None):
         """Return whether selected Quick Fit parameters include inclination."""
-        return any(int(param_value) in _qf_inclination_param_ids for param_value in (param_values or []))
+        return _has_trainable_inclination(grid_name, param_values)
 
-    def qf_fixed_inclination_to_usecols(base_usecols, inclination):
+    def qf_fixed_inclination_values_for_grid(grid_name=None):
+        """Return valid fixed observer angles for the selected grid."""
+        return _inclination_values(grid_name)
+
+    def qf_fixed_inclination_to_usecols(base_usecols, inclination, grid_name=None):
         """Map a fixed inclination angle to the grid-interface flux column."""
-        return (base_usecols[0], int(2 + (float(inclination) - 30.0) / 5.0))
+        return _inclination_to_usecols(grid_name, base_usecols, inclination)
 
-    return qf_fixed_inclination_to_usecols, qf_fixed_inclination_values, qf_has_trainable_inclination
+    def qf_default_fixed_inclination(grid_name=None):
+        """Return the default fixed observer angle for a grid."""
+        return _default_fixed_inclination(grid_name)
+
+    return format_param_tag, qf_default_fixed_inclination, qf_fixed_inclination_to_usecols, qf_fixed_inclination_values_for_grid, qf_has_trainable_inclination
 
 
 @app.cell
@@ -353,30 +356,14 @@ def _(mo, qf_is_hf_mode):
 
 @app.cell
 def _(pathlib):
-    # Grid configuration registry: defines the two available Sirocco spectral grids.
-    # Each entry maps a grid folder name to its interface class, column range for
-    # reading .spec files, and the maximum parameter set (used for the param selector).
-    # - no-BL grid: 6 wind/disk params + inclination = 7 parameters
-    # - BL grid: 8 wind/disk/BL params + inclination = 9 parameters
-    # The grid interfaces (from Speculate_addons) handle reading .spec files and
-    # extracting spectra at each inclination angle.
-    from Speculate_addons.Spec_gridinterfaces import Speculate_cv_bl_grid_v87f
-    from Speculate_addons.Spec_gridinterfaces import Speculate_cv_no_bl_grid_v87f
+    # Grid configuration registry: maps every supported raw grid folder to its
+    # interface class, default .spec columns, parameter set, and grid-specific
+    # defaults.  Quick Fit asks for quickfit=True because it exposes compact
+    # parameter sets: CV no-BL has 6 physical params + inclination; CV BL has 8
+    # physical params + inclination; AGN has 8 physical params + inclination.
+    from Speculate_addons.grid_registry import get_grid_configs
 
-    qf_grid_configs = {
-        "speculate_cv_no-bl_grid_v87f": {
-            "class": Speculate_cv_no_bl_grid_v87f,
-            "usecols": (1, 7),
-            "name": "speculate_cv_no-bl_grid_v87f",
-            "max_params": [1, 2, 3, 4, 5, 6, 11],
-        },
-        "speculate_cv_bl_grid_v87f": {
-            "class": Speculate_cv_bl_grid_v87f,
-            "usecols": (1, 7),
-            "name": "speculate_cv_bl_grid_v87f",
-            "max_params": [1, 2, 3, 4, 5, 6, 7, 8, 11],
-        },
-    }
+    qf_grid_configs = get_grid_configs(quickfit=True)
 
     # Scan sirocco_grids/ for locally available grid folders.
     # Only folders that match a known grid config AND contain .spec files are listed.
@@ -537,10 +524,10 @@ def _(mo, qf_available_grids, qf_is_hf_mode, qf_pretrained_selector):
 @app.cell
 def _(
     mo,
-    param_map_db,
     qf_grid_configs,
     qf_grid_selector,
     qf_is_hf_mode,
+    qf_param_map_db_for_grid,
     qf_sirocco_grids_path,
 ):
     # Build the parameter multiselect widget based on the selected grid.
@@ -570,13 +557,20 @@ def _(
                     _pidx = int(_pk.replace("param", ""))
                     _param_names[_pidx] = _pd
             except Exception:
-                _param_names = {i: param_map_db[i][0] if i in param_map_db else f"Parameter {i}" for i in _max_params}
+                # If the raw grid cannot be opened yet, fall back to registry
+                # labels so users still see meaningful names in the selector.
+                _param_map_db = qf_param_map_db_for_grid(_selected)
+                _param_names = {i: _param_map_db[i][0] if i in _param_map_db else f"Parameter {i}" for i in _max_params}
 
             _options = {
                 _param_names.get(i, f"Parameter {i}"): str(i)
                 for i in _max_params
             }
-            _default = [k for k, v in _options.items()]
+            # Registry defaults preserve grid-specific policy, including the AGN
+            # rule that two-point physical axes default to their higher value when
+            # omitted from a lower-dimensional model.
+            _default_params = [p for p in _config.get("default_params", _max_params) if p in _max_params]
+            _default = [_param_names.get(i, f"Parameter {i}") for i in _default_params]
 
             qf_params_selector = mo.ui.multiselect(
                 options=_options,
@@ -589,8 +583,10 @@ def _(
 @app.cell
 def _(
     mo,
-    qf_fixed_inclination_values,
+    qf_default_fixed_inclination,
+    qf_fixed_inclination_values_for_grid,
     qf_has_trainable_inclination,
+    qf_grid_selector,
     qf_is_hf_mode,
     qf_params_selector,
     qf_pretrained_selector,
@@ -605,11 +601,14 @@ def _(
         and not _pretrained_active
         and qf_params_selector is not None
         and qf_params_selector.value
-        and not qf_has_trainable_inclination(qf_params_selector.value)
+        and not qf_has_trainable_inclination(qf_params_selector.value, qf_grid_selector.value if qf_grid_selector is not None else None)
     ):
+        _grid_name = qf_grid_selector.value if qf_grid_selector is not None else None
+        _fixed_inclination_values = qf_fixed_inclination_values_for_grid(_grid_name)
+        _default_inclination = qf_default_fixed_inclination(_grid_name)
         qf_fixed_inclination_selector = mo.ui.dropdown(
-            options={f"{value}°": value for value in qf_fixed_inclination_values},
-            value="55°",
+            options={f"{value}°": value for value in _fixed_inclination_values},
+            value=f"{_default_inclination}°",
             label="Fixed Inclination:",
         )
 
@@ -690,6 +689,7 @@ def _(mo):
 
 @app.cell
 def _(
+    format_param_tag,
     np,
     os,
     qf_fixed_inclination_selector,
@@ -719,18 +719,20 @@ def _(
         _grid_name = qf_grid_selector.value  # e.g. "speculate_cv_no-bl_grid_v87f"
         _emu_dir = "Grid-Emulator_Files"
 
-        # Derive selected param indices to find matching processed grid file
+        # Derive selected param indices to find the matching processed grid file.
+        # format_param_tag() preserves the original concatenated filename
+        # convention for sorted param IDs, including 10 and 11.
         _selected_indices = []
         if qf_params_selector is not None and qf_params_selector.value:
             _selected_indices = sorted([int(v) for v in qf_params_selector.value])
 
-        _inclination_fixed = bool(_selected_indices) and not qf_has_trainable_inclination(_selected_indices)
+        _inclination_fixed = bool(_selected_indices) and not qf_has_trainable_inclination(_selected_indices, _grid_name)
         _fixed_inc = int(qf_fixed_inclination_selector.value) if qf_fixed_inclination_selector is not None else 55
         _fixed_inc_suffix = f"_{_fixed_inc}inc" if _inclination_fixed else ""
 
         # Build the EXACT expected filename so only a grid with the same params,
         # scale, smoothing, fixed inclination AND wavelength range can match.
-        _param_tag = "".join(str(i) for i in _selected_indices) if _selected_indices else ""
+        _param_tag = format_param_tag(_selected_indices) if _selected_indices else ""
         _scale = qf_scale_selector.value
         _smooth_suffix = "_smooth" if qf_use_smoothing.value else ""
         _wl_lo_tag = int(round(qf_wl_min.value))
@@ -799,15 +801,6 @@ def _(
         )
     else:
         _elements.append(qf_pretrained_selector)
-
-    if qf_pretrained_selector.value and qf_pretrained_selector.value != "":
-        _elements.append(
-            mo.callout(
-                mo.md(f"**Pre-trained model selected:** `{qf_pretrained_selector.value}`\n\n"
-                      "Skip to **Stage 3: Inference** below."),
-                kind="success",
-            )
-        )
 
     # ── Raw grid training config (local mode only) ───────────────────────
     # Hidden when a pre-trained model is selected so the UI is unambiguous.
@@ -904,6 +897,7 @@ def _(mo, qf_is_hf_mode, qf_pretrained_selector, torch):
 @app.cell
 def _(
     QFMarimoHDF5Creator,
+    format_param_tag,
     mo,
     np,
     os,
@@ -937,8 +931,8 @@ def _(
         # and save a compressed .npz for PCA testing and later training.
         _grid_name = qf_grid_selector.value
         _param_indices = sorted([int(v) for v in qf_params_selector.value])
-        _param_tag = "".join(str(i) for i in _param_indices)
-        _inclination_fixed = not qf_has_trainable_inclination(_param_indices)
+        _param_tag = format_param_tag(_param_indices)
+        _inclination_fixed = not qf_has_trainable_inclination(_param_indices, _grid_name)
         _fixed_inc = int(qf_fixed_inclination_selector.value) if qf_fixed_inclination_selector is not None else 55
         _fixed_inc_suffix = f"_{_fixed_inc}inc" if _inclination_fixed else ""
         _scale = qf_scale_selector.value
@@ -955,8 +949,11 @@ def _(
             try:
                 _config = qf_grid_configs[_grid_name]
                 _wl_range = (qf_wl_min.value, qf_wl_max.value)
+                # Fixed-inclination models bake a single .spec flux column into
+                # the processed grid; trainable-inclination models keep the
+                # registry interface's default column and vary inclination as an axis.
                 _usecols = (
-                    qf_fixed_inclination_to_usecols(_config["usecols"], _fixed_inc)
+                    qf_fixed_inclination_to_usecols(_config["usecols"], _fixed_inc, _grid_name)
                     if _inclination_fixed else _config["usecols"]
                 )
                 _iface = _config["class"](
@@ -1114,6 +1111,7 @@ def _(
     RegularGridInterpolator,
     alt,
     build_hidden_sizes,
+    format_param_tag,
     json,
     mo,
     nn,
@@ -1167,8 +1165,8 @@ def _(
     if _qf_grid_data_local is None and qf_grid_selector is not None and qf_grid_selector.value:
         _grid_name = qf_grid_selector.value
         _param_indices = sorted([int(v) for v in qf_params_selector.value])
-        _param_tag = "".join(str(i) for i in _param_indices)
-        _inclination_fixed_for_build = not qf_has_trainable_inclination(_param_indices)
+        _param_tag = format_param_tag(_param_indices)
+        _inclination_fixed_for_build = not qf_has_trainable_inclination(_param_indices, _grid_name)
         _fixed_inc_for_build = int(qf_fixed_inclination_selector.value) if qf_fixed_inclination_selector is not None else 55
         _fixed_inc_suffix = f"_{_fixed_inc_for_build}inc" if _inclination_fixed_for_build else ""
         _scale = qf_scale_selector.value
@@ -1184,7 +1182,7 @@ def _(
                     _config = qf_grid_configs[_grid_name]
                     _wl_range = (qf_wl_min.value, qf_wl_max.value)
                     _usecols = (
-                        qf_fixed_inclination_to_usecols(_config["usecols"], _fixed_inc_for_build)
+                        qf_fixed_inclination_to_usecols(_config["usecols"], _fixed_inc_for_build, _grid_name)
                         if _inclination_fixed_for_build else _config["usecols"]
                     )
                     _iface = _config["class"](
@@ -1204,7 +1202,9 @@ def _(
                 except Exception as _e:
                     mo.stop(True, mo.callout(mo.md(f"Grid build failed: {_e}"), kind="danger"))
 
-        # Load the freshly-built (or pre-existing) .npz
+        # Load the freshly-built (or pre-existing) .npz.  Newer processed grids
+        # include grid_name/source_file so saved Quick Fit emulators can recover
+        # the correct registry entry without parsing filenames.
         if os.path.exists(_grid_path):
             try:
                 _npz = np.load(_grid_path, allow_pickle=True)
@@ -1235,9 +1235,10 @@ def _(
         _param_names = _qf_grid_data_local["param_names"]
 
         _selected_param_indices = [int(v) for v in qf_params_selector.value]
+        _active_grid_name = qf_grid_selector.value if qf_grid_selector is not None else _qf_grid_data_local.get("grid_name")
         _fixed_inclination_value = (
             float(qf_fixed_inclination_selector.value)
-            if (not qf_has_trainable_inclination(_selected_param_indices)
+            if (not qf_has_trainable_inclination(_selected_param_indices, _active_grid_name)
                 and qf_fixed_inclination_selector is not None)
             else None
         )
@@ -1366,7 +1367,8 @@ def _(
             "pca_per_wl_rmse": _pca_per_wl_rmse,
             "scale": _scale,
             "smoothing": qf_use_smoothing.value,
-            "source_grid_file": qf_grid_selector.value,
+            "grid_name": _active_grid_name,
+            "source_grid_file": _qf_grid_data_local.get("source_file", ""),
             "selected_param_indices": _selected_param_indices,
             "fixed_inclination": _fixed_inclination_value,
         }
@@ -1983,8 +1985,8 @@ def _(
     alt,
     mo,
     np,
-    param_map_db,
     pd,
+    qf_param_map_db_for_grid,
     qf_input_scaler,
     qf_output_scaler,
     qf_pca_data,
@@ -2007,6 +2009,7 @@ def _(
     _Y_true = qf_pca_data["weights"].astype(np.float32)
     _n_comp = _Y_true.shape[1]
     _param_names = qf_pca_data["param_names"]
+    _param_map_db = qf_param_map_db_for_grid(qf_pca_data.get("grid_name"))
     _n_params = _X_grid.shape[1]
     _N = _X_grid.shape[0]
 
@@ -2015,7 +2018,7 @@ def _(
         _pn = _param_names[p_idx] if p_idx < len(_param_names) else f"param_{p_idx}"
         _m = re.search(r"(\d+)", str(_pn))
         _pidx = int(_m.group(1)) if _m else 0
-        return param_map_db[_pidx][0] if _pidx in param_map_db else str(_pn)
+        return _param_map_db[_pidx][0] if _pidx in _param_map_db else str(_pn)
 
     _unique_per_dim = [np.sort(np.unique(_X_grid[:, d])) for d in range(_n_params)]
 
@@ -2408,6 +2411,7 @@ def _(
 
 @app.cell
 def _(
+    format_param_tag,
     json,
     mo,
     np,
@@ -2441,10 +2445,12 @@ def _(
     _source = qf_train_info["source"]
 
     def _build_save_dict():
+        """Collect PCA, training, and registry metadata into one NPZ payload."""
         _fixed_inclination = qf_pca_data.get("fixed_inclination")
         _save_dict = {
             "model_type": _source,
             "best_hparams": json.dumps(qf_best_hparams or {}),
+            "grid_name": qf_pca_data.get("grid_name", ""),
             "source_grid_file": qf_pca_data["source_grid_file"],
             "eigenspectra": qf_pca_data["eigenspectra"],
             "flux_mean": qf_pca_data["flux_mean"],
@@ -2492,7 +2498,7 @@ def _(
     else:
         _tag = "qfnn"
     _grid_base = qf_grid_selector.value  # e.g. "speculate_cv_no-bl_grid_v87f"
-    _param_digits = "".join(str(i) for i in sorted(qf_pca_data["selected_param_indices"]))
+    _param_digits = format_param_tag(sorted(qf_pca_data["selected_param_indices"]))
     _scale = qf_pca_data["scale"]
     _smooth_suffix = "_smooth" if qf_pca_data["smoothing"] else ""
     _fixed_inclination = qf_pca_data.get("fixed_inclination")
@@ -2580,10 +2586,7 @@ def _(get_qf_inf_refresh, mo, os, qf_hf_model_cache_result, qf_pretrained_select
             label="Selected Quick Fit Model:",
             full_width=True,
         )
-        qf_inf_model_picker = mo.callout(
-            mo.md(f"**Quick Fit model:** `{_pre}`"),
-            kind="neutral",
-        )
+        qf_inf_model_picker = None
     else:
         _qf_options = {"— None (select a trained model) —": ""}
         _qf_options.update(_qf_files)
@@ -2627,12 +2630,15 @@ def _(
     qf_inf_is_grid_interp = False
 
     if qf_inf_model_selector.value and qf_inf_model_selector.value != "":
+        from Speculate_addons.grid_registry import has_trainable_inclination as _registry_has_trainable_inclination, infer_grid_name as _infer_grid_name
+
         _emu_dir = "Grid-Emulator_Files"
         _path = os.path.join(_emu_dir, qf_inf_model_selector.value)
         try:
             _npz = np.load(_path, allow_pickle=True)
             _model_type = str(_npz.get("model_type", "nn"))
             _param_names = list(_npz["param_names"])
+            _grid_name = str(_npz["grid_name"]) if "grid_name" in _npz else (_infer_grid_name(qf_inf_model_selector.value) or "")
 
             def _param_index(param_name):
                 """Extract the numeric parameter ID from saved names like param11."""
@@ -2649,7 +2655,9 @@ def _(
                     _idx for _idx in (_param_index(_name) for _name in _param_names)
                     if _idx is not None
                 ]
-            _has_trainable_inclination = any(_idx in {9, 10, 11} for _idx in _selected_param_indices)
+            # Use registry inclination metadata instead of assuming CV's {9,10,11}
+            # set; AGN has only param9/param10 inclination axes.
+            _has_trainable_inclination = _registry_has_trainable_inclination(_grid_name, _selected_param_indices)
 
             # fixed_inclination is optional for legacy files.  Missing metadata
             # means trainable inclination when an inclination axis is present;
@@ -2672,6 +2680,7 @@ def _(
             # Extract PCA reconstruction data and grid metadata.
             # These are shared by both NN and Grid Interp models.
             qf_inf_emu_data = {
+                "grid_name": _grid_name,
                 "grid_points": np.array(_npz["grid_points"]),
                 "weights": np.array(_npz["weights"]),
                 "eigenspectra": np.array(_npz["eigenspectra"]),
@@ -2987,8 +2996,10 @@ def _(
             kind="success"
         )
 
-    mo.vstack([
-        qf_inf_model_picker,
+    _stage3_controls = []
+    if qf_inf_model_picker is not None:
+        _stage3_controls.append(qf_inf_model_picker)
+    _stage3_controls.extend([
         _model_status,
         mo.md("---"),
         qf_obs_selector,
@@ -2997,6 +3008,7 @@ def _(
         mo.md("---"),
         _obs_status,
     ])
+    mo.vstack(_stage3_controls)
     return
 
 
@@ -3122,7 +3134,6 @@ def _(np, torch):
 def _(
     mo,
     np,
-    param_map_db,
     qf_inf_emu_data,
     qf_inf_input_scaler,
     qf_inf_is_grid_interp,
@@ -3131,6 +3142,7 @@ def _(
     qf_inf_wl_slider,
     qf_obs_data,
     qf_obs_scale_selector,
+    qf_param_map_db_for_grid,
     qf_predict_flux,
     qf_transform_observation_data,
     re,
@@ -3145,6 +3157,7 @@ def _(
     _param_names = qf_inf_emu_data["param_names"]
     _fixed_inclination = qf_inf_emu_data.get("fixed_inclination")
     _n_params = len(_param_names)
+    _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
 
     _fixed_toggles = []
     _value_inputs = []
@@ -3156,8 +3169,8 @@ def _(
         _name = _param_names[_i]
         _m = re.search(r"(\d+)", _name)
         _idx = int(_m.group(1)) if _m else 0
-        _base = param_map_db[_idx][0] if _idx in param_map_db else _name
-        _is_log = param_map_db[_idx][3] if _idx in param_map_db and len(param_map_db[_idx]) > 3 else False
+        _base = _param_map_db[_idx][0] if _idx in _param_map_db else _name
+        _is_log = _param_map_db[_idx][3] if _idx in _param_map_db and len(_param_map_db[_idx]) > 3 else False
         _display = f"log10({_base})" if _is_log else _base
 
         _lo = float(_min_p[_i])
@@ -3274,7 +3287,6 @@ def _(
 def _(
     mo,
     np,
-    param_map_db,
     qf_inf_emu_data,
     qf_inf_input_scaler,
     qf_inf_is_grid_interp,
@@ -3283,6 +3295,7 @@ def _(
     qf_inf_wl_slider,
     qf_obs_data,
     qf_obs_scale_selector,
+    qf_param_map_db_for_grid,
     qf_predict_flux,
     qf_transform_observation_data,
     re,
@@ -3307,6 +3320,7 @@ def _(
     _min_p = qf_inf_emu_data["min_params"]
     _max_p = qf_inf_emu_data["max_params"]
     _mid_params = (_min_p + _max_p) / 2.0
+    _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
     _wl_lo, _wl_hi = qf_inf_wl_slider.value
 
     # Auto-detect sensible log_scale centre from flux ratio.
@@ -3375,10 +3389,10 @@ def _(
 
         _m = re.search(r"(\d+)", str(_pname))
         _db_idx = int(_m.group(1)) if _m else None
-        if _db_idx is not None and _db_idx in param_map_db:
-            _base_name = param_map_db[_db_idx][0]
-            _is_log = (len(param_map_db[_db_idx]) > 3
-                       and bool(param_map_db[_db_idx][3]))
+        if _db_idx is not None and _db_idx in _param_map_db:
+            _base_name = _param_map_db[_db_idx][0]
+            _is_log = (len(_param_map_db[_db_idx]) > 3
+                       and bool(_param_map_db[_db_idx][3]))
             _label = f"log10({_base_name})" if _is_log else _base_name
         else:
             _label = str(_pname)
@@ -4324,6 +4338,7 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
         os.makedirs(_dir, exist_ok=True)
         try:
             from Speculate_addons.speculate_benchmark import emulator_to_physical
+            from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map, defaulted_physical_param_ids as _defaulted_physical_param_ids, infer_grid_name as _infer_grid_name
             from exports.templates.speculate_pf_exporter import write_pf
             import time as _time
 
@@ -4332,19 +4347,21 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
             _n_phys = qf_mle_result["n_physical"]
             _param_names = qf_inf_emu_data["param_names"]
 
-            physical = emulator_to_physical(_param_names, _best[:_n_phys])
-            _observer_angle = None
-            if _fixed_inclination is not None:
-                _observer_angle = float(_fixed_inclination)
-            elif "Inclination" in physical:
-                _observer_angle = float(physical["Inclination"])
-
             # Determine grid name from source file
             _src = qf_inf_emu_data.get("source_file", "unknown")
             # Strip _qfnn_/_qfnn-ensemble_/_qfgi_ suffix to recover grid name
             import re as _re
             _gn_match = _re.match(r"(.+?)_(qfnn-ensemble|qfnn|qfgi)_", _src)
-            _grid_name = _gn_match.group(1) if _gn_match else _src.split("_qf")[0]
+            _grid_name = qf_inf_emu_data.get("grid_name") or (_gn_match.group(1) if _gn_match else _infer_grid_name(_src))
+            if not _grid_name:
+                _grid_name = _src.split("_qf")[0]
+
+            physical = emulator_to_physical(_param_names, _best[:_n_phys], _grid_name)
+            _observer_angle = None
+            if _fixed_inclination is not None:
+                _observer_angle = float(_fixed_inclination)
+            elif "Inclination" in physical:
+                _observer_angle = float(physical["Inclination"])
 
             header = [
                 "### Sirocco .pf Template",
@@ -4355,6 +4372,16 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
             ]
             if _observer_angle is not None:
                 header.insert(-1, f"### Observer inclination: {_observer_angle:.6f}")
+
+            _defaulted_ids = _defaulted_physical_param_ids(_grid_name, _param_names)
+            if _defaulted_ids:
+                _param_map = _benchmark_param_map(_grid_name)
+                header.append("### Registry-defaulted physical parameters:")
+                for _param_id in _defaulted_ids:
+                    _, _key = _param_map.get(_param_id, (f"param{_param_id}", f"param{_param_id}"))
+                    if _key in physical:
+                        header.append(f"###   {_key}: {physical[_key]:.6g}")
+                header.append("###")
 
             _nuisance = {}
             for _i in range(_n_phys, len(_labels)):

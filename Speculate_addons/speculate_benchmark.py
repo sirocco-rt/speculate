@@ -30,6 +30,15 @@ import cma
 from scipy import stats
 from scipy.optimize import minimize as scipy_minimize
 
+from Speculate_addons.grid_registry import (
+    benchmark_param_map,
+    defaulted_physical_param_ids,
+    emulator_values_to_physical,
+    inclination_column,
+    infer_grid_name,
+    lookup_row_to_emulator_values,
+)
+
 log = logging.getLogger(__name__)
 
 _SIROCCO_CYCLE_RE = re.compile(
@@ -48,39 +57,20 @@ _SIROCCO_ION_CONVERGED_RE = re.compile(
 # ======================================================================
 # Parameter Mapping
 # ======================================================================
-# Maps the 1-based parameter index used in emulator filenames (e.g.
-# "param1", "param3") to a (friendly_name, sirocco_keyword) pair.
-#
-# Indices 1-6 are the Knigge-Wood-Drew (KWD) wind model parameters that
-# define the accretion disk and biconical wind geometry in Sirocco.
-# Indices 7-8 add a boundary-layer emission component (only present in
-# grids labelled "bl").  Indices 9-11 encode the observer inclination
-# at progressively finer angular resolution (sparse / mid / full).
-#
-# In emulator space, parameters 1, 3, and 5 are stored in log10; parameter 2
-# is the wind-to-disk mass-loss *ratio* rather than the absolute value.
-
-PARAM_MAP = {
-    1: ("disk.mdot", "Disk.mdot(msol/yr)"),          # log10(Msol/yr)
-    2: ("wind.mdot", "Wind.mdot(msol/yr)"),          # ratio: wind/disk
-    3: ("KWD.d", "KWD.d(in_units_of_rstar)"),        # log10(wind launch radius)
-    4: ("KWD.mdot_r_exponent", "KWD.mdot_r_exponent"),  # radial mdot power law
-    5: ("KWD.acceleration_length", "KWD.acceleration_length(cm)"),  # log10(cm)
-    6: ("KWD.acceleration_exponent", "KWD.acceleration_exponent"),  # velocity law exponent
-    7: ("Boundary_layer.luminosity", "Boundary_layer.luminosity(ergs/s)"),
-    8: ("Boundary_layer.temp", "Boundary_layer.temp(K)"),
-    9: ("Inclination", "Inclination"),   # sparse: 3 angles (30, 55, 80)
-    10: ("Inclination", "Inclination"),  # mid:    6 angles
-    11: ("Inclination", "Inclination"),  # full:  12 angles
-}
+# The registry supplies the parameter-index maps used by Tier 2 summaries and
+# Tier 3 exports.  All benchmark paths pass grid_name through to the
+# registry-aware helpers below.  For CV grids, param2 is the wind/disk mass-loss
+# ratio in emulator space and params 1, 3, and 5 are log10 axes; see
+# grid_registry.py for the AGN Eddington-fraction and R_g-scaled equivalents.
 
 
-def internal_to_friendly(param_names: Sequence[str]) -> List[str]:
-    """Map internal ``paramN`` names to human-readable names."""
+def internal_to_friendly(param_names: Sequence[str], grid_name: Optional[str] = None) -> List[str]:
+    """Map internal ``paramN`` names to grid-specific human-readable names."""
+    param_map = benchmark_param_map(grid_name)
     out = []
     for pn in param_names:
         idx = int(pn.replace("param", ""))
-        friendly, _ = PARAM_MAP.get(idx, (pn, pn))
+        friendly, _ = param_map.get(idx, (pn, pn))
         out.append(friendly)
     return out
 
@@ -102,19 +92,23 @@ TIER2_FRIENDLY_LABELS = {
 }
 
 
-def build_tier2_label_map(param_names: Sequence[str]) -> Dict[str, str]:
+def build_tier2_label_map(param_names: Sequence[str], grid_name: Optional[str] = None) -> Dict[str, str]:
     """Return friendly labels for Tier 2 grid and nuisance parameters."""
     label_map = {
         internal: friendly
-        for internal, friendly in zip(param_names, internal_to_friendly(param_names))
+        for internal, friendly in zip(param_names, internal_to_friendly(param_names, grid_name))
     }
     label_map.update(TIER2_FRIENDLY_LABELS)
     return label_map
 
 
-def build_tier2_freeze_defaults(param_names: Sequence[str]) -> dict:
-    """Return the default Tier 2 Stage 2/4 freeze dictionaries."""
-    label_map = build_tier2_label_map(param_names)
+def build_tier2_freeze_defaults(param_names: Sequence[str], grid_name: Optional[str] = None) -> dict:
+    """Return the default Tier 2 Stage 2/4 freeze dictionaries.
+
+    Grid parameter labels depend on the active registry entry, while nuisance
+    labels stay shared across grids.
+    """
+    label_map = build_tier2_label_map(param_names, grid_name)
     mle = {label: False for label in label_map}
     for mle_label in ("Av", "cheb:1"):
         if mle_label in mle:
@@ -162,39 +156,14 @@ def _apply_freeze_settings(model, freeze_params: Optional[dict], thaw_first: boo
     return applied
 
 
-def emulator_to_physical(param_names: Sequence[str], values: np.ndarray) -> dict:
+def emulator_to_physical(param_names: Sequence[str], values: np.ndarray, grid_name: Optional[str] = None) -> dict:
     """
     Convert emulator-space parameter values to physical Sirocco units.
 
-    Returns a dict mapping Sirocco parameter keywords to physical values.
+    Returns a dict mapping Sirocco parameter keywords to physical values.  The
+    registry fills omitted physical axes from grid defaults before converting.
     """
-    physical = {}
-    vals = np.atleast_1d(values)
-    for pn, v in zip(param_names, vals):
-        idx = int(pn.replace("param", ""))
-        friendly, sirocco_key = PARAM_MAP.get(idx, (pn, pn))
-        # The emulator does not store every parameter in native Sirocco units:
-        # some axes are log-transformed and param2 is represented as a ratio.
-        if idx == 1:
-            physical[sirocco_key] = 10 ** v  # log10(Msol/yr) -> Msol/yr
-        elif idx == 2:
-            # Wind mass loss is inferred as a fraction of disk.mdot and becomes
-            # an absolute quantity only after disk.mdot has been converted.
-            physical[sirocco_key] = v
-        elif idx == 3:
-            physical[sirocco_key] = 10 ** v  # log10(R_star) -> R_star
-        elif idx == 5:
-            physical[sirocco_key] = 10 ** v  # log10(cm) -> cm
-        else:
-            physical[sirocco_key] = v
-    # Compute absolute wind.mdot if both present
-    if "Disk.mdot(msol/yr)" in physical and "Wind.mdot(msol/yr)" in physical:
-        # Once both pieces exist in physical space, collapse the stored ratio into
-        # the absolute wind mass-loss rate expected by downstream Sirocco inputs.
-        physical["Wind.mdot(msol/yr)"] = (
-            physical["Wind.mdot(msol/yr)"] * physical["Disk.mdot(msol/yr)"]
-        )
-    return physical
+    return emulator_values_to_physical(grid_name, param_names, values)
 
 
 # ======================================================================
@@ -311,16 +280,17 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
 
 
 def _load_test_grid_spectrum(
-    spec_file: str, inclination: float, wl_range: Tuple[float, float]
+    spec_file: str, inclination: float, wl_range: Tuple[float, float], grid_name: Optional[str] = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load a Sirocco ``.spec`` file and extract wavelength, flux, and error arrays.
 
     Sirocco .spec files have a variable-length text header (comments starting
     with '#' and a column-label row beginning with 'Freq.'), followed by numeric
     data columns.  Column 0 is frequency (Hz), column 1 is wavelength (Å), and
-    columns 2+ hold the flux at successive viewing inclinations in 5-degree steps
-    starting from 30°.  Wavelengths in the file are descending; this function
-    flips them to ascending order.
+    columns 2+ hold fluxes at the grid's registered viewing inclinations.  CV
+    grids use 30-85 degrees in 5-degree steps; AGN uses 10, 25, 40, 55, 70, and
+    85 degrees.  Wavelengths in the file are descending; this function flips
+    them to ascending order.
     """
     # Determine header lines (skip comments, blank lines, and the 'Freq.' label row)
     skiprows = 0
@@ -336,9 +306,8 @@ def _load_test_grid_spectrum(
     # Column 0 = Freq (Hz), column 1 = Lambda (Å) — always use Lambda.
     # Flip to ascending wavelength order for consistency with the emulator.
     wl = np.flip(data[:, 1])
-    # Map the requested inclination angle to the correct data column:
-    # 30° → col 2, 35° → col 3, 40° → col 4, …
-    col = int(2 + (inclination - 30) / 5)
+    # Map the requested inclination angle to the correct data column.
+    col = inclination_column(grid_name, inclination)
     flux = np.flip(data[:, col])
 
     mask = (wl >= wl_range[0]) & (wl <= wl_range[1])
@@ -360,15 +329,16 @@ def _load_test_grid_spectrum(
 
 
 def _extract_ground_truth(
-    parquet_path: str, run_idx: int, emu_param_names: Sequence[str]
+    parquet_path: str, run_idx: int, emu_param_names: Sequence[str], grid_name: Optional[str] = None,
+    inclination: Optional[float] = None,
 ) -> dict:
     """Extract ground-truth parameters from the test grid's lookup table.
 
     The lookup table (a parquet file co-located with the .spec files) records the
     Sirocco simulation inputs for every run.  This function reads the raw physical
-    values, then applies the same forward transforms used during emulator training
-    (log10 for params 1, 3, and 5; wind/disk ratio for param 2) so the returned dict
-    lives in emulator space and is directly comparable to inference outputs.
+    values, then delegates to the registry so CV and AGN grids apply the same
+    forward transforms used during emulator training.  The returned dict lives
+    in emulator space and is directly comparable to inference outputs.
     """
     df = pd.read_parquet(parquet_path)
 
@@ -384,46 +354,9 @@ def _extract_ground_truth(
     else:
         row = df[df[run_col] == run_idx].iloc[0]
 
-    gt = {}
-    for pn in emu_param_names:
-        idx = int(pn.replace("param", ""))
-        friendly, sirocco_key = PARAM_MAP.get(idx, (pn, pn))
-
-        # Try to find the value in the parquet columns
-        value = None
-        for col in df.columns:
-            col_lower = col.lower().replace(" ", "").replace("(", "").replace(")", "")
-            key_lower = sirocco_key.lower().replace(" ", "").replace("(", "").replace(")", "")
-            if key_lower in col_lower or col_lower in key_lower:
-                raw = row[col]
-
-                # Apply forward transforms to match emulator space
-                if idx == 1:
-                    value = np.log10(raw) if raw > 0 else raw
-                elif idx == 2:
-                    # Wind.mdot in parquet is absolute (msol/yr)
-                    # Need to convert to fraction: wind/disk
-                    disk_mdot = None
-                    for dc in df.columns:
-                        if "disk" in dc.lower() and "mdot" in dc.lower():
-                            disk_mdot = row[dc]
-                            break
-                    value = raw / disk_mdot if disk_mdot and disk_mdot > 0 else raw
-                elif idx == 3:
-                    value = np.log10(raw) if raw > 0 else raw
-                elif idx == 5:
-                    value = np.log10(raw) if raw > 0 else raw
-                elif idx in (9, 10, 11):
-                    # Inclination is in degrees directly — might be labelled differently
-                    value = float(raw)
-                else:
-                    value = float(raw)
-                break
-
-        if value is not None:
-            gt[friendly] = float(value)
-
-    return gt
+    all_values = lookup_row_to_emulator_values(grid_name, row, inclination)
+    friendly_names = internal_to_friendly(emu_param_names, grid_name)
+    return {name: float(all_values[name]) for name in friendly_names if name in all_values}
 
 
 def _get_loc_scale(dist):
@@ -845,6 +778,7 @@ def run_mcmc_single(
     iteration_callback=None,
     freeze_nuisance: bool = False,
     freeze_params: Optional[Dict[str, bool]] = None,
+    grid_name: Optional[str] = None,
 ) -> dict:
     """
     Run MCMC on a SpectrumModel already set to MLE best-fit.
@@ -989,7 +923,8 @@ def run_mcmc_single(
 
     # Summary
     friendly = internal_to_friendly(
-        [l for l in model.labels if l.startswith("param")]
+        [l for l in model.labels if l.startswith("param")],
+        grid_name,
     )
     all_labels = []
     fi = 0
@@ -1325,6 +1260,16 @@ def run_tier2(
     """
     t0 = time.time()
     test_path = Path(test_grid_path)
+    # Prefer the test-grid path for grid inference because Tier 2 may run against
+    # an emulator object loaded from a generic file-like source with no name.
+    _tier_grid_name = infer_grid_name(str(test_path).replace("_testgrid_", "_grid_")) or infer_grid_name(getattr(emu, "name", None))
+    if _tier_grid_name is None:
+        log.warning(
+            "Could not infer grid family from Tier 2 test path '%s' or emulator name '%s'; "
+            "falling back to legacy CV no-BL metadata.",
+            test_path,
+            getattr(emu, "name", None),
+        )
 
     # Tier 2 is driven directly from the decompressed test-grid spectra, with the
     # optional max_spectra cap used to keep exploratory runs tractable in the UI.
@@ -1338,9 +1283,11 @@ def run_tier2(
     # The lookup parquet links each run file back to its known simulation inputs.
     parquet_file = ensure_lookup_table(test_path)
 
-    friendly_names = internal_to_friendly(emu.param_names)
+    # Friendly labels, freeze defaults, inclination columns, and ground-truth
+    # conversion all depend on the inferred grid family.
+    friendly_names = internal_to_friendly(emu.param_names, _tier_grid_name)
     n_params = len(emu.param_names)
-    _tier2_defaults = build_tier2_freeze_defaults(emu.param_names)
+    _tier2_defaults = build_tier2_freeze_defaults(emu.param_names, _tier_grid_name)
     _mle_defaults = _tier2_defaults["mle"]
     _mcmc_defaults = _tier2_defaults["mcmc"]
     mle_freeze_params = {
@@ -1368,7 +1315,7 @@ def run_tier2(
             progress_callback(_spec_idx, _n_total, sf.name, "loading")
 
         try:
-            wl, flux, sigma = _load_test_grid_spectrum(str(sf), inclination, wl_range)
+            wl, flux, sigma = _load_test_grid_spectrum(str(sf), inclination, wl_range, _tier_grid_name)
         except Exception as e:
             import traceback as _tb
             _msg = str(e)
@@ -1385,7 +1332,7 @@ def run_tier2(
         gt = {}
         if parquet_file.exists():
             try:
-                gt = _extract_ground_truth(str(parquet_file), run_idx, emu.param_names)
+                gt = _extract_ground_truth(str(parquet_file), run_idx, emu.param_names, _tier_grid_name, inclination)
             except Exception as e:
                 _msg = str(e)
                 log.warning(f"Failed to extract GT for {sf.name}: {_msg}")
@@ -1429,6 +1376,7 @@ def run_tier2(
                 nsteps=mcmc_steps,
                 burnin=mcmc_burnin,
                 freeze_params=mcmc_freeze_params,
+                grid_name=_tier_grid_name,
             )
         except Exception as e:
             import traceback as _tb
@@ -2056,9 +2004,10 @@ def _extract_posterior_mean_inclination(
     emu,
     samples: np.ndarray,
     friendly_labels: Sequence[str],
+    grid_name: Optional[str] = None,
 ) -> float:
     """Return the posterior-mean inclination used for the Sirocco observer."""
-    friendly_grid = internal_to_friendly(emu.param_names)
+    friendly_grid = internal_to_friendly(emu.param_names, grid_name)
     if "Inclination" not in friendly_grid:
         raise ValueError(
             "Tier 3 Sirocco comparison requires an emulator with an Inclination "
@@ -2228,6 +2177,7 @@ def run_tier3_single(
         nwalkers=mcmc_walkers, nsteps=mcmc_steps, burnin=mcmc_burnin,
         freeze_nuisance=True,
         iteration_callback=mcmc_iteration_callback,
+        grid_name=grid_name,
     )
     friendly_labels = mcmc.get("labels", [])
     internal_labels = mcmc.get("internal_labels", friendly_labels)
@@ -2300,7 +2250,7 @@ def run_tier3_single(
         reduced_chi2 = np.nan
 
     exact_inclination = _extract_posterior_mean_inclination(
-        emu, mcmc["samples"], friendly_labels
+        emu, mcmc["samples"], friendly_labels, grid_name
     )
 
     result = {
@@ -2326,7 +2276,7 @@ def run_tier3_single(
 
         _grid_means = []
         _uncertainties = {}
-        _friendly_grid = internal_to_friendly(emu.param_names)
+        _friendly_grid = internal_to_friendly(emu.param_names, grid_name)
         for _pn, _friendly in zip(emu.param_names, _friendly_grid):
             if _pn not in internal_labels:
                 raise ValueError(f"MCMC samples do not contain required grid parameter {_pn}")
@@ -2519,7 +2469,12 @@ def export_pf_template(
     if grid_name is None:
         raise ValueError("grid_name is required for Sirocco .pf template export")
 
-    physical = emulator_to_physical(emu.param_names, param_values)
+    # Convert from emulator coordinates into the exact physical keys expected by
+    # the selected Sirocco template.  For AGN this also inverts Eddington-fraction
+    # and R_g-scaled axes before the exporter generates QSOSED files.
+    physical = emulator_to_physical(emu.param_names, param_values, grid_name)
+    defaulted_ids = defaulted_physical_param_ids(grid_name, emu.param_names)
+    param_map = benchmark_param_map(grid_name)
 
     # Build the metadata header (### comments, ignored by Sirocco)
     header = [
@@ -2539,6 +2494,14 @@ def export_pf_template(
         header.append("### Global/Nuisance Parameters:")
         for k, v in global_params.items():
             header.append(f"###   {k}: {v:.6f}")
+        header.append("###")
+
+    if defaulted_ids:
+        header.append("### Registry-defaulted physical parameters:")
+        for param_id in defaulted_ids:
+            _, sirocco_key = param_map.get(param_id, (f"param{param_id}", f"param{param_id}"))
+            if sirocco_key in physical:
+                header.append(f"###   {sirocco_key}: {physical[sirocco_key]:.6g}")
         header.append("###")
 
     write_pf(
