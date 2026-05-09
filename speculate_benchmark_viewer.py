@@ -3131,6 +3131,9 @@ def _(
         _tier2_defaults = _build_tier2_freeze_defaults(_emu.param_names)
         _tier2_mle_freeze_settings = dict(tier2_mle_freeze.value or _tier2_defaults["mle"])
         _tier2_mcmc_freeze_settings = dict(tier2_mcmc_freeze.value or _tier2_defaults["mcmc"])
+        _mcmc_steps_val = mcmc_steps_slider.value
+        _mcmc_walkers_val = 64
+        _mcmc_burnin_val = 500
         _tier1_result = None
         _tier2_result = None
         _tier3_results = None
@@ -3196,9 +3199,6 @@ def _(
             _failures = 0
             _n_not_converged = 0
             _failure_log = []
-            _mcmc_steps_val = mcmc_steps_slider.value
-            _mcmc_walkers_val = 64
-            _mcmc_burnin_val = 500
 
             # Resume: load any previously checkpointed results
             if os.path.exists(_checkpoint_path):
@@ -3649,7 +3649,7 @@ def _(
                         wl_range=_tier3_wl_range,
                         mle_restarts=mle_restarts_slider.value,
                         mcmc_walkers=_mcmc_walkers_val,
-                        mcmc_steps=mcmc_steps_slider.value,
+                        mcmc_steps=_mcmc_steps_val,
                         mcmc_burnin=_mcmc_burnin_val,
                         grid_name=_grid_stem,
                         output_dir=_obs_export_dir,
@@ -3678,7 +3678,7 @@ def _(
             "test_grid": matched_testgrid_path,
             "tiers": _tiers,
             "mcmc_walkers": _mcmc_walkers_val,
-            "mcmc_steps": mcmc_steps_slider.value,
+            "mcmc_steps": _mcmc_steps_val,
             "mcmc_burnin": _mcmc_burnin_val,
             "mle_restarts": mle_restarts_slider.value,
             "max_spectra": max_spectra_slider.value,
