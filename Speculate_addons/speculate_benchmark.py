@@ -1753,8 +1753,18 @@ def _run_command_logged(
     log_path: Union[str, Path],
     progress_callback=None,
     signal_path: Optional[Union[str, Path]] = None,
-) -> None:
-    """Run a subprocess, capture combined output, and raise with log context."""
+    append: bool = False,
+    raise_on_error: bool = True,
+) -> int:
+    """Run a subprocess, capture combined output, and return its exit code."""
+    command_display = " ".join(command)
+    log_mode = "a" if append else "w"
+
+    def _write_command_header(log_file) -> None:
+        if append and log_file.tell() > 0:
+            log_file.write("\n\n")
+        log_file.write("$ " + command_display + "\n\n")
+
     if progress_callback is None or signal_path is None:
         completed = subprocess.run(
             command,
@@ -1764,15 +1774,15 @@ def _run_command_logged(
             stderr=subprocess.STDOUT,
             check=False,
         )
-        with open(log_path, "w") as log_file:
-            log_file.write("$ " + " ".join(command) + "\n\n")
+        with open(log_path, log_mode) as log_file:
+            _write_command_header(log_file)
             log_file.write(completed.stdout or "")
         return_code = completed.returncode
     else:
         offset = 0
         last_event_key = None
-        with open(log_path, "w") as log_file:
-            log_file.write("$ " + " ".join(command) + "\n\n")
+        with open(log_path, log_mode) as log_file:
+            _write_command_header(log_file)
             log_file.flush()
             process = subprocess.Popen(
                 command,
@@ -1789,11 +1799,12 @@ def _run_command_logged(
             return_code = process.returncode
             _poll_sirocco_signal(signal_path, offset, last_event_key, progress_callback)
 
-    if return_code != 0:
+    if return_code != 0 and raise_on_error:
         raise RuntimeError(
             f"Command failed with exit code {return_code}: "
-            f"{' '.join(command)}. See {_repo_relative(log_path)}"
+            f"{command_display}. See {_repo_relative(log_path)}"
         )
+    return return_code
 
 
 def run_sirocco_pf(
@@ -1807,6 +1818,8 @@ def run_sirocco_pf(
     `.pf` file's directory so fixed-name outputs, such as ``run0.spec``, remain
     isolated per observation. If provided, ``progress_callback`` receives
     best-effort cycle updates parsed from Sirocco's live ``root.sig`` file.
+    Multi-CPU MPI runs first try the standard ``mpirun -np`` form, then retry
+    with ``--use-hwthread-cpus`` if the standard command fails.
     """
     pf_path = Path(pf_path)
     work_dir = pf_path.parent
@@ -1830,18 +1843,52 @@ def run_sirocco_pf(
         command = [runtime["mpirun"], "-np", str(cpus), runtime["sirocco"], pf_path.name]
     else:
         command = [runtime["sirocco"], pf_path.name]
+    successful_command = command
     _emit_progress(progress_callback, {
         "phase": "sirocco",
         "state": "started",
         "message": "Simulation started; waiting for cycle log",
     })
-    _run_command_logged(
-        command,
-        work_dir,
-        run_log,
-        progress_callback=progress_callback,
-        signal_path=signal_path,
-    )
+    if cpus > 1:
+        return_code = _run_command_logged(
+            command,
+            work_dir,
+            run_log,
+            progress_callback=progress_callback,
+            signal_path=signal_path,
+            raise_on_error=False,
+        )
+        if return_code != 0:
+            fallback_command = [
+                runtime["mpirun"],
+                "--use-hwthread-cpus",
+                "-np",
+                str(cpus),
+                runtime["sirocco"],
+                pf_path.name,
+            ]
+            _emit_progress(progress_callback, {
+                "phase": "sirocco",
+                "state": "retrying",
+                "message": "MPI run failed; retrying with hardware-thread CPUs",
+            })
+            _run_command_logged(
+                fallback_command,
+                work_dir,
+                run_log,
+                progress_callback=progress_callback,
+                signal_path=signal_path,
+                append=True,
+            )
+            successful_command = fallback_command
+    else:
+        _run_command_logged(
+            command,
+            work_dir,
+            run_log,
+            progress_callback=progress_callback,
+            signal_path=signal_path,
+        )
 
     spec_files = _find_sirocco_spec_files(pf_path)
     if not spec_files:
@@ -1850,7 +1897,7 @@ def run_sirocco_pf(
         )
 
     return {
-        "command": " ".join(command),
+        "command": " ".join(successful_command),
         "setup_log_path": str(setup_log),
         "run_log_path": str(run_log),
         "signal_log_path": str(signal_path),
@@ -1901,22 +1948,26 @@ def _transform_flux_for_scale(
     wl: np.ndarray,
     flux: np.ndarray,
     flux_scale: str,
-    reference_wl: Optional[np.ndarray] = None,
-    reference_flux: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Transform a native linear-flux spectrum onto the benchmark fit scale."""
+    """Transform a native linear-flux spectrum onto the emulator fit scale."""
+    wl = np.asarray(wl, dtype=np.float64)
     flux = np.asarray(flux, dtype=np.float64)
     if flux_scale == "log":
-        return np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
+        flux = np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
+        finite = np.isfinite(flux)
+        offset = float(np.mean(flux[finite])) if np.any(finite) else 0.0
+        return flux - offset
     if flux_scale == "continuum-normalised":
         from Speculate_addons.Spec_functions import fit_power_law_continuum
 
-        ref_wl = np.asarray(reference_wl if reference_wl is not None else wl, dtype=np.float64)
-        ref_flux = np.asarray(reference_flux if reference_flux is not None else flux, dtype=np.float64)
-        continuum, _ = fit_power_law_continuum(ref_wl, ref_flux)
-        order = np.argsort(ref_wl)
-        continuum = np.interp(wl, ref_wl[order], continuum[order])
-        return flux / np.where(continuum > 0, continuum, 1.0)
+        continuum, _ = fit_power_law_continuum(wl, flux)
+        flux = flux / np.where(continuum > 0, continuum, 1.0)
+
+    finite = np.isfinite(flux)
+    factor = float(np.mean(flux[finite])) if np.any(finite) else 1.0
+    if not np.isfinite(factor) or abs(factor) == 0.0:
+        factor = 1.0
+    flux = flux / factor
     return flux
 
 
@@ -2337,8 +2388,6 @@ def run_tier3_single(
             sirocco_wl,
             sirocco_flux,
             flux_scale,
-            reference_wl=wl,
-            reference_flux=flux,
         )
         sirocco_flux_plot = _apply_spectrum_nuisance_transforms(
             sirocco_wl,
