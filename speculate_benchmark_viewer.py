@@ -1798,6 +1798,8 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
     # ── Tier 2 Best-Fit Spectrum Plot ──
     # Reconstructs the Starfish-style 3-panel plot (data vs model, residuals,
     # relative error) from spectral arrays stored during the benchmark run.
+    import numpy as _np
+
     _posteriors = get_tier2_posteriors()
     mo.stop(_posteriors is None or len(_posteriors) == 0)
 
@@ -1807,26 +1809,58 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
     _inc = _post.get("inclination", 55.0)
     _converged = _post.get("converged", False)
     _conv_tag = "converged" if _converged else "not converged"
-    _bf = _post.get("bestfit_spec")
+    _mle_bf = _post.get("mle_bestfit_spec")
+    _posterior_bf = _post.get("posterior_mean_bestfit_spec") or _post.get("bestfit_spec")
 
     mo.stop(
-        not _bf,
+        not (_mle_bf or _posterior_bf),
         mo.md("*Best-fit spectrum data not available for this spectrum. Older reports and runs produced before the best-fit export fix will not have it.*"),
     )
 
-    _fig = build_bestfit_spectrum_altair(
-        alt,
-        wavelength=_bf["wavelength"],
-        data_flux=_bf["data_flux"],
-        model_flux=_bf["model_flux"],
-        model_cov_diag=_bf["model_cov_diag"],
-        title=f"Best-Fit Model — {_filename} @ {_inc:.0f}° ({_conv_tag})",
-        zoom_name=f"tier2_bestfit_zoom_{_post['run']}",
-    )
+    def _nll_suffix(value, diagnostics):
+        if value is None and isinstance(diagnostics, dict):
+            value = diagnostics.get("nll")
+        if value is None:
+            return ""
+        try:
+            value = float(value)
+        except Exception:
+            return ""
+        return f", NLL={value:.2f}" if _np.isfinite(value) else ""
+
+    _tabs = {}
+    if _mle_bf:
+        _mle_diag = _post.get("mle_likelihood_diagnostics", {})
+        _tabs["MLE Objective Optimum"] = build_bestfit_spectrum_altair(
+            alt,
+            wavelength=_mle_bf["wavelength"],
+            data_flux=_mle_bf["data_flux"],
+            model_flux=_mle_bf["model_flux"],
+            model_cov_diag=_mle_bf["model_cov_diag"],
+            title=(
+                f"MLE Best Fit — {_filename} @ {_inc:.0f}° "
+                f"({_conv_tag}{_nll_suffix(_post.get('mle_nll'), _mle_diag)})"
+            ),
+            zoom_name=f"tier2_mle_bestfit_zoom_{_post['run']}",
+        )
+    if _posterior_bf:
+        _pm_diag = _post.get("posterior_mean_likelihood_diagnostics", {})
+        _tabs["MCMC Posterior Mean"] = build_bestfit_spectrum_altair(
+            alt,
+            wavelength=_posterior_bf["wavelength"],
+            data_flux=_posterior_bf["data_flux"],
+            model_flux=_posterior_bf["model_flux"],
+            model_cov_diag=_posterior_bf["model_cov_diag"],
+            title=(
+                f"MCMC Posterior Mean — {_filename} @ {_inc:.0f}° "
+                f"({_conv_tag}{_nll_suffix(None, _pm_diag)})"
+            ),
+            zoom_name=f"tier2_posterior_mean_zoom_{_post['run']}",
+        )
 
     mo.vstack([
-        mo.md("#### Best-Fit Spectrum (MCMC Posterior Mean)"),
-        _fig,
+        mo.md("#### Spectrum Fits"),
+        mo.ui.tabs(_tabs) if len(_tabs) > 1 else next(iter(_tabs.values())),
     ])
     return
 
@@ -3213,7 +3247,11 @@ def _(
                             # best-fit spectrum export fix are incomplete for
                             # the Tier 2 viewer, so rerun those spectra rather
                             # than treating them as finished.
-                            if not _entry.get("bestfit_spec"):
+                            if not (
+                                _entry.get("bestfit_spec")
+                                or _entry.get("posterior_mean_bestfit_spec")
+                                or _entry.get("mle_bestfit_spec")
+                            ):
                                 continue
                             _completed_runs.add(_entry["run"])
                             _per_spectrum.append(_entry["spec_result"])
@@ -3246,6 +3284,18 @@ def _(
                                     _post_entry["burnin_used"] = _entry.get("burnin_used", 500)
                                 if "bestfit_spec" in _entry:
                                     _post_entry["bestfit_spec"] = _entry["bestfit_spec"]
+                                if "posterior_mean_bestfit_spec" in _entry:
+                                    _post_entry["posterior_mean_bestfit_spec"] = _entry["posterior_mean_bestfit_spec"]
+                                if "mle_bestfit_spec" in _entry:
+                                    _post_entry["mle_bestfit_spec"] = _entry["mle_bestfit_spec"]
+                                if "mle_nll" in _entry:
+                                    _post_entry["mle_nll"] = _entry["mle_nll"]
+                                if "mle_optimizer_nll" in _entry:
+                                    _post_entry["mle_optimizer_nll"] = _entry["mle_optimizer_nll"]
+                                if "mle_likelihood_diagnostics" in _entry:
+                                    _post_entry["mle_likelihood_diagnostics"] = _entry["mle_likelihood_diagnostics"]
+                                if "posterior_mean_likelihood_diagnostics" in _entry:
+                                    _post_entry["posterior_mean_likelihood_diagnostics"] = _entry["posterior_mean_likelihood_diagnostics"]
                                 if "prior_ranges" in _entry:
                                     _post_entry["prior_ranges"] = _entry["prior_ranges"]
                                 if "mle_all_params" in _entry:
@@ -3431,7 +3481,11 @@ def _(
                         "mcmc_converged": _mcmc["converged"],
                         "n_effective": _mcmc["n_effective"],
                         "mle_grid_params": _mle["grid_params"],
+                        "mle_nll": _mle.get("nll"),
+                        "mle_optimizer_nll": _mle.get("optimizer_nll", _mle.get("nll")),
                         "mle_all_params": _mle.get("all_params", {}),
+                        "mle_likelihood_diagnostics": _mle.get("mle_likelihood_diagnostics", {}),
+                        "posterior_mean_likelihood_diagnostics": _mcmc.get("posterior_mean_likelihood_diagnostics", {}),
                         "mle_freeze_settings": _mle.get("freeze_params", {}),
                         "mle_frozen_params": _mle.get("frozen_params", []),
                         "mcmc_freeze_settings": _mcmc.get("freeze_params", {}),
@@ -3457,6 +3511,12 @@ def _(
                         },
                         "truths": dict(_gt),
                         "bestfit_spec": _mcmc.get("bestfit_spec", {}),
+                        "posterior_mean_bestfit_spec": _mcmc.get("posterior_mean_bestfit_spec", _mcmc.get("bestfit_spec", {})),
+                        "posterior_mean_likelihood_diagnostics": _mcmc.get("posterior_mean_likelihood_diagnostics", {}),
+                        "mle_bestfit_spec": _mle.get("mle_bestfit_spec", {}),
+                        "mle_nll": _mle.get("nll"),
+                        "mle_optimizer_nll": _mle.get("optimizer_nll", _mle.get("nll")),
+                        "mle_likelihood_diagnostics": _mle.get("mle_likelihood_diagnostics", {}),
                         "mle_all_params": _mle.get("all_params", {}),
                         "mle_freeze_settings": _mle.get("freeze_params", {}),
                         "mle_frozen_params": _mle.get("frozen_params", []),
@@ -3515,6 +3575,12 @@ def _(
                         "converged": _mcmc["converged"],
                         "truths": dict(_gt),
                         "bestfit_spec": _mcmc.get("bestfit_spec", {}),
+                        "posterior_mean_bestfit_spec": _mcmc.get("posterior_mean_bestfit_spec", _mcmc.get("bestfit_spec", {})),
+                        "posterior_mean_likelihood_diagnostics": _mcmc.get("posterior_mean_likelihood_diagnostics", {}),
+                        "mle_bestfit_spec": _mle.get("mle_bestfit_spec", {}),
+                        "mle_nll": _mle.get("nll"),
+                        "mle_optimizer_nll": _mle.get("optimizer_nll", _mle.get("nll")),
+                        "mle_likelihood_diagnostics": _mle.get("mle_likelihood_diagnostics", {}),
                         "prior_ranges": _prior_ranges_dict,
                         "mle_all_params": _mle.get("all_params", {}),
                         "mle_freeze_settings": _mle.get("freeze_params", {}),

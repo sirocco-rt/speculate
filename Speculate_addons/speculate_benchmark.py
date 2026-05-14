@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 import cma
 from scipy import stats
+from scipy.linalg import cho_factor, cho_solve
 from scipy.optimize import minimize as scipy_minimize
 
 from Speculate_addons.grid_registry import (
@@ -137,6 +138,87 @@ def _serialise_freeze_settings(freeze_params: Optional[dict]) -> Dict[str, bool]
 def _snapshot_model_params(model) -> Dict[str, float]:
     """Capture the current SpectrumModel parameter state as plain floats."""
     return {str(label): float(model.params[label]) for label in model.params.keys()}
+
+
+def _as_numpy_array(value) -> np.ndarray:
+    """Convert numpy/torch-like arrays to a float64 numpy array."""
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=np.float64)
+
+
+def _model_bestfit_spectrum(model) -> dict:
+    """Evaluate the current SpectrumModel state and return JSON-safe plot arrays."""
+    model_flux, model_cov = model()
+    model_flux = _as_numpy_array(model_flux)
+    model_cov = _as_numpy_array(model_cov)
+    return {
+        "wavelength": _as_numpy_array(model.data.wave).tolist(),
+        "data_flux": _as_numpy_array(model.data.flux).tolist(),
+        "model_flux": model_flux.tolist(),
+        "model_cov_diag": np.diag(model_cov).tolist(),
+    }
+
+
+def _model_likelihood_diagnostics(model, priors: Optional[dict] = None) -> dict:
+    """Decompose the current model log-likelihood into objective terms."""
+    prior_lp = 0.0
+    prior_terms = {}
+    if priors:
+        for key, prior in priors.items():
+            if key not in model.params:
+                continue
+            value = float(model.params[key])
+            logpdf = float(prior.logpdf(value))
+            prior_terms[key] = {"value": value, "logpdf": logpdf}
+            prior_lp += logpdf
+
+    try:
+        model_flux, model_cov = model()
+        model_flux = _as_numpy_array(model_flux)
+        model_cov = _as_numpy_array(model_cov)
+        data_flux = _as_numpy_array(model.data.flux)
+
+        diag = np.diag(model_cov)
+        jitter = max(1e-35, 1e-6 * float(np.max(diag)))
+        cov = model_cov.copy()
+        cov[np.diag_indices_from(cov)] += jitter
+        cho, lower = cho_factor(cov, lower=True, check_finite=False)
+        residual = model_flux - data_flux
+        solved = cho_solve((cho, lower), residual, check_finite=False)
+        sqmah = float(residual @ solved)
+        logdet = float(2.0 * np.sum(np.log(np.diag(cho))))
+        ll_no_prior = float(-0.5 * (logdet + sqmah))
+        ll = float(ll_no_prior + prior_lp)
+        cov_diag = np.diag(cov)
+        return {
+            "nll": float(-ll),
+            "ll": ll,
+            "ll_no_prior": ll_no_prior,
+            "prior_lp": float(prior_lp),
+            "logdet": logdet,
+            "sqmah": sqmah,
+            "jitter": float(jitter),
+            "rms_resid": float(np.sqrt(np.mean(residual ** 2))),
+            "mean_abs_resid": float(np.mean(np.abs(residual))),
+            "median_abs_resid": float(np.median(np.abs(residual))),
+            "max_abs_resid": float(np.max(np.abs(residual))),
+            "data_flux_mean": float(np.mean(data_flux)),
+            "model_flux_mean": float(np.mean(model_flux)),
+            "cov_diag_min": float(np.min(cov_diag)),
+            "cov_diag_median": float(np.median(cov_diag)),
+            "cov_diag_max": float(np.max(cov_diag)),
+            "n_points": int(data_flux.size),
+            "params": _snapshot_model_params(model),
+            "prior_terms": prior_terms,
+        }
+    except Exception as exc:
+        return {
+            "diagnostic_error": str(exc),
+            "prior_lp": float(prior_lp),
+            "params": _snapshot_model_params(model),
+            "prior_terms": prior_terms,
+        }
 
 
 def _apply_freeze_settings(model, freeze_params: Optional[dict], thaw_first: bool = False) -> List[str]:
@@ -612,10 +694,18 @@ def run_mle_single(
             _nll = float(-model.log_likelihood(priors))
         except Exception:
             _nll = 1e10
+        try:
+            _mle_bestfit_spec = _model_bestfit_spectrum(model)
+        except Exception:
+            _mle_bestfit_spec = {}
+        _mle_diag = _model_likelihood_diagnostics(model, priors)
         return {
             "grid_params": model.grid_params.tolist(),
             "all_params": _snapshot_model_params(model),
             "nll": _nll,
+            "optimizer_nll": _nll,
+            "mle_bestfit_spec": _mle_bestfit_spec,
+            "mle_likelihood_diagnostics": _mle_diag,
             "success": True,
             "n_iter": 0,
             "labels": labels_before,
@@ -755,10 +845,22 @@ def run_mle_single(
     if soln.success:
         model.set_param_vector(soln.x)
 
+    try:
+        mle_bestfit_spec = _model_bestfit_spectrum(model)
+    except Exception:
+        mle_bestfit_spec = {}
+    mle_diagnostics = _model_likelihood_diagnostics(model, priors)
+    final_nll = float(soln.fun)
+    if np.isfinite(mle_diagnostics.get("nll", np.nan)):
+        final_nll = float(mle_diagnostics["nll"])
+
     return {
         "grid_params": model.grid_params.tolist(),
         "all_params": _snapshot_model_params(model),
-        "nll": float(soln.fun),
+        "nll": final_nll,
+        "optimizer_nll": float(soln.fun),
+        "mle_bestfit_spec": mle_bestfit_spec,
+        "mle_likelihood_diagnostics": mle_diagnostics,
         "success": bool(soln.success),
         "n_iter": int(soln.nit),
         "labels": labels_before,
@@ -976,22 +1078,14 @@ def run_mcmc_single(
     # store the arrays so the viewer can reconstruct the Starfish-style plot
     # without needing the live model object.
     bestfit_spec = {}
+    posterior_mean_diagnostics = {}
     try:
         _mean_params = {}
         for i, label in enumerate(_sampled_labels):
             _mean_params[label] = float(np.mean(flat[:, i]))
         model.set_param_dict(_mean_params)
-        _bf_flux, _bf_cov = model()
-        if hasattr(_bf_flux, 'detach'):
-            _bf_flux = _bf_flux.detach().cpu().numpy()
-        if hasattr(_bf_cov, 'detach'):
-            _bf_cov = _bf_cov.detach().cpu().numpy()
-        bestfit_spec = {
-            "wavelength": model.data.wave.tolist(),
-            "data_flux": model.data.flux.tolist(),
-            "model_flux": np.asarray(_bf_flux).tolist(),
-            "model_cov_diag": np.diag(np.asarray(_bf_cov)).tolist(),
-        }
+        bestfit_spec = _model_bestfit_spectrum(model)
+        posterior_mean_diagnostics = _model_likelihood_diagnostics(model, priors)
     except Exception:
         pass  # non-critical — viewer will skip the plot
 
@@ -1026,6 +1120,8 @@ def run_mcmc_single(
         "labels": all_labels,
         "internal_labels": _sampled_labels,
         "bestfit_spec": bestfit_spec,
+        "posterior_mean_bestfit_spec": bestfit_spec,
+        "posterior_mean_likelihood_diagnostics": posterior_mean_diagnostics,
         "freeze_params": dict(_requested_freeze),
         "frozen_params": list(_applied_freezes),
         "frozen_param_values": dict(_frozen_param_values),
