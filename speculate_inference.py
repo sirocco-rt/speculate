@@ -1022,7 +1022,7 @@ def _(
                  opacity=0.10, color='cyan'
              ).encode(
                  x=alt.X('Wavelength:Q'),
-                 y=alt.Y('Lower:Q'),
+                 y=alt.Y('Lower:Q', scale=alt.Scale(zero=False)),
                  y2=alt.Y2('Upper:Q'),
              )
 
@@ -1030,7 +1030,7 @@ def _(
              width="container",
              height=400,
              title=f"{data_source_info} [{_scale_label}]" if data_source_info else "Spectrum"
-         ).interactive()
+         ).interactive(bind_y=False)
 
     obs_plot_accordion = mo.accordion({
         f"{mo.icon('lucide:trending-up')} View Selected Spectrum": obs_chart if obs_chart else mo.md("No data loaded.")
@@ -1254,8 +1254,8 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
                 pass  # keep fallback values
 
         # Round for cleaner slider display
-        _ls_centre = round(_ls_centre, 1)
-        _la_centre = round(_la_centre, 1)
+        _ls_centre = round(_ls_centre, 2)
+        _la_centre = round(_la_centre, 2)
 
         # Nuisance slider ranges centred on auto-detected values
         pg_av_slider = mo.ui.slider(
@@ -1264,7 +1264,7 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
         )
         pg_logscale_slider = mo.ui.slider(
             start=_ls_centre - 10.0, stop=_ls_centre + 10.0,
-            value=_ls_centre, step=0.1,
+            value=_ls_centre, step=0.01,
             label="log_scale (ln flux scaling)", show_value=True, full_width=True,
         )
         pg_cheb1_slider = mo.ui.slider(
@@ -1273,11 +1273,11 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
         )
         pg_logamp_slider = mo.ui.slider(
             start=_la_centre - 15.0, stop=_la_centre + 15.0,
-            value=_la_centre, step=0.5,
+            value=_la_centre, step=0.01,
             label="log_amp (ln GP amplitude)", show_value=True, full_width=True,
         )
         pg_logls_slider = mo.ui.slider(
-            start=0.0, stop=15.0, value=4.5, step=0.1,
+            start=0.0, stop=15.0, value=4.5, step=0.01,
             label="log_ls (ln GP length scale)", show_value=True, full_width=True,
         )
 
@@ -1300,7 +1300,7 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
             _lo = float(emu.min_params[_pi]) if hasattr(emu, 'min_params') else 0.0
             _hi = float(emu.max_params[_pi]) if hasattr(emu, 'max_params') else 1.0
             _mid = (_lo + _hi) / 2.0
-            _step = max((_hi - _lo) / 200.0, 1e-6)
+            _step = max((_hi - _lo) / 300.0, 1e-6)
 
             # Prefer the grid_indices mapping when it lines up; otherwise
             # fall back to parsing "paramN" directly from the axis name.
@@ -1553,7 +1553,7 @@ def _(
 
             _lines = alt.Chart(_combined).mark_line(opacity=0.9).encode(
                 x=alt.X('Wavelength:Q', title='Wavelength (Å)'),
-                y=alt.Y('Flux:Q', title=_y_title, axis=alt.Axis(format=_y_format)),
+                y=alt.Y('Flux:Q', title=_y_title, axis=alt.Axis(format=_y_format), scale=alt.Scale(zero=False)),
                 color=alt.Color('Type:N', scale=_color_scale, legend=alt.Legend(title="Spectrum")),
                 tooltip=['Wavelength:Q', 'Flux:Q', 'Type:N'],
             )
@@ -1562,7 +1562,7 @@ def _(
                 opacity=0.15, color='orange',
             ).encode(
                 x=alt.X('Wavelength:Q'),
-                y=alt.Y('Lower:Q'),
+                y=alt.Y('Lower:Q', scale=alt.Scale(zero=False)),
                 y2=alt.Y2('Upper:Q'),
             )
 
@@ -1572,7 +1572,7 @@ def _(
                     opacity=0.10, color='cyan',
                 ).encode(
                     x=alt.X('Wavelength:Q'),
-                    y=alt.Y('Lower:Q'),
+                    y=alt.Y('Lower:Q', scale=alt.Scale(zero=False)),
                     y2=alt.Y2('Upper:Q'),
                 )
 
@@ -1580,7 +1580,7 @@ def _(
                 width="container",
                 height=400,
                 title=f"Playground: Emulated (midpoint params) vs Observation [{_scale_label}]",
-            ).interactive()
+            ).interactive(bind_y=False)
 
         except Exception as _e:
             _playground_chart = mo.callout(
@@ -2185,6 +2185,7 @@ def _(
     emu,
     fit_power_law_continuum,
     ground_truth_params,
+    grid_selector,
     log10_params,
     mle_max_iter,
     mle_method,
@@ -2752,16 +2753,28 @@ def _(
                 else:
                     _results_md += "\n|-----------|--------|\n"
 
+                from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map
+                _truth_label_map = {
+                    int(_idx): _label
+                    for _idx, (_label, _sirocco_key) in _benchmark_param_map(
+                        grid_selector.value if grid_selector is not None else None
+                    ).items()
+                }
+
+                def _truth_key_for(_display_name, _internal_label):
+                    if "Inclination" in _display_name:
+                        return "Inclination"
+                    _internal_text = str(_internal_label)
+                    if _internal_text.startswith("param") and _internal_text[5:].isdigit():
+                        return _truth_label_map.get(int(_internal_text[5:]), _display_name)
+                    return _display_name
+
                 for _i, _p in enumerate(phys_names):
                     fitted_val = res_grid[_i]
                     _display_p = f"log10({_p})" if _p in log10_params else _p
                     _results_md += f"| **{_display_p}** | {fitted_val:.4f} | "
 
-                    # Resolve ground-truth key: inclination variants all map
-                    # to the single 'Inclination' entry in ground_truth_params.
-                    _gt_key = _p
-                    if 'Inclination' in _gt_key:
-                        _gt_key = 'Inclination'
+                    _gt_key = _truth_key_for(_p, emu.param_names[_i])
 
                     if ground_truth_params and _gt_key in ground_truth_params:
                         _gt_val = ground_truth_params[_gt_key]
@@ -2904,6 +2917,7 @@ def _(
     get_mle_model,
     get_mle_priors,
     ground_truth_params,
+    grid_selector,
     mcmc_burnin,
     mcmc_freeze,
     mcmc_label_map,
@@ -3149,15 +3163,28 @@ def _(
                 # Corner-plot truths are matched through the same friendly-name map
                 # used elsewhere, with all inclination variants collapsed onto the
                 # single lookup-table "Inclination" key.
+                from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map
+                _truth_label_map = {
+                    int(_idx): _label
+                    for _idx, (_label, _sirocco_key) in _benchmark_param_map(
+                        grid_selector.value if grid_selector is not None else None
+                    ).items()
+                }
+
+                def _truth_key_for(_display_name, _internal_label):
+                    if "Inclination" in _display_name:
+                        return "Inclination"
+                    _internal_text = str(_internal_label)
+                    if _internal_text.startswith("param") and _internal_text[5:].isdigit():
+                        return _truth_label_map.get(int(_internal_text[5:]), _display_name)
+                    return _display_name
+
                 _truths = None
                 if ground_truth_params:
                     _truths = []
                     _has_any = False
                     for _label in _model.labels:
-                        _gt_key = _friendly(_label)
-                        # Handle inclination variants → common key
-                        if 'Inclination' in _gt_key:
-                            _gt_key = 'Inclination'
+                        _gt_key = _truth_key_for(_friendly(_label), _label)
                         if _gt_key in ground_truth_params:
                             _truths.append(ground_truth_params[_gt_key])
                             _has_any = True
@@ -3173,8 +3200,12 @@ def _(
                     quantiles=_corner_quantiles,
                     levels=_corner_levels,
                     title_fmt=".4f",
-                    truths=_truths
+                    truths=_truths,
+                    truth_color="#ff4444",
+                    truth_kwargs={"linewidth": 2},
                 )
+                for _ax in _fig_corner.axes:
+                    _ax.grid(False)
 
                 # Prior-range corner plot: axes span the full prior support so
                 # the user can judge posterior breadth relative to the prior.
@@ -3198,8 +3229,12 @@ def _(
                         levels=_corner_levels,
                         title_fmt=".4f",
                         truths=_truths,
+                        truth_color="#ff4444",
+                        truth_kwargs={"linewidth": 2},
                         range=_safe_ranges,
                     )
+                    for _ax in _fig_corner_prior.axes:
+                        _ax.grid(False)
                     _corner_display = mo.ui.tabs({
                         "Posterior (Auto Range)": _fig_corner,
                         "Full Prior Range": _fig_corner_prior,
@@ -3286,9 +3321,7 @@ def _(
                     _results_md += f"| **{_display_name}** | {_mean:.4f} | {_std:.4f} | {_median:.4f} | "
 
                     if ground_truth_params:
-                        _gt_key = _display_name
-                        if 'Inclination' in _gt_key:
-                            _gt_key = 'Inclination'
+                        _gt_key = _truth_key_for(_display_name, _label)
                         if _gt_key in ground_truth_params:
                             _gt_val = ground_truth_params[_gt_key]
                             _delta_sigma = (_mean - _gt_val) / _std if _std > 0 else 0

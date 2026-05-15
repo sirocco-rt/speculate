@@ -2137,7 +2137,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         color="#54a24b", opacity=0.24,
     ).encode(
         x=alt.X("Wavelength:Q", title="Wavelength (A)"),
-        y=alt.Y("Lower:Q", title="Flux", scale=alt.Scale(zero=False)),
+        y=alt.Y("Lower:Q", title="Flux", scale=alt.Scale(zero=False), format=".4e"),
         y2="Upper:Q",
         tooltip=[
             alt.Tooltip("Wavelength:Q", title="Wavelength", format=".1f"),
@@ -2149,7 +2149,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         color="#4c78a8", strokeWidth=1.2,
     ).encode(
         x=alt.X("Wavelength:Q", title="Wavelength (A)"),
-        y=alt.Y("Data:Q", title="Flux", scale=alt.Scale(zero=False)),
+        y=alt.Y("Data:Q", title="Flux", scale=alt.Scale(zero=False), format=".4e"),
         tooltip=[
             alt.Tooltip("Wavelength:Q", title="Wavelength", format=".1f"),
             alt.Tooltip("Data:Q", title="Data", format=".4e"),
@@ -2159,7 +2159,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         width=760,
         height=300,
         title="Posterior Predictive Envelope",
-    ).interactive()
+    ).interactive(bind_y=False)
 
     mo.vstack([
         mo.md("#### Best-Fit Spectrum with Sirocco Overlay"),
@@ -2766,7 +2766,7 @@ def _(glob, mo, os):
     _cpu_total = max(1, os.cpu_count() or 1)
     sirocco_cpu_slider = mo.ui.slider(
         start=1, stop=_cpu_total, value=max(1, _cpu_total // 2), step=1,
-        show_value=True, label="Sirocco CPUs (Tier 3)", full_width=True,
+        show_value=True, label="Sirocco CPUs (Tier 3)", full_width=False,
     )
 
     # Inclination selector for Tier 2: which viewing angle column to read from
@@ -2897,10 +2897,10 @@ def _(
 ):
     mo.vstack([
         mo.md("### Run Benchmark"),
-        mo.hstack([emu_picker, flux_scale_picker], gap=1),
+        mo.vstack([tier_picker, emu_picker, flux_scale_picker], gap=1),
         emu_grid_info,
         mo.hstack([obs_picker], gap=1),
-        mo.hstack([tier_picker, max_spectra_slider, mcmc_steps_slider, mle_restarts_slider, inclination_picker], gap=1),
+        mo.vstack([inclination_picker, max_spectra_slider, mle_restarts_slider, mcmc_steps_slider], gap=1),
         sirocco_cpu_slider,
     ])
     return

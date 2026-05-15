@@ -323,12 +323,12 @@ def build_bestfit_spectrum_altair(
         })
 
     series_order = ["Input Data", "Emulated Model"]
-    series_colors = ["#000000", "#0072B2"]
+    series_colors = ["#0072B2", "#D55E00"]
     series_dashes = [[], []]
     if extra_flux_series:
         if isinstance(extra_flux_series, dict):
             extra_flux_series = [extra_flux_series]
-        default_colors = ["#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"]
+        default_colors = ["#009E73", "#CC79A7", "#E69F00", "#56B4E9"]
         for idx, series in enumerate(extra_flux_series):
             extra_wl = np.asarray(series.get("wavelength", wl), dtype=np.float64)
             extra_flux = np.asarray(series.get("flux", []), dtype=np.float64)
