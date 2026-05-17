@@ -700,6 +700,73 @@ def _(
     _selected_name = emulator_selector.value
     emulator_load_status = mo.md("")
 
+    def _format_cache_size(_gb):
+        return f"{_gb * 1024:.0f} MB" if _gb < 1.0 else f"{_gb:.1f} GB"
+
+    def _selected_emulator_cache_note(_filename):
+        if not _filename:
+            return "", "neutral"
+
+        try:
+            import numpy as _np
+            import os as _os
+
+            _path = _os.path.join("Grid-Emulator_Files", _filename)
+            if not _os.path.isfile(_path):
+                return "", "neutral"
+
+            with _np.load(_path, allow_pickle=True) as _npz:
+                _n_grid = int(_npz["grid_points"].shape[0])
+                if "eigenspectra" in _npz:
+                    _n_components = int(_npz["eigenspectra"].shape[0])
+                elif "weights" in _npz:
+                    _n_components = int(_npz["weights"].shape[1])
+                else:
+                    return "", "neutral"
+
+            _block_bytes = _n_grid * _n_grid * 8
+            _cache_bytes = _n_components * _block_bytes
+            _workspace_bytes = 2 * _block_bytes
+            _required_gb = (_cache_bytes + _workspace_bytes) * 1.1 / (1024**3)
+            _display = _format_cache_size(_required_gb)
+
+            _note = (
+                f"Inference cache estimate: **~{_display} required** to build the "
+                f"reusable MLE/MCMC cache ({_n_components} PCA components × "
+                f"{_n_grid:,} grid points)."
+            )
+            _kind = "neutral"
+
+            try:
+                import torch as _torch
+
+                if _torch.cuda.is_available():
+                    _free_bytes, _ = _torch.cuda.mem_get_info(0)
+                    _free_gb = _free_bytes / (1024**3)
+                    _usage_pct = (_required_gb / _free_gb) * 100 if _free_gb > 0 else float("inf")
+                    _can_cache = _required_gb < _free_gb * 0.9
+                    if _can_cache:
+                        _note += f" Current free VRAM: **{_free_gb:.1f} GB** ({_usage_pct:.0f}% required)."
+                    else:
+                        _note += (
+                            f" Current free VRAM: **{_free_gb:.1f} GB** ({_usage_pct:.0f}% required). "
+                            "If this cache cannot fit, Speculate will stream per component and MLE/MCMC will be much slower."
+                        )
+                        _kind = "warn"
+                else:
+                    _note += (
+                        " No NVIDIA GPU detected. The reusable GPU inference cache "
+                        "cannot be built, so inference will use CPU/fallback paths and may be slower."
+                    )
+                    _kind = "warn"
+            except Exception:
+                _note += " GPU status could not be checked, so cache fit is unknown."
+                _kind = "warn"
+
+            return _note, _kind
+        except Exception as _exc:
+            return f"Could not estimate inference cache memory for this emulator: {_exc}", "warn"
+
     if emu is not None and _loaded_name != _selected_name:
         clear_loaded_emu_cache()
         emu = None
@@ -733,10 +800,19 @@ def _(
                     mo.md(f"{mo.icon('lucide:x-circle')} Error loading `{_selected_name}`: {e}"),
                     kind="danger",
                 )
-    elif _selected_name and emu is None:
+    elif emu is not None and _loaded_name == _selected_name:
         emulator_load_status = mo.callout(
-            mo.md(f"Selected `{_selected_name}`. Click **Load Emulator** to enable inference."),
-            kind="neutral",
+            mo.md(f"{mo.icon('lucide:check-circle')} Loaded `{_selected_name}`."),
+            kind="success",
+        )
+    elif _selected_name and emu is None:
+        _cache_note, _cache_kind = _selected_emulator_cache_note(_selected_name)
+        _selected_message = f"Selected `{_selected_name}`. Click **Load Emulator** to enable inference."
+        if _cache_note:
+            _selected_message += f"\n\n{_cache_note}"
+        emulator_load_status = mo.callout(
+            mo.md(_selected_message),
+            kind=_cache_kind,
         )
 
     return emu, emulator_load_status
