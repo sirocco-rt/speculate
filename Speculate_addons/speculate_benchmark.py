@@ -33,6 +33,7 @@ from scipy.optimize import minimize as scipy_minimize
 
 from Speculate_addons.grid_registry import (
     benchmark_param_map,
+    default_fixed_inclination,
     defaulted_physical_param_ids,
     emulator_values_to_physical,
     inclination_column,
@@ -86,7 +87,7 @@ TIER2_NUISANCE_LABELS = (
 
 TIER2_FRIENDLY_LABELS = {
     "Av": "Av",
-    "log_scale": "log_scale",
+    "log_scale": "Distance (pc)",
     "cheb:1": "cheb_1",
     "global_cov:log_amp": "GP log_amp",
     "global_cov:log_ls": "GP log_ls",
@@ -111,7 +112,7 @@ def build_tier2_freeze_defaults(param_names: Sequence[str], grid_name: Optional[
     """
     label_map = build_tier2_label_map(param_names, grid_name)
     mle = {label: False for label in label_map}
-    for mle_label in ("Av", "cheb:1"):
+    for mle_label in ("Av", "log_scale", "cheb:1"):
         if mle_label in mle:
             mle[mle_label] = True
 
@@ -538,6 +539,8 @@ def run_mle_single(
     freeze_params: Optional[Dict[str, bool]] = None,
     iteration_callback=None,
     n_restarts: int = 1,
+    use_emulator_norm: bool = False,
+    fixed_log_scale: Optional[float] = None,
 ) -> dict:
     """
     Run MLE inference on a single spectrum.
@@ -580,6 +583,9 @@ def run_mle_single(
     from Starfish.spectrum import Spectrum
     from Starfish.models import SpectrumModel
 
+    if fixed_log_scale is None and flux_scale == "continuum-normalised":
+        fixed_log_scale = 0.0
+
     # Match the observation onto the emulator's training scale before building a
     # SpectrumModel, including consistent propagation of the uncertainties.
     flux = np.asarray(flux, dtype=np.float64)
@@ -617,11 +623,15 @@ def run_mle_single(
         global_cov={"log_amp": -55.0, "log_ls": 4.5},
         cheb=[0.0],
         flux_scale=flux_scale,
+        norm=use_emulator_norm,
     )
 
     _requested_freeze = _serialise_freeze_settings(freeze_params)
     if "Av" not in _requested_freeze:
         _requested_freeze["Av"] = bool(freeze_av)
+    if fixed_log_scale is not None:
+        model.params["log_scale"] = float(fixed_log_scale)
+        _requested_freeze["log_scale"] = True
 
     # Optionally fix Av = 0 (synthetic test-grid spectra have no dust
     # extinction, so allowing Av to float wastes degrees of freedom and
@@ -632,14 +642,15 @@ def run_mle_single(
 
     # Bootstrap log_scale from auto-calculation *before* building priors
     # so we can centre the log_scale prior on the data-informed value.
-    _bootstrapped_ls = -25.0  # sensible fallback
-    try:
-        _ = model()
-        if model._log_scale is not None and np.isfinite(model._log_scale):
-            _bootstrapped_ls = float(model._log_scale)
+    _bootstrapped_ls = float(fixed_log_scale) if fixed_log_scale is not None else -25.0
+    if fixed_log_scale is None:
+        try:
+            _ = model()
+            if model._log_scale is not None and np.isfinite(model._log_scale):
+                _bootstrapped_ls = float(model._log_scale)
+                model.params["log_scale"] = _bootstrapped_ls
+        except Exception:
             model.params["log_scale"] = _bootstrapped_ls
-    except Exception:
-        model.params["log_scale"] = _bootstrapped_ls
 
     # Build default priors — tightly bounded to match the inference tool's
     # optimised settings. Tight priors matter twice here: they regularize the
@@ -654,9 +665,10 @@ def run_mle_single(
             priors["Av"] = stats.uniform(loc=0, scale=2.0)
         # Keep log_scale centered on the bootstrap estimate so the optimizer does
         # not waste its early iterations finding the gross normalization.
-        priors["log_scale"] = stats.uniform(
-            loc=_bootstrapped_ls - 5.0, scale=10.0
-        )
+        if not _requested_freeze.get("log_scale", False):
+            priors["log_scale"] = stats.uniform(
+                loc=_bootstrapped_ls - 5.0, scale=10.0
+            )
         # Chebyshev c1 continuum tilt — small correction for gradient mismatch
         priors["cheb:1"] = stats.uniform(loc=-0.5, scale=1.0)
         # GP log_amp: auto-detect centre from residual variance between the
@@ -1299,14 +1311,18 @@ def aggregate_tier2_results(
         "n_failures": failures,
         "n_not_converged": n_not_converged,
         "failure_log": failure_log,
+        "distance_reference_pc": 100.0,
+        "distance_policy": "fixed_100pc",
         "mle_config": {
             "freeze_params": _serialise_freeze_settings(mle_freeze_params),
+            "fixed_distance_pc": 100.0,
         },
         "mcmc_config": {
             "walkers": mcmc_walkers,
             "steps": mcmc_steps,
             "burnin": mcmc_burnin,
             "freeze_params": _serialise_freeze_settings(mcmc_freeze_params),
+            "fixed_distance_pc": 100.0,
         },
         "tier2_time_s": elapsed,
     }
@@ -1394,6 +1410,10 @@ def run_tier2(
         label: bool((mcmc_freeze_params or {}).get(label, _mcmc_defaults[label]))
         for label in _mcmc_defaults
     }
+    if "log_scale" in mle_freeze_params:
+        mle_freeze_params["log_scale"] = True
+    if "log_scale" in mcmc_freeze_params:
+        mcmc_freeze_params["log_scale"] = True
 
     per_spectrum = []
     all_samples = {name: [] for name in friendly_names}
@@ -1448,6 +1468,8 @@ def run_tier2(
                 emu, wl, flux, sigma, flux_scale=flux_scale,
                 max_iter=max_mle_iter, n_restarts=mle_restarts,
                 freeze_params=mle_freeze_params,
+                use_emulator_norm=True,
+                fixed_log_scale=0.0,
             )
         except Exception as e:
             import traceback as _tb
@@ -2147,6 +2169,15 @@ def _format_sirocco_transform_label(transforms: dict) -> str:
     return "Sirocco Model" if not parts else "Sirocco Model (" + ", ".join(parts) + ")"
 
 
+def _fixed_inclination_from_emulator(emu, grid_name: Optional[str] = None) -> float:
+    """Return the fixed observer angle for an emulator without an inclination axis."""
+    emu_name = os.path.basename(str(getattr(emu, "name", "") or ""))
+    match = re.search(r"_(\d+(?:\.\d+)?)inc(?:_|$)", emu_name)
+    if match:
+        return float(match.group(1))
+    return float(default_fixed_inclination(grid_name))
+
+
 def _extract_posterior_mean_inclination(
     emu,
     samples: np.ndarray,
@@ -2156,10 +2187,7 @@ def _extract_posterior_mean_inclination(
     """Return the posterior-mean inclination used for the Sirocco observer."""
     friendly_grid = internal_to_friendly(emu.param_names, grid_name)
     if "Inclination" not in friendly_grid:
-        raise ValueError(
-            "Tier 3 Sirocco comparison requires an emulator with an Inclination "
-            "parameter (param9, param10, or param11)."
-        )
+        return _fixed_inclination_from_emulator(emu, grid_name)
     if "Inclination" not in friendly_labels:
         raise ValueError("MCMC samples do not contain an Inclination column.")
     col = list(friendly_labels).index("Inclination")

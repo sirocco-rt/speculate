@@ -424,7 +424,7 @@ def build_bestfit_spectrum_altair(
     ).encode(
         x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=x_scale),
         y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False), axis=y_axis),
-        y2="Upper:Q",
+        y2=alt.Y2(field="Upper"),
     )
     resid_band_2 = alt.Chart(alt.Data(values=band_2sigma)).mark_area(
         color="#54a24b",
@@ -432,7 +432,7 @@ def build_bestfit_spectrum_altair(
     ).encode(
         x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=x_scale),
         y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False), axis=y_axis),
-        y2="Upper:Q",
+        y2=alt.Y2(field="Upper"),
     )
     resid_band_1 = alt.Chart(alt.Data(values=band_1sigma)).mark_area(
         color="#54a24b",
@@ -440,7 +440,7 @@ def build_bestfit_spectrum_altair(
     ).encode(
         x=alt.X("Wavelength:Q", title="Wavelength (Å)", scale=x_scale),
         y=alt.Y("Lower:Q", title="Residual", scale=alt.Scale(zero=False), axis=y_axis),
-        y2="Upper:Q",
+        y2=alt.Y2(field="Upper"),
     )
     resid_zero = alt.Chart(alt.Data(values=[{"Zero": 0.0}])).mark_rule(
         color="grey",

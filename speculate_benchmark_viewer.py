@@ -2137,8 +2137,13 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         color="#54a24b", opacity=0.24,
     ).encode(
         x=alt.X("Wavelength:Q", title="Wavelength (A)"),
-        y=alt.Y("Lower:Q", title="Flux", scale=alt.Scale(zero=False), format=".4e"),
-        y2="Upper:Q",
+        y=alt.Y(
+            "Lower:Q",
+            title="Flux",
+            scale=alt.Scale(zero=False),
+            axis=alt.Axis(format=".4e"),
+        ),
+        y2=alt.Y2(field="Upper"),
         tooltip=[
             alt.Tooltip("Wavelength:Q", title="Wavelength", format=".1f"),
             alt.Tooltip("Lower:Q", title="PPC 2.5%", format=".4e"),
@@ -2149,17 +2154,27 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         color="#4c78a8", strokeWidth=1.2,
     ).encode(
         x=alt.X("Wavelength:Q", title="Wavelength (A)"),
-        y=alt.Y("Data:Q", title="Flux", scale=alt.Scale(zero=False), format=".4e"),
+        y=alt.Y(
+            "Data:Q",
+            title="Flux",
+            scale=alt.Scale(zero=False),
+            axis=alt.Axis(format=".4e"),
+        ),
         tooltip=[
             alt.Tooltip("Wavelength:Q", title="Wavelength", format=".1f"),
             alt.Tooltip("Data:Q", title="Data", format=".4e"),
         ],
     )
+    _ppc_zoom = alt.selection_interval(
+        name=f"tier3_ppc_zoom_{t3_observation_slider.value}",
+        bind="scales",
+        encodings=["x"],
+    )
     _ppc_chart = (_ppc_band + _ppc_data).properties(
         width=760,
         height=300,
         title="Posterior Predictive Envelope",
-    ).interactive(bind_y=False)
+    ).add_params(_ppc_zoom)
 
     mo.vstack([
         mo.md("#### Best-Fit Spectrum with Sirocco Overlay"),
@@ -2289,7 +2304,7 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
                     scale=alt.Scale(domain={"param": _spec_zoom_name}),
                 ),
                 y=alt.Y("Lower (2σ):Q", scale=alt.Scale(zero=False)),
-                y2=alt.Y2("Upper (2σ):Q"),
+                y2=alt.Y2(field="Upper (2σ)"),
             )
         )
 
@@ -2820,6 +2835,7 @@ def _(emu_picker, glob, mo, os, re):
     )
 
     matched_grid_path = ""
+    matched_grid_name = ""
     matched_testgrid_path = ""
     emu_grid_info = mo.md("")  # default: empty
 
@@ -2827,6 +2843,7 @@ def _(emu_picker, glob, mo, os, re):
         # The naming convention lets the viewer recover the matching training
         # grid and test-grid without asking the user to pick three separate paths.
         _grid_stem = _emu_base.split("_emu_")[0]  # e.g. speculate_cv_bl_grid_v87f
+        matched_grid_name = _grid_stem
 
         # Extract the processed-grid tag from the emulator filename so the
         # lookup lands on the NPZ created with the same params/scale/smoothing,
@@ -2878,7 +2895,7 @@ def _(emu_picker, glob, mo, os, re):
                    "Expected pattern: `{stem}_emu_{params}_{inc}inc_{wl}_{PCA}PCA.npz`"),
             kind="warn",
         )
-    return emu_grid_info, flux_scale_picker, matched_grid_path, matched_testgrid_path
+    return emu_grid_info, flux_scale_picker, matched_grid_name, matched_grid_path, matched_testgrid_path
 
 
 @app.cell(hide_code=True)
@@ -2981,7 +2998,7 @@ def _(emu_picker, mo, np, os):
                 mo.callout(
                     mo.md(
                         "Stage 2 freezes hold parameters at the benchmark starting values: "
-                        "grid midpoints, Av=0, bootstrapped log_scale, cheb_1=0, and the default GP initialisation. "
+                        "grid midpoints, Av=0, Distance=100 pc, cheb_1=0, and the default GP initialisation. "
                         "Stage 4 freezes hold parameters at their post-MLE values during MCMC."
                     ),
                     kind="neutral",
@@ -3057,6 +3074,7 @@ def _(
     emu_picker,
     flux_scale_picker,
     inclination_picker,
+    matched_grid_name,
     matched_grid_path,
     matched_testgrid_path,
     max_spectra_slider,
@@ -3107,6 +3125,7 @@ def _(
             run_mcmc_single as _run_mcmc,
             aggregate_tier2_results as _agg_t2,
         )
+        from Speculate_addons.grid_registry import inclination_values as _inclination_values
         import numpy as _np
         import traceback as _tb
 
@@ -3161,10 +3180,15 @@ def _(
         # Resolve the shared flux-scaling mode once so both Tier 2 and Tier 3
         # use the same setting even if only one tier is selected.
         _flux_scale = flux_scale_picker.value
+        _grid_name = matched_grid_name or None
         _tier3_wl_range = (float(_np.nanmin(_emu.wl)), float(_np.nanmax(_emu.wl)))
-        _tier2_defaults = _build_tier2_freeze_defaults(_emu.param_names)
+        _tier2_defaults = _build_tier2_freeze_defaults(_emu.param_names, _grid_name)
         _tier2_mle_freeze_settings = dict(tier2_mle_freeze.value or _tier2_defaults["mle"])
         _tier2_mcmc_freeze_settings = dict(tier2_mcmc_freeze.value or _tier2_defaults["mcmc"])
+        if "log_scale" in _tier2_mle_freeze_settings:
+            _tier2_mle_freeze_settings["log_scale"] = True
+        if "log_scale" in _tier2_mcmc_freeze_settings:
+            _tier2_mcmc_freeze_settings["log_scale"] = True
         _mcmc_steps_val = mcmc_steps_slider.value
         _mcmc_walkers_val = 64
         _mcmc_burnin_val = 500
@@ -3203,7 +3227,7 @@ def _(
             _inc_raw = inclination_picker.value
             _inc_is_random = (_inc_raw == "random")
             _inc_fixed = float(_inc_raw) if not _inc_is_random else 55.0
-            _VALID_INCS = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85]
+            _VALID_INCS = _inclination_values(_grid_name)
 
             # Resolve wavelength range from emulator
             _wl_range = (float(_emu.wl.min()) + 10, float(_emu.wl.max()) - 10)
@@ -3211,7 +3235,7 @@ def _(
             # The lookup table is optional metadata used to compare recovered
             # parameters against the known test-grid inputs.
             _parquet = _ensure_lookup(_test_path)
-            _friendly = _to_friendly(_emu.param_names)
+            _friendly = _to_friendly(_emu.param_names, _grid_name)
             _n_params = len(_emu.param_names)
 
             # ---- Checkpoint / Resume ----
@@ -3381,7 +3405,7 @@ def _(
                     # -- Load spectrum --
                     _t2_bar.update(increment=0, subtitle=f"Loading {_sname} (i={_inc:.0f}°)…")
                     try:
-                        _wl, _flux, _sigma = _load_spec(str(_sf), _inc, _wl_range)
+                        _wl, _flux, _sigma = _load_spec(str(_sf), _inc, _wl_range, _grid_name)
                     except Exception as _e:
                         _failure_log.append({
                             "run": _sname, "stage": "load",
@@ -3396,7 +3420,7 @@ def _(
                     _gt = {}
                     if _parquet.exists():
                         try:
-                            _gt = _extract_gt(str(_parquet), _run_idx, _emu.param_names)
+                            _gt = _extract_gt(str(_parquet), _run_idx, _emu.param_names, _grid_name, _inc)
                         except Exception:
                             pass
 
@@ -3428,6 +3452,8 @@ def _(
                                 max_iter=10_000, iteration_callback=_mle_cb,
                                 n_restarts=mle_restarts_slider.value,
                                 freeze_params=_tier2_mle_freeze_settings,
+                                use_emulator_norm=True,
+                                fixed_log_scale=0.0,
                             )
                         except Exception as _e:
                             _failure_log.append({
@@ -3459,6 +3485,7 @@ def _(
                                 burnin=_mcmc_burnin_val,
                                 iteration_callback=_mcmc_cb,
                                 freeze_params=_tier2_mcmc_freeze_settings,
+                                grid_name=_grid_name,
                             )
                         except Exception as _e:
                             _failure_log.append({
@@ -3651,13 +3678,6 @@ def _(
                 show_eta=True,
                 remove_on_exit=True,
             ) as _t3_bar:
-                # Derive the grid name from the emulator filename so Tier 3
-                # can export a valid Sirocco .pf for each observation.
-                _emu_base = os.path.basename(emu_picker.value or "")
-                _grid_stem = None
-                if "_emu_" in _emu_base:
-                    _grid_stem = _emu_base.split("_emu_")[0]
-
                 for _obs_i, _obs_path in enumerate(_obs_list, start=1):
                     _obs_name = os.path.basename(_obs_path)
                     _obs_stem = os.path.splitext(os.path.basename(_obs_path))[0]
@@ -3717,7 +3737,7 @@ def _(
                         mcmc_walkers=_mcmc_walkers_val,
                         mcmc_steps=_mcmc_steps_val,
                         mcmc_burnin=_mcmc_burnin_val,
-                        grid_name=_grid_stem,
+                        grid_name=_grid_name,
                         output_dir=_obs_export_dir,
                         sirocco_cpus=sirocco_cpu_slider.value,
                         require_sirocco=True,

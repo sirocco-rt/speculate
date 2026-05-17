@@ -38,12 +38,14 @@ def _():
     import numpy as np
     import pandas as pd
     import altair as alt
+    import importlib
     from Starfish.emulator import Emulator
     from Starfish.spectrum import Spectrum
-    from Starfish.models import SpectrumModel
+    import Starfish.models.spectrum_model as _spectrum_model_module
+    _spectrum_model_module = importlib.reload(_spectrum_model_module)
+    SpectrumModel = _spectrum_model_module.SpectrumModel
     import pathlib
     import scipy.stats as stats
-    import importlib
     from Speculate_addons import Spec_functions as spec_functions
 
     # Marimo can keep an older helper module cached across notebook reloads.
@@ -1174,13 +1176,13 @@ def _(mo):
 
 
 @app.cell
-def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
+def _(build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
     # ── Parameter Playground ──
     # Interactive sliders for the nuisance/inference parameters and the
     # physical grid axes so the user can visually explore how each shifts
     # the emulated spectrum before committing to prior bounds.
     #
-    # Slider ranges for log_scale and log_amp are auto-computed from the ratio
+    # Slider ranges for distance and log_amp are auto-computed from the ratio
     # of the emulator's midpoint flux to the (transformed) observation flux, so
     # they stay sensible regardless of emmulator training transform.
 
@@ -1194,67 +1196,51 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
         else:
             pg_mid_params = np.zeros(len(emu.param_names))
 
-        # --- Auto-compute log_scale and log_amp centres from data ---
-        # Reconstruct the emulator flux at the midpoint and compare with the
-        # transformed observation to estimate a sensible log_scale default.
-        _ls_centre = 0.0   # fallback
-        _la_centre = -5.0   # fallback
+        # --- Auto-compute log_amp centre from observational uncertainty ---
+        # GP amplitude is a residual/noise scale. It should be tied to the data
+        # uncertainty, not to mismatch against an arbitrary midpoint model.
+        _distance_centre = 100.0
+        _la_centre = -60.0 if obs_flux_scale.value == "linear" else -5.0
         if obs_data is not None:
             try:
                 _wl_lo, _wl_hi = wl_range_slider.value
-                # Emulator midpoint flux
-                _w, _c = emu(pg_mid_params)
-                _X = emu.eigenspectra * emu.flux_std
-                _emu_fl = (_w @ _X) + emu.flux_mean
-                _emu_wl = np.array(emu.wl)
-                _em = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
-                _emu_mean = np.mean(np.abs(_emu_fl[_em])) if _em.any() else 1.0
-
-                # Observation flux in the emulator's trained space
                 _om = (obs_data['wavelength'] >= _wl_lo) & (obs_data['wavelength'] <= _wl_hi)
-                _obs_fl = np.array(obs_data[_om]['flux'])
-                _obs_wl = np.array(obs_data[_om]['wavelength'])
+                _obs_sub = obs_data[_om]
+                _obs_wl = np.array(_obs_sub['wavelength'])
+                _obs_flux_native = np.array(_obs_sub['flux'])
+                _sigma_source = (
+                    str(_obs_sub['sigma_source'].iat[0]).strip().lower()
+                    if 'sigma_source' in _obs_sub.columns and len(_obs_sub) > 0
+                    else None
+                )
+                if _sigma_source == 'synthetic_sirocco_continuum':
+                    _fallback_sigma, _ = build_synthetic_sirocco_sigma(_obs_wl, _obs_flux_native)
+                else:
+                    _fallback_sigma, _ = build_default_observation_sigma(_obs_wl, _obs_flux_native)
+
+                if 'error' in _obs_sub.columns:
+                    _sigma = np.array(_obs_sub['error'], dtype=float)
+                    _sigma = np.where(np.isfinite(_sigma) & (_sigma > 0), _sigma, _fallback_sigma)
+                else:
+                    _sigma = _fallback_sigma
+
                 _scale_label = obs_flux_scale.value
                 if _scale_label == 'log':
-                    _obs_fl = np.where(_obs_fl > 0, np.log10(_obs_fl),
-                                       np.log10(np.abs(_obs_fl) + 1e-30))
+                    _sigma = _sigma / (np.abs(_obs_flux_native) * np.log(10.0) + 1e-30)
                 elif _scale_label == 'continuum-normalised':
-                    _ct, _ = fit_power_law_continuum(_obs_wl, _obs_fl)
+                    _ct, _ = fit_power_law_continuum(_obs_wl, _obs_flux_native)
                     _ct_safe = np.where(_ct > 0, _ct, 1.0)
-                    _obs_fl = _obs_fl / _ct_safe
+                    _sigma = _sigma / _ct_safe
 
-                _obs_mean = np.mean(np.abs(_obs_fl)) if len(_obs_fl) > 0 else 1.0
-                # log_scale = ln(obs / emu) — but in log₁₀ space the raw
-                # means are negative, so compare linear-space means instead.
-                if _scale_label == 'log':
-                    _emu_mean_lin = np.mean(np.abs(10.0 ** _emu_fl[_em])) if _em.any() else 1.0
-                    _obs_mean_lin = np.mean(np.abs(np.array(obs_data[_om]['flux']))) if len(_obs_fl) > 0 else 1.0
-                    if _emu_mean_lin > 0 and _obs_mean_lin > 0:
-                        _ls_centre = float(np.log(_obs_mean_lin / _emu_mean_lin))
-                else:
-                    if _emu_mean > 0 and _obs_mean > 0:
-                        _ls_centre = float(np.log(_obs_mean / _emu_mean))
-                # log_amp centre: residual variance as starting estimate.
-                # Apply log_scale additively in log₁₀ space, multiplicatively
-                # otherwise.
-                _ln10 = np.log(10.0)
-                _n_cmp = min(len(_obs_fl), int(_em.sum()))
-                if _n_cmp > 0:
-                    if _scale_label == 'log':
-                        _resid = (_obs_fl[:_n_cmp]
-                                  - (_emu_fl[_em][:_n_cmp] + _ls_centre / _ln10))
-                    else:
-                        _resid = (_obs_fl[:_n_cmp]
-                                  - _emu_fl[_em][:_n_cmp] * np.exp(_ls_centre))
-                    _residual_var = float(np.mean(_resid ** 2))
-                else:
-                    _residual_var = 1e-5
-                _la_centre = float(np.log(max(_residual_var, 1e-30)))
+                _sigma = np.asarray(_sigma, dtype=float)
+                _sigma = _sigma[np.isfinite(_sigma) & (_sigma > 0)]
+                if _sigma.size:
+                    _noise_var = float(np.median(_sigma ** 2))
+                    _la_centre = float(np.log(max(_noise_var, 1e-30)))
             except Exception:
                 pass  # keep fallback values
 
         # Round for cleaner slider display
-        _ls_centre = round(_ls_centre, 2)
         _la_centre = round(_la_centre, 2)
 
         # Nuisance slider ranges centred on auto-detected values
@@ -1263,16 +1249,16 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
             label="Av (Extinction)", show_value=True, full_width=True,
         )
         pg_logscale_slider = mo.ui.slider(
-            start=_ls_centre - 10.0, stop=_ls_centre + 10.0,
-            value=_ls_centre, step=0.01,
-            label="log_scale (ln flux scaling)", show_value=True, full_width=True,
+            start=10.0, stop=1000.0,
+            value=_distance_centre, step=1.0,
+            label="Distance (pc)", show_value=True, full_width=True,
         )
         pg_cheb1_slider = mo.ui.slider(
             start=-2.0, stop=2.0, value=0.0, step=0.01,
             label="cheb_1 (continuum tilt)", show_value=True, full_width=True,
         )
         pg_logamp_slider = mo.ui.slider(
-            start=_la_centre - 15.0, stop=_la_centre + 15.0,
+            start=_la_centre - 5.0, stop=_la_centre + 5.0,
             value=_la_centre, step=0.01,
             label="log_amp (ln GP amplitude)", show_value=True, full_width=True,
         )
@@ -1296,11 +1282,42 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
         # wrapper is added for parameters stored on a log10 axis.
         _phys_sliders = []
         _sorted_phys_idx = sorted(list(grid_indices)) if grid_indices else []
+
+        def _clean_slider_number(_value, _decimals=4):
+            _value = float(_value)
+            if not np.isfinite(_value):
+                return 0.0
+            if _value == 0.0:
+                return 0.0
+            if 1e-4 <= abs(_value) < 1e6:
+                return float(f"{_value:.{_decimals}f}")
+            return float(f"{_value:.{_decimals}g}")
+
+        def _nice_slider_step(_lo, _hi, _target_steps=300):
+            _span = abs(float(_hi) - float(_lo))
+            if not np.isfinite(_span) or _span <= 0.0:
+                return 1e-6
+            _raw = _span / float(_target_steps)
+            _exp = np.floor(np.log10(_raw))
+            _frac = _raw / (10.0 ** _exp)
+            if _frac <= 1.0:
+                _nice = 1.0
+            elif _frac <= 2.0:
+                _nice = 2.0
+            elif _frac <= 5.0:
+                _nice = 5.0
+            else:
+                _nice = 10.0
+            return max(_clean_slider_number(_nice * (10.0 ** _exp)), 1e-12)
+
         for _pi, _pname in enumerate(emu.param_names):
             _lo = float(emu.min_params[_pi]) if hasattr(emu, 'min_params') else 0.0
             _hi = float(emu.max_params[_pi]) if hasattr(emu, 'max_params') else 1.0
             _mid = (_lo + _hi) / 2.0
-            _step = max((_hi - _lo) / 300.0, 1e-6)
+            _lo_ui = _clean_slider_number(_lo)
+            _hi_ui = _clean_slider_number(_hi)
+            _mid_ui = _clean_slider_number(_mid)
+            _step = _nice_slider_step(_lo_ui, _hi_ui)
 
             # Prefer the grid_indices mapping when it lines up; otherwise
             # fall back to parsing "paramN" directly from the axis name.
@@ -1321,7 +1338,7 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
                 _label = str(_pname)
 
             _phys_sliders.append(mo.ui.slider(
-                start=_lo, stop=_hi, value=_mid, step=_step,
+                start=_lo_ui, stop=_hi_ui, value=_mid_ui, step=_step,
                 label=_label, show_value=True, full_width=True,
             ))
         pg_phys_sliders = mo.ui.array(_phys_sliders)
@@ -1374,6 +1391,8 @@ def _(
     if (emu is not None and obs_data is not None
             and pg_av_slider is not None and pg_mid_params is not None):
         try:
+            from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
+
             from Starfish.transforms import extinct, resample
 
             _wl_min = wl_range_slider.value[0]
@@ -1399,6 +1418,14 @@ def _(
 
             _is_log = (obs_flux_scale.value == "log")
             _ln10 = np.log(10.0)
+            try:
+                _norm_factor = float(np.asarray(emu.norm_factor(_phys_params)).squeeze())
+            except Exception:
+                _norm_factor = 0.0 if _is_log else 1.0
+            if _is_log:
+                emu_flux_crop = emu_flux_crop + _norm_factor
+            else:
+                emu_flux_crop = emu_flux_crop * _norm_factor
 
             if _is_log:
                 # ── Log₁₀-space nuisance transforms (additive) ──────
@@ -1417,7 +1444,7 @@ def _(
                     _cheb_poly = np.clip(_cheb_poly, 1e-30, None)
                     emu_flux_crop = emu_flux_crop + np.log10(_cheb_poly)
 
-                _log_scale = pg_logscale_slider.value
+                _log_scale = _distance_to_log_scale(pg_logscale_slider.value)
                 emu_flux_crop = emu_flux_crop + _log_scale / _ln10
             else:
                 # ── Linear-space nuisance transforms (original) ──────
@@ -1432,7 +1459,7 @@ def _(
                     _cheb_poly = chebval(_scale_wl, [1.0, _cheb1])
                     emu_flux_crop = emu_flux_crop * _cheb_poly
 
-                _log_scale = pg_logscale_slider.value
+                _log_scale = _distance_to_log_scale(pg_logscale_slider.value)
                 emu_flux_crop = emu_flux_crop * np.exp(_log_scale)
 
             # GP uncertainty envelope (±1σ from GP amplitude)
@@ -1612,7 +1639,7 @@ def _(
                 "**Physical Parameters** tab to reshape the emulated spectrum by "
                 "varying the grid axes.\n\n"
                 "- **Av** — Interstellar dust extinction (magnitudes). Reddens and dims the spectrum.\n"
-                "- **log_scale** — Natural log of the flux scaling factor. Shifts the spectrum up/down.\n"
+                "- **Distance** — Source distance in parsecs. Internally converted to backend log_scale.\n"
                 "- **cheb_1** — Chebyshev c₁ coefficient. Applies a linear tilt to the continuum gradient.\n"
                 "- **log_amp** — GP covariance amplitude (affects uncertainty envelope, not the mean spectrum).\n"
                 "- **log_ls** — GP covariance length scale (affects uncertainty smoothness, not the mean spectrum)."
@@ -1655,6 +1682,7 @@ def _(
     alt,
     build_bestfit_spectrum_altair,
     build_default_observation_sigma,
+    distance_prior_ack,
     Spectrum,
     SpectrumModel,
     build_synthetic_sirocco_sigma,
@@ -1690,6 +1718,8 @@ def _(
             )
         else:
             try:
+                from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
+
                 _wl_lo, _wl_hi = wl_range_slider.value
                 _mask = ((obs_data['wavelength'] >= _wl_lo)
                          & (obs_data['wavelength'] <= _wl_hi))
@@ -1762,7 +1792,7 @@ def _(
                 _phys = np.array(pg_phys_sliders.value, dtype=float)
                 _global = {
                     'Av': float(pg_av_slider.value),
-                    'log_scale': float(pg_logscale_slider.value),
+                    'log_scale': float(_distance_to_log_scale(pg_logscale_slider.value)),
                     'cheb': [float(pg_cheb1_slider.value)],
                     'global_cov': {
                         'log_amp': float(pg_logamp_slider.value),
@@ -1774,6 +1804,7 @@ def _(
                     data=_spec,
                     grid_params=list(_phys),
                     flux_scale=_scale,
+                    norm=True,
                     **_global,
                 )
 
@@ -1787,9 +1818,11 @@ def _(
                     if _hi > _lo:
                         _priors[_pname] = stats.uniform(loc=_lo, scale=_hi - _lo)
                 _priors['Av'] = stats.uniform(loc=0.0, scale=5.0)
+                _ls_a = _distance_to_log_scale(pg_logscale_slider.start)
+                _ls_b = _distance_to_log_scale(pg_logscale_slider.stop)
                 _priors['log_scale'] = stats.uniform(
-                    loc=pg_logscale_slider.start,
-                    scale=pg_logscale_slider.stop - pg_logscale_slider.start,
+                    loc=min(_ls_a, _ls_b),
+                    scale=abs(_ls_b - _ls_a),
                 )
                 _priors['cheb:1'] = stats.uniform(loc=-2.0, scale=4.0)
                 _priors['global_cov:log_amp'] = stats.uniform(
@@ -1818,7 +1851,7 @@ def _(
 
 
 @app.cell
-def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
+def _(build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
     # ── Stage 2: Prior & Parameter Setup ──
     # Build per-parameter UI widgets (fixed/free toggle, value, min, max) that
     # drive the prior construction in Stage 3.  Parameters fall into two groups:
@@ -1829,7 +1862,7 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
     #
     #   Inference / nuisance parameters — added on top of the grid axes:
     #       Av         – interstellar extinction in magnitudes
-    #       log_scale  – ln(flux scaling factor), absorbs distance/geometry
+    #       log_scale  – backend ln(flux scale), shown to users as Distance (pc)
     #       log_amp    – ln(GP global covariance amplitude)
     #       log_ls     – ln(GP global covariance length scale)
     #
@@ -1892,12 +1925,12 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
     # These are not part of the emulator grid but are optimised alongside
     # the grid parameters during MLE/MCMC.  They account for:
     #   Av        – dust reddening / extinction
-    #   log_scale – overall flux normalisation (distance + solid angle)
+    #   log_scale – backend distance/solid-angle scale, shown as Distance (pc)
     #   log_amp   – GP global covariance amplitude (model flexibility)
     #   log_ls    – GP global covariance length scale (smoothness)
     inf_params = [
         'Av',        # Extinction (magnitudes)
-        'log_scale', # Log Flux Scaling Factor (natural log)
+        'log_scale', # Distance in pc in the UI; backend stores natural-log flux scale
         'cheb_1',    # Chebyshev c1 coefficient (continuum tilt)
         'log_amp',   # GP Global Covariance Amplitude (natural log)
         'log_ls'     # GP Global Covariance Length Scale (natural log)
@@ -1911,60 +1944,52 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
         bounds['Av'] = [0.0, 2.0]
         defaults['Av'] = 0.0
 
-        # log_scale: natural log of flux scaling factor
-        # Auto-detect sensible centre from emulator/observation flux ratio.
-        _ls_default = 0.0
-        _la_default = -5.0
+        # log_scale is exposed as a distance prior. With SpectrumModel(norm=True),
+        # the emulator's stored normalisation is the 100 pc reference and
+        # backend log_scale=0 means Distance=100 pc.
+        _distance_default = 100.0
+        _la_default = -60.0 if obs_flux_scale.value == "linear" else -5.0
         if obs_data is not None:
             try:
                 _wl_lo, _wl_hi = wl_range_slider.value
-                _w_tmp, _ = emu(np.array([(lo + hi) / 2 for lo, hi in
-                    zip(emu.min_params, emu.max_params)]))
-                _X_tmp = emu.eigenspectra * emu.flux_std
-                _efl = (_w_tmp @ _X_tmp) + emu.flux_mean
-                _ewl = np.array(emu.wl)
-                _em_tmp = (_ewl >= _wl_lo) & (_ewl <= _wl_hi)
-                _emu_avg = np.mean(np.abs(_efl[_em_tmp])) if _em_tmp.any() else 1.0
-
                 _om_tmp = (obs_data['wavelength'] >= _wl_lo) & (obs_data['wavelength'] <= _wl_hi)
-                _ofl = np.array(obs_data[_om_tmp]['flux'])
-                _owl = np.array(obs_data[_om_tmp]['wavelength'])
+                _obs_sub = obs_data[_om_tmp]
+                _owl = np.array(_obs_sub['wavelength'])
+                _ofl_native = np.array(_obs_sub['flux'])
+                _sigma_source = (
+                    str(_obs_sub['sigma_source'].iat[0]).strip().lower()
+                    if 'sigma_source' in _obs_sub.columns and len(_obs_sub) > 0
+                    else None
+                )
+                if _sigma_source == 'synthetic_sirocco_continuum':
+                    _fallback_sigma, _ = build_synthetic_sirocco_sigma(_owl, _ofl_native)
+                else:
+                    _fallback_sigma, _ = build_default_observation_sigma(_owl, _ofl_native)
+                if 'error' in _obs_sub.columns:
+                    _sigma = np.array(_obs_sub['error'], dtype=float)
+                    _sigma = np.where(np.isfinite(_sigma) & (_sigma > 0), _sigma, _fallback_sigma)
+                else:
+                    _sigma = _fallback_sigma
+
                 _sc = obs_flux_scale.value
                 if _sc == 'log':
-                    _ofl = np.where(_ofl > 0, np.log10(_ofl),
-                                    np.log10(np.abs(_ofl) + 1e-30))
+                    _sigma = _sigma / (np.abs(_ofl_native) * np.log(10.0) + 1e-30)
                 elif _sc == 'continuum-normalised':
-                    _ct2, _ = fit_power_law_continuum(_owl, _ofl)
+                    _ct2, _ = fit_power_law_continuum(_owl, _ofl_native)
                     _ct2s = np.where(_ct2 > 0, _ct2, 1.0)
-                    _ofl = _ofl / _ct2s
+                    _sigma = _sigma / _ct2s
 
-                _obs_avg = np.mean(np.abs(_ofl)) if len(_ofl) > 0 else 1.0
-                if _sc == 'log':
-                    _emu_avg_lin = np.mean(np.abs(10.0 ** _efl[_em_tmp])) if _em_tmp.any() else 1.0
-                    _obs_avg_lin = np.mean(np.abs(np.array(obs_data[_om_tmp]['flux']))) if len(_ofl) > 0 else 1.0
-                    if _emu_avg_lin > 0 and _obs_avg_lin > 0:
-                        _ls_default = float(np.log(_obs_avg_lin / _emu_avg_lin))
-                else:
-                    if _emu_avg > 0 and _obs_avg > 0:
-                        _ls_default = float(np.log(_obs_avg / _emu_avg))
-                _n = min(len(_ofl), int(_em_tmp.sum()))
-                _ln10 = np.log(10.0)
-                if _n > 0:
-                    if _sc == 'log':
-                        _resid = _ofl[:_n] - (_efl[_em_tmp][:_n] + _ls_default / _ln10)
-                    else:
-                        _resid = _ofl[:_n] - _efl[_em_tmp][:_n] * np.exp(_ls_default)
-                    _resid_var = float(np.mean(_resid ** 2))
-                else:
-                    _resid_var = 1e-5
-                _la_default = float(np.log(max(_resid_var, 1e-30)))
+                _sigma = np.asarray(_sigma, dtype=float)
+                _sigma = _sigma[np.isfinite(_sigma) & (_sigma > 0)]
+                if _sigma.size:
+                    _noise_var = float(np.median(_sigma ** 2))
+                    _la_default = float(np.log(max(_noise_var, 1e-30)))
             except Exception:
                 pass
-        _ls_default = round(_ls_default, 1)
         _la_default = round(_la_default, 1)
 
-        bounds['log_scale'] = [_ls_default - 5.0, _ls_default + 5.0]
-        defaults['log_scale'] = _ls_default
+        bounds['log_scale'] = [90.0, 110.0]
+        defaults['log_scale'] = _distance_default
 
         # cheb_1: Chebyshev c1 coefficient – linear continuum tilt
         # Multiplies the model by a Chebyshev polynomial; c0 is fixed to 1.
@@ -1973,8 +1998,10 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
         defaults['cheb_1'] = 0.0
 
         # log_amp: GP global covariance amplitude (natural log)
-        # Normal prior: center ± 2σ defines the bounds displayed in the UI
-        bounds['log_amp'] = [_la_default - 5.0, _la_default + 5.0]
+        # Normal prior: center is tied to observational uncertainty, while the
+        # displayed range gives the optimizer room to discover extra model
+        # discrepancy without starting from arbitrary line mismatch.
+        bounds['log_amp'] = [_la_default - 4.0, _la_default + 4.0]
         defaults['log_amp'] = _la_default
 
         # log_ls: GP global covariance length scale (natural log)
@@ -1987,9 +2014,16 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
     _val_dict = {}
     w_min = {}
     w_max = {}
+    distance_prior_ack = mo.ui.checkbox(
+        value=False,
+        label="I have entered the target distance and uncertainty",
+    )
 
+    _fix_distance_for_shape_only = obs_flux_scale.value == "continuum-normalised"
     for _name in param_names:
-        _fix_dict[_name] = mo.ui.checkbox(value=False)
+        _fix_dict[_name] = mo.ui.checkbox(
+            value=(_name == 'log_scale' and _fix_distance_for_shape_only)
+        )
 
         mn, mx = bounds.get(_name, [0.0, 1.0])
         default = defaults.get(_name, 0.5)
@@ -2001,21 +2035,21 @@ def _(emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_d
     # Wrap in mo.ui.dictionary for Marimo reactivity
     w_fix = mo.ui.dictionary(_fix_dict) if _fix_dict else mo.ui.dictionary({})
     w_val = mo.ui.dictionary(_val_dict) if _val_dict else mo.ui.dictionary({})
-    return bounds, log10_params, param_names, w_fix, w_max, w_min, w_val
+    return bounds, distance_prior_ack, log10_params, param_names, w_fix, w_max, w_min, w_val
 
 
 @app.cell(hide_code=True)
-def _(bounds, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
+def _(bounds, distance_prior_ack, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
     # Render Parameter UI
     if not param_names:
          param_settings = mo.md("*Load an emulator to see parameters.*")
     else:
         # Parameters that use a normal prior instead of uniform
-        _normal_prior_params = {'log_amp'}
+        _normal_prior_params = {'log_amp', 'log_scale'}
 
         # Friendly display names
         _label_map = {
-            'log_scale': 'Log Scale (ln)',
+            'log_scale': 'Distance (pc)',
             'cheb_1': 'Continuum Tilt (c₁)',
             'log_amp': 'GP Log Amp (ln)',
             'log_ls': 'GP Log Length (ln)',
@@ -2032,7 +2066,7 @@ def _(bounds, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
 
         for _name in param_names:
             is_fixed = _fix_values.get(_name, False)
-            display_name = _label_map.get(_name, _name)
+            display_name = _label_map.get(_name) or str(_name)
             # Wrap log10-scaled parameters so the user knows the value is a logarithm
             if _name in log10_params and not display_name.startswith('log'):
                 display_name = f"log10({display_name})"
@@ -2085,6 +2119,8 @@ def _(bounds, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
             _sections.append(mo.md("---"))
             _sections.append(mo.md("#### Inference / Nuisance Parameters"))
             _sections.extend(_global_rows)
+            if 'log_scale' in param_names and not _fix_values.get('log_scale', False):
+                _sections.append(distance_prior_ack)
 
         param_settings = mo.vstack(_sections)
 
@@ -2094,7 +2130,7 @@ def _(bounds, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
             "Set prior distributions for each parameter. "
             "**Fix** a parameter to lock it at a specific value (tight δ-prior). "
             "Free parameters use **Uniform** priors (lower–upper) except "
-            "GP Log Amp which uses a **Normal** prior (center ± 2σ)."
+            "Distance and GP Log Amp, which use **Normal** priors (center ± 2σ)."
         ), kind="neutral"),
         param_settings
     ])
@@ -2179,6 +2215,7 @@ def _(
     alt,
     build_bestfit_spectrum_altair,
     build_default_observation_sigma,
+    distance_prior_ack,
     Spectrum,
     SpectrumModel,
     build_synthetic_sirocco_sigma,
@@ -2213,6 +2250,19 @@ def _(
     if run_mle_btn.value:
         if emu is None or obs_data is None:
             mo.stop(True, mo.md("Please load both an emulator and data."))
+        if ('log_scale' in param_names
+            and not w_fix.value.get('log_scale', False)
+            and not distance_prior_ack.value):
+            mo.stop(
+                True,
+                mo.callout(
+                    mo.md(
+                        "Confirm the Distance (pc) prior in Stage 2 before running MLE. "
+                        "The center is the target distance and the -2σ/+2σ fields define its uncertainty."
+                    ),
+                    kind="warn",
+                ),
+            )
 
         # Use a spinner rather than a static markdown block so the notebook keeps
         # surfacing progress while the optimizer and plotting code run.
@@ -2220,6 +2270,10 @@ def _(
             try:
                 from scipy.optimize import minimize as scipy_minimize
                 import time as _time
+                from Speculate_addons.distance_scale import (
+                    distance_prior_to_log_scale_prior as _distance_prior_to_log_scale_prior,
+                    distance_to_log_scale as _distance_to_log_scale,
+                )
 
                 # Restrict the observation to the selected wavelength window before
                 # transforming fluxes and uncertainties onto the emulator scale.
@@ -2315,19 +2369,20 @@ def _(
                 if 'cheb_1' in param_names:
                     global_params['cheb'] = [w_val.value['cheb_1']]
 
-                # Handle log_scale (flux scaling)
-                # If user has fixed log_scale, use their value
-                # If free, let Starfish auto-calculate initially, then optimize
-                if 'log_scale' in param_names and w_fix.value['log_scale']:
-                    global_params['log_scale'] = w_val.value['log_scale']
+                # Handle Distance (pc) UI wrapper. Backend remains log_scale.
+                if 'log_scale' in param_names:
+                    global_params['log_scale'] = _distance_to_log_scale(
+                        w_val.value['log_scale']
+                    )
 
                 # 3. Initialize Model
                 _model = SpectrumModel(
-                       emulator=emu, 
-                       data=spec_data, 
-                       grid_params=grid_params_init,
-                       flux_scale=_flux_scale,
-                       **global_params
+                    emulator=emu,
+                    data=spec_data,
+                    grid_params=grid_params_init,
+                    flux_scale=_flux_scale,
+                    norm=True,
+                    **global_params,
                 )
 
                 # Translate the Stage 2 UI state into scipy prior objects and freeze
@@ -2357,23 +2412,21 @@ def _(
                         _mx = w_max['Av'].value
                         _priors['Av'] = stats.uniform(loc=_mn, scale=_mx - _mn)
 
-                # C. log_scale Prior (if not fixed and user wants to optimize it)
+                # C. Distance prior (backend key: log_scale)
                 if 'log_scale' in param_names:
+                    _distance_pc = float(w_val.value['log_scale'])
+                    _distance_lo = float(w_min['log_scale'].value)
+                    _distance_hi = float(w_max['log_scale'].value)
+                    _distance_sigma = max((_distance_hi - _distance_lo) / 4.0, 1e-12)
+                    _ls_loc, _ls_sigma = _distance_prior_to_log_scale_prior(
+                        _distance_pc, _distance_sigma
+                    )
                     if w_fix.value['log_scale']:
-                        _model.params['log_scale'] = w_val.value['log_scale']
+                        _model.params['log_scale'] = _ls_loc
                         _model.freeze('log_scale')
                     else:
-                        # Bootstrap log_scale from auto-calculation
-                        try:
-                            _ = _model()  # Trigger one evaluation
-                            if _model._log_scale is not None and np.isfinite(_model._log_scale):
-                                _model.params['log_scale'] = _model._log_scale
-                        except:
-                            _model.params['log_scale'] = 0.0
-
-                        _mn = w_min['log_scale'].value
-                        _mx = w_max['log_scale'].value
-                        _priors['log_scale'] = stats.uniform(loc=_mn, scale=_mx - _mn)
+                        _model.params['log_scale'] = _ls_loc
+                        _priors['log_scale'] = stats.norm(loc=_ls_loc, scale=_ls_sigma)
 
                 # D. GP Priors (log_amp and log_ls handled independently)
                 if 'log_amp' in param_names:
@@ -2493,30 +2546,8 @@ def _(
                         _simplex[:, _col_idx] = np.roll(
                             _simplex[:, _col_idx], _col_idx)
 
-                    # Bootstrap log_scale into the simplex
-                    if 'log_scale' in _active_labels:
-                        _ls_idx = _active_labels.index('log_scale')
-                        for _row in range(_N + 1):
-                            try:
-                                _model.set_param_vector(_simplex[_row])
-                                _ = _model()
-                                if (_model._log_scale is not None
-                                        and np.isfinite(_model._log_scale)):
-                                    _simplex[_row, _ls_idx] = _model._log_scale
-                            except Exception:
-                                pass
-
                     _centroid = _simplex.mean(axis=0)
                     _model.set_param_vector(_centroid)
-                else:
-                    # L-BFGS-B / CMA-ES: bootstrap log_scale at the starting point
-                    if 'log_scale' in _active_labels:
-                        try:
-                            _ = _model()
-                            if _model._log_scale is not None and np.isfinite(_model._log_scale):
-                                _model.params['log_scale'] = _model._log_scale
-                        except Exception:
-                            pass
 
                 # 5. Run MLE Optimization
                 # Warm up emulator caches (Cholesky factorisation etc.)
@@ -2573,16 +2604,6 @@ def _(
                     np.random.seed(None)
                     for _ in range(_n_restarts - 1):
                         _rnd = _lo_arr + np.random.rand(_N) * (_hi_arr - _lo_arr)
-                        # Bootstrap log_scale for random starts too
-                        if 'log_scale' in _active_labels:
-                            _ls_idx = _active_labels.index('log_scale')
-                            try:
-                                _model.set_param_vector(_rnd)
-                                _ = _model()
-                                if _model._log_scale is not None and np.isfinite(_model._log_scale):
-                                    _rnd[_ls_idx] = _model._log_scale
-                            except Exception:
-                                pass
                         _start_points.append(_rnd)
 
                 _global_best_x = _p0.copy()
@@ -2792,9 +2813,13 @@ def _(
                 if 'Av' in res_global:
                     _global_md += f"| **Av** | {res_global['Av']:.4f} |\n"
                 if 'log_scale' in res_global:
-                    _global_md += f"| **ln(scale)** | {res_global['log_scale']:.4f} |\n"
+                    from Speculate_addons.distance_scale import log_scale_to_distance_pc as _log_scale_to_distance_pc
+                    _distance_pc = _log_scale_to_distance_pc(res_global['log_scale'])
+                    _global_md += f"| **Distance (pc)** | {_distance_pc:.4f} |\n"
                 elif hasattr(_model, '_log_scale') and _model._log_scale is not None:
-                    _global_md += f"| **ln(scale) (auto)** | {_model._log_scale:.4f} |\n"
+                    from Speculate_addons.distance_scale import log_scale_to_distance_pc as _log_scale_to_distance_pc
+                    _distance_pc = _log_scale_to_distance_pc(_model._log_scale)
+                    _global_md += f"| **Distance (pc) (auto)** | {_distance_pc:.4f} |\n"
                 if 'cheb:1' in res_global:
                     _global_md += f"| **cheb₁** | {res_global['cheb:1']:.4f} |\n"
                 if 'global_cov:log_amp' in res_global:
@@ -2873,7 +2898,7 @@ def _(emu, get_mle_model, mo, param_names, re):
             mcmc_label_map[_internal] = _friendly
         # Map global/nuisance params to friendly names
         mcmc_label_map['Av'] = 'Av'
-        mcmc_label_map['log_scale'] = 'log_scale'
+        mcmc_label_map['log_scale'] = 'Distance (pc)'
         mcmc_label_map['cheb:1'] = 'cheb_1'
         mcmc_label_map['global_cov:log_amp'] = 'GP log_amp'
         mcmc_label_map['global_cov:log_ls'] = 'GP log_ls'
@@ -2988,6 +3013,7 @@ def _(
                 import matplotlib.pyplot as _plt
                 import matplotlib
                 import warnings as _warnings
+                from Speculate_addons.distance_scale import log_scale_to_distance_pc as _log_scale_to_distance_pc
                 matplotlib.rcParams['figure.max_open_warning'] = 50
                 _warnings.filterwarnings("ignore", module="arviz", message="More chains")
 
@@ -3064,12 +3090,26 @@ def _(
                 # _sampler.get_chain() shape: (nsteps, nwalkers, ndim)
                 _full_chain = _sampler.get_chain()
 
+                def _display_chain_values(_internal_label, _values):
+                    if _internal_label == 'log_scale':
+                        return _log_scale_to_distance_pc(_values)
+                    return _values
+
+                def _display_samples(_samples):
+                    _display = _samples.copy()
+                    for _idx, _label in enumerate(_model.labels):
+                        if _label == 'log_scale':
+                            _display[:, _idx] = _log_scale_to_distance_pc(_display[:, _idx])
+                    return _display
+
                 # Convert the raw emcee chain into ArviZ's (chains, draws) layout
                 # using friendly parameter names for all user-facing plots.
                 _friendly_labels = [_friendly(l) for l in _model.labels]
                 _full_dd = {}
-                for _i, _label in enumerate(_friendly_labels):
-                    _full_dd[_label] = _full_chain[:, :, _i].T  # (walkers, steps)
+                for _i, _internal_label in enumerate(_model.labels):
+                    _full_dd[_friendly(_internal_label)] = _display_chain_values(
+                        _internal_label, _full_chain[:, :, _i].T
+                    )  # (walkers, steps)
                 _full_data = _az.from_dict(posterior=_full_dd)
 
                 # Plot full chains (trace plot)
@@ -3108,6 +3148,7 @@ def _(
 
                 _burn_chain = _sampler.get_chain(discard=_burnin_used, thin=_thin_used)
                 _burn_samples = _burn_chain.reshape((-1, _ndim))
+                _burn_samples_display = _display_samples(_burn_samples)
 
                 _burnin_info = (
                     f"- **Manual burn-in requested:** {_burnin_manual}\n"
@@ -3125,8 +3166,10 @@ def _(
                 # Stage 17: Burnt chain trace, summary & posteriors
                 # ============================================================
                 _burn_dd = {}
-                for _i, _label in enumerate(_friendly_labels):
-                    _burn_dd[_label] = _burn_chain[:, :, _i].T  # (walkers, steps_after_burn)
+                for _i, _internal_label in enumerate(_model.labels):
+                    _burn_dd[_friendly(_internal_label)] = _display_chain_values(
+                        _internal_label, _burn_chain[:, :, _i].T
+                    )  # (walkers, steps_after_burn)
                 _burn_data = _az.from_dict(posterior=_burn_dd)
 
                 # Trace plot (post burn-in)
@@ -3141,7 +3184,7 @@ def _(
 
                 # Persist the post-burn samples and summary table so the export cells
                 # can write files without rerunning the sampler.
-                set_mcmc_samples(_burn_samples.copy())
+                set_mcmc_samples(_burn_samples_display.copy())
                 set_mcmc_labels(list(_friendly_labels))
                 set_mcmc_summary_df(_summary_df)
 
@@ -3194,7 +3237,7 @@ def _(
                         _truths = None
 
                 _fig_corner = _corner.corner(
-                    _burn_samples,
+                    _burn_samples_display,
                     labels=_friendly_labels,
                     show_titles=True,
                     quantiles=_corner_quantiles,
@@ -3213,8 +3256,17 @@ def _(
                 for _label in _model.labels:
                     _pr = _priors.get(_label)
                     if _pr is not None and hasattr(_pr, 'interval'):
-                        _lo, _hi = _pr.interval(1.0)
-                        _prior_ranges.append((_lo, _hi))
+                        if getattr(getattr(_pr, 'dist', None), 'name', None) == 'norm':
+                            _lo = float(_pr.mean() - 4.0 * _pr.std())
+                            _hi = float(_pr.mean() + 4.0 * _pr.std())
+                        else:
+                            _lo, _hi = _pr.interval(1.0)
+                        if _label == 'log_scale':
+                            _d0 = _log_scale_to_distance_pc(_lo)
+                            _d1 = _log_scale_to_distance_pc(_hi)
+                            _prior_ranges.append((min(_d0, _d1), max(_d0, _d1)))
+                        else:
+                            _prior_ranges.append((_lo, _hi))
                     else:
                         _prior_ranges.append(None)
                 # Only build the second plot if we resolved at least one range
@@ -3222,7 +3274,7 @@ def _(
                     # Replace None entries with auto-range sentinel (corner uses 0.999 quantile)
                     _safe_ranges = [_r if _r is not None else (1.0,) for _r in _prior_ranges]
                     _fig_corner_prior = _corner.corner(
-                        _burn_samples,
+                        _burn_samples_display,
                         labels=_friendly_labels,
                         show_titles=True,
                         quantiles=_corner_quantiles,
@@ -3314,9 +3366,12 @@ def _(
 
                 for _i, _label in enumerate(_model.labels):
                     _display_name = _friendly(_label)
-                    _mean = np.mean(_burn_samples[:, _i])
-                    _std = np.std(_burn_samples[:, _i])
-                    _median = np.median(_burn_samples[:, _i])
+                    _display_vals = _display_chain_values(
+                        _label, _burn_samples[:, _i]
+                    )
+                    _mean = np.mean(_display_vals)
+                    _std = np.std(_display_vals)
+                    _median = np.median(_display_vals)
 
                     _results_md += f"| **{_display_name}** | {_mean:.4f} | {_std:.4f} | {_median:.4f} | "
 

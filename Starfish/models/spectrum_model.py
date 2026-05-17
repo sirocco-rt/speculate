@@ -33,6 +33,18 @@ from Starfish.utils import calculate_dv, create_log_lam_grid
 from .kernels import global_covariance_matrix, local_covariance_matrix
 
 
+def _as_float(value):
+    if PYTORCH_AVAILABLE and isinstance(value, torch.Tensor):
+        return float(value.detach().cpu().reshape(-1)[0].item())
+    return float(np.asarray(value).reshape(-1)[0])
+
+
+def _expanded_param_keys(params):
+    keys = {str(key) for key in params.keys()}
+    keys.update(key.split(":", 1)[0] for key in tuple(keys))
+    return keys
+
+
 class SpectrumModel:
     """
     A single-order spectrum model.
@@ -345,14 +357,15 @@ class SpectrumModel:
         """
         wave = self.min_dv_wave
         fluxes = self.bulk_fluxes
+        _param_keys = _expanded_param_keys(self.params)
 
         # Track whether wave/fluxes changed (vsini/vz invalidate cache)
         _wave_changed = False
-        if "vsini" in self.params:
+        if "vsini" in _param_keys:
             fluxes = rotational_broaden(wave, fluxes, self.params["vsini"])
             _wave_changed = True
 
-        if "vz" in self.params:
+        if "vz" in _param_keys:
             wave = doppler_shift(wave, self.params["vz"])
             _wave_changed = True
 
@@ -368,11 +381,11 @@ class SpectrumModel:
 
         # In log10 space, nuisance transforms are additive offsets applied
         # AFTER PCA reconstruction, so skip pre-reconstruction bulk ops.
-        if "Av" in self.params and self.flux_scale != "log":
+        if "Av" in _param_keys and self.flux_scale != "log":
             fluxes = extinct(self.data.wave, fluxes, self.params["Av"],
                             Rv=self.params.get("Rv", 3.1))
 
-        if "cheb" in self.params and self.flux_scale != "log":
+        if "cheb" in _param_keys and self.flux_scale != "log":
             # force constant term to be 1 to avoid degeneracy with log_scale
             coeffs = [1, *self.cheb]
             fluxes = chebyshev_correct(self.data.wave, fluxes, coeffs)
@@ -400,7 +413,7 @@ class SpectrumModel:
         if using_gpu:
             # GPU Path
             # Cache the fluxes GPU tensor when Av/cheb are not present (fluxes constant)
-            _av_or_cheb_active = "Av" in self.params or "cheb" in self.params
+            _av_or_cheb_active = "Av" in _param_keys or "cheb" in _param_keys
             if _av_or_cheb_active or _wave_changed or self._cached_fluxes_gpu is None:
                 fluxes_gpu = torch.from_numpy(fluxes).to(device, DTYPE)
                 if not _av_or_cheb_active and not _wave_changed:
@@ -420,14 +433,19 @@ class SpectrumModel:
                 # In log₁₀ space, multiplicative nuisance ops become
                 # additive offsets and do NOT change the GP covariance.
                 _ln10 = np.log(10.0)
-                if "Av" in self.params:
+                if self.norm:
+                    _norm_offset = _as_float(self.emulator.norm_factor(self.grid_params))
+                    flux = flux + torch.as_tensor(
+                        _norm_offset, device=flux.device, dtype=flux.dtype
+                    )
+                if "Av" in _param_keys:
                     _ext_np = extinct(
                         self.data.wave, np.zeros_like(self.data.wave),
                         self.params["Av"], Rv=self.params.get("Rv", 3.1),
                         flux_scale="log",
                     )
                     flux = flux + torch.from_numpy(_ext_np).to(flux.device, flux.dtype)
-                if "cheb" in self.params:
+                if "cheb" in _param_keys:
                     coeffs_np = np.array([1, *self.cheb.tolist()])
                     _sw = self.data.wave / self.data.wave.max()
                     from numpy.polynomial.chebyshev import chebval as _chebval
@@ -436,9 +454,9 @@ class SpectrumModel:
                     flux = flux + torch.from_numpy(
                         np.log10(_cheb_poly)
                     ).to(flux.device, flux.dtype)
-                if "log_scale" in self.params:
-                    self._log_scale = self.params["log_scale"]
-                    flux = flux + self.params["log_scale"] / _ln10
+                if "log_scale" in _param_keys:
+                    self._log_scale = _as_float(self.params["log_scale"])
+                    flux = flux + self._log_scale / _ln10
                 else:
                     _flux_np = flux.detach().cpu().numpy()
                     self._log_scale = self._estimate_log_scale_from_log_flux(_flux_np)
@@ -448,20 +466,20 @@ class SpectrumModel:
                 # ── Linear-space nuisance transforms (original path) ─────
                 # optionally scale using absolute flux calibration
                 if self.norm:
-                    norm = self.emulator.norm_factor(self.grid_params)
+                    norm = _as_float(self.emulator.norm_factor(self.grid_params))
                 else:
                     norm = 1.0
 
                 # Renorm to data flux if no "log_scale" provided
-                if "log_scale" not in self.params:
+                if "log_scale" not in _param_keys:
                     flux_cpu = flux.detach().cpu().numpy()
                     scale = _get_renorm_factor(self.data.wave, flux_cpu * norm, self.data.flux)
                     self._log_scale = np.log(scale)
                     scale *= norm
                     self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
                 else:
-                    self._log_scale = self.params["log_scale"]
-                    scale = np.exp(self.params["log_scale"]) * norm
+                    self._log_scale = _as_float(self.params["log_scale"])
+                    scale = np.exp(self._log_scale) * norm
                 
                 # Apply scale
                 flux = flux * scale
@@ -485,9 +503,9 @@ class SpectrumModel:
             cov.diagonal().add_(self._cached_data_sigma_gpu ** 2)
             
             # Global covariance — GPU-accelerated with parameter-based caching
-            if "global_cov" in self.params:
-                _cur_ag = self.params["global_cov:log_amp"]
-                _cur_lg = self.params["global_cov:log_ls"]
+            if "global_cov" in _param_keys:
+                _cur_ag = _as_float(self.params["global_cov:log_amp"])
+                _cur_lg = _as_float(self.params["global_cov:log_ls"])
                 _cur_glob_params = (_cur_ag, _cur_lg)
 
                 if ("global_cov" not in self.frozen
@@ -525,13 +543,13 @@ class SpectrumModel:
                     cov = cov + self._cached_glob_cov_gpu
 
             # Local covariance
-            if "local_cov" in self.params:
+            if "local_cov" in _param_keys:
                 if "local_cov" not in self.frozen or self._loc_cov is None:
                     self._loc_cov = 0
                     for kernel in self.params.as_dict()["local_cov"]:
-                        mu = kernel["mu"]
-                        amplitude = np.exp(kernel["log_amp"])
-                        sigma = np.exp(kernel["log_sigma"])
+                        mu = _as_float(kernel["mu"])
+                        amplitude = np.exp(_as_float(kernel["log_amp"]))
+                        sigma = np.exp(_as_float(kernel["log_sigma"]))
                         self._loc_cov += local_covariance_matrix(
                             self.data.wave, amplitude, mu, sigma
                         )
@@ -557,21 +575,23 @@ class SpectrumModel:
         if self.flux_scale == "log":
             # ── Log₁₀-space nuisance transforms (additive) ──────────
             _ln10 = np.log(10.0)
-            if "Av" in self.params:
+            if self.norm:
+                flux = flux + _as_float(self.emulator.norm_factor(self.grid_params))
+            if "Av" in _param_keys:
                 flux = extinct(
                     self.data.wave, flux, self.params["Av"],
                     Rv=self.params.get("Rv", 3.1), flux_scale="log",
                 )
-            if "cheb" in self.params:
+            if "cheb" in _param_keys:
                 coeffs_np = np.array([1, *self.cheb.tolist()])
                 _sw = self.data.wave / self.data.wave.max()
                 from numpy.polynomial.chebyshev import chebval as _chebval
                 _cheb_poly = _chebval(_sw, coeffs_np)
                 _cheb_poly = np.clip(_cheb_poly, 1e-30, None)
                 flux = flux + np.log10(_cheb_poly)
-            if "log_scale" in self.params:
-                self._log_scale = self.params["log_scale"]
-                flux = flux + self.params["log_scale"] / _ln10
+            if "log_scale" in _param_keys:
+                self._log_scale = _as_float(self.params["log_scale"])
+                flux = flux + self._log_scale / _ln10
             else:
                 self._log_scale = self._estimate_log_scale_from_log_flux(flux)
                 flux = flux + self._log_scale / _ln10
@@ -580,19 +600,19 @@ class SpectrumModel:
             # ── Linear-space nuisance transforms (original path) ─────
             # optionally scale using absolute flux calibration
             if self.norm:
-                norm = self.emulator.norm_factor(self.grid_params)
+                norm = _as_float(self.emulator.norm_factor(self.grid_params))
             else:
                 norm = 1
 
             # Renorm to data flux if no "log_scale" provided
-            if "log_scale" not in self.params:
+            if "log_scale" not in _param_keys:
                 scale = _get_renorm_factor(self.data.wave, flux * norm, self.data.flux)
                 self._log_scale = np.log(scale)
                 scale *= norm
                 self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
             else:
-                self._log_scale = self.params["log_scale"]
-                scale = np.exp(self.params["log_scale"]) * norm
+                self._log_scale = _as_float(self.params["log_scale"])
+                scale = np.exp(self._log_scale) * norm
 
             flux = rescale(flux, scale)
             X = rescale(X, scale)
@@ -610,23 +630,23 @@ class SpectrumModel:
         np.fill_diagonal(cov, cov.diagonal() + self.data.sigma**2)
 
         # Global covariance
-        if "global_cov" in self.params:
+        if "global_cov" in _param_keys:
             if "global_cov" not in self.frozen or self._glob_cov is None:
-                ag = np.exp(self.params["global_cov:log_amp"])
-                lg = np.exp(self.params["global_cov:log_ls"])
+                ag = np.exp(_as_float(self.params["global_cov:log_amp"]))
+                lg = np.exp(_as_float(self.params["global_cov:log_ls"]))
                 self._glob_cov = global_covariance_matrix(self.data.wave, ag, lg)
 
         if self._glob_cov is not None:
             cov += self._glob_cov
 
         # Local covariance
-        if "local_cov" in self.params:
+        if "local_cov" in _param_keys:
             if "local_cov" not in self.frozen or self._loc_cov is None:
                 self._loc_cov = 0
                 for kernel in self.params.as_dict()["local_cov"]:
-                    mu = kernel["mu"]
-                    amplitude = np.exp(kernel["log_amp"])
-                    sigma = np.exp(kernel["log_sigma"])
+                    mu = _as_float(kernel["mu"])
+                    amplitude = np.exp(_as_float(kernel["log_amp"]))
+                    sigma = np.exp(_as_float(kernel["log_sigma"]))
                     self._loc_cov += local_covariance_matrix(
                         self.data.wave, amplitude, mu, sigma
                     )
@@ -651,20 +671,21 @@ class SpectrumModel:
         """
         wave = self.min_dv_wave
         fluxes = self.bulk_fluxes
+        _param_keys = _expanded_param_keys(self.params)
 
-        if "vsini" in self.params:
+        if "vsini" in _param_keys:
             fluxes = rotational_broaden(wave, fluxes, self.params["vsini"])
 
-        if "vz" in self.params:
+        if "vz" in _param_keys:
             wave = doppler_shift(wave, self.params["vz"])
 
         fluxes = resample(wave, fluxes, self.data.wave)
 
-        if "Av" in self.params:
+        if "Av" in _param_keys:
             fluxes = extinct(self.data.wave, fluxes, self.params["Av"],
                             Rv=self.params.get("Rv", 3.1))
 
-        if "cheb" in self.params:
+        if "cheb" in _param_keys:
             # force constant term to be 1 to avoid degeneracy with log_scale
             coeffs = [1, *self.cheb]
             fluxes = chebyshev_correct(self.data.wave, fluxes, coeffs)
@@ -679,19 +700,19 @@ class SpectrumModel:
 
         # optionally scale using absolute flux calibration
         if self.norm:
-            norm = self.emulator.norm_factor(self.grid_params)
+            norm = _as_float(self.emulator.norm_factor(self.grid_params))
         else:
             norm = 1
 
         # Renorm to data flux if no "log_scale" provided
-        if "log_scale" not in self.params:
+        if "log_scale" not in _param_keys:
             scale = _get_renorm_factor(self.data.wave, flux * norm, self.data.flux)
             self._log_scale = np.log(scale)
             scale *= norm
             self.log.debug(f"fit scale factor using integrated flux ratio: {scale}")
         else:
-            self._log_scale = self.params["log_scale"]
-            scale = np.exp(self.params["log_scale"]) * norm
+            self._log_scale = _as_float(self.params["log_scale"])
+            scale = np.exp(self._log_scale) * norm
 
         flux = rescale(flux, scale)
         
@@ -727,7 +748,7 @@ class SpectrumModel:
         if priors is not None:
             for key, prior in priors.items():
                 if key in self.params:
-                    prior_lp += prior.logpdf(self[key])
+                    prior_lp += prior.logpdf(_as_float(self[key]))
 
         if not np.isfinite(prior_lp):
             return -np.inf

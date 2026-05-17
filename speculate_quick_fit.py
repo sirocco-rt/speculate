@@ -1276,7 +1276,7 @@ def _(
             for _row_index, _entry in _row_and_entries:
                 if not isinstance(_entry, dict) or "flux" not in _entry:
                     continue
-                _fl = np.asarray(_entry["flux"], dtype=np.float32)
+                _fl = np.asarray(_entry["flux"], dtype=np.float64)
                 if _fl.size < _wl.size:
                     continue
                 _rows.append(_row_index)
@@ -1301,7 +1301,7 @@ def _(
         if not _flux_matrix:
             mo.stop(True, mo.callout(mo.md("Could not extract flux data from grid."), kind="danger"))
 
-        _flux_matrix = np.array(_flux_matrix, dtype=np.float32)
+        _flux_matrix = np.array(_flux_matrix, dtype=np.float64)
         if _valid_rows:
             X_grid = X_grid[_valid_rows]
 
@@ -1323,7 +1323,7 @@ def _(
         # space this is a divide-by-mean normalisation; in log space it becomes
         # subtracting the mean log flux, which is the consistent analogue of
         # removing a multiplicative flux offset.
-        _norm_factors = _flux_matrix.mean(axis=1)
+        _norm_factors = _flux_matrix.mean(axis=1, dtype=np.float64)
         if _scale == "log":
             _flux_matrix = _flux_matrix - _norm_factors[:, np.newaxis]
         else:
@@ -1358,6 +1358,7 @@ def _(
             "eigenspectra": _eigenspectra,
             "flux_mean": _flux_mean,
             "flux_std": _flux_std,
+            "norm_factors": _norm_factors.astype(np.float64),
             "wl": _wl_trimmed,
             "param_names": [_param_names[c] for c in _col_mask] if _param_names else [f"param_{c}" for c in _col_mask],
             "min_params": X_grid.min(axis=0),
@@ -2455,6 +2456,7 @@ def _(
             "eigenspectra": qf_pca_data["eigenspectra"],
             "flux_mean": qf_pca_data["flux_mean"],
             "flux_std": qf_pca_data["flux_std"],
+            "norm_factors": qf_pca_data["norm_factors"],
             "wl": qf_pca_data["wl"],
             "grid_points": qf_pca_data["grid_points"],
             "weights": qf_pca_data["weights"],
@@ -2686,6 +2688,8 @@ def _(
                 "eigenspectra": np.array(_npz["eigenspectra"]),
                 "flux_mean": np.array(_npz["flux_mean"]),
                 "flux_std": np.array(_npz["flux_std"]),
+                "norm_factors": np.array(_npz["norm_factors"]) if "norm_factors" in _npz.files else None,
+                "has_norm_factors": "norm_factors" in _npz.files,
                 "wl": np.array(_npz["wl"]),
                 "param_names": _param_names,
                 "min_params": np.array(_npz["grid_points"]).min(axis=0),
@@ -2695,6 +2699,21 @@ def _(
                 "selected_param_indices": _selected_param_indices,
                 "fixed_inclination": _fixed_inclination,
             }
+
+            if qf_inf_emu_data["has_norm_factors"]:
+                try:
+                    _gp_norm = np.array(_npz["grid_points"]).astype(np.float32)
+                    _nf = np.array(_npz["norm_factors"], dtype=np.float64)
+                    _axes_norm = [np.unique(_gp_norm[:, i]) for i in range(_gp_norm.shape[1])]
+                    _sorted_norm = np.lexsort(_gp_norm.T[::-1])
+                    _grid_shape_norm = [len(a) for a in _axes_norm]
+                    _nf_grid = _nf[_sorted_norm].reshape(_grid_shape_norm)
+                    qf_inf_emu_data["norm_factor_interpolator"] = RegularGridInterpolator(
+                        _axes_norm, _nf_grid, method="linear",
+                        bounds_error=False, fill_value=None,
+                    )
+                except Exception:
+                    qf_inf_emu_data["norm_factor_interpolator"] = None
 
             # Restore input parameter scaler (min-max normalisation).
             if "input_scaler_min" in _npz:
@@ -3084,13 +3103,13 @@ def _(alt, mo, np, pd, qf_inf_emu_data, qf_inf_wl_slider, qf_obs_data, qf_obs_sc
                 opacity=0.10, color='cyan'
             ).encode(
                 x=alt.X('Wavelength:Q'),
-                y=alt.Y('Lower:Q'),
-                y2=alt.Y2('Upper:Q'),
+                y=alt.Y('Lower:Q', scale=alt.Scale(zero=False)),
+                y2=alt.Y2(field='Upper'),
             )
 
         _obs_chart = (_obs_band + _obs_line).properties(
             width="container", height=400, title="Observation Spectrum"
-        ).interactive()
+        ).interactive(bind_y=False)
 
     mo.accordion({
         f"{mo.icon('lucide:trending-up')} View Selected Spectrum":
@@ -3108,10 +3127,35 @@ def _(np, torch):
         flux_mean = emu_data["flux_mean"]
         flux_std = emu_data["flux_std"]
 
+        def _norm_factor():
+            _interp = emu_data.get("norm_factor_interpolator")
+            if _interp is not None:
+                try:
+                    return float(np.asarray(_interp(X_raw)).squeeze())
+                except Exception:
+                    pass
+            _stored = emu_data.get("norm_factors")
+            if _stored is None:
+                return None
+            _grid = emu_data.get("grid_points")
+            if _grid is None:
+                return None
+            _dist = np.sum((np.asarray(_grid, dtype=np.float32) - X_raw) ** 2, axis=1)
+            return float(np.asarray(_stored).reshape(-1)[int(np.argmin(_dist))])
+
+        def _restore_norm(flux):
+            _factor = _norm_factor()
+            if _factor is None or not np.isfinite(_factor):
+                return flux
+            if emu_data.get("scale") == "log":
+                return flux + _factor
+            return flux * _factor
+
         if is_grid_interp:
             # RegularGridInterpolator uses raw parameter values
             w = np.array([m(X_raw)[0] for m in models])
             flux = (w @ (eigenspectra * flux_std)) + flux_mean
+            flux = _restore_norm(flux)
             return flux, [flux]
         else:
             X_norm = (X_raw - input_scaler["min"]) / input_scaler["range"]
@@ -3124,7 +3168,7 @@ def _(np, torch):
                 if output_scaler is not None:
                     w = w * output_scaler["std"] + output_scaler["mean"]
                 flux = (w @ (eigenspectra * flux_std)) + flux_mean
-                fluxes.append(flux)
+                fluxes.append(_restore_norm(flux))
             mean_flux = np.mean(fluxes, axis=0)
             return mean_flux, fluxes
     return (qf_predict_flux,)
@@ -3183,63 +3227,19 @@ def _(
         _min_inputs.append(mo.ui.number(value=round(_lo, 4), step=0.001, label="Min"))
         _max_inputs.append(mo.ui.number(value=round(_hi, 4), step=0.001, label="Max"))
 
-    # ── Auto-configure nuisance parameter defaults ──
-    # Estimate log_scale from the ratio of observation to emulator midpoint flux
-    # so the MLE starts with both spectra at roughly the same scale.
-    _ls_default = 0.0
-    if qf_obs_data is not None and qf_inf_models is not None:
-        try:
-            _wl_lo, _wl_hi = qf_inf_wl_slider.value
-            _mid_params = (_min_p + _max_p) / 2.0
-            _emu_fl, _ = qf_predict_flux(
-                qf_inf_models, _mid_params, qf_inf_emu_data,
-                qf_inf_input_scaler, qf_inf_output_scaler,
-                is_grid_interp=qf_inf_is_grid_interp,
-            )
-            _emu_wl = qf_inf_emu_data["wl"]
-            _em = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
-            _emu_mean = np.mean(np.abs(_emu_fl[_em])) if _em.any() else 1.0
-
-            _om = (qf_obs_data['wavelength'] >= _wl_lo) & (qf_obs_data['wavelength'] <= _wl_hi)
-            _obs_wl = np.array(qf_obs_data[_om]['wavelength'])
-            _raw_fl = np.array(qf_obs_data[_om]['flux'])
-            _raw_err = np.array(qf_obs_data[_om]['error']) if 'error' in qf_obs_data.columns else None
-            _sigma_source = (
-                qf_obs_data['sigma_source'].iat[0]
-                if 'sigma_source' in qf_obs_data.columns and len(qf_obs_data) > 0
-                else None
-            )
-            _scale = qf_obs_scale_selector.value
-            _obs_fl, _ = qf_transform_observation_data(
-                _obs_wl,
-                _raw_fl,
-                _raw_err,
-                _scale,
-                _sigma_source,
-            )
-            # Auto-centre log_scale.  When the emulator outputs log₁₀ flux,
-            # the transformed means are negative and their ratio is meaningless.
-            # Convert both back to linear space to get a sensible scaling offset.
-            if _scale == "log":
-                _emu_mean_lin = np.mean(np.abs(10.0 ** _emu_fl[_em])) if _em.any() else 1.0
-                _obs_mean_lin = np.mean(np.abs(_raw_fl)) if len(_raw_fl) > 0 else 1.0
-                if _emu_mean_lin > 0 and _obs_mean_lin > 0:
-                    _ls_default = round(float(np.log(_obs_mean_lin / _emu_mean_lin)), 1)
-            else:
-                _obs_mean = np.mean(np.abs(_obs_fl)) if len(_obs_fl) > 0 else 1.0
-                if _emu_mean > 0 and _obs_mean > 0:
-                    _ls_default = round(float(np.log(_obs_mean / _emu_mean)), 1)
-        except Exception:
-            pass
-
+    _model_flux_scale = str(qf_inf_emu_data.get("scale", "linear"))
+    _fix_distance_for_shape_only = (
+        qf_obs_scale_selector.value == "continuum-normalised"
+        or _model_flux_scale == "continuum-normalised"
+    )
     _nuisance = [
-        ("Av",        0.0,         0.0,               2.0),
-        ("log_scale", _ls_default, _ls_default - 5.0, _ls_default + 5.0),
-        ("cheb_1",    0.0,         -0.5,              0.5),
+        ("Av",        0.0,         0.0,               2.0, False),
+        ("Distance (pc)", 100.0, 90.0, 110.0, _fix_distance_for_shape_only),
+        ("cheb_1",    0.0,         -0.5,              0.5, True),
     ]
-    for _name, _val, _lo, _hi in _nuisance:
+    for _name, _val, _lo, _hi, _fixed_default in _nuisance:
         _labels.append(_name)
-        _fixed_toggles.append(mo.ui.checkbox(label="Fix", value=(_name == "cheb_1")))
+        _fixed_toggles.append(mo.ui.checkbox(label="Fix", value=_fixed_default))
         _value_inputs.append(mo.ui.number(value=round(_val, 4), step=0.01, label="Value"))
         _min_inputs.append(mo.ui.number(value=round(_lo, 4), step=0.01, label="Min"))
         _max_inputs.append(mo.ui.number(value=round(_hi, 4), step=0.01, label="Max"))
@@ -3279,6 +3279,18 @@ def _(
     else:
         _config_output = _config_accordion
 
+    if _fix_distance_for_shape_only:
+        _config_output = mo.vstack([
+            mo.callout(
+                mo.md(
+                    "Continuum-normalised fits remove the absolute flux scale, "
+                    "so Distance is fixed at 100 pc by default."
+                ),
+                kind="neutral",
+            ),
+            _config_output,
+        ])
+
     _config_output
     return (qf_param_config,)
 
@@ -3301,7 +3313,7 @@ def _(
     re,
 ):
     # ── Parameter Playground ──
-    # Interactive sliders to preview how Av, log_scale, cheb_1, and the
+    # Interactive sliders to preview how Av, Distance, cheb_1, and the
     # physical grid axes shift the emulated spectrum relative to the
     # observation. Helps find sensible prior bounds before running MLE.
 
@@ -3309,8 +3321,8 @@ def _(
     # always receive valid references even before a model is loaded.
     qf_pg_av = mo.ui.slider(start=0.0, stop=5.0, value=0.0, step=0.01,
                              label="Av (Extinction)", show_value=True, full_width=True)
-    qf_pg_logscale = mo.ui.slider(start=-10.0, stop=10.0, value=0.0, step=0.1,
-                                   label="log_scale (ln flux scaling)", show_value=True, full_width=True)
+    qf_pg_logscale = mo.ui.slider(start=10.0, stop=1000.0, value=100.0, step=1.0,
+                                   label="Distance (pc)", show_value=True, full_width=True)
     qf_pg_cheb1 = mo.ui.slider(start=-2.0, stop=2.0, value=0.0, step=0.01,
                                 label="cheb_1 (continuum tilt)", show_value=True, full_width=True)
 
@@ -3321,54 +3333,12 @@ def _(
     _max_p = qf_inf_emu_data["max_params"]
     _mid_params = (_min_p + _max_p) / 2.0
     _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
-    _wl_lo, _wl_hi = qf_inf_wl_slider.value
-
-    # Auto-detect sensible log_scale centre from flux ratio.
-    _ls_centre = 0.0
-    try:
-        _emu_fl, _ = qf_predict_flux(
-            qf_inf_models, _mid_params, qf_inf_emu_data,
-            qf_inf_input_scaler, qf_inf_output_scaler,
-            is_grid_interp=qf_inf_is_grid_interp,
-        )
-        _emu_wl = qf_inf_emu_data["wl"]
-        _em = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
-        _emu_mean = np.mean(np.abs(_emu_fl[_em])) if _em.any() else 1.0
-
-        _om = (qf_obs_data['wavelength'] >= _wl_lo) & (qf_obs_data['wavelength'] <= _wl_hi)
-        _obs_wl_pg = np.array(qf_obs_data[_om]['wavelength'])
-        _raw_fl_pg = np.array(qf_obs_data[_om]['flux'])
-        _raw_err_pg = np.array(qf_obs_data[_om]['error']) if 'error' in qf_obs_data.columns else None
-        _sigma_source_pg = (
-            qf_obs_data['sigma_source'].iat[0]
-            if 'sigma_source' in qf_obs_data.columns and len(qf_obs_data) > 0
-            else None
-        )
-        _scale_pg = qf_obs_scale_selector.value
-        _obs_fl_pg, _ = qf_transform_observation_data(
-            _obs_wl_pg,
-            _raw_fl_pg,
-            _raw_err_pg,
-            _scale_pg,
-            _sigma_source_pg,
-        )
-        if _scale_pg == "log":
-            _emu_mean_lin = np.mean(np.abs(10.0 ** _emu_fl[_em])) if _em.any() else 1.0
-            _obs_mean_lin = np.mean(np.abs(_raw_fl_pg)) if len(_raw_fl_pg) > 0 else 1.0
-            if _emu_mean_lin > 0 and _obs_mean_lin > 0:
-                _ls_centre = round(float(np.log(_obs_mean_lin / _emu_mean_lin)), 1)
-        else:
-            _obs_mean = np.mean(np.abs(_obs_fl_pg)) if len(_obs_fl_pg) > 0 else 1.0
-            if _emu_mean > 0 and _obs_mean > 0:
-                _ls_centre = round(float(np.log(_obs_mean / _emu_mean)), 1)
-    except Exception:
-        pass
 
     qf_pg_av = mo.ui.slider(start=0.0, stop=5.0, value=0.0, step=0.01,
                              label="Av (Extinction)", show_value=True, full_width=True)
-    qf_pg_logscale = mo.ui.slider(start=_ls_centre - 10.0, stop=_ls_centre + 10.0,
-                                   value=_ls_centre, step=0.1,
-                                   label="log_scale (ln flux scaling)", show_value=True, full_width=True)
+    qf_pg_logscale = mo.ui.slider(start=10.0, stop=1000.0,
+                                   value=100.0, step=1.0,
+                                   label="Distance (pc)", show_value=True, full_width=True)
     qf_pg_cheb1 = mo.ui.slider(start=-2.0, stop=2.0, value=0.0, step=0.01,
                                 label="cheb_1 (continuum tilt)", show_value=True, full_width=True)
 
@@ -3381,11 +3351,42 @@ def _(
     # wrapper is added for parameters stored on a log10 axis.
     _qf_phys_sliders = []
     _qf_param_names = qf_inf_emu_data["param_names"]
+
+    def _clean_slider_number(_value, _decimals=4):
+        _value = float(_value)
+        if not np.isfinite(_value):
+            return 0.0
+        if _value == 0.0:
+            return 0.0
+        if 1e-4 <= abs(_value) < 1e6:
+            return float(f"{_value:.{_decimals}f}")
+        return float(f"{_value:.{_decimals}g}")
+
+    def _nice_slider_step(_lo, _hi, _target_steps=300):
+        _span = abs(float(_hi) - float(_lo))
+        if not np.isfinite(_span) or _span <= 0.0:
+            return 1e-6
+        _raw = _span / float(_target_steps)
+        _exp = np.floor(np.log10(_raw))
+        _frac = _raw / (10.0 ** _exp)
+        if _frac <= 1.0:
+            _nice = 1.0
+        elif _frac <= 2.0:
+            _nice = 2.0
+        elif _frac <= 5.0:
+            _nice = 5.0
+        else:
+            _nice = 10.0
+        return max(_clean_slider_number(_nice * (10.0 ** _exp)), 1e-12)
+
     for _pi, _pname in enumerate(_qf_param_names):
         _lo = float(_min_p[_pi])
         _hi = float(_max_p[_pi])
         _mid = (_lo + _hi) / 2.0
-        _step = max((_hi - _lo) / 200.0, 1e-6)
+        _lo_ui = _clean_slider_number(_lo)
+        _hi_ui = _clean_slider_number(_hi)
+        _mid_ui = _clean_slider_number(_mid)
+        _step = _nice_slider_step(_lo_ui, _hi_ui)
 
         _m = re.search(r"(\d+)", str(_pname))
         _db_idx = int(_m.group(1)) if _m else None
@@ -3398,7 +3399,7 @@ def _(
             _label = str(_pname)
 
         _qf_phys_sliders.append(mo.ui.slider(
-            start=_lo, stop=_hi, value=_mid, step=_step,
+            start=_lo_ui, stop=_hi_ui, value=_mid_ui, step=_step,
             label=_label, show_value=True, full_width=True,
         ))
     qf_pg_phys_sliders = mo.ui.array(_qf_phys_sliders)
@@ -3437,6 +3438,7 @@ def _(
 
     if qf_inf_emu_data is not None and qf_inf_models is not None and qf_obs_data is not None:
         try:
+            from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
             _min_p = qf_inf_emu_data["min_params"]
             _max_p = qf_inf_emu_data["max_params"]
             # Physical parameter vector — from sliders when available, otherwise
@@ -3460,8 +3462,8 @@ def _(
             # Apply nuisance transforms
             # When the emulator outputs log₁₀(flux), convert to linear
             # before applying nuisance transforms, then convert back.
-            _is_log_scale = (qf_obs_scale_selector.value == "log")
-            if _is_log_scale:
+            _model_is_log = (qf_inf_emu_data.get("scale") == "log")
+            if _model_is_log:
                 _emu_fl_c = 10.0 ** _emu_fl_c
 
             _av = qf_pg_av.value
@@ -3475,9 +3477,10 @@ def _(
                 _scale_wl = _emu_wl_c / _emu_wl_c.max()
                 _emu_fl_c = _emu_fl_c * chebval(_scale_wl, [1.0, _cheb1])
 
-            _emu_fl_c = _emu_fl_c * np.exp(qf_pg_logscale.value)
+            _log_scale = _distance_to_log_scale(float(qf_pg_logscale.value))
+            _emu_fl_c = _emu_fl_c * np.exp(_log_scale)
 
-            if _is_log_scale:
+            if _model_is_log:
                 _emu_fl_c = np.log10(np.clip(_emu_fl_c, 1e-30, None))
 
             # Observation in emulator scale
@@ -3551,7 +3554,7 @@ def _(
                 "to a similar scale as the observation, and the **Physical Parameters** "
                 "tab to reshape the emulated spectrum by varying the grid axes.\n\n"
                 "- **Av** — Interstellar dust extinction (magnitudes)\n"
-                "- **log_scale** — Natural log of flux scaling factor\n"
+                "- **Distance (pc)** — Distance prior wrapper for the backend flux scale\n"
                 "- **cheb_1** — Chebyshev c₁ coefficient (continuum tilt)"
             ), kind="neutral"),
             _slider_tabs,
@@ -3617,6 +3620,7 @@ def _(
             )
         else:
             try:
+                from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
                 _wl_lo, _wl_hi = qf_inf_wl_slider.value
                 _obs_mask = ((qf_obs_data['wavelength'] >= _wl_lo)
                              & (qf_obs_data['wavelength'] <= _wl_hi))
@@ -3630,9 +3634,10 @@ def _(
                     else None
                 )
 
-                _scale = qf_obs_scale_selector.value
+                _obs_scale = qf_obs_scale_selector.value
+                _model_is_log = (qf_inf_emu_data.get("scale") == "log")
                 _obs_fl, _obs_err = qf_transform_observation_data(
-                    _obs_wl, _raw_fl, _raw_err, _scale, _sigma_source
+                    _obs_wl, _raw_fl, _raw_err, _obs_scale, _sigma_source
                 )
 
                 _phys = np.array(qf_pg_phys_sliders.value, dtype=float)
@@ -3646,7 +3651,7 @@ def _(
                 _fl = _model_fl[_em].copy()
                 _wl = _emu_wl[_em]
 
-                if _scale == "log":
+                if _model_is_log:
                     _fl = 10.0 ** _fl
 
                 _av = float(qf_pg_av.value)
@@ -3661,9 +3666,10 @@ def _(
                     _scale_wl = _wl / _wl.max()
                     _fl = _fl * chebval(_scale_wl, [1.0, _cheb1])
 
-                _fl = _fl * np.exp(float(qf_pg_logscale.value))
+                _log_scale = _distance_to_log_scale(float(qf_pg_logscale.value))
+                _fl = _fl * np.exp(_log_scale)
 
-                if _scale == "log":
+                if _model_is_log:
                     _fl = np.log10(np.clip(_fl, 1e-30, None))
 
                 _model_interp = np.interp(_obs_wl, _wl, _fl)
@@ -3791,12 +3797,12 @@ def _(
     if _obs_wl.size == 0:
         mo.stop(True, mo.callout(mo.md("No observation points fall within the selected wavelength range."), kind="warn"))
 
-    _scale = qf_obs_scale_selector.value
+    _model_is_log = (qf_inf_emu_data.get("scale") == "log")
     _obs_fl, _obs_err = qf_transform_observation_data(
         _obs_wl,
         _raw_obs_fl,
         _raw_obs_err,
-        _scale,
+        _obs_scale,
         _sigma_source,
     )
 
@@ -3805,6 +3811,8 @@ def _(
 
     if not np.any(_emu_mask):
         mo.stop(True, mo.callout(mo.md("No emulator wavelengths fall within the selected wavelength range."), kind="warn"))
+
+    from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
 
     def _chi2(active_params):
         # ── Enforce prior bounds ─────────────────────────────────────────
@@ -3829,7 +3837,8 @@ def _(
 
         phys = full_params[:_n_phys]
         _av = full_params[_n_phys] if len(full_params) > _n_phys else 0.0
-        _log_scale = full_params[_n_phys + 1] if len(full_params) > _n_phys + 1 else 0.0
+        _distance_pc = full_params[_n_phys + 1] if len(full_params) > _n_phys + 1 else 100.0
+        _log_scale = _distance_to_log_scale(_distance_pc)
         _cheb1 = full_params[_n_phys + 2] if len(full_params) > _n_phys + 2 else 0.0
 
         model_flux, _ = qf_predict_flux(
@@ -3841,7 +3850,7 @@ def _(
         _wl = _emu_wl[_emu_mask]
 
         # Convert log₁₀ emulator output to linear before nuisance transforms.
-        if _scale == "log":
+        if _model_is_log:
             _fl = 10.0 ** _fl
 
         if _av > 0 and fitzpatrick99 is not None:
@@ -3856,7 +3865,7 @@ def _(
         _fl = _fl * np.exp(_log_scale)
 
         # Convert back to log₁₀ after nuisance transforms.
-        if _scale == "log":
+        if _model_is_log:
             _fl = np.log10(np.clip(_fl, 1e-30, None))
 
         _model_interp = np.interp(_obs_wl, _wl, _fl)
@@ -3998,7 +4007,8 @@ def _(
                     full_params[_gi] = P[_ai]
                 phys = full_params[:_n_phys]
                 _av_s = full_params[_n_phys] if len(full_params) > _n_phys else 0.0
-                _ls_s = full_params[_n_phys + 1] if len(full_params) > _n_phys + 1 else 0.0
+                _distance_s = full_params[_n_phys + 1] if len(full_params) > _n_phys + 1 else 100.0
+                _ls_s = _distance_to_log_scale(_distance_s)
                 _ch_s = full_params[_n_phys + 2] if len(full_params) > _n_phys + 2 else 0.0
 
                 mf, _ = qf_predict_flux(
@@ -4008,7 +4018,7 @@ def _(
                 fl = mf[_emu_mask]
                 wl = _emu_wl[_emu_mask]
 
-                if _scale == "log":
+                if _model_is_log:
                     fl = 10.0 ** fl
 
                 if _av_s > 0 and fitzpatrick99 is not None:
@@ -4018,7 +4028,7 @@ def _(
                     fl = fl * chebval(wl / wl.max(), [1.0, _ch_s])
                 fl = fl * np.exp(_ls_s)
 
-                if _scale == "log":
+                if _model_is_log:
                     fl = np.log10(np.clip(fl, 1e-30, None))
 
                 mi = np.interp(_obs_wl, wl, fl)
@@ -4096,7 +4106,9 @@ def _(
     _n_phys = qf_mle_result["n_physical"]
     _phys = _best_full[:_n_phys]
     _av = _best_full[_n_phys] if len(_best_full) > _n_phys else 0.0
-    _log_scale = _best_full[_n_phys + 1] if len(_best_full) > _n_phys + 1 else 0.0
+    from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
+    _distance_pc = _best_full[_n_phys + 1] if len(_best_full) > _n_phys + 1 else 100.0
+    _log_scale = _distance_to_log_scale(_distance_pc)
     _cheb1 = _best_full[_n_phys + 2] if len(_best_full) > _n_phys + 2 else 0.0
 
     _mean_fl, _ens_fl = qf_predict_flux(
@@ -4109,11 +4121,12 @@ def _(
     _mask = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
     _wl = _emu_wl[_mask]
 
-    _sc = qf_obs_scale_selector.value
+    _obs_scale = qf_obs_scale_selector.value
+    _model_is_log = (qf_inf_emu_data.get("scale") == "log")
 
     def _apply_nuisance(fl, wl, av, log_scale, cheb1):
         fl = fl.copy()
-        if _sc == "log":
+        if _model_is_log:
             fl = 10.0 ** fl
         if av > 0 and fitzpatrick99 is not None:
             a_l = fitzpatrick99(wl.astype(np.float64), av, 3.1)
@@ -4121,7 +4134,7 @@ def _(
         if cheb1 != 0.0:
             fl = fl * chebval(wl / wl.max(), [1.0, cheb1])
         fl = fl * np.exp(log_scale)
-        if _sc == "log":
+        if _model_is_log:
             fl = np.log10(np.clip(fl, 1e-30, None))
         return fl
 
@@ -4196,14 +4209,14 @@ def _(
 
     _band = alt.Chart(_band_df).mark_area(opacity=0.2, color='orange').encode(
         x='Wavelength:Q',
-        y='Lower:Q',
-        y2='Upper:Q',
+        y=alt.Y('Lower:Q', scale=alt.Scale(zero=False)),
+        y2=alt.Y2(field='Upper'),
     )
 
     _overlay_chart = (_band + _line).properties(
         width="container", height=350,
         title="Best-Fit Spectrum Overlay"
-    ).interactive()
+    ).interactive(bind_y=False)
 
     _resid_df = pd.DataFrame({'Wavelength': _obs_wl_p, 'Residual (σ)': _resid_p})
     _resid_chart = alt.Chart(_resid_df).mark_point(size=3, color='cyan').encode(
@@ -4213,7 +4226,7 @@ def _(
     ).properties(
         width="container", height=200,
         title="Normalised Residuals"
-    ).interactive()
+    ).interactive(bind_y=False)
 
     _zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color='grey', strokeDash=[4, 4]).encode(y='y:Q')
 
