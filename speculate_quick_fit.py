@@ -2765,8 +2765,8 @@ def _(
                 # Uses the same construction logic as the training cell:
                 # 1. Extract unique values along each parameter axis
                 # 2. Lexsort points into Cartesian order
-                # 3. Reshape weights into N-D grid and build interpolator
-                # One interpolator per PCA component.
+                # 3. Reshape weights into an N-D grid with a trailing PCA-weight
+                #    dimension, so one interpolation call returns all weights.
                 qf_inf_is_grid_interp = True
                 _gp = np.array(_npz["grid_points"]).astype(np.float32)
                 _wt = np.array(_npz["weights"]).astype(np.float32)
@@ -2777,13 +2777,11 @@ def _(
                 _wt_sorted = _wt[_sorted_idx]
                 _grid_shape = [len(a) for a in _axes]
 
-                qf_inf_models = []
-                for _c in range(_n_out):
-                    _vals = _wt_sorted[:, _c].reshape(_grid_shape)
-                    qf_inf_models.append(RegularGridInterpolator(
-                        _axes, _vals, method="linear",
-                        bounds_error=False, fill_value=None,
-                    ))
+                _vals = _wt_sorted.reshape((*_grid_shape, _n_out))
+                qf_inf_models = [RegularGridInterpolator(
+                    _axes, _vals, method="linear",
+                    bounds_error=False, fill_value=None,
+                )]
 
             _npz.close()
         except Exception as e:
@@ -3153,9 +3151,12 @@ def _(np, torch):
 
         if is_grid_interp:
             # RegularGridInterpolator uses raw parameter values
-            w = np.array([m(X_raw)[0] for m in models])
+            if len(models) == 1:
+                w = np.asarray(models[0](X_raw)).squeeze()
+            else:
+                w = np.array([np.asarray(m(X_raw)).squeeze() for m in models])
             flux = (w @ (eigenspectra * flux_std)) + flux_mean
-            flux = _restore_norm(flux)
+            flux = np.asarray(_restore_norm(flux)).squeeze()
             return flux, [flux]
         else:
             X_norm = (X_raw - input_scaler["min"]) / input_scaler["range"]
@@ -3798,6 +3799,7 @@ def _(
         mo.stop(True, mo.callout(mo.md("No observation points fall within the selected wavelength range."), kind="warn"))
 
     _model_is_log = (qf_inf_emu_data.get("scale") == "log")
+    _obs_scale = qf_obs_scale_selector.value
     _obs_fl, _obs_err = qf_transform_observation_data(
         _obs_wl,
         _raw_obs_fl,
