@@ -3215,6 +3215,7 @@ def _(
         _tier1_result = None
         _tier2_result = None
         _tier3_results = None
+        _tier3_checkpoint_path_to_remove = None
 
         # ---- Tier 1 (spinner — single LOO cross-validation pass) ----
         if 1 in _tiers and matched_grid_path:
@@ -3685,21 +3686,102 @@ def _(
 
         # ---- Tier 3 (progress bar — one step per observation) ----
         if 3 in _tiers and obs_picker.value:
-            _obs_list = obs_picker.value
+            import hashlib as _hashlib
+            import json as _json
+
+            _obs_list = list(obs_picker.value)
             _tier3_results = []
+
+            # ---- Checkpoint / Resume ----
+            # Tier 3 observations are independent but expensive: each completed
+            # observation writes one JSONL checkpoint row so interrupted runs can
+            # resume by skipping completed fitting + Sirocco modelling.
+            _emu_stem = os.path.basename(emu_picker.value or "").replace(".npz", "") or "emulator"
+            _obs_keys = [str(_Path(_obs).expanduser().resolve()) for _obs in _obs_list]
+            _tier3_checkpoint_config = {
+                "schema_version": 1,
+                "emulator": str(_Path(_emu_path).expanduser().resolve()),
+                "grid_name": _grid_name,
+                "flux_scale": _flux_scale,
+                "wl_range": [float(_tier3_wl_range[0]), float(_tier3_wl_range[1])],
+                "mle_restarts": int(mle_restarts_slider.value),
+                "mcmc_walkers": int(_mcmc_walkers_val),
+                "mcmc_steps": int(_mcmc_steps_val),
+                "mcmc_burnin": int(_mcmc_burnin_val),
+                "sirocco_cpus": int(sirocco_cpu_slider.value),
+                "observations": sorted(_obs_keys),
+            }
+            _tier3_checkpoint_hash = _hashlib.sha256(
+                _json.dumps(_tier3_checkpoint_config, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:16]
+            _tier3_checkpoint_path = os.path.join(
+                "benchmark_results",
+                f"benchmark_partial_tier3_{_emu_stem}_{_tier3_checkpoint_hash}.jsonl",
+            )
+            _resumed_tier3_results = {}
+            _resume_export_dir = None
+
+            if os.path.exists(_tier3_checkpoint_path):
+                try:
+                    with open(_tier3_checkpoint_path, "r") as _cpf:
+                        for _line in _cpf:
+                            _line = _line.strip()
+                            if not _line:
+                                continue
+                            _entry = _json.loads(_line)
+                            if _entry.get("config_hash") != _tier3_checkpoint_hash:
+                                continue
+                            _obs_key = _entry.get("obs_path")
+                            _result = _entry.get("result")
+                            if not _obs_key or not isinstance(_result, dict):
+                                continue
+                            # Checkpoint rows are only useful if the external
+                            # artifacts needed by the Tier 3 explorer survived.
+                            _artifacts = _result.get("artifacts") or {}
+                            _required_artifacts = [
+                                _artifacts.get("posterior_npz"),
+                                _artifacts.get("plot_data_npz"),
+                            ]
+                            if not all(_p and os.path.isfile(_p) for _p in _required_artifacts):
+                                continue
+                            _resumed_tier3_results[_obs_key] = _result
+                            if _resume_export_dir is None:
+                                _resume_export_dir = (
+                                    _entry.get("tier3_export_dir")
+                                    or os.path.dirname(_result.get("export_dir", ""))
+                                    or None
+                                )
+                except Exception:
+                    _resumed_tier3_results = {}
+                    _resume_export_dir = None
+
+            if _resume_export_dir:
+                _tier3_export_dir = _resume_export_dir
             os.makedirs(_tier3_export_dir, exist_ok=True)
+            _n_resumed_t3 = sum(1 for _obs_key in _obs_keys if _obs_key in _resumed_tier3_results)
             with mo.status.progress_bar(
                 total=len(_obs_list),
                 title="Tier 3 — Observational Spectra",
-                subtitle="Starting…",
+                subtitle=f"Resuming from {_n_resumed_t3} completed…" if _n_resumed_t3 else "Starting…",
                 completion_title="Tier 3 — Observational Spectra",
                 completion_subtitle="Complete ✓",
                 show_rate=True,
                 show_eta=True,
                 remove_on_exit=True,
             ) as _t3_bar:
+                if _n_resumed_t3 > 0:
+                    _t3_bar.update(
+                        increment=_n_resumed_t3,
+                        subtitle=f"Resumed {_n_resumed_t3} observation(s)",
+                    )
+
                 for _obs_i, _obs_path in enumerate(_obs_list, start=1):
                     _obs_name = os.path.basename(_obs_path)
+                    _obs_key = str(_Path(_obs_path).expanduser().resolve())
+                    if _obs_key in _resumed_tier3_results:
+                        _tier3_results.append(_resumed_tier3_results[_obs_key])
+                        continue
+
                     _obs_stem = os.path.splitext(os.path.basename(_obs_path))[0]
                     _safe_obs_stem = "".join(
                         _ch if _ch.isalnum() or _ch in "-_" else "_"
@@ -3767,6 +3849,22 @@ def _(
                         sirocco_progress_callback=_t3_sirocco_cb,
                     )
                     _tier3_results.append(_r)
+                    try:
+                        _cp_entry = {
+                            "kind": "tier3_observation",
+                            "schema_version": 1,
+                            "config_hash": _tier3_checkpoint_hash,
+                            "config": _tier3_checkpoint_config,
+                            "tier3_export_dir": _tier3_export_dir,
+                            "obs_path": _obs_key,
+                            "obs_file": _obs_name,
+                            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "result": _r,
+                        }
+                        with open(_tier3_checkpoint_path, "a") as _cpf:
+                            _cpf.write(_json.dumps(_cp_entry, default=str) + "\n")
+                    except Exception:
+                        pass
                     _pf_status = ""
                     if "pf_path" in _r:
                         _pf_status = f" → {os.path.basename(_r['pf_path'])}"
@@ -3774,6 +3872,8 @@ def _(
                         increment=1,
                         subtitle=f"✓ {_obs_name} complete{_pf_status}",
                     )
+            if len(_tier3_results) == len(_obs_list):
+                _tier3_checkpoint_path_to_remove = _tier3_checkpoint_path
             set_tier3_posteriors(_tier3_results if _tier3_results else None)
 
         # Store the execution settings alongside the benchmark outputs so a saved
@@ -3801,6 +3901,11 @@ def _(
 
         # Save each live run under a timestamped filename to avoid clobbering earlier reports.
         _save_report(_report, _out_path)
+        if _tier3_checkpoint_path_to_remove and os.path.exists(_tier3_checkpoint_path_to_remove):
+            try:
+                os.remove(_tier3_checkpoint_path_to_remove)
+            except Exception:
+                pass
 
         set_report(_report)
         _elapsed = time.time() - _t0

@@ -1936,6 +1936,7 @@ def run_sirocco_pf(
     `.pf` file's directory so fixed-name outputs, such as ``run0.spec``, remain
     isolated per observation. If provided, ``progress_callback`` receives
     best-effort cycle updates parsed from Sirocco's live ``root.sig`` file.
+    Sirocco is launched with ``-p`` to match the intended Tier 3 runtime mode.
     Multi-CPU MPI runs first try the standard ``mpirun -np`` form, then retry
     with ``--use-hwthread-cpus`` if the standard command fails.
     """
@@ -1957,10 +1958,11 @@ def run_sirocco_pf(
 
     run_log = work_dir / "sirocco_run.log"
     signal_path = work_dir / f"{pf_path.stem}.sig"
+    sirocco_args = ["-p", pf_path.name]
     if cpus > 1:
-        command = [runtime["mpirun"], "-np", str(cpus), runtime["sirocco"], pf_path.name]
+        command = [runtime["mpirun"], "-np", str(cpus), runtime["sirocco"], *sirocco_args]
     else:
-        command = [runtime["sirocco"], pf_path.name]
+        command = [runtime["sirocco"], *sirocco_args]
     successful_command = command
     _emit_progress(progress_callback, {
         "phase": "sirocco",
@@ -1983,7 +1985,7 @@ def run_sirocco_pf(
                 "-np",
                 str(cpus),
                 runtime["sirocco"],
-                pf_path.name,
+                *sirocco_args,
             ]
             _emit_progress(progress_callback, {
                 "phase": "sirocco",
