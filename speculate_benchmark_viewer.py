@@ -1798,6 +1798,8 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
     # ── Tier 2 Best-Fit Spectrum Plot ──
     # Reconstructs the Starfish-style 3-panel plot (data vs model, residuals,
     # relative error) from spectral arrays stored during the benchmark run.
+    import numpy as _np
+
     _posteriors = get_tier2_posteriors()
     mo.stop(_posteriors is None or len(_posteriors) == 0)
 
@@ -1807,26 +1809,58 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
     _inc = _post.get("inclination", 55.0)
     _converged = _post.get("converged", False)
     _conv_tag = "converged" if _converged else "not converged"
-    _bf = _post.get("bestfit_spec")
+    _mle_bf = _post.get("mle_bestfit_spec")
+    _posterior_bf = _post.get("posterior_mean_bestfit_spec") or _post.get("bestfit_spec")
 
     mo.stop(
-        not _bf,
+        not (_mle_bf or _posterior_bf),
         mo.md("*Best-fit spectrum data not available for this spectrum. Older reports and runs produced before the best-fit export fix will not have it.*"),
     )
 
-    _fig = build_bestfit_spectrum_altair(
-        alt,
-        wavelength=_bf["wavelength"],
-        data_flux=_bf["data_flux"],
-        model_flux=_bf["model_flux"],
-        model_cov_diag=_bf["model_cov_diag"],
-        title=f"Best-Fit Model — {_filename} @ {_inc:.0f}° ({_conv_tag})",
-        zoom_name=f"tier2_bestfit_zoom_{_post['run']}",
-    )
+    def _nll_suffix(value, diagnostics):
+        if value is None and isinstance(diagnostics, dict):
+            value = diagnostics.get("nll")
+        if value is None:
+            return ""
+        try:
+            value = float(value)
+        except Exception:
+            return ""
+        return f", NLL={value:.2f}" if _np.isfinite(value) else ""
+
+    _tabs = {}
+    if _mle_bf:
+        _mle_diag = _post.get("mle_likelihood_diagnostics", {})
+        _tabs["MLE Objective Optimum"] = build_bestfit_spectrum_altair(
+            alt,
+            wavelength=_mle_bf["wavelength"],
+            data_flux=_mle_bf["data_flux"],
+            model_flux=_mle_bf["model_flux"],
+            model_cov_diag=_mle_bf["model_cov_diag"],
+            title=(
+                f"MLE Best Fit — {_filename} @ {_inc:.0f}° "
+                f"({_conv_tag}{_nll_suffix(_post.get('mle_nll'), _mle_diag)})"
+            ),
+            zoom_name=f"tier2_mle_bestfit_zoom_{_post['run']}",
+        )
+    if _posterior_bf:
+        _pm_diag = _post.get("posterior_mean_likelihood_diagnostics", {})
+        _tabs["MCMC Posterior Mean"] = build_bestfit_spectrum_altair(
+            alt,
+            wavelength=_posterior_bf["wavelength"],
+            data_flux=_posterior_bf["data_flux"],
+            model_flux=_posterior_bf["model_flux"],
+            model_cov_diag=_posterior_bf["model_cov_diag"],
+            title=(
+                f"MCMC Posterior Mean — {_filename} @ {_inc:.0f}° "
+                f"({_conv_tag}{_nll_suffix(None, _pm_diag)})"
+            ),
+            zoom_name=f"tier2_posterior_mean_zoom_{_post['run']}",
+        )
 
     mo.vstack([
-        mo.md("#### Best-Fit Spectrum (MCMC Posterior Mean)"),
-        _fig,
+        mo.md("#### Spectrum Fits"),
+        mo.ui.tabs(_tabs) if len(_tabs) > 1 else next(iter(_tabs.values())),
     ])
     return
 
@@ -2072,9 +2106,29 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
 
     _extra = []
     if len(_sirocco_wl) and len(_sirocco_flux):
+        _sirocco_order = np.argsort(_sirocco_wl)
+        _sirocco_wl = _sirocco_wl[_sirocco_order]
+        _sirocco_flux = _sirocco_flux[_sirocco_order]
+        _finite_sirocco = np.isfinite(_sirocco_wl) & np.isfinite(_sirocco_flux)
+        _sirocco_wl = _sirocco_wl[_finite_sirocco]
+        _sirocco_flux = _sirocco_flux[_finite_sirocco]
+
+    if len(_wl) and len(_sirocco_wl) and len(_sirocco_flux):
+        _sirocco_overlap = (_wl >= np.min(_sirocco_wl)) & (_wl <= np.max(_sirocco_wl))
+        _sirocco_plot_wl = _wl[_sirocco_overlap]
+        _sirocco_plot_flux = np.interp(
+            _sirocco_plot_wl,
+            _sirocco_wl,
+            _sirocco_flux,
+        )
+    else:
+        _sirocco_plot_wl = np.array([])
+        _sirocco_plot_flux = np.array([])
+
+    if len(_sirocco_plot_wl) and len(_sirocco_plot_flux):
         _extra.append({
-            "wavelength": _sirocco_wl,
-            "flux": _sirocco_flux,
+            "wavelength": _sirocco_plot_wl,
+            "flux": _sirocco_plot_flux,
             "label": _sirocco_label,
             "color": "#9467bd",
             "dash": [6, 3],
@@ -2103,8 +2157,13 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         color="#54a24b", opacity=0.24,
     ).encode(
         x=alt.X("Wavelength:Q", title="Wavelength (A)"),
-        y=alt.Y("Lower:Q", title="Flux", scale=alt.Scale(zero=False)),
-        y2="Upper:Q",
+        y=alt.Y(
+            "Lower:Q",
+            title="Flux",
+            scale=alt.Scale(zero=False),
+            axis=alt.Axis(format=".4e"),
+        ),
+        y2=alt.Y2(field="Upper"),
         tooltip=[
             alt.Tooltip("Wavelength:Q", title="Wavelength", format=".1f"),
             alt.Tooltip("Lower:Q", title="PPC 2.5%", format=".4e"),
@@ -2115,17 +2174,27 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         color="#4c78a8", strokeWidth=1.2,
     ).encode(
         x=alt.X("Wavelength:Q", title="Wavelength (A)"),
-        y=alt.Y("Data:Q", title="Flux", scale=alt.Scale(zero=False)),
+        y=alt.Y(
+            "Data:Q",
+            title="Flux",
+            scale=alt.Scale(zero=False),
+            axis=alt.Axis(format=".4e"),
+        ),
         tooltip=[
             alt.Tooltip("Wavelength:Q", title="Wavelength", format=".1f"),
             alt.Tooltip("Data:Q", title="Data", format=".4e"),
         ],
     )
+    _ppc_zoom = alt.selection_interval(
+        name=f"tier3_ppc_zoom_{t3_observation_slider.value}",
+        bind="scales",
+        encodings=["x"],
+    )
     _ppc_chart = (_ppc_band + _ppc_data).properties(
         width=760,
         height=300,
         title="Posterior Predictive Envelope",
-    ).interactive()
+    ).add_params(_ppc_zoom)
 
     mo.vstack([
         mo.md("#### Best-Fit Spectrum with Sirocco Overlay"),
@@ -2255,7 +2324,7 @@ def _(alt, get_tier1_arrays, mo, np, pd, recon_param_names, spectrum_slider):
                     scale=alt.Scale(domain={"param": _spec_zoom_name}),
                 ),
                 y=alt.Y("Lower (2σ):Q", scale=alt.Scale(zero=False)),
-                y2=alt.Y2("Upper (2σ):Q"),
+                y2=alt.Y2(field="Upper (2σ)"),
             )
         )
 
@@ -2732,7 +2801,7 @@ def _(glob, mo, os):
     _cpu_total = max(1, os.cpu_count() or 1)
     sirocco_cpu_slider = mo.ui.slider(
         start=1, stop=_cpu_total, value=max(1, _cpu_total // 2), step=1,
-        show_value=True, label="Sirocco CPUs (Tier 3)", full_width=True,
+        show_value=True, label="Sirocco CPUs (Tier 3)", full_width=False,
     )
 
     # Inclination selector for Tier 2: which viewing angle column to read from
@@ -2786,6 +2855,7 @@ def _(emu_picker, glob, mo, os, re):
     )
 
     matched_grid_path = ""
+    matched_grid_name = ""
     matched_testgrid_path = ""
     emu_grid_info = mo.md("")  # default: empty
 
@@ -2793,6 +2863,7 @@ def _(emu_picker, glob, mo, os, re):
         # The naming convention lets the viewer recover the matching training
         # grid and test-grid without asking the user to pick three separate paths.
         _grid_stem = _emu_base.split("_emu_")[0]  # e.g. speculate_cv_bl_grid_v87f
+        matched_grid_name = _grid_stem
 
         # Extract the processed-grid tag from the emulator filename so the
         # lookup lands on the NPZ created with the same params/scale/smoothing,
@@ -2844,7 +2915,7 @@ def _(emu_picker, glob, mo, os, re):
                    "Expected pattern: `{stem}_emu_{params}_{inc}inc_{wl}_{PCA}PCA.npz`"),
             kind="warn",
         )
-    return emu_grid_info, flux_scale_picker, matched_grid_path, matched_testgrid_path
+    return emu_grid_info, flux_scale_picker, matched_grid_name, matched_grid_path, matched_testgrid_path
 
 
 @app.cell(hide_code=True)
@@ -2863,10 +2934,10 @@ def _(
 ):
     mo.vstack([
         mo.md("### Run Benchmark"),
-        mo.hstack([emu_picker, flux_scale_picker], gap=1),
+        mo.vstack([tier_picker, emu_picker, flux_scale_picker], gap=1),
         emu_grid_info,
         mo.hstack([obs_picker], gap=1),
-        mo.hstack([tier_picker, max_spectra_slider, mcmc_steps_slider, mle_restarts_slider, inclination_picker], gap=1),
+        mo.vstack([inclination_picker, max_spectra_slider, mle_restarts_slider, mcmc_steps_slider], gap=1),
         sirocco_cpu_slider,
     ])
     return
@@ -2947,7 +3018,7 @@ def _(emu_picker, mo, np, os):
                 mo.callout(
                     mo.md(
                         "Stage 2 freezes hold parameters at the benchmark starting values: "
-                        "grid midpoints, Av=0, bootstrapped log_scale, cheb_1=0, and the default GP initialisation. "
+                        "grid midpoints, Av=0, Distance=100 pc, cheb_1=0, and the default GP initialisation. "
                         "Stage 4 freezes hold parameters at their post-MLE values during MCMC."
                     ),
                     kind="neutral",
@@ -2979,11 +3050,40 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(mo, run_btn, tier2_freeze_controls, tier_picker):
+def _(emu_picker, matched_grid_path, matched_testgrid_path, mo, run_btn, tier2_freeze_controls, tier_picker):
     _selected_tiers = set(tier_picker.value or [])
     _items = []
     if 2 in _selected_tiers or "Tier 2" in _selected_tiers:
         _items.append(tier2_freeze_controls)
+
+    # Pre-trained emulators can be downloaded before the matching processed
+    # Tier 1 grid or decompressed Tier 2 test grid exists locally.  Surface any
+    # inferred resource that is still shown as "not found" so a fresh install
+    # has an obvious path to make the affected benchmark tier runnable.
+    _emu_selected = bool(emu_picker.value)
+    _missing_messages = []
+    if _emu_selected and not matched_grid_path:
+        _missing_messages.append(
+            "**Grid (Tier 1)** is missing. To generate the grid file, go to the "
+            "Training notebook, select the emulator in the Load a pre-trained "
+            "emulator dropdown, and press the Test PCA button."
+        )
+    if _emu_selected and not matched_testgrid_path:
+        _missing_messages.append(
+            "**Test Grid (Tier 2)** is missing. To retrieve the test grid, "
+            "download and decompress the grid in the Model Downloader notebook."
+        )
+    if _missing_messages:
+        _items.append(
+            mo.callout(
+                mo.md(
+                    "### Missing benchmark input\n\n"
+                    + "\n\n".join(f"- {_message}" for _message in _missing_messages)
+                    + "\n\nOnly tiers that need a missing input are blocked when you run the benchmark."
+                ),
+                kind="warn",
+            )
+        )
     _items.append(run_btn)
     mo.vstack(_items)
     return
@@ -2994,6 +3094,7 @@ def _(
     emu_picker,
     flux_scale_picker,
     inclination_picker,
+    matched_grid_name,
     matched_grid_path,
     matched_testgrid_path,
     max_spectra_slider,
@@ -3044,6 +3145,7 @@ def _(
             run_mcmc_single as _run_mcmc,
             aggregate_tier2_results as _agg_t2,
         )
+        from Speculate_addons.grid_registry import inclination_values as _inclination_values
         import numpy as _np
         import traceback as _tb
 
@@ -3073,6 +3175,15 @@ def _(
         # The picker stores numeric tier ids; keep the selected run isolated to
         # this execution so later reactive reruns do not reuse stale results.
         _tiers = [_v for _v in (tier_picker.value or [])]
+        _missing_run_inputs = []
+        if (1 in _tiers or "Tier 1" in _tiers) and not matched_grid_path:
+            _missing_run_inputs.append("Tier 1 grid")
+        if (2 in _tiers or "Tier 2" in _tiers) and not matched_testgrid_path:
+            _missing_run_inputs.append("Tier 2 test grid")
+        if _missing_run_inputs:
+            set_status_msg(f"Error: missing required benchmark input(s): {', '.join(_missing_run_inputs)}.")
+            mo.stop(True)
+
         _ts = time.strftime("%Y%m%d_%H%M%S")
         _run_stem = f"benchmark_report_live_{_ts}"
         _out_path = f"benchmark_results/{_run_stem}.json"
@@ -3089,13 +3200,22 @@ def _(
         # Resolve the shared flux-scaling mode once so both Tier 2 and Tier 3
         # use the same setting even if only one tier is selected.
         _flux_scale = flux_scale_picker.value
+        _grid_name = matched_grid_name or None
         _tier3_wl_range = (float(_np.nanmin(_emu.wl)), float(_np.nanmax(_emu.wl)))
-        _tier2_defaults = _build_tier2_freeze_defaults(_emu.param_names)
+        _tier2_defaults = _build_tier2_freeze_defaults(_emu.param_names, _grid_name)
         _tier2_mle_freeze_settings = dict(tier2_mle_freeze.value or _tier2_defaults["mle"])
         _tier2_mcmc_freeze_settings = dict(tier2_mcmc_freeze.value or _tier2_defaults["mcmc"])
+        if "log_scale" in _tier2_mle_freeze_settings:
+            _tier2_mle_freeze_settings["log_scale"] = True
+        if "log_scale" in _tier2_mcmc_freeze_settings:
+            _tier2_mcmc_freeze_settings["log_scale"] = True
+        _mcmc_steps_val = mcmc_steps_slider.value
+        _mcmc_walkers_val = 64
+        _mcmc_burnin_val = 500
         _tier1_result = None
         _tier2_result = None
         _tier3_results = None
+        _tier3_checkpoint_path_to_remove = None
 
         # ---- Tier 1 (spinner — single LOO cross-validation pass) ----
         if 1 in _tiers and matched_grid_path:
@@ -3128,7 +3248,7 @@ def _(
             _inc_raw = inclination_picker.value
             _inc_is_random = (_inc_raw == "random")
             _inc_fixed = float(_inc_raw) if not _inc_is_random else 55.0
-            _VALID_INCS = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85]
+            _VALID_INCS = _inclination_values(_grid_name)
 
             # Resolve wavelength range from emulator
             _wl_range = (float(_emu.wl.min()) + 10, float(_emu.wl.max()) - 10)
@@ -3136,7 +3256,7 @@ def _(
             # The lookup table is optional metadata used to compare recovered
             # parameters against the known test-grid inputs.
             _parquet = _ensure_lookup(_test_path)
-            _friendly = _to_friendly(_emu.param_names)
+            _friendly = _to_friendly(_emu.param_names, _grid_name)
             _n_params = len(_emu.param_names)
 
             # ---- Checkpoint / Resume ----
@@ -3158,9 +3278,6 @@ def _(
             _failures = 0
             _n_not_converged = 0
             _failure_log = []
-            _mcmc_steps_val = mcmc_steps_slider.value
-            _mcmc_walkers_val = 64
-            _mcmc_burnin_val = 500
 
             # Resume: load any previously checkpointed results
             if os.path.exists(_checkpoint_path):
@@ -3175,7 +3292,11 @@ def _(
                             # best-fit spectrum export fix are incomplete for
                             # the Tier 2 viewer, so rerun those spectra rather
                             # than treating them as finished.
-                            if not _entry.get("bestfit_spec"):
+                            if not (
+                                _entry.get("bestfit_spec")
+                                or _entry.get("posterior_mean_bestfit_spec")
+                                or _entry.get("mle_bestfit_spec")
+                            ):
                                 continue
                             _completed_runs.add(_entry["run"])
                             _per_spectrum.append(_entry["spec_result"])
@@ -3208,6 +3329,18 @@ def _(
                                     _post_entry["burnin_used"] = _entry.get("burnin_used", 500)
                                 if "bestfit_spec" in _entry:
                                     _post_entry["bestfit_spec"] = _entry["bestfit_spec"]
+                                if "posterior_mean_bestfit_spec" in _entry:
+                                    _post_entry["posterior_mean_bestfit_spec"] = _entry["posterior_mean_bestfit_spec"]
+                                if "mle_bestfit_spec" in _entry:
+                                    _post_entry["mle_bestfit_spec"] = _entry["mle_bestfit_spec"]
+                                if "mle_nll" in _entry:
+                                    _post_entry["mle_nll"] = _entry["mle_nll"]
+                                if "mle_optimizer_nll" in _entry:
+                                    _post_entry["mle_optimizer_nll"] = _entry["mle_optimizer_nll"]
+                                if "mle_likelihood_diagnostics" in _entry:
+                                    _post_entry["mle_likelihood_diagnostics"] = _entry["mle_likelihood_diagnostics"]
+                                if "posterior_mean_likelihood_diagnostics" in _entry:
+                                    _post_entry["posterior_mean_likelihood_diagnostics"] = _entry["posterior_mean_likelihood_diagnostics"]
                                 if "prior_ranges" in _entry:
                                     _post_entry["prior_ranges"] = _entry["prior_ranges"]
                                 if "mle_all_params" in _entry:
@@ -3293,7 +3426,7 @@ def _(
                     # -- Load spectrum --
                     _t2_bar.update(increment=0, subtitle=f"Loading {_sname} (i={_inc:.0f}°)…")
                     try:
-                        _wl, _flux, _sigma = _load_spec(str(_sf), _inc, _wl_range)
+                        _wl, _flux, _sigma = _load_spec(str(_sf), _inc, _wl_range, _grid_name)
                     except Exception as _e:
                         _failure_log.append({
                             "run": _sname, "stage": "load",
@@ -3308,7 +3441,7 @@ def _(
                     _gt = {}
                     if _parquet.exists():
                         try:
-                            _gt = _extract_gt(str(_parquet), _run_idx, _emu.param_names)
+                            _gt = _extract_gt(str(_parquet), _run_idx, _emu.param_names, _grid_name, _inc)
                         except Exception:
                             pass
 
@@ -3340,6 +3473,8 @@ def _(
                                 max_iter=10_000, iteration_callback=_mle_cb,
                                 n_restarts=mle_restarts_slider.value,
                                 freeze_params=_tier2_mle_freeze_settings,
+                                use_emulator_norm=True,
+                                fixed_log_scale=0.0,
                             )
                         except Exception as _e:
                             _failure_log.append({
@@ -3371,6 +3506,7 @@ def _(
                                 burnin=_mcmc_burnin_val,
                                 iteration_callback=_mcmc_cb,
                                 freeze_params=_tier2_mcmc_freeze_settings,
+                                grid_name=_grid_name,
                             )
                         except Exception as _e:
                             _failure_log.append({
@@ -3393,7 +3529,11 @@ def _(
                         "mcmc_converged": _mcmc["converged"],
                         "n_effective": _mcmc["n_effective"],
                         "mle_grid_params": _mle["grid_params"],
+                        "mle_nll": _mle.get("nll"),
+                        "mle_optimizer_nll": _mle.get("optimizer_nll", _mle.get("nll")),
                         "mle_all_params": _mle.get("all_params", {}),
+                        "mle_likelihood_diagnostics": _mle.get("mle_likelihood_diagnostics", {}),
+                        "posterior_mean_likelihood_diagnostics": _mcmc.get("posterior_mean_likelihood_diagnostics", {}),
                         "mle_freeze_settings": _mle.get("freeze_params", {}),
                         "mle_frozen_params": _mle.get("frozen_params", []),
                         "mcmc_freeze_settings": _mcmc.get("freeze_params", {}),
@@ -3419,6 +3559,12 @@ def _(
                         },
                         "truths": dict(_gt),
                         "bestfit_spec": _mcmc.get("bestfit_spec", {}),
+                        "posterior_mean_bestfit_spec": _mcmc.get("posterior_mean_bestfit_spec", _mcmc.get("bestfit_spec", {})),
+                        "posterior_mean_likelihood_diagnostics": _mcmc.get("posterior_mean_likelihood_diagnostics", {}),
+                        "mle_bestfit_spec": _mle.get("mle_bestfit_spec", {}),
+                        "mle_nll": _mle.get("nll"),
+                        "mle_optimizer_nll": _mle.get("optimizer_nll", _mle.get("nll")),
+                        "mle_likelihood_diagnostics": _mle.get("mle_likelihood_diagnostics", {}),
                         "mle_all_params": _mle.get("all_params", {}),
                         "mle_freeze_settings": _mle.get("freeze_params", {}),
                         "mle_frozen_params": _mle.get("frozen_params", []),
@@ -3477,6 +3623,12 @@ def _(
                         "converged": _mcmc["converged"],
                         "truths": dict(_gt),
                         "bestfit_spec": _mcmc.get("bestfit_spec", {}),
+                        "posterior_mean_bestfit_spec": _mcmc.get("posterior_mean_bestfit_spec", _mcmc.get("bestfit_spec", {})),
+                        "posterior_mean_likelihood_diagnostics": _mcmc.get("posterior_mean_likelihood_diagnostics", {}),
+                        "mle_bestfit_spec": _mle.get("mle_bestfit_spec", {}),
+                        "mle_nll": _mle.get("nll"),
+                        "mle_optimizer_nll": _mle.get("optimizer_nll", _mle.get("nll")),
+                        "mle_likelihood_diagnostics": _mle.get("mle_likelihood_diagnostics", {}),
                         "prior_ranges": _prior_ranges_dict,
                         "mle_all_params": _mle.get("all_params", {}),
                         "mle_freeze_settings": _mle.get("freeze_params", {}),
@@ -3534,28 +3686,102 @@ def _(
 
         # ---- Tier 3 (progress bar — one step per observation) ----
         if 3 in _tiers and obs_picker.value:
-            _obs_list = obs_picker.value
+            import hashlib as _hashlib
+            import json as _json
+
+            _obs_list = list(obs_picker.value)
             _tier3_results = []
+
+            # ---- Checkpoint / Resume ----
+            # Tier 3 observations are independent but expensive: each completed
+            # observation writes one JSONL checkpoint row so interrupted runs can
+            # resume by skipping completed fitting + Sirocco modelling.
+            _emu_stem = os.path.basename(emu_picker.value or "").replace(".npz", "") or "emulator"
+            _obs_keys = [str(_Path(_obs).expanduser().resolve()) for _obs in _obs_list]
+            _tier3_checkpoint_config = {
+                "schema_version": 1,
+                "emulator": str(_Path(_emu_path).expanduser().resolve()),
+                "grid_name": _grid_name,
+                "flux_scale": _flux_scale,
+                "wl_range": [float(_tier3_wl_range[0]), float(_tier3_wl_range[1])],
+                "mle_restarts": int(mle_restarts_slider.value),
+                "mcmc_walkers": int(_mcmc_walkers_val),
+                "mcmc_steps": int(_mcmc_steps_val),
+                "mcmc_burnin": int(_mcmc_burnin_val),
+                "sirocco_cpus": int(sirocco_cpu_slider.value),
+                "observations": sorted(_obs_keys),
+            }
+            _tier3_checkpoint_hash = _hashlib.sha256(
+                _json.dumps(_tier3_checkpoint_config, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:16]
+            _tier3_checkpoint_path = os.path.join(
+                "benchmark_results",
+                f"benchmark_partial_tier3_{_emu_stem}_{_tier3_checkpoint_hash}.jsonl",
+            )
+            _resumed_tier3_results = {}
+            _resume_export_dir = None
+
+            if os.path.exists(_tier3_checkpoint_path):
+                try:
+                    with open(_tier3_checkpoint_path, "r") as _cpf:
+                        for _line in _cpf:
+                            _line = _line.strip()
+                            if not _line:
+                                continue
+                            _entry = _json.loads(_line)
+                            if _entry.get("config_hash") != _tier3_checkpoint_hash:
+                                continue
+                            _obs_key = _entry.get("obs_path")
+                            _result = _entry.get("result")
+                            if not _obs_key or not isinstance(_result, dict):
+                                continue
+                            # Checkpoint rows are only useful if the external
+                            # artifacts needed by the Tier 3 explorer survived.
+                            _artifacts = _result.get("artifacts") or {}
+                            _required_artifacts = [
+                                _artifacts.get("posterior_npz"),
+                                _artifacts.get("plot_data_npz"),
+                            ]
+                            if not all(_p and os.path.isfile(_p) for _p in _required_artifacts):
+                                continue
+                            _resumed_tier3_results[_obs_key] = _result
+                            if _resume_export_dir is None:
+                                _resume_export_dir = (
+                                    _entry.get("tier3_export_dir")
+                                    or os.path.dirname(_result.get("export_dir", ""))
+                                    or None
+                                )
+                except Exception:
+                    _resumed_tier3_results = {}
+                    _resume_export_dir = None
+
+            if _resume_export_dir:
+                _tier3_export_dir = _resume_export_dir
             os.makedirs(_tier3_export_dir, exist_ok=True)
+            _n_resumed_t3 = sum(1 for _obs_key in _obs_keys if _obs_key in _resumed_tier3_results)
             with mo.status.progress_bar(
                 total=len(_obs_list),
                 title="Tier 3 — Observational Spectra",
-                subtitle="Starting…",
+                subtitle=f"Resuming from {_n_resumed_t3} completed…" if _n_resumed_t3 else "Starting…",
                 completion_title="Tier 3 — Observational Spectra",
                 completion_subtitle="Complete ✓",
                 show_rate=True,
                 show_eta=True,
                 remove_on_exit=True,
             ) as _t3_bar:
-                # Derive the grid name from the emulator filename so Tier 3
-                # can export a valid Sirocco .pf for each observation.
-                _emu_base = os.path.basename(emu_picker.value or "")
-                _grid_stem = None
-                if "_emu_" in _emu_base:
-                    _grid_stem = _emu_base.split("_emu_")[0]
+                if _n_resumed_t3 > 0:
+                    _t3_bar.update(
+                        increment=_n_resumed_t3,
+                        subtitle=f"Resumed {_n_resumed_t3} observation(s)",
+                    )
 
                 for _obs_i, _obs_path in enumerate(_obs_list, start=1):
                     _obs_name = os.path.basename(_obs_path)
+                    _obs_key = str(_Path(_obs_path).expanduser().resolve())
+                    if _obs_key in _resumed_tier3_results:
+                        _tier3_results.append(_resumed_tier3_results[_obs_key])
+                        continue
+
                     _obs_stem = os.path.splitext(os.path.basename(_obs_path))[0]
                     _safe_obs_stem = "".join(
                         _ch if _ch.isalnum() or _ch in "-_" else "_"
@@ -3611,9 +3837,9 @@ def _(
                         wl_range=_tier3_wl_range,
                         mle_restarts=mle_restarts_slider.value,
                         mcmc_walkers=_mcmc_walkers_val,
-                        mcmc_steps=mcmc_steps_slider.value,
+                        mcmc_steps=_mcmc_steps_val,
                         mcmc_burnin=_mcmc_burnin_val,
-                        grid_name=_grid_stem,
+                        grid_name=_grid_name,
                         output_dir=_obs_export_dir,
                         sirocco_cpus=sirocco_cpu_slider.value,
                         require_sirocco=True,
@@ -3623,6 +3849,22 @@ def _(
                         sirocco_progress_callback=_t3_sirocco_cb,
                     )
                     _tier3_results.append(_r)
+                    try:
+                        _cp_entry = {
+                            "kind": "tier3_observation",
+                            "schema_version": 1,
+                            "config_hash": _tier3_checkpoint_hash,
+                            "config": _tier3_checkpoint_config,
+                            "tier3_export_dir": _tier3_export_dir,
+                            "obs_path": _obs_key,
+                            "obs_file": _obs_name,
+                            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "result": _r,
+                        }
+                        with open(_tier3_checkpoint_path, "a") as _cpf:
+                            _cpf.write(_json.dumps(_cp_entry, default=str) + "\n")
+                    except Exception:
+                        pass
                     _pf_status = ""
                     if "pf_path" in _r:
                         _pf_status = f" → {os.path.basename(_r['pf_path'])}"
@@ -3630,6 +3872,8 @@ def _(
                         increment=1,
                         subtitle=f"✓ {_obs_name} complete{_pf_status}",
                     )
+            if len(_tier3_results) == len(_obs_list):
+                _tier3_checkpoint_path_to_remove = _tier3_checkpoint_path
             set_tier3_posteriors(_tier3_results if _tier3_results else None)
 
         # Store the execution settings alongside the benchmark outputs so a saved
@@ -3640,7 +3884,7 @@ def _(
             "test_grid": matched_testgrid_path,
             "tiers": _tiers,
             "mcmc_walkers": _mcmc_walkers_val,
-            "mcmc_steps": mcmc_steps_slider.value,
+            "mcmc_steps": _mcmc_steps_val,
             "mcmc_burnin": _mcmc_burnin_val,
             "mle_restarts": mle_restarts_slider.value,
             "max_spectra": max_spectra_slider.value,
@@ -3657,6 +3901,11 @@ def _(
 
         # Save each live run under a timestamped filename to avoid clobbering earlier reports.
         _save_report(_report, _out_path)
+        if _tier3_checkpoint_path_to_remove and os.path.exists(_tier3_checkpoint_path_to_remove):
+            try:
+                os.remove(_tier3_checkpoint_path_to_remove)
+            except Exception:
+                pass
 
         set_report(_report)
         _elapsed = time.time() - _t0

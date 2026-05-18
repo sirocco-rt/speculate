@@ -258,43 +258,46 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
 
 @app.cell
 def _():
-    # Parameter database: maps Sirocco parameter index → (human-readable name, min, max, is_log).
-    # These are the physical parameters that define each grid spectrum.
-    # Params 1-6 are common to both no-BL and BL grids.
-    # Params 7-8 exist only in BL grids (boundary layer luminosity/temperature).
-    # Param 11 = viewing inclination angle (30°–85°), shared by both grids.
-    # Note: params 9, 10 were sparse/mid inclination options, now removed.
-    # is_log=True means the emulator-space value is log10 of the physical quantity.
-    param_map_db = {
-        1: ("disk.mdot", 0.0, 1.0, True),
-        2: ("wind.mdot", 0.0, 1.0, False),
-        3: ("KWD.d", 0.0, 1.0, True),
-        4: ("KWD.mdot_r_exponent", 0.0, 1.0, False),
-        5: ("KWD.acceleration_length", 0.0, 1.0, True),
-        6: ("KWD.acceleration_exponent", 0.0, 1.0, False),
-        7: ("Boundary_layer.luminosity", 0.0, 1.0, True),
-        8: ("Boundary_layer.temp", 0.0, 1.0, False),
-        11: ("Inclination", 30.0, 85.0, False),
-    }
-    return (param_map_db,)
+    from Speculate_addons.grid_registry import param_map_db as _registry_param_map_db
+
+    def qf_param_map_db_for_grid(grid_name=None):
+        """Return Quick Fit parameter labels/ranges from the shared registry."""
+        return _registry_param_map_db(grid_name)
+
+    param_map_db = qf_param_map_db_for_grid()
+    return param_map_db, qf_param_map_db_for_grid
 
 
 @app.cell
 def _():
-    # Parameter IDs 9-11 encode inclination as trainable grid axes.  If no such
-    # axis is selected, Quick Fit trains against one fixed inclination column.
-    _qf_inclination_param_ids = {9, 10, 11}
-    qf_fixed_inclination_values = list(range(30, 90, 5))
+    # Quick Fit uses the same inclination helpers as the Training Tool, but keeps
+    # qf_* wrappers so existing reactive cells do not need to know about registry
+    # argument ordering.
+    from Speculate_addons.grid_registry import (
+        default_fixed_inclination as _default_fixed_inclination,
+        format_param_tag,
+        has_trainable_inclination as _has_trainable_inclination,
+        inclination_to_usecols as _inclination_to_usecols,
+        inclination_values as _inclination_values,
+    )
 
-    def qf_has_trainable_inclination(param_values):
+    def qf_has_trainable_inclination(param_values, grid_name=None):
         """Return whether selected Quick Fit parameters include inclination."""
-        return any(int(param_value) in _qf_inclination_param_ids for param_value in (param_values or []))
+        return _has_trainable_inclination(grid_name, param_values)
 
-    def qf_fixed_inclination_to_usecols(base_usecols, inclination):
+    def qf_fixed_inclination_values_for_grid(grid_name=None):
+        """Return valid fixed observer angles for the selected grid."""
+        return _inclination_values(grid_name)
+
+    def qf_fixed_inclination_to_usecols(base_usecols, inclination, grid_name=None):
         """Map a fixed inclination angle to the grid-interface flux column."""
-        return (base_usecols[0], int(2 + (float(inclination) - 30.0) / 5.0))
+        return _inclination_to_usecols(grid_name, base_usecols, inclination)
 
-    return qf_fixed_inclination_to_usecols, qf_fixed_inclination_values, qf_has_trainable_inclination
+    def qf_default_fixed_inclination(grid_name=None):
+        """Return the default fixed observer angle for a grid."""
+        return _default_fixed_inclination(grid_name)
+
+    return format_param_tag, qf_default_fixed_inclination, qf_fixed_inclination_to_usecols, qf_fixed_inclination_values_for_grid, qf_has_trainable_inclination
 
 
 @app.cell
@@ -353,30 +356,14 @@ def _(mo, qf_is_hf_mode):
 
 @app.cell
 def _(pathlib):
-    # Grid configuration registry: defines the two available Sirocco spectral grids.
-    # Each entry maps a grid folder name to its interface class, column range for
-    # reading .spec files, and the maximum parameter set (used for the param selector).
-    # - no-BL grid: 6 wind/disk params + inclination = 7 parameters
-    # - BL grid: 8 wind/disk/BL params + inclination = 9 parameters
-    # The grid interfaces (from Speculate_addons) handle reading .spec files and
-    # extracting spectra at each inclination angle.
-    from Speculate_addons.Spec_gridinterfaces import Speculate_cv_bl_grid_v87f
-    from Speculate_addons.Spec_gridinterfaces import Speculate_cv_no_bl_grid_v87f
+    # Grid configuration registry: maps every supported raw grid folder to its
+    # interface class, default .spec columns, parameter set, and grid-specific
+    # defaults.  Quick Fit asks for quickfit=True because it exposes compact
+    # parameter sets: CV no-BL has 6 physical params + inclination; CV BL has 8
+    # physical params + inclination; AGN has 8 physical params + inclination.
+    from Speculate_addons.grid_registry import get_grid_configs
 
-    qf_grid_configs = {
-        "speculate_cv_no-bl_grid_v87f": {
-            "class": Speculate_cv_no_bl_grid_v87f,
-            "usecols": (1, 7),
-            "name": "speculate_cv_no-bl_grid_v87f",
-            "max_params": [1, 2, 3, 4, 5, 6, 11],
-        },
-        "speculate_cv_bl_grid_v87f": {
-            "class": Speculate_cv_bl_grid_v87f,
-            "usecols": (1, 7),
-            "name": "speculate_cv_bl_grid_v87f",
-            "max_params": [1, 2, 3, 4, 5, 6, 7, 8, 11],
-        },
-    }
+    qf_grid_configs = get_grid_configs(quickfit=True)
 
     # Scan sirocco_grids/ for locally available grid folders.
     # Only folders that match a known grid config AND contain .spec files are listed.
@@ -537,10 +524,10 @@ def _(mo, qf_available_grids, qf_is_hf_mode, qf_pretrained_selector):
 @app.cell
 def _(
     mo,
-    param_map_db,
     qf_grid_configs,
     qf_grid_selector,
     qf_is_hf_mode,
+    qf_param_map_db_for_grid,
     qf_sirocco_grids_path,
 ):
     # Build the parameter multiselect widget based on the selected grid.
@@ -570,13 +557,20 @@ def _(
                     _pidx = int(_pk.replace("param", ""))
                     _param_names[_pidx] = _pd
             except Exception:
-                _param_names = {i: param_map_db[i][0] if i in param_map_db else f"Parameter {i}" for i in _max_params}
+                # If the raw grid cannot be opened yet, fall back to registry
+                # labels so users still see meaningful names in the selector.
+                _param_map_db = qf_param_map_db_for_grid(_selected)
+                _param_names = {i: _param_map_db[i][0] if i in _param_map_db else f"Parameter {i}" for i in _max_params}
 
             _options = {
                 _param_names.get(i, f"Parameter {i}"): str(i)
                 for i in _max_params
             }
-            _default = [k for k, v in _options.items()]
+            # Registry defaults preserve grid-specific policy, including the AGN
+            # rule that two-point physical axes default to their higher value when
+            # omitted from a lower-dimensional model.
+            _default_params = [p for p in _config.get("default_params", _max_params) if p in _max_params]
+            _default = [_param_names.get(i, f"Parameter {i}") for i in _default_params]
 
             qf_params_selector = mo.ui.multiselect(
                 options=_options,
@@ -589,8 +583,10 @@ def _(
 @app.cell
 def _(
     mo,
-    qf_fixed_inclination_values,
+    qf_default_fixed_inclination,
+    qf_fixed_inclination_values_for_grid,
     qf_has_trainable_inclination,
+    qf_grid_selector,
     qf_is_hf_mode,
     qf_params_selector,
     qf_pretrained_selector,
@@ -605,11 +601,14 @@ def _(
         and not _pretrained_active
         and qf_params_selector is not None
         and qf_params_selector.value
-        and not qf_has_trainable_inclination(qf_params_selector.value)
+        and not qf_has_trainable_inclination(qf_params_selector.value, qf_grid_selector.value if qf_grid_selector is not None else None)
     ):
+        _grid_name = qf_grid_selector.value if qf_grid_selector is not None else None
+        _fixed_inclination_values = qf_fixed_inclination_values_for_grid(_grid_name)
+        _default_inclination = qf_default_fixed_inclination(_grid_name)
         qf_fixed_inclination_selector = mo.ui.dropdown(
-            options={f"{value}°": value for value in qf_fixed_inclination_values},
-            value="55°",
+            options={f"{value}°": value for value in _fixed_inclination_values},
+            value=f"{_default_inclination}°",
             label="Fixed Inclination:",
         )
 
@@ -690,6 +689,7 @@ def _(mo):
 
 @app.cell
 def _(
+    format_param_tag,
     np,
     os,
     qf_fixed_inclination_selector,
@@ -719,18 +719,20 @@ def _(
         _grid_name = qf_grid_selector.value  # e.g. "speculate_cv_no-bl_grid_v87f"
         _emu_dir = "Grid-Emulator_Files"
 
-        # Derive selected param indices to find matching processed grid file
+        # Derive selected param indices to find the matching processed grid file.
+        # format_param_tag() preserves the original concatenated filename
+        # convention for sorted param IDs, including 10 and 11.
         _selected_indices = []
         if qf_params_selector is not None and qf_params_selector.value:
             _selected_indices = sorted([int(v) for v in qf_params_selector.value])
 
-        _inclination_fixed = bool(_selected_indices) and not qf_has_trainable_inclination(_selected_indices)
+        _inclination_fixed = bool(_selected_indices) and not qf_has_trainable_inclination(_selected_indices, _grid_name)
         _fixed_inc = int(qf_fixed_inclination_selector.value) if qf_fixed_inclination_selector is not None else 55
         _fixed_inc_suffix = f"_{_fixed_inc}inc" if _inclination_fixed else ""
 
         # Build the EXACT expected filename so only a grid with the same params,
         # scale, smoothing, fixed inclination AND wavelength range can match.
-        _param_tag = "".join(str(i) for i in _selected_indices) if _selected_indices else ""
+        _param_tag = format_param_tag(_selected_indices) if _selected_indices else ""
         _scale = qf_scale_selector.value
         _smooth_suffix = "_smooth" if qf_use_smoothing.value else ""
         _wl_lo_tag = int(round(qf_wl_min.value))
@@ -799,15 +801,6 @@ def _(
         )
     else:
         _elements.append(qf_pretrained_selector)
-
-    if qf_pretrained_selector.value and qf_pretrained_selector.value != "":
-        _elements.append(
-            mo.callout(
-                mo.md(f"**Pre-trained model selected:** `{qf_pretrained_selector.value}`\n\n"
-                      "Skip to **Stage 3: Inference** below."),
-                kind="success",
-            )
-        )
 
     # ── Raw grid training config (local mode only) ───────────────────────
     # Hidden when a pre-trained model is selected so the UI is unambiguous.
@@ -904,6 +897,7 @@ def _(mo, qf_is_hf_mode, qf_pretrained_selector, torch):
 @app.cell
 def _(
     QFMarimoHDF5Creator,
+    format_param_tag,
     mo,
     np,
     os,
@@ -937,8 +931,8 @@ def _(
         # and save a compressed .npz for PCA testing and later training.
         _grid_name = qf_grid_selector.value
         _param_indices = sorted([int(v) for v in qf_params_selector.value])
-        _param_tag = "".join(str(i) for i in _param_indices)
-        _inclination_fixed = not qf_has_trainable_inclination(_param_indices)
+        _param_tag = format_param_tag(_param_indices)
+        _inclination_fixed = not qf_has_trainable_inclination(_param_indices, _grid_name)
         _fixed_inc = int(qf_fixed_inclination_selector.value) if qf_fixed_inclination_selector is not None else 55
         _fixed_inc_suffix = f"_{_fixed_inc}inc" if _inclination_fixed else ""
         _scale = qf_scale_selector.value
@@ -955,8 +949,11 @@ def _(
             try:
                 _config = qf_grid_configs[_grid_name]
                 _wl_range = (qf_wl_min.value, qf_wl_max.value)
+                # Fixed-inclination models bake a single .spec flux column into
+                # the processed grid; trainable-inclination models keep the
+                # registry interface's default column and vary inclination as an axis.
                 _usecols = (
-                    qf_fixed_inclination_to_usecols(_config["usecols"], _fixed_inc)
+                    qf_fixed_inclination_to_usecols(_config["usecols"], _fixed_inc, _grid_name)
                     if _inclination_fixed else _config["usecols"]
                 )
                 _iface = _config["class"](
@@ -1114,6 +1111,7 @@ def _(
     RegularGridInterpolator,
     alt,
     build_hidden_sizes,
+    format_param_tag,
     json,
     mo,
     nn,
@@ -1167,8 +1165,8 @@ def _(
     if _qf_grid_data_local is None and qf_grid_selector is not None and qf_grid_selector.value:
         _grid_name = qf_grid_selector.value
         _param_indices = sorted([int(v) for v in qf_params_selector.value])
-        _param_tag = "".join(str(i) for i in _param_indices)
-        _inclination_fixed_for_build = not qf_has_trainable_inclination(_param_indices)
+        _param_tag = format_param_tag(_param_indices)
+        _inclination_fixed_for_build = not qf_has_trainable_inclination(_param_indices, _grid_name)
         _fixed_inc_for_build = int(qf_fixed_inclination_selector.value) if qf_fixed_inclination_selector is not None else 55
         _fixed_inc_suffix = f"_{_fixed_inc_for_build}inc" if _inclination_fixed_for_build else ""
         _scale = qf_scale_selector.value
@@ -1184,7 +1182,7 @@ def _(
                     _config = qf_grid_configs[_grid_name]
                     _wl_range = (qf_wl_min.value, qf_wl_max.value)
                     _usecols = (
-                        qf_fixed_inclination_to_usecols(_config["usecols"], _fixed_inc_for_build)
+                        qf_fixed_inclination_to_usecols(_config["usecols"], _fixed_inc_for_build, _grid_name)
                         if _inclination_fixed_for_build else _config["usecols"]
                     )
                     _iface = _config["class"](
@@ -1204,7 +1202,9 @@ def _(
                 except Exception as _e:
                     mo.stop(True, mo.callout(mo.md(f"Grid build failed: {_e}"), kind="danger"))
 
-        # Load the freshly-built (or pre-existing) .npz
+        # Load the freshly-built (or pre-existing) .npz.  Newer processed grids
+        # include grid_name/source_file so saved Quick Fit emulators can recover
+        # the correct registry entry without parsing filenames.
         if os.path.exists(_grid_path):
             try:
                 _npz = np.load(_grid_path, allow_pickle=True)
@@ -1235,9 +1235,10 @@ def _(
         _param_names = _qf_grid_data_local["param_names"]
 
         _selected_param_indices = [int(v) for v in qf_params_selector.value]
+        _active_grid_name = qf_grid_selector.value if qf_grid_selector is not None else _qf_grid_data_local.get("grid_name")
         _fixed_inclination_value = (
             float(qf_fixed_inclination_selector.value)
-            if (not qf_has_trainable_inclination(_selected_param_indices)
+            if (not qf_has_trainable_inclination(_selected_param_indices, _active_grid_name)
                 and qf_fixed_inclination_selector is not None)
             else None
         )
@@ -1275,7 +1276,7 @@ def _(
             for _row_index, _entry in _row_and_entries:
                 if not isinstance(_entry, dict) or "flux" not in _entry:
                     continue
-                _fl = np.asarray(_entry["flux"], dtype=np.float32)
+                _fl = np.asarray(_entry["flux"], dtype=np.float64)
                 if _fl.size < _wl.size:
                     continue
                 _rows.append(_row_index)
@@ -1300,7 +1301,7 @@ def _(
         if not _flux_matrix:
             mo.stop(True, mo.callout(mo.md("Could not extract flux data from grid."), kind="danger"))
 
-        _flux_matrix = np.array(_flux_matrix, dtype=np.float32)
+        _flux_matrix = np.array(_flux_matrix, dtype=np.float64)
         if _valid_rows:
             X_grid = X_grid[_valid_rows]
 
@@ -1322,7 +1323,7 @@ def _(
         # space this is a divide-by-mean normalisation; in log space it becomes
         # subtracting the mean log flux, which is the consistent analogue of
         # removing a multiplicative flux offset.
-        _norm_factors = _flux_matrix.mean(axis=1)
+        _norm_factors = _flux_matrix.mean(axis=1, dtype=np.float64)
         if _scale == "log":
             _flux_matrix = _flux_matrix - _norm_factors[:, np.newaxis]
         else:
@@ -1357,6 +1358,7 @@ def _(
             "eigenspectra": _eigenspectra,
             "flux_mean": _flux_mean,
             "flux_std": _flux_std,
+            "norm_factors": _norm_factors.astype(np.float64),
             "wl": _wl_trimmed,
             "param_names": [_param_names[c] for c in _col_mask] if _param_names else [f"param_{c}" for c in _col_mask],
             "min_params": X_grid.min(axis=0),
@@ -1366,7 +1368,8 @@ def _(
             "pca_per_wl_rmse": _pca_per_wl_rmse,
             "scale": _scale,
             "smoothing": qf_use_smoothing.value,
-            "source_grid_file": qf_grid_selector.value,
+            "grid_name": _active_grid_name,
+            "source_grid_file": _qf_grid_data_local.get("source_file", ""),
             "selected_param_indices": _selected_param_indices,
             "fixed_inclination": _fixed_inclination_value,
         }
@@ -1983,8 +1986,8 @@ def _(
     alt,
     mo,
     np,
-    param_map_db,
     pd,
+    qf_param_map_db_for_grid,
     qf_input_scaler,
     qf_output_scaler,
     qf_pca_data,
@@ -2007,6 +2010,7 @@ def _(
     _Y_true = qf_pca_data["weights"].astype(np.float32)
     _n_comp = _Y_true.shape[1]
     _param_names = qf_pca_data["param_names"]
+    _param_map_db = qf_param_map_db_for_grid(qf_pca_data.get("grid_name"))
     _n_params = _X_grid.shape[1]
     _N = _X_grid.shape[0]
 
@@ -2015,7 +2019,7 @@ def _(
         _pn = _param_names[p_idx] if p_idx < len(_param_names) else f"param_{p_idx}"
         _m = re.search(r"(\d+)", str(_pn))
         _pidx = int(_m.group(1)) if _m else 0
-        return param_map_db[_pidx][0] if _pidx in param_map_db else str(_pn)
+        return _param_map_db[_pidx][0] if _pidx in _param_map_db else str(_pn)
 
     _unique_per_dim = [np.sort(np.unique(_X_grid[:, d])) for d in range(_n_params)]
 
@@ -2408,6 +2412,7 @@ def _(
 
 @app.cell
 def _(
+    format_param_tag,
     json,
     mo,
     np,
@@ -2441,14 +2446,17 @@ def _(
     _source = qf_train_info["source"]
 
     def _build_save_dict():
+        """Collect PCA, training, and registry metadata into one NPZ payload."""
         _fixed_inclination = qf_pca_data.get("fixed_inclination")
         _save_dict = {
             "model_type": _source,
             "best_hparams": json.dumps(qf_best_hparams or {}),
+            "grid_name": qf_pca_data.get("grid_name", ""),
             "source_grid_file": qf_pca_data["source_grid_file"],
             "eigenspectra": qf_pca_data["eigenspectra"],
             "flux_mean": qf_pca_data["flux_mean"],
             "flux_std": qf_pca_data["flux_std"],
+            "norm_factors": qf_pca_data["norm_factors"],
             "wl": qf_pca_data["wl"],
             "grid_points": qf_pca_data["grid_points"],
             "weights": qf_pca_data["weights"],
@@ -2492,7 +2500,7 @@ def _(
     else:
         _tag = "qfnn"
     _grid_base = qf_grid_selector.value  # e.g. "speculate_cv_no-bl_grid_v87f"
-    _param_digits = "".join(str(i) for i in sorted(qf_pca_data["selected_param_indices"]))
+    _param_digits = format_param_tag(sorted(qf_pca_data["selected_param_indices"]))
     _scale = qf_pca_data["scale"]
     _smooth_suffix = "_smooth" if qf_pca_data["smoothing"] else ""
     _fixed_inclination = qf_pca_data.get("fixed_inclination")
@@ -2580,10 +2588,7 @@ def _(get_qf_inf_refresh, mo, os, qf_hf_model_cache_result, qf_pretrained_select
             label="Selected Quick Fit Model:",
             full_width=True,
         )
-        qf_inf_model_picker = mo.callout(
-            mo.md(f"**Quick Fit model:** `{_pre}`"),
-            kind="neutral",
-        )
+        qf_inf_model_picker = None
     else:
         _qf_options = {"— None (select a trained model) —": ""}
         _qf_options.update(_qf_files)
@@ -2627,12 +2632,15 @@ def _(
     qf_inf_is_grid_interp = False
 
     if qf_inf_model_selector.value and qf_inf_model_selector.value != "":
+        from Speculate_addons.grid_registry import has_trainable_inclination as _registry_has_trainable_inclination, infer_grid_name as _infer_grid_name
+
         _emu_dir = "Grid-Emulator_Files"
         _path = os.path.join(_emu_dir, qf_inf_model_selector.value)
         try:
             _npz = np.load(_path, allow_pickle=True)
             _model_type = str(_npz.get("model_type", "nn"))
             _param_names = list(_npz["param_names"])
+            _grid_name = str(_npz["grid_name"]) if "grid_name" in _npz else (_infer_grid_name(qf_inf_model_selector.value) or "")
 
             def _param_index(param_name):
                 """Extract the numeric parameter ID from saved names like param11."""
@@ -2649,7 +2657,9 @@ def _(
                     _idx for _idx in (_param_index(_name) for _name in _param_names)
                     if _idx is not None
                 ]
-            _has_trainable_inclination = any(_idx in {9, 10, 11} for _idx in _selected_param_indices)
+            # Use registry inclination metadata instead of assuming CV's {9,10,11}
+            # set; AGN has only param9/param10 inclination axes.
+            _has_trainable_inclination = _registry_has_trainable_inclination(_grid_name, _selected_param_indices)
 
             # fixed_inclination is optional for legacy files.  Missing metadata
             # means trainable inclination when an inclination axis is present;
@@ -2672,11 +2682,14 @@ def _(
             # Extract PCA reconstruction data and grid metadata.
             # These are shared by both NN and Grid Interp models.
             qf_inf_emu_data = {
+                "grid_name": _grid_name,
                 "grid_points": np.array(_npz["grid_points"]),
                 "weights": np.array(_npz["weights"]),
                 "eigenspectra": np.array(_npz["eigenspectra"]),
                 "flux_mean": np.array(_npz["flux_mean"]),
                 "flux_std": np.array(_npz["flux_std"]),
+                "norm_factors": np.array(_npz["norm_factors"]) if "norm_factors" in _npz.files else None,
+                "has_norm_factors": "norm_factors" in _npz.files,
                 "wl": np.array(_npz["wl"]),
                 "param_names": _param_names,
                 "min_params": np.array(_npz["grid_points"]).min(axis=0),
@@ -2686,6 +2699,21 @@ def _(
                 "selected_param_indices": _selected_param_indices,
                 "fixed_inclination": _fixed_inclination,
             }
+
+            if qf_inf_emu_data["has_norm_factors"]:
+                try:
+                    _gp_norm = np.array(_npz["grid_points"]).astype(np.float32)
+                    _nf = np.array(_npz["norm_factors"], dtype=np.float64)
+                    _axes_norm = [np.unique(_gp_norm[:, i]) for i in range(_gp_norm.shape[1])]
+                    _sorted_norm = np.lexsort(_gp_norm.T[::-1])
+                    _grid_shape_norm = [len(a) for a in _axes_norm]
+                    _nf_grid = _nf[_sorted_norm].reshape(_grid_shape_norm)
+                    qf_inf_emu_data["norm_factor_interpolator"] = RegularGridInterpolator(
+                        _axes_norm, _nf_grid, method="linear",
+                        bounds_error=False, fill_value=None,
+                    )
+                except Exception:
+                    qf_inf_emu_data["norm_factor_interpolator"] = None
 
             # Restore input parameter scaler (min-max normalisation).
             if "input_scaler_min" in _npz:
@@ -2737,8 +2765,8 @@ def _(
                 # Uses the same construction logic as the training cell:
                 # 1. Extract unique values along each parameter axis
                 # 2. Lexsort points into Cartesian order
-                # 3. Reshape weights into N-D grid and build interpolator
-                # One interpolator per PCA component.
+                # 3. Reshape weights into an N-D grid with a trailing PCA-weight
+                #    dimension, so one interpolation call returns all weights.
                 qf_inf_is_grid_interp = True
                 _gp = np.array(_npz["grid_points"]).astype(np.float32)
                 _wt = np.array(_npz["weights"]).astype(np.float32)
@@ -2749,13 +2777,11 @@ def _(
                 _wt_sorted = _wt[_sorted_idx]
                 _grid_shape = [len(a) for a in _axes]
 
-                qf_inf_models = []
-                for _c in range(_n_out):
-                    _vals = _wt_sorted[:, _c].reshape(_grid_shape)
-                    qf_inf_models.append(RegularGridInterpolator(
-                        _axes, _vals, method="linear",
-                        bounds_error=False, fill_value=None,
-                    ))
+                _vals = _wt_sorted.reshape((*_grid_shape, _n_out))
+                qf_inf_models = [RegularGridInterpolator(
+                    _axes, _vals, method="linear",
+                    bounds_error=False, fill_value=None,
+                )]
 
             _npz.close()
         except Exception as e:
@@ -2987,8 +3013,10 @@ def _(
             kind="success"
         )
 
-    mo.vstack([
-        qf_inf_model_picker,
+    _stage3_controls = []
+    if qf_inf_model_picker is not None:
+        _stage3_controls.append(qf_inf_model_picker)
+    _stage3_controls.extend([
         _model_status,
         mo.md("---"),
         qf_obs_selector,
@@ -2997,6 +3025,7 @@ def _(
         mo.md("---"),
         _obs_status,
     ])
+    mo.vstack(_stage3_controls)
     return
 
 
@@ -3072,13 +3101,13 @@ def _(alt, mo, np, pd, qf_inf_emu_data, qf_inf_wl_slider, qf_obs_data, qf_obs_sc
                 opacity=0.10, color='cyan'
             ).encode(
                 x=alt.X('Wavelength:Q'),
-                y=alt.Y('Lower:Q'),
-                y2=alt.Y2('Upper:Q'),
+                y=alt.Y('Lower:Q', scale=alt.Scale(zero=False)),
+                y2=alt.Y2(field='Upper'),
             )
 
         _obs_chart = (_obs_band + _obs_line).properties(
             width="container", height=400, title="Observation Spectrum"
-        ).interactive()
+        ).interactive(bind_y=False)
 
     mo.accordion({
         f"{mo.icon('lucide:trending-up')} View Selected Spectrum":
@@ -3096,10 +3125,38 @@ def _(np, torch):
         flux_mean = emu_data["flux_mean"]
         flux_std = emu_data["flux_std"]
 
+        def _norm_factor():
+            _interp = emu_data.get("norm_factor_interpolator")
+            if _interp is not None:
+                try:
+                    return float(np.asarray(_interp(X_raw)).squeeze())
+                except Exception:
+                    pass
+            _stored = emu_data.get("norm_factors")
+            if _stored is None:
+                return None
+            _grid = emu_data.get("grid_points")
+            if _grid is None:
+                return None
+            _dist = np.sum((np.asarray(_grid, dtype=np.float32) - X_raw) ** 2, axis=1)
+            return float(np.asarray(_stored).reshape(-1)[int(np.argmin(_dist))])
+
+        def _restore_norm(flux):
+            _factor = _norm_factor()
+            if _factor is None or not np.isfinite(_factor):
+                return flux
+            if emu_data.get("scale") == "log":
+                return flux + _factor
+            return flux * _factor
+
         if is_grid_interp:
             # RegularGridInterpolator uses raw parameter values
-            w = np.array([m(X_raw)[0] for m in models])
+            if len(models) == 1:
+                w = np.asarray(models[0](X_raw)).squeeze()
+            else:
+                w = np.array([np.asarray(m(X_raw)).squeeze() for m in models])
             flux = (w @ (eigenspectra * flux_std)) + flux_mean
+            flux = np.asarray(_restore_norm(flux)).squeeze()
             return flux, [flux]
         else:
             X_norm = (X_raw - input_scaler["min"]) / input_scaler["range"]
@@ -3112,7 +3169,7 @@ def _(np, torch):
                 if output_scaler is not None:
                     w = w * output_scaler["std"] + output_scaler["mean"]
                 flux = (w @ (eigenspectra * flux_std)) + flux_mean
-                fluxes.append(flux)
+                fluxes.append(_restore_norm(flux))
             mean_flux = np.mean(fluxes, axis=0)
             return mean_flux, fluxes
     return (qf_predict_flux,)
@@ -3122,7 +3179,6 @@ def _(np, torch):
 def _(
     mo,
     np,
-    param_map_db,
     qf_inf_emu_data,
     qf_inf_input_scaler,
     qf_inf_is_grid_interp,
@@ -3131,6 +3187,7 @@ def _(
     qf_inf_wl_slider,
     qf_obs_data,
     qf_obs_scale_selector,
+    qf_param_map_db_for_grid,
     qf_predict_flux,
     qf_transform_observation_data,
     re,
@@ -3145,6 +3202,7 @@ def _(
     _param_names = qf_inf_emu_data["param_names"]
     _fixed_inclination = qf_inf_emu_data.get("fixed_inclination")
     _n_params = len(_param_names)
+    _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
 
     _fixed_toggles = []
     _value_inputs = []
@@ -3156,8 +3214,8 @@ def _(
         _name = _param_names[_i]
         _m = re.search(r"(\d+)", _name)
         _idx = int(_m.group(1)) if _m else 0
-        _base = param_map_db[_idx][0] if _idx in param_map_db else _name
-        _is_log = param_map_db[_idx][3] if _idx in param_map_db and len(param_map_db[_idx]) > 3 else False
+        _base = _param_map_db[_idx][0] if _idx in _param_map_db else _name
+        _is_log = _param_map_db[_idx][3] if _idx in _param_map_db and len(_param_map_db[_idx]) > 3 else False
         _display = f"log10({_base})" if _is_log else _base
 
         _lo = float(_min_p[_i])
@@ -3170,63 +3228,19 @@ def _(
         _min_inputs.append(mo.ui.number(value=round(_lo, 4), step=0.001, label="Min"))
         _max_inputs.append(mo.ui.number(value=round(_hi, 4), step=0.001, label="Max"))
 
-    # ── Auto-configure nuisance parameter defaults ──
-    # Estimate log_scale from the ratio of observation to emulator midpoint flux
-    # so the MLE starts with both spectra at roughly the same scale.
-    _ls_default = 0.0
-    if qf_obs_data is not None and qf_inf_models is not None:
-        try:
-            _wl_lo, _wl_hi = qf_inf_wl_slider.value
-            _mid_params = (_min_p + _max_p) / 2.0
-            _emu_fl, _ = qf_predict_flux(
-                qf_inf_models, _mid_params, qf_inf_emu_data,
-                qf_inf_input_scaler, qf_inf_output_scaler,
-                is_grid_interp=qf_inf_is_grid_interp,
-            )
-            _emu_wl = qf_inf_emu_data["wl"]
-            _em = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
-            _emu_mean = np.mean(np.abs(_emu_fl[_em])) if _em.any() else 1.0
-
-            _om = (qf_obs_data['wavelength'] >= _wl_lo) & (qf_obs_data['wavelength'] <= _wl_hi)
-            _obs_wl = np.array(qf_obs_data[_om]['wavelength'])
-            _raw_fl = np.array(qf_obs_data[_om]['flux'])
-            _raw_err = np.array(qf_obs_data[_om]['error']) if 'error' in qf_obs_data.columns else None
-            _sigma_source = (
-                qf_obs_data['sigma_source'].iat[0]
-                if 'sigma_source' in qf_obs_data.columns and len(qf_obs_data) > 0
-                else None
-            )
-            _scale = qf_obs_scale_selector.value
-            _obs_fl, _ = qf_transform_observation_data(
-                _obs_wl,
-                _raw_fl,
-                _raw_err,
-                _scale,
-                _sigma_source,
-            )
-            # Auto-centre log_scale.  When the emulator outputs log₁₀ flux,
-            # the transformed means are negative and their ratio is meaningless.
-            # Convert both back to linear space to get a sensible scaling offset.
-            if _scale == "log":
-                _emu_mean_lin = np.mean(np.abs(10.0 ** _emu_fl[_em])) if _em.any() else 1.0
-                _obs_mean_lin = np.mean(np.abs(_raw_fl)) if len(_raw_fl) > 0 else 1.0
-                if _emu_mean_lin > 0 and _obs_mean_lin > 0:
-                    _ls_default = round(float(np.log(_obs_mean_lin / _emu_mean_lin)), 1)
-            else:
-                _obs_mean = np.mean(np.abs(_obs_fl)) if len(_obs_fl) > 0 else 1.0
-                if _emu_mean > 0 and _obs_mean > 0:
-                    _ls_default = round(float(np.log(_obs_mean / _emu_mean)), 1)
-        except Exception:
-            pass
-
+    _model_flux_scale = str(qf_inf_emu_data.get("scale", "linear"))
+    _fix_distance_for_shape_only = (
+        qf_obs_scale_selector.value == "continuum-normalised"
+        or _model_flux_scale == "continuum-normalised"
+    )
     _nuisance = [
-        ("Av",        0.0,         0.0,               2.0),
-        ("log_scale", _ls_default, _ls_default - 5.0, _ls_default + 5.0),
-        ("cheb_1",    0.0,         -0.5,              0.5),
+        ("Av",        0.0,         0.0,               2.0, False),
+        ("Distance (pc)", 100.0, 90.0, 110.0, _fix_distance_for_shape_only),
+        ("cheb_1",    0.0,         -0.5,              0.5, True),
     ]
-    for _name, _val, _lo, _hi in _nuisance:
+    for _name, _val, _lo, _hi, _fixed_default in _nuisance:
         _labels.append(_name)
-        _fixed_toggles.append(mo.ui.checkbox(label="Fix", value=(_name == "cheb_1")))
+        _fixed_toggles.append(mo.ui.checkbox(label="Fix", value=_fixed_default))
         _value_inputs.append(mo.ui.number(value=round(_val, 4), step=0.01, label="Value"))
         _min_inputs.append(mo.ui.number(value=round(_lo, 4), step=0.01, label="Min"))
         _max_inputs.append(mo.ui.number(value=round(_hi, 4), step=0.01, label="Max"))
@@ -3266,6 +3280,18 @@ def _(
     else:
         _config_output = _config_accordion
 
+    if _fix_distance_for_shape_only:
+        _config_output = mo.vstack([
+            mo.callout(
+                mo.md(
+                    "Continuum-normalised fits remove the absolute flux scale, "
+                    "so Distance is fixed at 100 pc by default."
+                ),
+                kind="neutral",
+            ),
+            _config_output,
+        ])
+
     _config_output
     return (qf_param_config,)
 
@@ -3274,7 +3300,6 @@ def _(
 def _(
     mo,
     np,
-    param_map_db,
     qf_inf_emu_data,
     qf_inf_input_scaler,
     qf_inf_is_grid_interp,
@@ -3283,12 +3308,13 @@ def _(
     qf_inf_wl_slider,
     qf_obs_data,
     qf_obs_scale_selector,
+    qf_param_map_db_for_grid,
     qf_predict_flux,
     qf_transform_observation_data,
     re,
 ):
     # ── Parameter Playground ──
-    # Interactive sliders to preview how Av, log_scale, cheb_1, and the
+    # Interactive sliders to preview how Av, Distance, cheb_1, and the
     # physical grid axes shift the emulated spectrum relative to the
     # observation. Helps find sensible prior bounds before running MLE.
 
@@ -3296,8 +3322,8 @@ def _(
     # always receive valid references even before a model is loaded.
     qf_pg_av = mo.ui.slider(start=0.0, stop=5.0, value=0.0, step=0.01,
                              label="Av (Extinction)", show_value=True, full_width=True)
-    qf_pg_logscale = mo.ui.slider(start=-10.0, stop=10.0, value=0.0, step=0.1,
-                                   label="log_scale (ln flux scaling)", show_value=True, full_width=True)
+    qf_pg_logscale = mo.ui.slider(start=10.0, stop=1000.0, value=100.0, step=1.0,
+                                   label="Distance (pc)", show_value=True, full_width=True)
     qf_pg_cheb1 = mo.ui.slider(start=-2.0, stop=2.0, value=0.0, step=0.01,
                                 label="cheb_1 (continuum tilt)", show_value=True, full_width=True)
 
@@ -3307,54 +3333,13 @@ def _(
     _min_p = qf_inf_emu_data["min_params"]
     _max_p = qf_inf_emu_data["max_params"]
     _mid_params = (_min_p + _max_p) / 2.0
-    _wl_lo, _wl_hi = qf_inf_wl_slider.value
-
-    # Auto-detect sensible log_scale centre from flux ratio.
-    _ls_centre = 0.0
-    try:
-        _emu_fl, _ = qf_predict_flux(
-            qf_inf_models, _mid_params, qf_inf_emu_data,
-            qf_inf_input_scaler, qf_inf_output_scaler,
-            is_grid_interp=qf_inf_is_grid_interp,
-        )
-        _emu_wl = qf_inf_emu_data["wl"]
-        _em = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
-        _emu_mean = np.mean(np.abs(_emu_fl[_em])) if _em.any() else 1.0
-
-        _om = (qf_obs_data['wavelength'] >= _wl_lo) & (qf_obs_data['wavelength'] <= _wl_hi)
-        _obs_wl_pg = np.array(qf_obs_data[_om]['wavelength'])
-        _raw_fl_pg = np.array(qf_obs_data[_om]['flux'])
-        _raw_err_pg = np.array(qf_obs_data[_om]['error']) if 'error' in qf_obs_data.columns else None
-        _sigma_source_pg = (
-            qf_obs_data['sigma_source'].iat[0]
-            if 'sigma_source' in qf_obs_data.columns and len(qf_obs_data) > 0
-            else None
-        )
-        _scale_pg = qf_obs_scale_selector.value
-        _obs_fl_pg, _ = qf_transform_observation_data(
-            _obs_wl_pg,
-            _raw_fl_pg,
-            _raw_err_pg,
-            _scale_pg,
-            _sigma_source_pg,
-        )
-        if _scale_pg == "log":
-            _emu_mean_lin = np.mean(np.abs(10.0 ** _emu_fl[_em])) if _em.any() else 1.0
-            _obs_mean_lin = np.mean(np.abs(_raw_fl_pg)) if len(_raw_fl_pg) > 0 else 1.0
-            if _emu_mean_lin > 0 and _obs_mean_lin > 0:
-                _ls_centre = round(float(np.log(_obs_mean_lin / _emu_mean_lin)), 1)
-        else:
-            _obs_mean = np.mean(np.abs(_obs_fl_pg)) if len(_obs_fl_pg) > 0 else 1.0
-            if _emu_mean > 0 and _obs_mean > 0:
-                _ls_centre = round(float(np.log(_obs_mean / _emu_mean)), 1)
-    except Exception:
-        pass
+    _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
 
     qf_pg_av = mo.ui.slider(start=0.0, stop=5.0, value=0.0, step=0.01,
                              label="Av (Extinction)", show_value=True, full_width=True)
-    qf_pg_logscale = mo.ui.slider(start=_ls_centre - 10.0, stop=_ls_centre + 10.0,
-                                   value=_ls_centre, step=0.1,
-                                   label="log_scale (ln flux scaling)", show_value=True, full_width=True)
+    qf_pg_logscale = mo.ui.slider(start=10.0, stop=1000.0,
+                                   value=100.0, step=1.0,
+                                   label="Distance (pc)", show_value=True, full_width=True)
     qf_pg_cheb1 = mo.ui.slider(start=-2.0, stop=2.0, value=0.0, step=0.01,
                                 label="cheb_1 (continuum tilt)", show_value=True, full_width=True)
 
@@ -3367,24 +3352,55 @@ def _(
     # wrapper is added for parameters stored on a log10 axis.
     _qf_phys_sliders = []
     _qf_param_names = qf_inf_emu_data["param_names"]
+
+    def _clean_slider_number(_value, _decimals=4):
+        _value = float(_value)
+        if not np.isfinite(_value):
+            return 0.0
+        if _value == 0.0:
+            return 0.0
+        if 1e-4 <= abs(_value) < 1e6:
+            return float(f"{_value:.{_decimals}f}")
+        return float(f"{_value:.{_decimals}g}")
+
+    def _nice_slider_step(_lo, _hi, _target_steps=300):
+        _span = abs(float(_hi) - float(_lo))
+        if not np.isfinite(_span) or _span <= 0.0:
+            return 1e-6
+        _raw = _span / float(_target_steps)
+        _exp = np.floor(np.log10(_raw))
+        _frac = _raw / (10.0 ** _exp)
+        if _frac <= 1.0:
+            _nice = 1.0
+        elif _frac <= 2.0:
+            _nice = 2.0
+        elif _frac <= 5.0:
+            _nice = 5.0
+        else:
+            _nice = 10.0
+        return max(_clean_slider_number(_nice * (10.0 ** _exp)), 1e-12)
+
     for _pi, _pname in enumerate(_qf_param_names):
         _lo = float(_min_p[_pi])
         _hi = float(_max_p[_pi])
         _mid = (_lo + _hi) / 2.0
-        _step = max((_hi - _lo) / 200.0, 1e-6)
+        _lo_ui = _clean_slider_number(_lo)
+        _hi_ui = _clean_slider_number(_hi)
+        _mid_ui = _clean_slider_number(_mid)
+        _step = _nice_slider_step(_lo_ui, _hi_ui)
 
         _m = re.search(r"(\d+)", str(_pname))
         _db_idx = int(_m.group(1)) if _m else None
-        if _db_idx is not None and _db_idx in param_map_db:
-            _base_name = param_map_db[_db_idx][0]
-            _is_log = (len(param_map_db[_db_idx]) > 3
-                       and bool(param_map_db[_db_idx][3]))
+        if _db_idx is not None and _db_idx in _param_map_db:
+            _base_name = _param_map_db[_db_idx][0]
+            _is_log = (len(_param_map_db[_db_idx]) > 3
+                       and bool(_param_map_db[_db_idx][3]))
             _label = f"log10({_base_name})" if _is_log else _base_name
         else:
             _label = str(_pname)
 
         _qf_phys_sliders.append(mo.ui.slider(
-            start=_lo, stop=_hi, value=_mid, step=_step,
+            start=_lo_ui, stop=_hi_ui, value=_mid_ui, step=_step,
             label=_label, show_value=True, full_width=True,
         ))
     qf_pg_phys_sliders = mo.ui.array(_qf_phys_sliders)
@@ -3423,6 +3439,7 @@ def _(
 
     if qf_inf_emu_data is not None and qf_inf_models is not None and qf_obs_data is not None:
         try:
+            from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
             _min_p = qf_inf_emu_data["min_params"]
             _max_p = qf_inf_emu_data["max_params"]
             # Physical parameter vector — from sliders when available, otherwise
@@ -3446,8 +3463,8 @@ def _(
             # Apply nuisance transforms
             # When the emulator outputs log₁₀(flux), convert to linear
             # before applying nuisance transforms, then convert back.
-            _is_log_scale = (qf_obs_scale_selector.value == "log")
-            if _is_log_scale:
+            _model_is_log = (qf_inf_emu_data.get("scale") == "log")
+            if _model_is_log:
                 _emu_fl_c = 10.0 ** _emu_fl_c
 
             _av = qf_pg_av.value
@@ -3461,9 +3478,10 @@ def _(
                 _scale_wl = _emu_wl_c / _emu_wl_c.max()
                 _emu_fl_c = _emu_fl_c * chebval(_scale_wl, [1.0, _cheb1])
 
-            _emu_fl_c = _emu_fl_c * np.exp(qf_pg_logscale.value)
+            _log_scale = _distance_to_log_scale(float(qf_pg_logscale.value))
+            _emu_fl_c = _emu_fl_c * np.exp(_log_scale)
 
-            if _is_log_scale:
+            if _model_is_log:
                 _emu_fl_c = np.log10(np.clip(_emu_fl_c, 1e-30, None))
 
             # Observation in emulator scale
@@ -3537,7 +3555,7 @@ def _(
                 "to a similar scale as the observation, and the **Physical Parameters** "
                 "tab to reshape the emulated spectrum by varying the grid axes.\n\n"
                 "- **Av** — Interstellar dust extinction (magnitudes)\n"
-                "- **log_scale** — Natural log of flux scaling factor\n"
+                "- **Distance (pc)** — Distance prior wrapper for the backend flux scale\n"
                 "- **cheb_1** — Chebyshev c₁ coefficient (continuum tilt)"
             ), kind="neutral"),
             _slider_tabs,
@@ -3603,6 +3621,7 @@ def _(
             )
         else:
             try:
+                from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
                 _wl_lo, _wl_hi = qf_inf_wl_slider.value
                 _obs_mask = ((qf_obs_data['wavelength'] >= _wl_lo)
                              & (qf_obs_data['wavelength'] <= _wl_hi))
@@ -3616,9 +3635,10 @@ def _(
                     else None
                 )
 
-                _scale = qf_obs_scale_selector.value
+                _obs_scale = qf_obs_scale_selector.value
+                _model_is_log = (qf_inf_emu_data.get("scale") == "log")
                 _obs_fl, _obs_err = qf_transform_observation_data(
-                    _obs_wl, _raw_fl, _raw_err, _scale, _sigma_source
+                    _obs_wl, _raw_fl, _raw_err, _obs_scale, _sigma_source
                 )
 
                 _phys = np.array(qf_pg_phys_sliders.value, dtype=float)
@@ -3632,7 +3652,7 @@ def _(
                 _fl = _model_fl[_em].copy()
                 _wl = _emu_wl[_em]
 
-                if _scale == "log":
+                if _model_is_log:
                     _fl = 10.0 ** _fl
 
                 _av = float(qf_pg_av.value)
@@ -3647,9 +3667,10 @@ def _(
                     _scale_wl = _wl / _wl.max()
                     _fl = _fl * chebval(_scale_wl, [1.0, _cheb1])
 
-                _fl = _fl * np.exp(float(qf_pg_logscale.value))
+                _log_scale = _distance_to_log_scale(float(qf_pg_logscale.value))
+                _fl = _fl * np.exp(_log_scale)
 
-                if _scale == "log":
+                if _model_is_log:
                     _fl = np.log10(np.clip(_fl, 1e-30, None))
 
                 _model_interp = np.interp(_obs_wl, _wl, _fl)
@@ -3777,12 +3798,13 @@ def _(
     if _obs_wl.size == 0:
         mo.stop(True, mo.callout(mo.md("No observation points fall within the selected wavelength range."), kind="warn"))
 
-    _scale = qf_obs_scale_selector.value
+    _model_is_log = (qf_inf_emu_data.get("scale") == "log")
+    _obs_scale = qf_obs_scale_selector.value
     _obs_fl, _obs_err = qf_transform_observation_data(
         _obs_wl,
         _raw_obs_fl,
         _raw_obs_err,
-        _scale,
+        _obs_scale,
         _sigma_source,
     )
 
@@ -3791,6 +3813,8 @@ def _(
 
     if not np.any(_emu_mask):
         mo.stop(True, mo.callout(mo.md("No emulator wavelengths fall within the selected wavelength range."), kind="warn"))
+
+    from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
 
     def _chi2(active_params):
         # ── Enforce prior bounds ─────────────────────────────────────────
@@ -3815,7 +3839,8 @@ def _(
 
         phys = full_params[:_n_phys]
         _av = full_params[_n_phys] if len(full_params) > _n_phys else 0.0
-        _log_scale = full_params[_n_phys + 1] if len(full_params) > _n_phys + 1 else 0.0
+        _distance_pc = full_params[_n_phys + 1] if len(full_params) > _n_phys + 1 else 100.0
+        _log_scale = _distance_to_log_scale(_distance_pc)
         _cheb1 = full_params[_n_phys + 2] if len(full_params) > _n_phys + 2 else 0.0
 
         model_flux, _ = qf_predict_flux(
@@ -3827,7 +3852,7 @@ def _(
         _wl = _emu_wl[_emu_mask]
 
         # Convert log₁₀ emulator output to linear before nuisance transforms.
-        if _scale == "log":
+        if _model_is_log:
             _fl = 10.0 ** _fl
 
         if _av > 0 and fitzpatrick99 is not None:
@@ -3842,7 +3867,7 @@ def _(
         _fl = _fl * np.exp(_log_scale)
 
         # Convert back to log₁₀ after nuisance transforms.
-        if _scale == "log":
+        if _model_is_log:
             _fl = np.log10(np.clip(_fl, 1e-30, None))
 
         _model_interp = np.interp(_obs_wl, _wl, _fl)
@@ -3984,7 +4009,8 @@ def _(
                     full_params[_gi] = P[_ai]
                 phys = full_params[:_n_phys]
                 _av_s = full_params[_n_phys] if len(full_params) > _n_phys else 0.0
-                _ls_s = full_params[_n_phys + 1] if len(full_params) > _n_phys + 1 else 0.0
+                _distance_s = full_params[_n_phys + 1] if len(full_params) > _n_phys + 1 else 100.0
+                _ls_s = _distance_to_log_scale(_distance_s)
                 _ch_s = full_params[_n_phys + 2] if len(full_params) > _n_phys + 2 else 0.0
 
                 mf, _ = qf_predict_flux(
@@ -3994,7 +4020,7 @@ def _(
                 fl = mf[_emu_mask]
                 wl = _emu_wl[_emu_mask]
 
-                if _scale == "log":
+                if _model_is_log:
                     fl = 10.0 ** fl
 
                 if _av_s > 0 and fitzpatrick99 is not None:
@@ -4004,7 +4030,7 @@ def _(
                     fl = fl * chebval(wl / wl.max(), [1.0, _ch_s])
                 fl = fl * np.exp(_ls_s)
 
-                if _scale == "log":
+                if _model_is_log:
                     fl = np.log10(np.clip(fl, 1e-30, None))
 
                 mi = np.interp(_obs_wl, wl, fl)
@@ -4082,7 +4108,9 @@ def _(
     _n_phys = qf_mle_result["n_physical"]
     _phys = _best_full[:_n_phys]
     _av = _best_full[_n_phys] if len(_best_full) > _n_phys else 0.0
-    _log_scale = _best_full[_n_phys + 1] if len(_best_full) > _n_phys + 1 else 0.0
+    from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
+    _distance_pc = _best_full[_n_phys + 1] if len(_best_full) > _n_phys + 1 else 100.0
+    _log_scale = _distance_to_log_scale(_distance_pc)
     _cheb1 = _best_full[_n_phys + 2] if len(_best_full) > _n_phys + 2 else 0.0
 
     _mean_fl, _ens_fl = qf_predict_flux(
@@ -4095,11 +4123,12 @@ def _(
     _mask = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
     _wl = _emu_wl[_mask]
 
-    _sc = qf_obs_scale_selector.value
+    _obs_scale = qf_obs_scale_selector.value
+    _model_is_log = (qf_inf_emu_data.get("scale") == "log")
 
     def _apply_nuisance(fl, wl, av, log_scale, cheb1):
         fl = fl.copy()
-        if _sc == "log":
+        if _model_is_log:
             fl = 10.0 ** fl
         if av > 0 and fitzpatrick99 is not None:
             a_l = fitzpatrick99(wl.astype(np.float64), av, 3.1)
@@ -4107,7 +4136,7 @@ def _(
         if cheb1 != 0.0:
             fl = fl * chebval(wl / wl.max(), [1.0, cheb1])
         fl = fl * np.exp(log_scale)
-        if _sc == "log":
+        if _model_is_log:
             fl = np.log10(np.clip(fl, 1e-30, None))
         return fl
 
@@ -4182,14 +4211,14 @@ def _(
 
     _band = alt.Chart(_band_df).mark_area(opacity=0.2, color='orange').encode(
         x='Wavelength:Q',
-        y='Lower:Q',
-        y2='Upper:Q',
+        y=alt.Y('Lower:Q', scale=alt.Scale(zero=False)),
+        y2=alt.Y2(field='Upper'),
     )
 
     _overlay_chart = (_band + _line).properties(
         width="container", height=350,
         title="Best-Fit Spectrum Overlay"
-    ).interactive()
+    ).interactive(bind_y=False)
 
     _resid_df = pd.DataFrame({'Wavelength': _obs_wl_p, 'Residual (σ)': _resid_p})
     _resid_chart = alt.Chart(_resid_df).mark_point(size=3, color='cyan').encode(
@@ -4199,7 +4228,7 @@ def _(
     ).properties(
         width="container", height=200,
         title="Normalised Residuals"
-    ).interactive()
+    ).interactive(bind_y=False)
 
     _zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color='grey', strokeDash=[4, 4]).encode(y='y:Q')
 
@@ -4324,6 +4353,7 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
         os.makedirs(_dir, exist_ok=True)
         try:
             from Speculate_addons.speculate_benchmark import emulator_to_physical
+            from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map, defaulted_physical_param_ids as _defaulted_physical_param_ids, infer_grid_name as _infer_grid_name
             from exports.templates.speculate_pf_exporter import write_pf
             import time as _time
 
@@ -4332,19 +4362,21 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
             _n_phys = qf_mle_result["n_physical"]
             _param_names = qf_inf_emu_data["param_names"]
 
-            physical = emulator_to_physical(_param_names, _best[:_n_phys])
-            _observer_angle = None
-            if _fixed_inclination is not None:
-                _observer_angle = float(_fixed_inclination)
-            elif "Inclination" in physical:
-                _observer_angle = float(physical["Inclination"])
-
             # Determine grid name from source file
             _src = qf_inf_emu_data.get("source_file", "unknown")
             # Strip _qfnn_/_qfnn-ensemble_/_qfgi_ suffix to recover grid name
             import re as _re
             _gn_match = _re.match(r"(.+?)_(qfnn-ensemble|qfnn|qfgi)_", _src)
-            _grid_name = _gn_match.group(1) if _gn_match else _src.split("_qf")[0]
+            _grid_name = qf_inf_emu_data.get("grid_name") or (_gn_match.group(1) if _gn_match else _infer_grid_name(_src))
+            if not _grid_name:
+                _grid_name = _src.split("_qf")[0]
+
+            physical = emulator_to_physical(_param_names, _best[:_n_phys], _grid_name)
+            _observer_angle = None
+            if _fixed_inclination is not None:
+                _observer_angle = float(_fixed_inclination)
+            elif "Inclination" in physical:
+                _observer_angle = float(physical["Inclination"])
 
             header = [
                 "### Sirocco .pf Template",
@@ -4355,6 +4387,16 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
             ]
             if _observer_angle is not None:
                 header.insert(-1, f"### Observer inclination: {_observer_angle:.6f}")
+
+            _defaulted_ids = _defaulted_physical_param_ids(_grid_name, _param_names)
+            if _defaulted_ids:
+                _param_map = _benchmark_param_map(_grid_name)
+                header.append("### Registry-defaulted physical parameters:")
+                for _param_id in _defaulted_ids:
+                    _, _key = _param_map.get(_param_id, (f"param{_param_id}", f"param{_param_id}"))
+                    if _key in physical:
+                        header.append(f"###   {_key}: {physical[_key]:.6g}")
+                header.append("###")
 
             _nuisance = {}
             for _i in range(_n_phys, len(_labels)):

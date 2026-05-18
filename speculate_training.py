@@ -357,8 +357,7 @@ def _(mo):
     from Starfish.grid_tools import HDF5Creator
     from Starfish.emulator import Emulator
     from Starfish.emulator.plotting import plot_eigenspectra
-    from Speculate_addons.Spec_gridinterfaces import Speculate_cv_bl_grid_v87f
-    from Speculate_addons.Spec_gridinterfaces import Speculate_cv_no_bl_grid_v87f
+    from Speculate_addons.grid_registry import get_grid_configs
 
     class MarimoHDF5Creator(HDF5Creator):
         """Override the grid-processing loop to surface a marimo progress bar
@@ -441,20 +440,7 @@ def _(mo):
     # the FITS columns to read, and the parameter indices supported by that grid.
     # "max_params" lists every axis the interface can expose; the user selects a
     # subset in the multiselect widget.
-    grid_configs = {
-        "speculate_cv_no-bl_grid_v87f": {
-            "class": Speculate_cv_no_bl_grid_v87f,
-            "usecols": (1, 7),
-            "name": "speculate_cv_no-bl_grid_v87f",
-            "max_params": [1, 2, 3, 4, 5, 6, 9, 10, 11]
-        },
-        "speculate_cv_bl_grid_v87f": {
-            "class": Speculate_cv_bl_grid_v87f,
-            "usecols": (1, 7),
-            "name": "speculate_cv_bl_grid_v87f",
-            "max_params": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        }
-    }
+    grid_configs = get_grid_configs()
 
     if sirocco_grids_path.exists():
         # Scan for grid folders
@@ -485,20 +471,33 @@ def _(mo):
 
 @app.cell
 def _():
-    # Parameter IDs 9-11 are alternate inclination-grid axes.  When none are
-    # selected, the emulator is trained at one fixed observer angle instead.
-    _inclination_param_ids = {9, 10, 11}
-    fixed_inclination_values = list(range(30, 90, 5))
+    # Thin notebook wrappers around grid_registry keep the marimo dependency graph
+    # stable while moving all grid-specific decisions into one source of truth.
+    from Speculate_addons.grid_registry import (
+        default_fixed_inclination as _default_fixed_inclination,
+        format_param_tag,
+        has_trainable_inclination as _has_trainable_inclination,
+        inclination_to_usecols as _inclination_to_usecols,
+        inclination_values as _inclination_values,
+    )
 
-    def has_trainable_inclination(param_values):
+    def has_trainable_inclination(param_values, grid_name=None):
         """Return whether the selected model parameters include inclination."""
-        return any(int(param_value) in _inclination_param_ids for param_value in (param_values or []))
+        return _has_trainable_inclination(grid_name, param_values)
 
-    def fixed_inclination_to_usecols(base_usecols, inclination):
+    def fixed_inclination_values_for_grid(grid_name=None):
+        """Return valid fixed observer angles for the selected grid."""
+        return _inclination_values(grid_name)
+
+    def fixed_inclination_to_usecols(base_usecols, inclination, grid_name=None):
         """Map a fixed inclination angle to the grid-interface flux column."""
-        return (base_usecols[0], int(2 + (float(inclination) - 30.0) / 5.0))
+        return _inclination_to_usecols(grid_name, base_usecols, inclination)
 
-    return fixed_inclination_to_usecols, fixed_inclination_values, has_trainable_inclination
+    def default_fixed_inclination(grid_name=None):
+        """Return the default fixed observer angle for a grid."""
+        return _default_fixed_inclination(grid_name)
+
+    return default_fixed_inclination, fixed_inclination_to_usecols, fixed_inclination_values_for_grid, format_param_tag, has_trainable_inclination
 
 
 @app.cell
@@ -514,6 +513,7 @@ def _(
 ):
     import re as _re
     from pathlib import Path as _Path
+    from Speculate_addons.grid_registry import parse_param_tag
 
     # Rescan after training completes so newly created emulators appear
     _ = get_training_trigger()
@@ -523,6 +523,9 @@ def _(
 
         Right-to-left parsing of the naming convention:
           {grid}_emu_{params}_{scale}[_smooth][_{inc}inc]_{wlmin}-{wlmax}AA_{n}PCA
+
+                Parameter tags use the original concatenated increasing-ID form,
+                e.g. 12391011 for params 1, 2, 3, 9, 10, and 11.
         """
         name = name.replace('.npz', '')
         result = {}
@@ -556,24 +559,12 @@ def _(
             result['smoothing'] = False
 
         # 5. Grid name, params string, scale
-        m = _re.match(r'^(.+?)_emu_(\d+)_(.+)$', name)
+        m = _re.match(r'^(.+?)_emu_([^_]+)_(.+)$', name)
         if not m:
             return None
         result['grid_name'] = m.group(1)
         result['scale'] = m.group(3)
-
-        # Parse param digits — single digits 1-9, multi-digit 10/11
-        params = []
-        i = 0
-        s = m.group(2)
-        while i < len(s):
-            if i + 1 < len(s) and s[i:i+2] in ('10', '11'):
-                params.append(int(s[i:i+2]))
-                i += 2
-            else:
-                params.append(int(s[i]))
-                i += 1
-        result['params'] = params
+        result['params'] = parse_param_tag(m.group(2))
 
         return result
 
@@ -734,7 +725,7 @@ def _(available_grids, get_loaded_emu_config, mo, update_loaded_emu_config):
             label="Select Grid:",
             on_change=update_loaded_emu_config(
                 "grid_name",
-                remove_keys=("params", "fixed_inclination"),
+                remove_keys=("params", "physical_params", "inclination_choice", "fixed_inclination"),
             )
         )
         mo.vstack([
@@ -756,10 +747,19 @@ def _(available_grids, get_loaded_emu_config, mo, update_loaded_emu_config):
 
 
 @app.cell
-def _(grid_configs, grid_selector, get_loaded_emu_config, mo, sirocco_grids_path, update_loaded_emu_config):
+def _(
+    default_fixed_inclination,
+    fixed_inclination_values_for_grid,
+    grid_configs,
+    grid_selector,
+    get_loaded_emu_config,
+    mo,
+    sirocco_grids_path,
+    update_loaded_emu_config,
+):
     # Introspect the selected grid interface so the Stage 1 multiselect shows the
-    # parameters that grid actually exposes, using the interface's own metadata
-    # when possible.
+    # non-inclination parameters that grid exposes.  Inclination is selected in a
+    # separate dropdown below because it is mutually exclusive by construction.
     param_names = {}
     _cfg = get_loaded_emu_config()
 
@@ -797,88 +797,190 @@ def _(grid_configs, grid_selector, get_loaded_emu_config, mo, sirocco_grids_path
                 # Fallback if interface fails (e.g. files missing)
                 param_names = {i: f"Parameter {i}" for i in max_params}
 
-            # Use loaded params when the loaded grid matches, otherwise standard defaults
-            if _cfg and _cfg.get('params') and selected_grid == _cfg.get('grid_name'):
-                default_params = [p for p in _cfg['params'] if p in max_params]
-            else:
-                default_params = [p for p in max_params if p <= 9]
+            # The UI intentionally separates two ideas that used to be tangled in
+            # one multiselect: physical/file-defining axes and the observer
+            # inclination choice.  This prevents users from selecting sparse,
+            # mid, and full inclination axes at the same time while keeping the
+            # downstream training code's old ``params.value`` contract intact.
+            _inclination_param_ids = set(config.get("inclination_param_ids", ()))
+            _physical_param_ids = [
+                param_id for param_id in max_params
+                if param_id not in _inclination_param_ids
+            ]
+            _label_to_param = {
+                param_names.get(param_index, f"Parameter {param_index}"): param_index
+                for param_index in _physical_param_ids
+            }
+            _param_to_label = {
+                param_index: param_names.get(param_index, f"Parameter {param_index}")
+                for param_index in _physical_param_ids
+            }
 
-            def _coerce_selected_params(selected_values):
-                """Normalize multiselect output to integer parameter IDs."""
-                label_to_param = {
-                    param_names.get(param_index, f"Parameter {param_index}"): param_index
-                    for param_index in max_params
-                }
+            def _coerce_physical_params(selected_values):
+                """Normalize multiselect labels/values into ordered physical IDs."""
                 selected_params = []
                 for selected_value in selected_values or []:
                     try:
                         selected_params.append(int(selected_value))
                     except (TypeError, ValueError):
-                        param_index = label_to_param.get(str(selected_value))
+                        param_index = _label_to_param.get(str(selected_value))
                         if param_index is not None:
                             selected_params.append(param_index)
-                return selected_params
+                _selected_param_ids = set(selected_params)
+                return [
+                    param_id for param_id in _physical_param_ids
+                    if param_id in _selected_param_ids
+                ]
 
-            # Create options
-            params = mo.ui.multiselect(
-                options={param_names.get(i, f"Parameter {i}"): str(i) for i in max_params},
-                value=[param_names.get(p, f"Parameter {p}") for p in default_params if p in max_params],
+            def _param_labels(selected_params):
+                """Convert saved physical parameter IDs back to multiselect labels."""
+                return [_param_to_label[p] for p in selected_params if p in _param_to_label]
+
+            if _cfg and selected_grid == _cfg.get('grid_name') and _cfg.get('physical_params'):
+                default_physical_params = _coerce_physical_params(_cfg.get('physical_params'))
+            elif _cfg and selected_grid == _cfg.get('grid_name') and _cfg.get('params'):
+                default_physical_params = _coerce_physical_params(_cfg.get('params'))
+            else:
+                default_physical_params = _coerce_physical_params(
+                    config.get("default_params", max_params)
+                )
+
+            # Dropdown option values are compact tokens consumed by the merge cell:
+            # ``fixed:55`` means train at one flux column, while ``param:9`` means
+            # expose that inclination axis as part of the emulator grid.  Marimo's
+            # dict dropdown API uses display labels for initial selection, so the
+            # reverse map below converts stored tokens back to labels.
+            _fixed_inclination_values = fixed_inclination_values_for_grid(selected_grid)
+            _inclination_options = {
+                f"Fixed {value}°": f"fixed:{value}"
+                for value in _fixed_inclination_values
+            }
+            for _param_id in max_params:
+                if _param_id in _inclination_param_ids:
+                    _inclination_options[
+                        param_names.get(_param_id, f"Parameter {_param_id}")
+                    ] = f"param:{_param_id}"
+            _choice_to_label = {
+                _choice: _label for _label, _choice in _inclination_options.items()
+            }
+
+            _default_choice = None
+            if _cfg and selected_grid == _cfg.get('grid_name'):
+                # New configs store the explicit fixed:/param: token.  Older
+                # emulator filenames only stored params plus an optional fixed
+                # inclination suffix, so the fallback reconstructs the token.
+                _stored_choice = _cfg.get('inclination_choice')
+                if _stored_choice in _choice_to_label:
+                    _default_choice = _stored_choice
+                else:
+                    _loaded_params = []
+                    for _param_id in _cfg.get('params') or []:
+                        try:
+                            _loaded_params.append(int(_param_id))
+                        except (TypeError, ValueError):
+                            pass
+                    _loaded_inclinations = [
+                        _param_id for _param_id in _loaded_params
+                        if _param_id in _inclination_param_ids
+                    ]
+                    if _loaded_inclinations:
+                        _default_choice = f"param:{_loaded_inclinations[0]}"
+                    else:
+                        _fixed_inc = int(_cfg.get(
+                            'fixed_inclination',
+                            default_fixed_inclination(selected_grid),
+                        ))
+                        _default_choice = f"fixed:{_fixed_inc}"
+
+            if _default_choice not in _choice_to_label:
+                _default_trainable_inclinations = [
+                    _param_id for _param_id in config.get("default_params", max_params)
+                    if _param_id in _inclination_param_ids
+                ]
+                if _default_trainable_inclinations:
+                    _default_choice = f"param:{_default_trainable_inclinations[0]}"
+                else:
+                    _default_choice = f"fixed:{default_fixed_inclination(selected_grid)}"
+            if _default_choice not in _choice_to_label:
+                _default_choice = next(iter(_choice_to_label))
+
+            physical_params_selector = mo.ui.multiselect(
+                options={param_names.get(i, f"Parameter {i}"): str(i) for i in _physical_param_ids},
+                value=_param_labels(default_physical_params),
                 label="Select parameters to include:",
-                on_change=update_loaded_emu_config("params", _coerce_selected_params)
+                on_change=update_loaded_emu_config("physical_params", _coerce_physical_params),
+            )
+            inclination_selector = mo.ui.dropdown(
+                options=_inclination_options,
+                value=_choice_to_label[_default_choice],
+                label="Inclination parameter:",
+                on_change=update_loaded_emu_config("inclination_choice", str),
             )
         else:
-            params = mo.ui.multiselect(
+            physical_params_selector = mo.ui.multiselect(
                 options={},
                 value=[],
                 label="Select parameters to include:"
             )
+            inclination_selector = None
     else:
-        params = None
-    return (params,)
+        physical_params_selector = None
+        inclination_selector = None
+    return inclination_selector, physical_params_selector
 
 
 @app.cell
 def _(
-    fixed_inclination_values,
-    get_loaded_emu_config,
-    has_trainable_inclination,
+    inclination_selector,
     mo,
-    params,
-    update_loaded_emu_config,
+    physical_params_selector,
 ):
-    fixed_inclination_selector = None
-
-    if params is None:
+    if physical_params_selector is None:
         _controls = mo.md("*Select a grid first*")
-    elif params.value and not has_trainable_inclination(params.value):
-        # If inclination is not a trained axis, expose the observer angle as a
-        # fixed-grid choice and store it in the emulator filename/metadata.
-        _cfg = get_loaded_emu_config()
-        _default_inclination = int(_cfg.get('fixed_inclination', 55)) if _cfg else 55
-        if _default_inclination not in fixed_inclination_values:
-            _default_inclination = 55
-        _inclination_options = {f"{value}°": value for value in fixed_inclination_values}
-        fixed_inclination_selector = mo.ui.dropdown(
-            options=_inclination_options,
-            value=f"{_default_inclination}°",
-            label="Fixed Inclination:",
-            on_change=update_loaded_emu_config("fixed_inclination", lambda value: int(value)),
-        )
+    elif inclination_selector is None:
+        _controls = physical_params_selector
+    else:
         _controls = mo.hstack(
-            [params, fixed_inclination_selector],
+            [physical_params_selector, inclination_selector],
             justify="start",
             align="end",
             gap=1,
         )
-    else:
-        _controls = params
 
     _controls
-    return (fixed_inclination_selector,)
+    return
 
 
 @app.cell
-def _(mo, n_components, params):
+def _(default_fixed_inclination, grid_selector, inclination_selector, physical_params_selector):
+    from types import SimpleNamespace as _SimpleNamespace
+
+    # Keep the rest of the Training Tool unchanged by rebuilding the legacy
+    # objects it expects: ``params.value`` contains the selected physical axes
+    # plus at most one trainable inclination axis, and fixed_inclination_selector
+    # exists only when inclination is baked into a single flux column.
+    params = None
+    fixed_inclination_selector = None
+
+    if physical_params_selector is not None:
+        _selected_params = [int(param_id) for param_id in (physical_params_selector.value or [])]
+        _choice = str(inclination_selector.value) if inclination_selector is not None else ""
+        if _choice.startswith("param:"):
+            _selected_params.append(int(_choice.split(":", 1)[1]))
+        elif _choice.startswith("fixed:"):
+            fixed_inclination_selector = _SimpleNamespace(value=int(_choice.split(":", 1)[1]))
+        else:
+            _grid_name = grid_selector.value if grid_selector is not None else None
+            fixed_inclination_selector = _SimpleNamespace(value=default_fixed_inclination(_grid_name))
+
+        _merged_params = sorted(set(_selected_params))
+        params = _SimpleNamespace(value=[str(param_id) for param_id in _merged_params])
+
+    return fixed_inclination_selector, params
+
+
+@app.cell
+def _(grid_configs, grid_selector, mo, n_components, params):
     # Estimate the combinatorial grid size and the dominant GPU memory footprint
     # before training begins, using the selected parameterization and PCA size.
     high_vram = mo.md("")
@@ -887,18 +989,26 @@ def _(mo, n_components, params):
         try:
             # The UI stores parameter ids as strings; convert them back to ints for
             # the size heuristics used below.
-            selected = [int(p) for p in params.value]
+            _selected = [int(p) for p in params.value]
+            _grid_name = grid_selector.value if grid_selector is not None else None
+            _grid_config = grid_configs.get(_grid_name) if _grid_name else None
+            _point_axes = _grid_config.get("points", {}) if _grid_config else {}
 
-            # The inclination encodings have higher cardinality than the other grid
-            # axes, so they contribute disproportionately to total grid size.
+            # Use the selected grid's registered axis sizes.  CV and AGN do not
+            # share the same physical-axis cardinalities, and their inclination
+            # axes are registry-defined rather than inferred from the parameter ID.
             total_points = 1
-            for p in selected:
-                if p == 11:
-                    total_points *= 12
-                elif p == 10:
-                    total_points *= 6
+            for p in _selected:
+                if p in _point_axes:
+                    total_points *= len(_point_axes[p])
                 else:
-                    total_points *= 3
+                    # Legacy fallback for unknown grids that predate the registry.
+                    if p == 11:
+                        total_points *= 12
+                    elif p == 10:
+                        total_points *= 6
+                    else:
+                        total_points *= 3
 
             # V11 is the dominant dense tensor in emulator training. In standard
             # mode it scales as (n_components, M, M), so memory grows roughly with
@@ -917,9 +1027,11 @@ def _(mo, n_components, params):
             gpu_vram_total_gb = None
             gpu_vram_free_gb = None
             try:
-                if torch.cuda.is_available():
-                    gpu_vram_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                    free_bytes, _ = torch.cuda.mem_get_info(0)
+                import torch as _torch
+
+                if _torch.cuda.is_available():
+                    gpu_vram_total_gb = _torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                    free_bytes, _ = _torch.cuda.mem_get_info(0)
                     gpu_vram_free_gb = free_bytes / (1024**3)
             except Exception:
                 pass
@@ -1226,6 +1338,7 @@ def _(
     MarimoHDF5Creator,
     fixed_inclination_selector,
     fixed_inclination_to_usecols,
+    format_param_tag,
     grid_configs,
     grid_selector,
     has_trainable_inclination,
@@ -1244,9 +1357,10 @@ def _(
 ):
     if test_pca_btn.value:
         if grid_selector is not None and grid_selector.value and params is not None and params.value:
-            # 1. Determine parameters
+            # 1. Determine parameters.  format_param_tag() preserves the
+            # original concatenated filename convention for sorted param IDs.
             _model_params = tuple(sorted([int(p) for p in params.value]))
-            _model_params_str = ''.join(str(i) for i in _model_params)
+            _model_params_str = format_param_tag(_model_params)
             _grid_name = grid_selector.value
             _base_name = _grid_name + "_"
             _smoothing = use_smoothing.value
@@ -1254,7 +1368,7 @@ def _(
             _smooth_suffix = "_smooth" if _smoothing else ""
             _wl_lo = wl_min.value
             _wl_hi = wl_max.value
-            _inclination_fixed = not has_trainable_inclination(_model_params)
+            _inclination_fixed = not has_trainable_inclination(_model_params, _grid_name)
             _fixed_inc = int(fixed_inclination_selector.value) if fixed_inclination_selector is not None else 55
             _fixed_inc_suffix = f"_{_fixed_inc}inc" if _inclination_fixed else ""
             _grid_file_name_pca = f"{_base_name}grid_{_model_params_str}_{_scale}{_smooth_suffix}{_fixed_inc_suffix}_{_wl_lo}-{_wl_hi}AA"
@@ -1272,7 +1386,7 @@ def _(
                     if _grid_name in grid_configs:
                         _grid_config = grid_configs[_grid_name]
                         _usecols = (
-                            fixed_inclination_to_usecols(_grid_config["usecols"], _fixed_inc)
+                            fixed_inclination_to_usecols(_grid_config["usecols"], _fixed_inc, _grid_name)
                             if _inclination_fixed else _grid_config["usecols"]
                         )
                         _grid = _grid_config["class"](
@@ -1331,6 +1445,7 @@ def _(
 def _(
     clear_trained_emu_cache,
     fixed_inclination_selector,
+    format_param_tag,
     get_training_trigger,
     grid_selector,
     has_trainable_inclination,
@@ -1350,17 +1465,18 @@ def _(
     # Register dependency on training completion
     _ = get_training_trigger()
 
-        # Recompute the expected emulator filename reactively so the UI can warn when
-        # the current configuration would overwrite an existing trained model.
+    # Recompute the expected emulator filename reactively so the UI can warn when
+    # the current configuration would overwrite an existing trained model.
     _emu_btn_label = f"{mo.icon('lucide:rocket')} Train Emulator"
     _emu_btn_kind = "success"
     _emu_info_text = "Click to begin training. This may take several minutes to hours depending on grid size and hardware."
 
     if grid_selector is not None and grid_selector.value and params is not None and params.value:
         # Duplicate the naming logic from the training cell so this preview stays
-        # consistent with the file that would actually be written on train.
+        # consistent with the file that would actually be written on train.  The
+        # registry formatter keeps the original concatenated increasing-ID tag.
         _model_params = tuple(sorted([int(p) for p in params.value]))
-        _model_params_str = ''.join(str(i) for i in _model_params)
+        _model_params_str = format_param_tag(_model_params)
         _wl_range = (wl_min.value, wl_max.value)
         _scale = scale_selector.value
         _grid_name = grid_selector.value
@@ -1372,7 +1488,7 @@ def _(
         # Inclination-aware models follow a shorter filename convention because
         # the inclination axis is already part of the parameter tuple; otherwise
         # the selected fixed inclination is encoded into the name explicitly.
-        _inclination_fixed = not has_trainable_inclination(_model_params)
+        _inclination_fixed = not has_trainable_inclination(_model_params, _grid_name)
         _fixed_inc = int(fixed_inclination_selector.value) if fixed_inclination_selector is not None else 55
         if not _inclination_fixed:
             _chk_name = f'{_base_name}emu_{_model_params_str}_{_scale}{_smooth_tag}_{_wl_range[0]}-{_wl_range[1]}AA_{n_components.value}PCA'
@@ -1429,6 +1545,7 @@ def _(
     continue_train_button,
     fixed_inclination_selector,
     fixed_inclination_to_usecols,
+    format_param_tag,
     grid_configs,
     grid_selector,
     has_trainable_inclination,
@@ -1453,6 +1570,7 @@ def _(
 ):
     # This cell resolves the on-disk filenames, reports the planned training
     # configuration, and creates the processed grid file on demand.
+    active_training_config = None
     emu_exists = False
     emu_file_name = ""
     grid_file_name = ""
@@ -1460,9 +1578,10 @@ def _(
 
     if (train_button.value or continue_train_button.value) and grid_selector is not None and params is not None:
         # Normalize the selected UI controls into the exact identifiers used by the
-        # downstream grid-processing and emulator-training code.
+        # downstream grid-processing and emulator-training code.  The formatted
+        # parameter tag becomes part of both processed-grid and emulator filenames.
         model_parameters = tuple(sorted([int(p) for p in params.value]))
-        model_parameters_str = ''.join(str(i) for i in model_parameters)
+        model_parameters_str = format_param_tag(model_parameters)
         wl_range = (wl_min.value, wl_max.value)
         scale = scale_selector.value
         smoothing = use_smoothing.value
@@ -1477,10 +1596,44 @@ def _(
         # filename because the processed spectra themselves differ when any of these
         # options change.  Without the wavelength range a cached grid from a previous
         # run with a different range would be silently reused.
-        inclination_fixed = not has_trainable_inclination(model_parameters)
+        inclination_fixed = not has_trainable_inclination(model_parameters, grid_name)
         fixed_inc = int(fixed_inclination_selector.value) if fixed_inclination_selector is not None else 55
         fixed_inc_tag = f"_{fixed_inc}inc" if inclination_fixed else ""
         grid_file_name = f"{base_name}grid_{model_parameters_str}_{scale}{smooth_tag}{fixed_inc_tag}_{wl_range[0]}-{wl_range[1]}AA"
+
+        _grid_config = grid_configs.get(grid_name, {})
+        _inclination_param_ids = set(_grid_config.get("inclination_param_ids", ()))
+        _physical_params = [
+            param_id for param_id in model_parameters
+            if param_id not in _inclination_param_ids
+        ]
+        _trainable_inclinations = [
+            param_id for param_id in model_parameters
+            if param_id in _inclination_param_ids
+        ]
+        _inclination_choice = (
+            f"param:{_trainable_inclinations[0]}"
+            if _trainable_inclinations
+            else f"fixed:{fixed_inc}"
+        )
+        active_training_config = {
+            "grid_name": grid_name,
+            "params": list(model_parameters),
+            "physical_params": _physical_params,
+            "inclination_choice": _inclination_choice,
+            "fixed_inclination": fixed_inc,
+            "wl_min": int(wl_range[0]),
+            "wl_max": int(wl_range[1]),
+            "scale": scale,
+            "smoothing": bool(smoothing),
+            "n_components": int(n_components.value),
+            "method": method.value,
+            "max_iter": int(max_iter.value),
+            "strict_weight_fit": bool(strict_weight_fit.value),
+            "per_component": bool(per_component.value),
+            "refine_lambda_xi": bool(refine_lambda_xi.value),
+            "kernel": kernel_selector.value,
+        }
 
         # Determine emulator file name based on Speculate_dev.py conventions
         if not inclination_fixed:
@@ -1497,7 +1650,7 @@ def _(
             f"- **Grid:** `{grid_name}`",
             f"- **Grid Path:** `{grid_path}`",
             f"- **Parameters:** {model_parameters}",
-            f"- **Fixed Inclination:** {f'{fixed_inc}°' if inclination_fixed else 'Trainable'}",
+            f"- **Inclination parameter:** {f'Fixed {fixed_inc}°' if inclination_fixed else 'Trainable'}",
             f"- **Wavelength Range:** {wl_range[0]}-{wl_range[1]} Å",
             f"- **Flux Scale:** {scale}",
             f"- **Smoothing:** {'Yes (Gaussian σ=50)' if smoothing else 'No'}",
@@ -1522,8 +1675,11 @@ def _(
         grid_error_md = None
         if grid_name in grid_configs:
             grid_config = grid_configs[grid_name]
+            # If inclination is not a trained axis, replace the default flux
+            # column with the grid-specific fixed observer column.  AGN uses a
+            # different angle set from CV, so this must go through the registry.
             grid_usecols = (
-                fixed_inclination_to_usecols(grid_config["usecols"], fixed_inc)
+                fixed_inclination_to_usecols(grid_config["usecols"], fixed_inc, grid_name)
                 if inclination_fixed else grid_config["usecols"]
             )
             grid = grid_config["class"](
@@ -1633,7 +1789,7 @@ def _(
         training_setup_display = mo.vstack([config_md, results_md, emu_status])
 
     training_setup_display
-    return emu_file_name, grid_file_name
+    return active_training_config, emu_file_name, grid_file_name
 
 
 @app.cell
@@ -1647,6 +1803,7 @@ def _(mo):
 @app.cell
 def _(
     Emulator,
+    active_training_config,
     alt,
     clear_trained_emu_cache,
     continue_train_button,
@@ -1666,6 +1823,7 @@ def _(
     refine_lambda_xi,
     set_console_logs,
     set_diagnostics_emu_display,
+    set_loaded_emu_config,
     set_loss_history,
     set_trained_emu,
     set_training_status,
@@ -1889,17 +2047,20 @@ def _(
                 emu.save(f'Grid-Emulator_Files/{emu_file_name}.npz')
                 print(f"Emulator saved to Grid-Emulator_Files/{emu_file_name}.npz")
                 training_complete = True
+                if active_training_config is not None:
+                    set_loaded_emu_config(dict(active_training_config))
                 set_trained_emu(emu)
                 set_diagnostics_emu_display(emu_file_name)
-
-                # Trigger button update
-                set_training_trigger(lambda v: v + 1)
 
                 # Save persistent state
                 set_console_logs("".join(log_buffer))
                 # Also save loss history
                 if hasattr(emu, 'loss_history'):
                     set_loss_history(list(emu.loss_history))
+
+                # Trigger button update after state needed by rebuilt controls
+                # is already available.
+                set_training_trigger(lambda v: v + 1)
 
             # Create result display
             train_result = mo.md(f"""
@@ -1951,13 +2112,11 @@ def _(get_trained_emu, mo, np):
     if _emu is not None:
         _n_params = _emu.grid_points.shape[1]
 
+        from Speculate_addons.grid_registry import infer_grid_name as _infer_grid_name, parameter_label_map as _parameter_label_map
+
         # Parameter descriptions lookup
-        _desc_map = {
-            1: "Disk.mdot", 2: "Wind.mdot", 3: "KWD.d",
-            4: "KWD.mdot_r_exponent", 5: "KWD.accel_length",
-            6: "KWD.accel_exponent", 7: "BL.luminosity", 8: "BL.temp",
-            9: "Inc (sparse)", 10: "Inc (mid)", 11: "Inc (full)"
-        }
+        _grid_name = _infer_grid_name(getattr(_emu, 'name', None))
+        _desc_map = dict(_parameter_label_map(_grid_name))
 
         # Build parameter options: map display name -> column index
         _param_indices = [int(pn.replace("param", "")) for pn in _emu.param_names]
@@ -2184,19 +2343,15 @@ def _(
             except Exception:
                 pass
 
+        from Speculate_addons.grid_registry import infer_grid_name as _infer_grid_name, log_param_ids as _log_param_ids, parameter_label_map as _parameter_label_map
+
         # Parameter description for x-axis label
-        _desc_map = {
-            1: "Disk.mdot", 2: "Wind.mdot", 3: "KWD.d",
-            4: "KWD.mdot_r_exponent", 5: "KWD.accel_length",
-            6: "KWD.accel_exponent", 7: "BL.luminosity", 8: "BL.temp",
-            9: "Inc (sparse)", 10: "Inc (mid)", 11: "Inc (full)"
-        }
+        _grid_name = _infer_grid_name(getattr(_emu, 'name', None))
+        _desc_map = dict(_parameter_label_map(_grid_name))
         _param_name = _emu.param_names[_not_fixed_col]
         _p_idx = int(_param_name.replace("param", ""))
         _xlabel = _desc_map.get(_p_idx, _param_name)
-        # Parameters 1 (Disk.mdot), 3 (KWD.d) and 5 (KWD.accel_length) are
-        # stored in log10 space; all others are linear.
-        _logged_params = {1, 3, 5}
+        _logged_params = _log_param_ids(_grid_name)
         _xlabel_axis = f'log\u2081\u2080({_xlabel})' if _p_idx in _logged_params else _xlabel
 
         # Build Altair charts for selected components
@@ -2349,12 +2504,10 @@ def _(alt, get_loss_history, get_trained_emu, gp_figure, mo, pd):
         _s += f"Kernel:         {getattr(_emu, 'kernel', 'rbf')}\n"
         _s += f"PCA Components: {_emu.ncomps}\n"
         _s += f"Grid Points:    {_emu.grid_points.shape[0]}\n"
-        _desc_map = {
-            1: "Disk.mdot", 2: "Wind.mdot", 3: "KWD.d",
-            4: "KWD.mdot_r_exponent", 5: "KWD.accel_length",
-            6: "KWD.accel_exponent", 7: "BL.luminosity", 8: "BL.temp",
-            9: "Inc (sparse)", 10: "Inc (mid)", 11: "Inc (full)",
-        }
+        from Speculate_addons.grid_registry import infer_grid_name as _infer_grid_name, parameter_label_map as _parameter_label_map
+
+        _grid_name = _infer_grid_name(getattr(_emu, 'name', None))
+        _desc_map = dict(_parameter_label_map(_grid_name))
         _raw_pnames = list(_emu.param_names) if hasattr(_emu, 'param_names') else []
         _pnames = []
         for _pn in _raw_pnames:

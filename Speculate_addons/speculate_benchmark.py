@@ -28,7 +28,18 @@ import numpy as np
 import pandas as pd
 import cma
 from scipy import stats
+from scipy.linalg import cho_factor, cho_solve
 from scipy.optimize import minimize as scipy_minimize
+
+from Speculate_addons.grid_registry import (
+    benchmark_param_map,
+    default_fixed_inclination,
+    defaulted_physical_param_ids,
+    emulator_values_to_physical,
+    inclination_column,
+    infer_grid_name,
+    lookup_row_to_emulator_values,
+)
 
 log = logging.getLogger(__name__)
 
@@ -48,39 +59,20 @@ _SIROCCO_ION_CONVERGED_RE = re.compile(
 # ======================================================================
 # Parameter Mapping
 # ======================================================================
-# Maps the 1-based parameter index used in emulator filenames (e.g.
-# "param1", "param3") to a (friendly_name, sirocco_keyword) pair.
-#
-# Indices 1-6 are the Knigge-Wood-Drew (KWD) wind model parameters that
-# define the accretion disk and biconical wind geometry in Sirocco.
-# Indices 7-8 add a boundary-layer emission component (only present in
-# grids labelled "bl").  Indices 9-11 encode the observer inclination
-# at progressively finer angular resolution (sparse / mid / full).
-#
-# In emulator space, parameters 1, 3, and 5 are stored in log10; parameter 2
-# is the wind-to-disk mass-loss *ratio* rather than the absolute value.
-
-PARAM_MAP = {
-    1: ("disk.mdot", "Disk.mdot(msol/yr)"),          # log10(Msol/yr)
-    2: ("wind.mdot", "Wind.mdot(msol/yr)"),          # ratio: wind/disk
-    3: ("KWD.d", "KWD.d(in_units_of_rstar)"),        # log10(wind launch radius)
-    4: ("KWD.mdot_r_exponent", "KWD.mdot_r_exponent"),  # radial mdot power law
-    5: ("KWD.acceleration_length", "KWD.acceleration_length(cm)"),  # log10(cm)
-    6: ("KWD.acceleration_exponent", "KWD.acceleration_exponent"),  # velocity law exponent
-    7: ("Boundary_layer.luminosity", "Boundary_layer.luminosity(ergs/s)"),
-    8: ("Boundary_layer.temp", "Boundary_layer.temp(K)"),
-    9: ("Inclination", "Inclination"),   # sparse: 3 angles (30, 55, 80)
-    10: ("Inclination", "Inclination"),  # mid:    6 angles
-    11: ("Inclination", "Inclination"),  # full:  12 angles
-}
+# The registry supplies the parameter-index maps used by Tier 2 summaries and
+# Tier 3 exports.  All benchmark paths pass grid_name through to the
+# registry-aware helpers below.  For CV grids, param2 is the wind/disk mass-loss
+# ratio in emulator space and params 1, 3, and 5 are log10 axes; see
+# grid_registry.py for the AGN Eddington-fraction and R_g-scaled equivalents.
 
 
-def internal_to_friendly(param_names: Sequence[str]) -> List[str]:
-    """Map internal ``paramN`` names to human-readable names."""
+def internal_to_friendly(param_names: Sequence[str], grid_name: Optional[str] = None) -> List[str]:
+    """Map internal ``paramN`` names to grid-specific human-readable names."""
+    param_map = benchmark_param_map(grid_name)
     out = []
     for pn in param_names:
         idx = int(pn.replace("param", ""))
-        friendly, _ = PARAM_MAP.get(idx, (pn, pn))
+        friendly, _ = param_map.get(idx, (pn, pn))
         out.append(friendly)
     return out
 
@@ -95,28 +87,32 @@ TIER2_NUISANCE_LABELS = (
 
 TIER2_FRIENDLY_LABELS = {
     "Av": "Av",
-    "log_scale": "log_scale",
+    "log_scale": "Distance (pc)",
     "cheb:1": "cheb_1",
     "global_cov:log_amp": "GP log_amp",
     "global_cov:log_ls": "GP log_ls",
 }
 
 
-def build_tier2_label_map(param_names: Sequence[str]) -> Dict[str, str]:
+def build_tier2_label_map(param_names: Sequence[str], grid_name: Optional[str] = None) -> Dict[str, str]:
     """Return friendly labels for Tier 2 grid and nuisance parameters."""
     label_map = {
         internal: friendly
-        for internal, friendly in zip(param_names, internal_to_friendly(param_names))
+        for internal, friendly in zip(param_names, internal_to_friendly(param_names, grid_name))
     }
     label_map.update(TIER2_FRIENDLY_LABELS)
     return label_map
 
 
-def build_tier2_freeze_defaults(param_names: Sequence[str]) -> dict:
-    """Return the default Tier 2 Stage 2/4 freeze dictionaries."""
-    label_map = build_tier2_label_map(param_names)
+def build_tier2_freeze_defaults(param_names: Sequence[str], grid_name: Optional[str] = None) -> dict:
+    """Return the default Tier 2 Stage 2/4 freeze dictionaries.
+
+    Grid parameter labels depend on the active registry entry, while nuisance
+    labels stay shared across grids.
+    """
+    label_map = build_tier2_label_map(param_names, grid_name)
     mle = {label: False for label in label_map}
-    for mle_label in ("Av", "cheb:1"):
+    for mle_label in ("Av", "log_scale", "cheb:1"):
         if mle_label in mle:
             mle[mle_label] = True
 
@@ -145,6 +141,87 @@ def _snapshot_model_params(model) -> Dict[str, float]:
     return {str(label): float(model.params[label]) for label in model.params.keys()}
 
 
+def _as_numpy_array(value) -> np.ndarray:
+    """Convert numpy/torch-like arrays to a float64 numpy array."""
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=np.float64)
+
+
+def _model_bestfit_spectrum(model) -> dict:
+    """Evaluate the current SpectrumModel state and return JSON-safe plot arrays."""
+    model_flux, model_cov = model()
+    model_flux = _as_numpy_array(model_flux)
+    model_cov = _as_numpy_array(model_cov)
+    return {
+        "wavelength": _as_numpy_array(model.data.wave).tolist(),
+        "data_flux": _as_numpy_array(model.data.flux).tolist(),
+        "model_flux": model_flux.tolist(),
+        "model_cov_diag": np.diag(model_cov).tolist(),
+    }
+
+
+def _model_likelihood_diagnostics(model, priors: Optional[dict] = None) -> dict:
+    """Decompose the current model log-likelihood into objective terms."""
+    prior_lp = 0.0
+    prior_terms = {}
+    if priors:
+        for key, prior in priors.items():
+            if key not in model.params:
+                continue
+            value = float(model.params[key])
+            logpdf = float(prior.logpdf(value))
+            prior_terms[key] = {"value": value, "logpdf": logpdf}
+            prior_lp += logpdf
+
+    try:
+        model_flux, model_cov = model()
+        model_flux = _as_numpy_array(model_flux)
+        model_cov = _as_numpy_array(model_cov)
+        data_flux = _as_numpy_array(model.data.flux)
+
+        diag = np.diag(model_cov)
+        jitter = max(1e-35, 1e-6 * float(np.max(diag)))
+        cov = model_cov.copy()
+        cov[np.diag_indices_from(cov)] += jitter
+        cho, lower = cho_factor(cov, lower=True, check_finite=False)
+        residual = model_flux - data_flux
+        solved = cho_solve((cho, lower), residual, check_finite=False)
+        sqmah = float(residual @ solved)
+        logdet = float(2.0 * np.sum(np.log(np.diag(cho))))
+        ll_no_prior = float(-0.5 * (logdet + sqmah))
+        ll = float(ll_no_prior + prior_lp)
+        cov_diag = np.diag(cov)
+        return {
+            "nll": float(-ll),
+            "ll": ll,
+            "ll_no_prior": ll_no_prior,
+            "prior_lp": float(prior_lp),
+            "logdet": logdet,
+            "sqmah": sqmah,
+            "jitter": float(jitter),
+            "rms_resid": float(np.sqrt(np.mean(residual ** 2))),
+            "mean_abs_resid": float(np.mean(np.abs(residual))),
+            "median_abs_resid": float(np.median(np.abs(residual))),
+            "max_abs_resid": float(np.max(np.abs(residual))),
+            "data_flux_mean": float(np.mean(data_flux)),
+            "model_flux_mean": float(np.mean(model_flux)),
+            "cov_diag_min": float(np.min(cov_diag)),
+            "cov_diag_median": float(np.median(cov_diag)),
+            "cov_diag_max": float(np.max(cov_diag)),
+            "n_points": int(data_flux.size),
+            "params": _snapshot_model_params(model),
+            "prior_terms": prior_terms,
+        }
+    except Exception as exc:
+        return {
+            "diagnostic_error": str(exc),
+            "prior_lp": float(prior_lp),
+            "params": _snapshot_model_params(model),
+            "prior_terms": prior_terms,
+        }
+
+
 def _apply_freeze_settings(model, freeze_params: Optional[dict], thaw_first: bool = False) -> List[str]:
     """Apply a freeze dictionary to the current SpectrumModel."""
     applied = []
@@ -162,39 +239,14 @@ def _apply_freeze_settings(model, freeze_params: Optional[dict], thaw_first: boo
     return applied
 
 
-def emulator_to_physical(param_names: Sequence[str], values: np.ndarray) -> dict:
+def emulator_to_physical(param_names: Sequence[str], values: np.ndarray, grid_name: Optional[str] = None) -> dict:
     """
     Convert emulator-space parameter values to physical Sirocco units.
 
-    Returns a dict mapping Sirocco parameter keywords to physical values.
+    Returns a dict mapping Sirocco parameter keywords to physical values.  The
+    registry fills omitted physical axes from grid defaults before converting.
     """
-    physical = {}
-    vals = np.atleast_1d(values)
-    for pn, v in zip(param_names, vals):
-        idx = int(pn.replace("param", ""))
-        friendly, sirocco_key = PARAM_MAP.get(idx, (pn, pn))
-        # The emulator does not store every parameter in native Sirocco units:
-        # some axes are log-transformed and param2 is represented as a ratio.
-        if idx == 1:
-            physical[sirocco_key] = 10 ** v  # log10(Msol/yr) -> Msol/yr
-        elif idx == 2:
-            # Wind mass loss is inferred as a fraction of disk.mdot and becomes
-            # an absolute quantity only after disk.mdot has been converted.
-            physical[sirocco_key] = v
-        elif idx == 3:
-            physical[sirocco_key] = 10 ** v  # log10(R_star) -> R_star
-        elif idx == 5:
-            physical[sirocco_key] = 10 ** v  # log10(cm) -> cm
-        else:
-            physical[sirocco_key] = v
-    # Compute absolute wind.mdot if both present
-    if "Disk.mdot(msol/yr)" in physical and "Wind.mdot(msol/yr)" in physical:
-        # Once both pieces exist in physical space, collapse the stored ratio into
-        # the absolute wind mass-loss rate expected by downstream Sirocco inputs.
-        physical["Wind.mdot(msol/yr)"] = (
-            physical["Wind.mdot(msol/yr)"] * physical["Disk.mdot(msol/yr)"]
-        )
-    return physical
+    return emulator_values_to_physical(grid_name, param_names, values)
 
 
 # ======================================================================
@@ -311,16 +363,17 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
 
 
 def _load_test_grid_spectrum(
-    spec_file: str, inclination: float, wl_range: Tuple[float, float]
+    spec_file: str, inclination: float, wl_range: Tuple[float, float], grid_name: Optional[str] = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load a Sirocco ``.spec`` file and extract wavelength, flux, and error arrays.
 
     Sirocco .spec files have a variable-length text header (comments starting
     with '#' and a column-label row beginning with 'Freq.'), followed by numeric
     data columns.  Column 0 is frequency (Hz), column 1 is wavelength (Å), and
-    columns 2+ hold the flux at successive viewing inclinations in 5-degree steps
-    starting from 30°.  Wavelengths in the file are descending; this function
-    flips them to ascending order.
+    columns 2+ hold fluxes at the grid's registered viewing inclinations.  CV
+    grids use 30-85 degrees in 5-degree steps; AGN uses 10, 25, 40, 55, 70, and
+    85 degrees.  Wavelengths in the file are descending; this function flips
+    them to ascending order.
     """
     # Determine header lines (skip comments, blank lines, and the 'Freq.' label row)
     skiprows = 0
@@ -336,9 +389,8 @@ def _load_test_grid_spectrum(
     # Column 0 = Freq (Hz), column 1 = Lambda (Å) — always use Lambda.
     # Flip to ascending wavelength order for consistency with the emulator.
     wl = np.flip(data[:, 1])
-    # Map the requested inclination angle to the correct data column:
-    # 30° → col 2, 35° → col 3, 40° → col 4, …
-    col = int(2 + (inclination - 30) / 5)
+    # Map the requested inclination angle to the correct data column.
+    col = inclination_column(grid_name, inclination)
     flux = np.flip(data[:, col])
 
     mask = (wl >= wl_range[0]) & (wl <= wl_range[1])
@@ -360,15 +412,16 @@ def _load_test_grid_spectrum(
 
 
 def _extract_ground_truth(
-    parquet_path: str, run_idx: int, emu_param_names: Sequence[str]
+    parquet_path: str, run_idx: int, emu_param_names: Sequence[str], grid_name: Optional[str] = None,
+    inclination: Optional[float] = None,
 ) -> dict:
     """Extract ground-truth parameters from the test grid's lookup table.
 
     The lookup table (a parquet file co-located with the .spec files) records the
     Sirocco simulation inputs for every run.  This function reads the raw physical
-    values, then applies the same forward transforms used during emulator training
-    (log10 for params 1, 3, and 5; wind/disk ratio for param 2) so the returned dict
-    lives in emulator space and is directly comparable to inference outputs.
+    values, then delegates to the registry so CV and AGN grids apply the same
+    forward transforms used during emulator training.  The returned dict lives
+    in emulator space and is directly comparable to inference outputs.
     """
     df = pd.read_parquet(parquet_path)
 
@@ -384,46 +437,9 @@ def _extract_ground_truth(
     else:
         row = df[df[run_col] == run_idx].iloc[0]
 
-    gt = {}
-    for pn in emu_param_names:
-        idx = int(pn.replace("param", ""))
-        friendly, sirocco_key = PARAM_MAP.get(idx, (pn, pn))
-
-        # Try to find the value in the parquet columns
-        value = None
-        for col in df.columns:
-            col_lower = col.lower().replace(" ", "").replace("(", "").replace(")", "")
-            key_lower = sirocco_key.lower().replace(" ", "").replace("(", "").replace(")", "")
-            if key_lower in col_lower or col_lower in key_lower:
-                raw = row[col]
-
-                # Apply forward transforms to match emulator space
-                if idx == 1:
-                    value = np.log10(raw) if raw > 0 else raw
-                elif idx == 2:
-                    # Wind.mdot in parquet is absolute (msol/yr)
-                    # Need to convert to fraction: wind/disk
-                    disk_mdot = None
-                    for dc in df.columns:
-                        if "disk" in dc.lower() and "mdot" in dc.lower():
-                            disk_mdot = row[dc]
-                            break
-                    value = raw / disk_mdot if disk_mdot and disk_mdot > 0 else raw
-                elif idx == 3:
-                    value = np.log10(raw) if raw > 0 else raw
-                elif idx == 5:
-                    value = np.log10(raw) if raw > 0 else raw
-                elif idx in (9, 10, 11):
-                    # Inclination is in degrees directly — might be labelled differently
-                    value = float(raw)
-                else:
-                    value = float(raw)
-                break
-
-        if value is not None:
-            gt[friendly] = float(value)
-
-    return gt
+    all_values = lookup_row_to_emulator_values(grid_name, row, inclination)
+    friendly_names = internal_to_friendly(emu_param_names, grid_name)
+    return {name: float(all_values[name]) for name in friendly_names if name in all_values}
 
 
 def _get_loc_scale(dist):
@@ -523,6 +539,8 @@ def run_mle_single(
     freeze_params: Optional[Dict[str, bool]] = None,
     iteration_callback=None,
     n_restarts: int = 1,
+    use_emulator_norm: bool = False,
+    fixed_log_scale: Optional[float] = None,
 ) -> dict:
     """
     Run MLE inference on a single spectrum.
@@ -565,6 +583,9 @@ def run_mle_single(
     from Starfish.spectrum import Spectrum
     from Starfish.models import SpectrumModel
 
+    if fixed_log_scale is None and flux_scale == "continuum-normalised":
+        fixed_log_scale = 0.0
+
     # Match the observation onto the emulator's training scale before building a
     # SpectrumModel, including consistent propagation of the uncertainties.
     flux = np.asarray(flux, dtype=np.float64)
@@ -602,11 +623,15 @@ def run_mle_single(
         global_cov={"log_amp": -55.0, "log_ls": 4.5},
         cheb=[0.0],
         flux_scale=flux_scale,
+        norm=use_emulator_norm,
     )
 
     _requested_freeze = _serialise_freeze_settings(freeze_params)
     if "Av" not in _requested_freeze:
         _requested_freeze["Av"] = bool(freeze_av)
+    if fixed_log_scale is not None:
+        model.params["log_scale"] = float(fixed_log_scale)
+        _requested_freeze["log_scale"] = True
 
     # Optionally fix Av = 0 (synthetic test-grid spectra have no dust
     # extinction, so allowing Av to float wastes degrees of freedom and
@@ -617,14 +642,15 @@ def run_mle_single(
 
     # Bootstrap log_scale from auto-calculation *before* building priors
     # so we can centre the log_scale prior on the data-informed value.
-    _bootstrapped_ls = -25.0  # sensible fallback
-    try:
-        _ = model()
-        if model._log_scale is not None and np.isfinite(model._log_scale):
-            _bootstrapped_ls = float(model._log_scale)
+    _bootstrapped_ls = float(fixed_log_scale) if fixed_log_scale is not None else -25.0
+    if fixed_log_scale is None:
+        try:
+            _ = model()
+            if model._log_scale is not None and np.isfinite(model._log_scale):
+                _bootstrapped_ls = float(model._log_scale)
+                model.params["log_scale"] = _bootstrapped_ls
+        except Exception:
             model.params["log_scale"] = _bootstrapped_ls
-    except Exception:
-        model.params["log_scale"] = _bootstrapped_ls
 
     # Build default priors — tightly bounded to match the inference tool's
     # optimised settings. Tight priors matter twice here: they regularize the
@@ -639,9 +665,10 @@ def run_mle_single(
             priors["Av"] = stats.uniform(loc=0, scale=2.0)
         # Keep log_scale centered on the bootstrap estimate so the optimizer does
         # not waste its early iterations finding the gross normalization.
-        priors["log_scale"] = stats.uniform(
-            loc=_bootstrapped_ls - 5.0, scale=10.0
-        )
+        if not _requested_freeze.get("log_scale", False):
+            priors["log_scale"] = stats.uniform(
+                loc=_bootstrapped_ls - 5.0, scale=10.0
+            )
         # Chebyshev c1 continuum tilt — small correction for gradient mismatch
         priors["cheb:1"] = stats.uniform(loc=-0.5, scale=1.0)
         # GP log_amp: auto-detect centre from residual variance between the
@@ -679,10 +706,18 @@ def run_mle_single(
             _nll = float(-model.log_likelihood(priors))
         except Exception:
             _nll = 1e10
+        try:
+            _mle_bestfit_spec = _model_bestfit_spectrum(model)
+        except Exception:
+            _mle_bestfit_spec = {}
+        _mle_diag = _model_likelihood_diagnostics(model, priors)
         return {
             "grid_params": model.grid_params.tolist(),
             "all_params": _snapshot_model_params(model),
             "nll": _nll,
+            "optimizer_nll": _nll,
+            "mle_bestfit_spec": _mle_bestfit_spec,
+            "mle_likelihood_diagnostics": _mle_diag,
             "success": True,
             "n_iter": 0,
             "labels": labels_before,
@@ -822,10 +857,22 @@ def run_mle_single(
     if soln.success:
         model.set_param_vector(soln.x)
 
+    try:
+        mle_bestfit_spec = _model_bestfit_spectrum(model)
+    except Exception:
+        mle_bestfit_spec = {}
+    mle_diagnostics = _model_likelihood_diagnostics(model, priors)
+    final_nll = float(soln.fun)
+    if np.isfinite(mle_diagnostics.get("nll", np.nan)):
+        final_nll = float(mle_diagnostics["nll"])
+
     return {
         "grid_params": model.grid_params.tolist(),
         "all_params": _snapshot_model_params(model),
-        "nll": float(soln.fun),
+        "nll": final_nll,
+        "optimizer_nll": float(soln.fun),
+        "mle_bestfit_spec": mle_bestfit_spec,
+        "mle_likelihood_diagnostics": mle_diagnostics,
         "success": bool(soln.success),
         "n_iter": int(soln.nit),
         "labels": labels_before,
@@ -845,6 +892,7 @@ def run_mcmc_single(
     iteration_callback=None,
     freeze_nuisance: bool = False,
     freeze_params: Optional[Dict[str, bool]] = None,
+    grid_name: Optional[str] = None,
 ) -> dict:
     """
     Run MCMC on a SpectrumModel already set to MLE best-fit.
@@ -989,7 +1037,8 @@ def run_mcmc_single(
 
     # Summary
     friendly = internal_to_friendly(
-        [l for l in model.labels if l.startswith("param")]
+        [l for l in model.labels if l.startswith("param")],
+        grid_name,
     )
     all_labels = []
     fi = 0
@@ -1041,22 +1090,14 @@ def run_mcmc_single(
     # store the arrays so the viewer can reconstruct the Starfish-style plot
     # without needing the live model object.
     bestfit_spec = {}
+    posterior_mean_diagnostics = {}
     try:
         _mean_params = {}
         for i, label in enumerate(_sampled_labels):
             _mean_params[label] = float(np.mean(flat[:, i]))
         model.set_param_dict(_mean_params)
-        _bf_flux, _bf_cov = model()
-        if hasattr(_bf_flux, 'detach'):
-            _bf_flux = _bf_flux.detach().cpu().numpy()
-        if hasattr(_bf_cov, 'detach'):
-            _bf_cov = _bf_cov.detach().cpu().numpy()
-        bestfit_spec = {
-            "wavelength": model.data.wave.tolist(),
-            "data_flux": model.data.flux.tolist(),
-            "model_flux": np.asarray(_bf_flux).tolist(),
-            "model_cov_diag": np.diag(np.asarray(_bf_cov)).tolist(),
-        }
+        bestfit_spec = _model_bestfit_spectrum(model)
+        posterior_mean_diagnostics = _model_likelihood_diagnostics(model, priors)
     except Exception:
         pass  # non-critical — viewer will skip the plot
 
@@ -1091,6 +1132,8 @@ def run_mcmc_single(
         "labels": all_labels,
         "internal_labels": _sampled_labels,
         "bestfit_spec": bestfit_spec,
+        "posterior_mean_bestfit_spec": bestfit_spec,
+        "posterior_mean_likelihood_diagnostics": posterior_mean_diagnostics,
         "freeze_params": dict(_requested_freeze),
         "frozen_params": list(_applied_freezes),
         "frozen_param_values": dict(_frozen_param_values),
@@ -1268,14 +1311,18 @@ def aggregate_tier2_results(
         "n_failures": failures,
         "n_not_converged": n_not_converged,
         "failure_log": failure_log,
+        "distance_reference_pc": 100.0,
+        "distance_policy": "fixed_100pc",
         "mle_config": {
             "freeze_params": _serialise_freeze_settings(mle_freeze_params),
+            "fixed_distance_pc": 100.0,
         },
         "mcmc_config": {
             "walkers": mcmc_walkers,
             "steps": mcmc_steps,
             "burnin": mcmc_burnin,
             "freeze_params": _serialise_freeze_settings(mcmc_freeze_params),
+            "fixed_distance_pc": 100.0,
         },
         "tier2_time_s": elapsed,
     }
@@ -1325,6 +1372,16 @@ def run_tier2(
     """
     t0 = time.time()
     test_path = Path(test_grid_path)
+    # Prefer the test-grid path for grid inference because Tier 2 may run against
+    # an emulator object loaded from a generic file-like source with no name.
+    _tier_grid_name = infer_grid_name(str(test_path).replace("_testgrid_", "_grid_")) or infer_grid_name(getattr(emu, "name", None))
+    if _tier_grid_name is None:
+        log.warning(
+            "Could not infer grid family from Tier 2 test path '%s' or emulator name '%s'; "
+            "falling back to legacy CV no-BL metadata.",
+            test_path,
+            getattr(emu, "name", None),
+        )
 
     # Tier 2 is driven directly from the decompressed test-grid spectra, with the
     # optional max_spectra cap used to keep exploratory runs tractable in the UI.
@@ -1338,9 +1395,11 @@ def run_tier2(
     # The lookup parquet links each run file back to its known simulation inputs.
     parquet_file = ensure_lookup_table(test_path)
 
-    friendly_names = internal_to_friendly(emu.param_names)
+    # Friendly labels, freeze defaults, inclination columns, and ground-truth
+    # conversion all depend on the inferred grid family.
+    friendly_names = internal_to_friendly(emu.param_names, _tier_grid_name)
     n_params = len(emu.param_names)
-    _tier2_defaults = build_tier2_freeze_defaults(emu.param_names)
+    _tier2_defaults = build_tier2_freeze_defaults(emu.param_names, _tier_grid_name)
     _mle_defaults = _tier2_defaults["mle"]
     _mcmc_defaults = _tier2_defaults["mcmc"]
     mle_freeze_params = {
@@ -1351,6 +1410,10 @@ def run_tier2(
         label: bool((mcmc_freeze_params or {}).get(label, _mcmc_defaults[label]))
         for label in _mcmc_defaults
     }
+    if "log_scale" in mle_freeze_params:
+        mle_freeze_params["log_scale"] = True
+    if "log_scale" in mcmc_freeze_params:
+        mcmc_freeze_params["log_scale"] = True
 
     per_spectrum = []
     all_samples = {name: [] for name in friendly_names}
@@ -1368,7 +1431,7 @@ def run_tier2(
             progress_callback(_spec_idx, _n_total, sf.name, "loading")
 
         try:
-            wl, flux, sigma = _load_test_grid_spectrum(str(sf), inclination, wl_range)
+            wl, flux, sigma = _load_test_grid_spectrum(str(sf), inclination, wl_range, _tier_grid_name)
         except Exception as e:
             import traceback as _tb
             _msg = str(e)
@@ -1385,7 +1448,7 @@ def run_tier2(
         gt = {}
         if parquet_file.exists():
             try:
-                gt = _extract_ground_truth(str(parquet_file), run_idx, emu.param_names)
+                gt = _extract_ground_truth(str(parquet_file), run_idx, emu.param_names, _tier_grid_name, inclination)
             except Exception as e:
                 _msg = str(e)
                 log.warning(f"Failed to extract GT for {sf.name}: {_msg}")
@@ -1405,6 +1468,8 @@ def run_tier2(
                 emu, wl, flux, sigma, flux_scale=flux_scale,
                 max_iter=max_mle_iter, n_restarts=mle_restarts,
                 freeze_params=mle_freeze_params,
+                use_emulator_norm=True,
+                fixed_log_scale=0.0,
             )
         except Exception as e:
             import traceback as _tb
@@ -1429,6 +1494,7 @@ def run_tier2(
                 nsteps=mcmc_steps,
                 burnin=mcmc_burnin,
                 freeze_params=mcmc_freeze_params,
+                grid_name=_tier_grid_name,
             )
         except Exception as e:
             import traceback as _tb
@@ -1805,8 +1871,18 @@ def _run_command_logged(
     log_path: Union[str, Path],
     progress_callback=None,
     signal_path: Optional[Union[str, Path]] = None,
-) -> None:
-    """Run a subprocess, capture combined output, and raise with log context."""
+    append: bool = False,
+    raise_on_error: bool = True,
+) -> int:
+    """Run a subprocess, capture combined output, and return its exit code."""
+    command_display = " ".join(command)
+    log_mode = "a" if append else "w"
+
+    def _write_command_header(log_file) -> None:
+        if append and log_file.tell() > 0:
+            log_file.write("\n\n")
+        log_file.write("$ " + command_display + "\n\n")
+
     if progress_callback is None or signal_path is None:
         completed = subprocess.run(
             command,
@@ -1816,15 +1892,15 @@ def _run_command_logged(
             stderr=subprocess.STDOUT,
             check=False,
         )
-        with open(log_path, "w") as log_file:
-            log_file.write("$ " + " ".join(command) + "\n\n")
+        with open(log_path, log_mode) as log_file:
+            _write_command_header(log_file)
             log_file.write(completed.stdout or "")
         return_code = completed.returncode
     else:
         offset = 0
         last_event_key = None
-        with open(log_path, "w") as log_file:
-            log_file.write("$ " + " ".join(command) + "\n\n")
+        with open(log_path, log_mode) as log_file:
+            _write_command_header(log_file)
             log_file.flush()
             process = subprocess.Popen(
                 command,
@@ -1841,11 +1917,12 @@ def _run_command_logged(
             return_code = process.returncode
             _poll_sirocco_signal(signal_path, offset, last_event_key, progress_callback)
 
-    if return_code != 0:
+    if return_code != 0 and raise_on_error:
         raise RuntimeError(
             f"Command failed with exit code {return_code}: "
-            f"{' '.join(command)}. See {_repo_relative(log_path)}"
+            f"{command_display}. See {_repo_relative(log_path)}"
         )
+    return return_code
 
 
 def run_sirocco_pf(
@@ -1859,6 +1936,9 @@ def run_sirocco_pf(
     `.pf` file's directory so fixed-name outputs, such as ``run0.spec``, remain
     isolated per observation. If provided, ``progress_callback`` receives
     best-effort cycle updates parsed from Sirocco's live ``root.sig`` file.
+    Sirocco is launched with ``-p`` to match the intended Tier 3 runtime mode.
+    Multi-CPU MPI runs first try the standard ``mpirun -np`` form, then retry
+    with ``--use-hwthread-cpus`` if the standard command fails.
     """
     pf_path = Path(pf_path)
     work_dir = pf_path.parent
@@ -1878,22 +1958,57 @@ def run_sirocco_pf(
 
     run_log = work_dir / "sirocco_run.log"
     signal_path = work_dir / f"{pf_path.stem}.sig"
+    sirocco_args = ["-p", pf_path.name]
     if cpus > 1:
-        command = [runtime["mpirun"], "-np", str(cpus), runtime["sirocco"], pf_path.name]
+        command = [runtime["mpirun"], "-np", str(cpus), runtime["sirocco"], *sirocco_args]
     else:
-        command = [runtime["sirocco"], pf_path.name]
+        command = [runtime["sirocco"], *sirocco_args]
+    successful_command = command
     _emit_progress(progress_callback, {
         "phase": "sirocco",
         "state": "started",
         "message": "Simulation started; waiting for cycle log",
     })
-    _run_command_logged(
-        command,
-        work_dir,
-        run_log,
-        progress_callback=progress_callback,
-        signal_path=signal_path,
-    )
+    if cpus > 1:
+        return_code = _run_command_logged(
+            command,
+            work_dir,
+            run_log,
+            progress_callback=progress_callback,
+            signal_path=signal_path,
+            raise_on_error=False,
+        )
+        if return_code != 0:
+            fallback_command = [
+                runtime["mpirun"],
+                "--use-hwthread-cpus",
+                "-np",
+                str(cpus),
+                runtime["sirocco"],
+                *sirocco_args,
+            ]
+            _emit_progress(progress_callback, {
+                "phase": "sirocco",
+                "state": "retrying",
+                "message": "MPI run failed; retrying with hardware-thread CPUs",
+            })
+            _run_command_logged(
+                fallback_command,
+                work_dir,
+                run_log,
+                progress_callback=progress_callback,
+                signal_path=signal_path,
+                append=True,
+            )
+            successful_command = fallback_command
+    else:
+        _run_command_logged(
+            command,
+            work_dir,
+            run_log,
+            progress_callback=progress_callback,
+            signal_path=signal_path,
+        )
 
     spec_files = _find_sirocco_spec_files(pf_path)
     if not spec_files:
@@ -1902,7 +2017,7 @@ def run_sirocco_pf(
         )
 
     return {
-        "command": " ".join(command),
+        "command": " ".join(successful_command),
         "setup_log_path": str(setup_log),
         "run_log_path": str(run_log),
         "signal_log_path": str(signal_path),
@@ -1953,22 +2068,26 @@ def _transform_flux_for_scale(
     wl: np.ndarray,
     flux: np.ndarray,
     flux_scale: str,
-    reference_wl: Optional[np.ndarray] = None,
-    reference_flux: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Transform a native linear-flux spectrum onto the benchmark fit scale."""
+    """Transform a native linear-flux spectrum onto the emulator fit scale."""
+    wl = np.asarray(wl, dtype=np.float64)
     flux = np.asarray(flux, dtype=np.float64)
     if flux_scale == "log":
-        return np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
+        flux = np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
+        finite = np.isfinite(flux)
+        offset = float(np.mean(flux[finite])) if np.any(finite) else 0.0
+        return flux - offset
     if flux_scale == "continuum-normalised":
         from Speculate_addons.Spec_functions import fit_power_law_continuum
 
-        ref_wl = np.asarray(reference_wl if reference_wl is not None else wl, dtype=np.float64)
-        ref_flux = np.asarray(reference_flux if reference_flux is not None else flux, dtype=np.float64)
-        continuum, _ = fit_power_law_continuum(ref_wl, ref_flux)
-        order = np.argsort(ref_wl)
-        continuum = np.interp(wl, ref_wl[order], continuum[order])
-        return flux / np.where(continuum > 0, continuum, 1.0)
+        continuum, _ = fit_power_law_continuum(wl, flux)
+        flux = flux / np.where(continuum > 0, continuum, 1.0)
+
+    finite = np.isfinite(flux)
+    factor = float(np.mean(flux[finite])) if np.any(finite) else 1.0
+    if not np.isfinite(factor) or abs(factor) == 0.0:
+        factor = 1.0
+    flux = flux / factor
     return flux
 
 
@@ -2052,18 +2171,25 @@ def _format_sirocco_transform_label(transforms: dict) -> str:
     return "Sirocco Model" if not parts else "Sirocco Model (" + ", ".join(parts) + ")"
 
 
+def _fixed_inclination_from_emulator(emu, grid_name: Optional[str] = None) -> float:
+    """Return the fixed observer angle for an emulator without an inclination axis."""
+    emu_name = os.path.basename(str(getattr(emu, "name", "") or ""))
+    match = re.search(r"_(\d+(?:\.\d+)?)inc(?:_|$)", emu_name)
+    if match:
+        return float(match.group(1))
+    return float(default_fixed_inclination(grid_name))
+
+
 def _extract_posterior_mean_inclination(
     emu,
     samples: np.ndarray,
     friendly_labels: Sequence[str],
+    grid_name: Optional[str] = None,
 ) -> float:
     """Return the posterior-mean inclination used for the Sirocco observer."""
-    friendly_grid = internal_to_friendly(emu.param_names)
+    friendly_grid = internal_to_friendly(emu.param_names, grid_name)
     if "Inclination" not in friendly_grid:
-        raise ValueError(
-            "Tier 3 Sirocco comparison requires an emulator with an Inclination "
-            "parameter (param9, param10, or param11)."
-        )
+        return _fixed_inclination_from_emulator(emu, grid_name)
     if "Inclination" not in friendly_labels:
         raise ValueError("MCMC samples do not contain an Inclination column.")
     col = list(friendly_labels).index("Inclination")
@@ -2228,6 +2354,7 @@ def run_tier3_single(
         nwalkers=mcmc_walkers, nsteps=mcmc_steps, burnin=mcmc_burnin,
         freeze_nuisance=True,
         iteration_callback=mcmc_iteration_callback,
+        grid_name=grid_name,
     )
     friendly_labels = mcmc.get("labels", [])
     internal_labels = mcmc.get("internal_labels", friendly_labels)
@@ -2300,7 +2427,7 @@ def run_tier3_single(
         reduced_chi2 = np.nan
 
     exact_inclination = _extract_posterior_mean_inclination(
-        emu, mcmc["samples"], friendly_labels
+        emu, mcmc["samples"], friendly_labels, grid_name
     )
 
     result = {
@@ -2326,7 +2453,7 @@ def run_tier3_single(
 
         _grid_means = []
         _uncertainties = {}
-        _friendly_grid = internal_to_friendly(emu.param_names)
+        _friendly_grid = internal_to_friendly(emu.param_names, grid_name)
         for _pn, _friendly in zip(emu.param_names, _friendly_grid):
             if _pn not in internal_labels:
                 raise ValueError(f"MCMC samples do not contain required grid parameter {_pn}")
@@ -2387,8 +2514,6 @@ def run_tier3_single(
             sirocco_wl,
             sirocco_flux,
             flux_scale,
-            reference_wl=wl,
-            reference_flux=flux,
         )
         sirocco_flux_plot = _apply_spectrum_nuisance_transforms(
             sirocco_wl,
@@ -2401,13 +2526,34 @@ def run_tier3_single(
             "flux": sirocco_flux_plot,
             "label": sirocco_transform_label,
         }
-
         _bf_wl = np.asarray(bestfit_spec.get("wavelength", []), dtype=np.float64)
         _bf_data = np.asarray(bestfit_spec.get("data_flux", []), dtype=np.float64)
         _bf_model = np.asarray(bestfit_spec.get("model_flux", []), dtype=np.float64)
         _model_sigma = np.asarray(model.data.sigma, dtype=np.float64)
+        sirocco_interp_plot = np.asarray([], dtype=np.float64)
+        if len(_bf_wl) and len(sirocco_wl) and len(sirocco_flux_plot):
+            _overlap = (_bf_wl >= np.min(sirocco_wl)) & (_bf_wl <= np.max(sirocco_wl))
+            if np.any(_overlap):
+                _sirocco_plot_wl = _bf_wl[_overlap]
+                sirocco_interp_plot = np.interp(
+                    _sirocco_plot_wl,
+                    sirocco_wl,
+                    sirocco_flux_plot,
+                )
+                sirocco_plot = {
+                    "wavelength": _sirocco_plot_wl,
+                    "flux": sirocco_interp_plot,
+                    "label": sirocco_transform_label,
+                }
+            else:
+                sirocco_plot = {
+                    "wavelength": [],
+                    "flux": [],
+                    "label": sirocco_transform_label,
+                }
         if len(_bf_wl) and len(_bf_data) and len(_model_sigma):
-            sirocco_interp_plot = np.interp(_bf_wl, sirocco_wl, sirocco_flux_plot)
+            if len(sirocco_interp_plot) != len(_bf_wl):
+                sirocco_interp_plot = np.interp(_bf_wl, sirocco_wl, sirocco_flux_plot)
             _n_sirocco = min(len(_bf_data), len(_model_sigma), len(sirocco_interp_plot))
             n_dof_sirocco = _n_sirocco - len(internal_labels)
             sirocco_reduced_chi2 = float(
@@ -2417,7 +2563,8 @@ def run_tier3_single(
                 ) / max(n_dof_sirocco, 1)
             )
         if len(_bf_wl) and len(_bf_data) and len(_bf_model):
-            sirocco_interp_plot = np.interp(_bf_wl, sirocco_wl, sirocco_flux_plot)
+            if len(sirocco_interp_plot) != len(_bf_wl):
+                sirocco_interp_plot = np.interp(_bf_wl, sirocco_wl, sirocco_flux_plot)
             denom = np.maximum(np.abs(_bf_data), 1e-30)
             emulator_sirocco_frac_rmse = float(
                 np.sqrt(np.nanmean(((_bf_model - sirocco_interp_plot) / denom) ** 2))
@@ -2519,7 +2666,12 @@ def export_pf_template(
     if grid_name is None:
         raise ValueError("grid_name is required for Sirocco .pf template export")
 
-    physical = emulator_to_physical(emu.param_names, param_values)
+    # Convert from emulator coordinates into the exact physical keys expected by
+    # the selected Sirocco template.  For AGN this also inverts Eddington-fraction
+    # and R_g-scaled axes before the exporter generates QSOSED files.
+    physical = emulator_to_physical(emu.param_names, param_values, grid_name)
+    defaulted_ids = defaulted_physical_param_ids(grid_name, emu.param_names)
+    param_map = benchmark_param_map(grid_name)
 
     # Build the metadata header (### comments, ignored by Sirocco)
     header = [
@@ -2539,6 +2691,14 @@ def export_pf_template(
         header.append("### Global/Nuisance Parameters:")
         for k, v in global_params.items():
             header.append(f"###   {k}: {v:.6f}")
+        header.append("###")
+
+    if defaulted_ids:
+        header.append("### Registry-defaulted physical parameters:")
+        for param_id in defaulted_ids:
+            _, sirocco_key = param_map.get(param_id, (f"param{param_id}", f"param{param_id}"))
+            if sirocco_key in physical:
+                header.append(f"###   {sirocco_key}: {physical[sirocco_key]:.6g}")
         header.append("###")
 
     write_pf(

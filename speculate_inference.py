@@ -38,12 +38,14 @@ def _():
     import numpy as np
     import pandas as pd
     import altair as alt
+    import importlib
     from Starfish.emulator import Emulator
     from Starfish.spectrum import Spectrum
-    from Starfish.models import SpectrumModel
+    import Starfish.models.spectrum_model as _spectrum_model_module
+    _spectrum_model_module = importlib.reload(_spectrum_model_module)
+    SpectrumModel = _spectrum_model_module.SpectrumModel
     import pathlib
     import scipy.stats as stats
-    import importlib
     from Speculate_addons import Spec_functions as spec_functions
 
     # Marimo can keep an older helper module cached across notebook reloads.
@@ -52,6 +54,7 @@ def _():
         not hasattr(spec_functions, "build_default_observation_sigma")
         or not hasattr(spec_functions, "build_bestfit_spectrum_altair")
         or not hasattr(spec_functions, "enable_speculate_altair_theme")
+        or "model_label" not in spec_functions.build_bestfit_spectrum_altair.__code__.co_varnames
     ):
         spec_functions = importlib.reload(spec_functions)
 
@@ -317,63 +320,51 @@ def _(mo):
 
 @app.cell
 def _():
-    # Parameter Mapping Dictionary
-    # Maps the 1-based parameter index used in emulator filenames to a
-    # (friendly_name, default_min, default_max) tuple.  Default bounds of
-    # (0, 1) are placeholders overridden once the emulator is loaded;
-    # inclination bounds are physical (degrees).
-    #
-    # Indices 1-6  : Knigge-Wood-Drew (KWD) accretion disc wind model.
-    # Indices 7-8  : Boundary-layer emission (only in "bl" grids).
-    # Indices 9-11 : Observer inclination at increasing angular resolution.
-    #
-    # In emulator space param1, param3, and param5 are stored in log10.
-    # param2 (wind.mdot) is stored as the ratio wind/disk mass-loss rate.
-    # Tuple: (friendly_name, default_min, default_max, is_log10)
-    param_map_db = {
-        1: ("disk.mdot", 0.0, 1.0, True),              # log10(Msol/yr)
-        2: ("wind.mdot", 0.0, 1.0, False),              # ratio: wind / disk
-        3: ("KWD.d", 0.0, 1.0, True),                  # log10(wind launch radius / r_star)
-        4: ("KWD.mdot_r_exponent", 0.0, 1.0, False),    # radial mdot power law
-        5: ("KWD.acceleration_length", 0.0, 1.0, True), # log10(cm)
-        6: ("KWD.acceleration_exponent", 0.0, 1.0, False),
-        7: ("Boundary_layer.luminosity", 0.0, 1.0, True),  # log10(erg/s)
-        8: ("Boundary_layer.temp", 0.0, 1.0, True),        # log10(K)
-        9: ("Inclination (Sparse)", 30.0, 80.0, False),  # 3 angles (30, 55, 80)
-        10: ("Inclination (Mid)", 30.0, 80.0, False),    # 6 angles
-        11: ("Inclination (Full)", 30.0, 80.0, False),   # 12 angles
-    }
-    return (param_map_db,)
+    from Speculate_addons.grid_registry import param_map_db as _registry_param_map_db
+
+    def inf_param_map_db_for_grid(grid_name=None):
+        """Return Inference Tool parameter labels/ranges from the registry."""
+        return _registry_param_map_db(grid_name)
+
+    param_map_db = inf_param_map_db_for_grid()
+    return inf_param_map_db_for_grid, param_map_db
 
 
 @app.cell
 def _(get_loaded_emu_filename, get_selected_grid, mo, on_grid_select, os):
     # --- Grid Selection ---
-    # Scan the Grid-Emulator_Files directory for .npz emulator files and
-    # extract unique grid stem names (everything before "_emu_").  The stem
-    # encodes the Sirocco grid version and physics variant (e.g.
-    # "speculate_cv_bl_grid_v87f").
+    # Discover grid families from local raw grids, processed grid files, and GP
+    # emulator files.  A grid can be present before a trained emulator exists;
+    # in that case the downstream emulator dropdown will simply show no matching
+    # GP emulators for that grid.
+    from Speculate_addons.grid_registry import GRID_REGISTRY as _GRID_REGISTRY, infer_grid_name as _infer_grid_name
 
     _emu_dir = "Grid-Emulator_Files"
+    _sirocco_grids_dir = "sirocco_grids"
     _unique_grids = set()
+
+    if os.path.exists(_sirocco_grids_dir):
+        _local_grid_dirs = {
+            _name
+            for _name in os.listdir(_sirocco_grids_dir)
+            if os.path.isdir(os.path.join(_sirocco_grids_dir, _name))
+        }
+        for _grid_name, _config in _GRID_REGISTRY.items():
+            if _grid_name in _local_grid_dirs or _config.get("test_grid_name") in _local_grid_dirs:
+                _unique_grids.add(_grid_name)
 
     if os.path.exists(_emu_dir):
         _files = [f for f in os.listdir(_emu_dir) if f.endswith(".npz")]
         for _f in _files:
-            # Parse grid name
-            # Pattern: {GRID}_emu_{INDICES}... OR {GRID}_grid_{INDICES}...
-            # We assume the grid name is everything before "_emu_" or "_grid_"
+            _grid_name = _infer_grid_name(_f)
+            if _grid_name is not None and ("_emu_" in _f or "_grid_" in _f):
+                _unique_grids.add(_grid_name)
+                continue
 
-            # Try splitting by _emu_ first (most common for emulators)
+            # Legacy fallback for emulator filenames from unregistered grids.
             _parts = _f.split("_emu_")
             if len(_parts) > 1:
                 _unique_grids.add(_parts[0])
-                continue
-
-            # Try splitting by _grid_
-            _parts = _f.split("_grid_")
-            if len(_parts) > 1:
-                pass
 
     _sorted_grids = sorted(list(_unique_grids))
 
@@ -408,19 +399,24 @@ def _(get_loaded_emu_filename, get_selected_grid, mo, on_grid_select, os):
 
 
 @app.cell
-def _(get_loaded_emu_filename, get_selected_emu_filename, grid_selector, mo, on_emulator_select, os, param_map_db, re):
+def _(get_loaded_emu_filename, get_selected_emu_filename, grid_selector, inf_param_map_db_for_grid, mo, on_emulator_select, os, re):
     # --- Emulator Selection (Dependent on Grid) ---
     # Filter the .npz files to those matching the selected grid stem and
-    # discover which parameter indices this grid supports.  Indices are
-    # parsed from the filename digits after "_emu_" or "_grid_", then
-    # augmented with known conventions for CV grids (e.g. inclination
-    # variants always present, boundary-layer params absent in "no_bl").
+    # discover which parameter indices this grid supports.  The registry gives
+    # the complete supported set for the selected grid, while filenames provide
+    # the specific parameter tag for saved emulators/grids.
 
     _emu_dir = "Grid-Emulator_Files"
     _filtered_emus = []
+    from Speculate_addons.grid_registry import get_grid_config as _get_grid_config, parse_param_tag as _parse_param_tag
 
-    # Grid Parameter Detection
+    # Grid Parameter Detection.  Prefer registry metadata so AGN and CV grids do
+    # not need separate filename heuristics for boundary-layer or inclination axes.
     grid_indices = set()
+    _param_map_db = inf_param_map_db_for_grid(grid_selector.value)
+    _grid_config = _get_grid_config(grid_selector.value)
+    if _grid_config is not None:
+        grid_indices.update(_grid_config.get("max_params", []))
 
     if grid_selector.value and os.path.exists(_emu_dir):
         _files = [f for f in os.listdir(_emu_dir) if f.endswith(".npz")]
@@ -431,22 +427,15 @@ def _(get_loaded_emu_filename, get_selected_emu_filename, grid_selector, mo, on_
                 if "_emu_" in _f:
                     _filtered_emus.append(_f)
 
-                # Check for parameters based on digits after _emu_ or _grid_
-                # Match _emu_(\d+) or _grid_(\d+)
-                _m = re.search(r"(_emu_|_grid_)(\d+)", _f)
+                # Check for parameters based on the tag after _emu_ or _grid_.
+                # parse_param_tag() uses the increasing-ID convention to
+                # disambiguate concatenated IDs such as 12391011.
+                _m = re.search(r"(_emu_|_grid_)([^_]+)", _f)
                 if _m:
-                    _digits = _m.group(2)
-                    for _d in _digits:
-                        grid_indices.add(int(_d))
-
-    # Force inclusion of specific parameters based on Grid Name conventions (cv)
-    if grid_selector.value and "cv" in grid_selector.value:
-         # Inclination variants (9, 10, 11) are present in the grid definition
-         grid_indices.update([9, 10, 11])
-
-         # 7, 8 are Boundary Layer, present unless specifically "no_bl"
-         if "_no_bl_" not in grid_selector.value and "_no-bl_" not in grid_selector.value:
-              grid_indices.update([7, 8])
+                    try:
+                        grid_indices.update(_parse_param_tag(_m.group(2)))
+                    except ValueError:
+                        pass
 
     _filtered_emus = sorted(_filtered_emus)
 
@@ -485,11 +474,11 @@ def _(get_loaded_emu_filename, get_selected_emu_filename, grid_selector, mo, on_
     if grid_indices:
         _sorted_ind = sorted(list(grid_indices))
         for _idx in _sorted_ind:
-            if _idx in param_map_db:
-                 _p_name = param_map_db[_idx][0]
-                 _param_lookup_info.append(f"**{_idx}** -> `{_p_name}`")
+            if _idx in _param_map_db:
+                _p_name = _param_map_db[_idx][0]
+                _param_lookup_info.append(f"**{_idx}** -> `{_p_name}`")
             else:
-                 _param_lookup_info.append(f"**{_idx}** -> `Unknown`")
+                _param_lookup_info.append(f"**{_idx}** -> `Unknown`")
     else:
         _param_lookup_info.append("No parameters detected from filenames.")
 
@@ -566,6 +555,7 @@ def _(mo, obs_file_uploader, os, set_obs_refresh):
 def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
     # Build the selectable observation-file list and, when possible, the paired
     # test-grid metadata derived from the currently selected emulator grid.
+    from Speculate_addons.grid_registry import get_grid_config as _get_grid_config
 
     # Trigger refresh on upload or delete
     _ = obs_file_uploader.value
@@ -587,10 +577,12 @@ def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
     test_grid_params_df = None
 
     if grid_selector.value:
-        # The emulator grids and validation test grids follow the same naming
-        # convention, with only the "_grid_" / "_testgrid_" token changing.
+        # The registry records the paired validation grid where available.  The
+        # string replacement is kept only as a backward-compatible fallback for
+        # older emulator names that predate the registry.
         _grid_name = grid_selector.value
-        _test_grid_name = _grid_name.replace("_grid_", "_testgrid_")
+        _grid_config = _get_grid_config(_grid_name)
+        _test_grid_name = _grid_config.get("test_grid_name") if _grid_config else _grid_name.replace("_grid_", "_testgrid_")
         test_grid_path = f"sirocco_grids/{_test_grid_name}"
 
         if os.path.exists(test_grid_path):
@@ -610,7 +602,8 @@ def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
 
 
 @app.cell
-def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
+def _(grid_selector, mo, obs_files, os, set_obs_refresh, test_grid_files):
+    from Speculate_addons.grid_registry import default_fixed_inclination as _default_fixed_inclination, inclination_values as _get_inclination_values
 
     # Dropdown for selecting observation file
     if obs_files:
@@ -665,10 +658,13 @@ def _(mo, obs_files, os, set_obs_refresh, test_grid_files):
         on_click=lambda _: delete_selected_file()
     )
 
-    # Inclination selector for test grid (spec files have multiple angles)
+    # Inclination selector for test grids.  CV and AGN .spec files expose
+    # different angle sets, so both the options and default come from the registry.
+    _inclination_values = _get_inclination_values(grid_selector.value if grid_selector is not None else None)
+    _default_inclination = _default_fixed_inclination(grid_selector.value if grid_selector is not None else None)
     test_inclination_selector = mo.ui.dropdown(
-        options=["30", "35", "40", "45", "50", "55", "60", "65", "70", "75", "80", "85"],
-        value="55",
+        options=[str(value) for value in _inclination_values],
+        value=str(_default_inclination),
         label="Inclination (°):",
         full_width=True
     )
@@ -705,6 +701,73 @@ def _(
     _selected_name = emulator_selector.value
     emulator_load_status = mo.md("")
 
+    def _format_cache_size(_gb):
+        return f"{_gb * 1024:.0f} MB" if _gb < 1.0 else f"{_gb:.1f} GB"
+
+    def _selected_emulator_cache_note(_filename):
+        if not _filename:
+            return "", "neutral"
+
+        try:
+            import numpy as _np
+            import os as _os
+
+            _path = _os.path.join("Grid-Emulator_Files", _filename)
+            if not _os.path.isfile(_path):
+                return "", "neutral"
+
+            with _np.load(_path, allow_pickle=True) as _npz:
+                _n_grid = int(_npz["grid_points"].shape[0])
+                if "eigenspectra" in _npz:
+                    _n_components = int(_npz["eigenspectra"].shape[0])
+                elif "weights" in _npz:
+                    _n_components = int(_npz["weights"].shape[1])
+                else:
+                    return "", "neutral"
+
+            _block_bytes = _n_grid * _n_grid * 8
+            _cache_bytes = _n_components * _block_bytes
+            _workspace_bytes = 2 * _block_bytes
+            _required_gb = (_cache_bytes + _workspace_bytes) * 1.1 / (1024**3)
+            _display = _format_cache_size(_required_gb)
+
+            _note = (
+                f"Inference cache estimate: **~{_display} required** to build the "
+                f"reusable MLE/MCMC cache ({_n_components} PCA components × "
+                f"{_n_grid:,} grid points)."
+            )
+            _kind = "neutral"
+
+            try:
+                import torch as _torch
+
+                if _torch.cuda.is_available():
+                    _free_bytes, _ = _torch.cuda.mem_get_info(0)
+                    _free_gb = _free_bytes / (1024**3)
+                    _usage_pct = (_required_gb / _free_gb) * 100 if _free_gb > 0 else float("inf")
+                    _can_cache = _required_gb < _free_gb * 0.9
+                    if _can_cache:
+                        _note += f" Current free VRAM: **{_free_gb:.1f} GB** ({_usage_pct:.0f}% required)."
+                    else:
+                        _note += (
+                            f" Current free VRAM: **{_free_gb:.1f} GB** ({_usage_pct:.0f}% required). "
+                            "If this cache cannot fit, Speculate will stream per component and MLE/MCMC will be much slower."
+                        )
+                        _kind = "warn"
+                else:
+                    _note += (
+                        " No NVIDIA GPU detected. The reusable GPU inference cache "
+                        "cannot be built, so inference will use CPU/fallback paths and may be slower."
+                    )
+                    _kind = "warn"
+            except Exception:
+                _note += " GPU status could not be checked, so cache fit is unknown."
+                _kind = "warn"
+
+            return _note, _kind
+        except Exception as _exc:
+            return f"Could not estimate inference cache memory for this emulator: {_exc}", "warn"
+
     if emu is not None and _loaded_name != _selected_name:
         clear_loaded_emu_cache()
         emu = None
@@ -738,10 +801,19 @@ def _(
                     mo.md(f"{mo.icon('lucide:x-circle')} Error loading `{_selected_name}`: {e}"),
                     kind="danger",
                 )
-    elif _selected_name and emu is None:
+    elif emu is not None and _loaded_name == _selected_name:
         emulator_load_status = mo.callout(
-            mo.md(f"Selected `{_selected_name}`. Click **Load Emulator** to enable inference."),
-            kind="neutral",
+            mo.md(f"{mo.icon('lucide:check-circle')} Loaded `{_selected_name}`."),
+            kind="success",
+        )
+    elif _selected_name and emu is None:
+        _cache_note, _cache_kind = _selected_emulator_cache_note(_selected_name)
+        _selected_message = f"Selected `{_selected_name}`. Click **Load Emulator** to enable inference."
+        if _cache_note:
+            _selected_message += f"\n\n{_cache_note}"
+        emulator_load_status = mo.callout(
+            mo.md(_selected_message),
+            kind=_cache_kind,
         )
 
     return emu, emulator_load_status
@@ -753,6 +825,7 @@ def _(
     data_source_selector,
     emu,
     emulator_selector,
+    grid_selector,
     mo,
     np,
     obs_file_selector,
@@ -765,6 +838,8 @@ def _(
     test_run_selector,
 ):
     # Load observation data (from file OR test grid)
+    from Speculate_addons.grid_registry import inclination_column as _inclination_column, lookup_row_to_emulator_values as _lookup_row_to_emulator_values
+
     obs_data = None
     ground_truth_params = None  # For test grid validation
     _obs_dir = "observation_files"
@@ -790,10 +865,10 @@ def _(
                     break
 
             # After frequency and wavelength, the remaining columns are fluxes at
-            # fixed viewing angles; map the selected angle onto that column index.
+            # fixed viewing angles.  Use the registry rather than CV-only column
+            # arithmetic because AGN has a different angle grid.
             inc_val = int(test_inclination_selector.value)
-            inc_options = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85]
-            inc_col_idx = inc_options.index(inc_val) + 2  # +2 for Freq, Lambda columns
+            inc_col_idx = _inclination_column(grid_selector.value if grid_selector is not None else None, inc_val)
 
             # Flip both arrays so wavelength increases left-to-right in the UI.
             data_raw = np.loadtxt(spec_path, skiprows=skiprows, unpack=True)
@@ -811,22 +886,18 @@ def _(
                 'sigma_source': 'synthetic_sirocco_continuum',
             })
 
-            # Translate the lookup-table values into the emulator parameterisation:
-            # some parameters are stored in log space and wind.mdot is recovered as
-            # the wind-to-disk mass-loss ratio rather than an absolute value.
+            # Translate lookup-table values into the active emulator
+            # parameterisation.  The registry handles the CV ratio/log transforms
+            # and the AGN Eddington-fraction/R_g-scaled transforms.
             if test_grid_params_df is not None:
                 run_num = int(test_run_selector.value.replace('run', '').replace('.spec', ''))
                 gt_row = test_grid_params_df[test_grid_params_df['Run Number'] == run_num]
                 if len(gt_row) > 0:
-                    ground_truth_params = {
-                        'disk.mdot': np.log10(gt_row['Disk.mdot(msol/yr)'].values[0]),
-                        'wind.mdot': gt_row['Wind.mdot(msol/yr)'].values[0] / gt_row['Disk.mdot(msol/yr)'].values[0],  # Ratio
-                        'KWD.d': np.log10(gt_row['KWD.d(in_units_of_rstar)'].values[0]),
-                        'KWD.mdot_r_exponent': gt_row['KWD.mdot_r_exponent'].values[0],
-                        'KWD.acceleration_length': np.log10(gt_row['KWD.acceleration_length(cm)'].values[0]),
-                        'KWD.acceleration_exponent': gt_row['KWD.acceleration_exponent'].values[0],
-                        'Inclination': inc_val
-                    }
+                    ground_truth_params = _lookup_row_to_emulator_values(
+                        grid_selector.value if grid_selector is not None else None,
+                        gt_row.iloc[0],
+                        inc_val,
+                    )
 
             data_source_info = f"Test Grid: {test_run_selector.value} @ {inc_val}°"
 
@@ -1030,7 +1101,7 @@ def _(
                  opacity=0.10, color='cyan'
              ).encode(
                  x=alt.X('Wavelength:Q'),
-                 y=alt.Y('Lower:Q'),
+                 y=alt.Y('Lower:Q', scale=alt.Scale(zero=False)),
                  y2=alt.Y2('Upper:Q'),
              )
 
@@ -1038,7 +1109,7 @@ def _(
              width="container",
              height=400,
              title=f"{data_source_info} [{_scale_label}]" if data_source_info else "Spectrum"
-         ).interactive()
+         ).interactive(bind_y=False)
 
     obs_plot_accordion = mo.accordion({
         f"{mo.icon('lucide:trending-up')} View Selected Spectrum": obs_chart if obs_chart else mo.md("No data loaded.")
@@ -1182,87 +1253,72 @@ def _(mo):
 
 
 @app.cell
-def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_scale, param_map_db, re, wl_range_slider):
+def _(build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
     # ── Parameter Playground ──
     # Interactive sliders for the nuisance/inference parameters and the
     # physical grid axes so the user can visually explore how each shifts
     # the emulated spectrum before committing to prior bounds.
     #
-    # Slider ranges for log_scale and log_amp are auto-computed from the ratio
+    # Slider ranges for distance and log_amp are auto-computed from the ratio
     # of the emulator's midpoint flux to the (transformed) observation flux, so
     # they stay sensible regardless of emmulator training transform.
 
     _playground_ui = mo.md("*Load an emulator and observation data to use the playground.*")
 
     if emu is not None:
+        _param_map_db = inf_param_map_db_for_grid(grid_selector.value if grid_selector is not None else None)
         # Midpoint physical parameters for preview
         if hasattr(emu, 'min_params') and hasattr(emu, 'max_params'):
             pg_mid_params = (np.array(emu.min_params) + np.array(emu.max_params)) / 2.0
         else:
             pg_mid_params = np.zeros(len(emu.param_names))
 
-        # --- Auto-compute log_scale and log_amp centres from data ---
-        # Reconstruct the emulator flux at the midpoint and compare with the
-        # transformed observation to estimate a sensible log_scale default.
-        _ls_centre = 0.0   # fallback
-        _la_centre = -5.0   # fallback
+        # --- Auto-compute log_amp centre from observational uncertainty ---
+        # GP amplitude is a residual/noise scale. It should be tied to the data
+        # uncertainty, not to mismatch against an arbitrary midpoint model.
+        _distance_centre = 100.0
+        _la_centre = -60.0 if obs_flux_scale.value == "linear" else -5.0
         if obs_data is not None:
             try:
                 _wl_lo, _wl_hi = wl_range_slider.value
-                # Emulator midpoint flux
-                _w, _c = emu(pg_mid_params)
-                _X = emu.eigenspectra * emu.flux_std
-                _emu_fl = (_w @ _X) + emu.flux_mean
-                _emu_wl = np.array(emu.wl)
-                _em = (_emu_wl >= _wl_lo) & (_emu_wl <= _wl_hi)
-                _emu_mean = np.mean(np.abs(_emu_fl[_em])) if _em.any() else 1.0
-
-                # Observation flux in the emulator's trained space
                 _om = (obs_data['wavelength'] >= _wl_lo) & (obs_data['wavelength'] <= _wl_hi)
-                _obs_fl = np.array(obs_data[_om]['flux'])
-                _obs_wl = np.array(obs_data[_om]['wavelength'])
+                _obs_sub = obs_data[_om]
+                _obs_wl = np.array(_obs_sub['wavelength'])
+                _obs_flux_native = np.array(_obs_sub['flux'])
+                _sigma_source = (
+                    str(_obs_sub['sigma_source'].iat[0]).strip().lower()
+                    if 'sigma_source' in _obs_sub.columns and len(_obs_sub) > 0
+                    else None
+                )
+                if _sigma_source == 'synthetic_sirocco_continuum':
+                    _fallback_sigma, _ = build_synthetic_sirocco_sigma(_obs_wl, _obs_flux_native)
+                else:
+                    _fallback_sigma, _ = build_default_observation_sigma(_obs_wl, _obs_flux_native)
+
+                if 'error' in _obs_sub.columns:
+                    _sigma = np.array(_obs_sub['error'], dtype=float)
+                    _sigma = np.where(np.isfinite(_sigma) & (_sigma > 0), _sigma, _fallback_sigma)
+                else:
+                    _sigma = _fallback_sigma
+
                 _scale_label = obs_flux_scale.value
                 if _scale_label == 'log':
-                    _obs_fl = np.where(_obs_fl > 0, np.log10(_obs_fl),
-                                       np.log10(np.abs(_obs_fl) + 1e-30))
+                    _sigma = _sigma / (np.abs(_obs_flux_native) * np.log(10.0) + 1e-30)
                 elif _scale_label == 'continuum-normalised':
-                    _ct, _ = fit_power_law_continuum(_obs_wl, _obs_fl)
+                    _ct, _ = fit_power_law_continuum(_obs_wl, _obs_flux_native)
                     _ct_safe = np.where(_ct > 0, _ct, 1.0)
-                    _obs_fl = _obs_fl / _ct_safe
+                    _sigma = _sigma / _ct_safe
 
-                _obs_mean = np.mean(np.abs(_obs_fl)) if len(_obs_fl) > 0 else 1.0
-                # log_scale = ln(obs / emu) — but in log₁₀ space the raw
-                # means are negative, so compare linear-space means instead.
-                if _scale_label == 'log':
-                    _emu_mean_lin = np.mean(np.abs(10.0 ** _emu_fl[_em])) if _em.any() else 1.0
-                    _obs_mean_lin = np.mean(np.abs(np.array(obs_data[_om]['flux']))) if len(_obs_fl) > 0 else 1.0
-                    if _emu_mean_lin > 0 and _obs_mean_lin > 0:
-                        _ls_centre = float(np.log(_obs_mean_lin / _emu_mean_lin))
-                else:
-                    if _emu_mean > 0 and _obs_mean > 0:
-                        _ls_centre = float(np.log(_obs_mean / _emu_mean))
-                # log_amp centre: residual variance as starting estimate.
-                # Apply log_scale additively in log₁₀ space, multiplicatively
-                # otherwise.
-                _ln10 = np.log(10.0)
-                _n_cmp = min(len(_obs_fl), int(_em.sum()))
-                if _n_cmp > 0:
-                    if _scale_label == 'log':
-                        _resid = (_obs_fl[:_n_cmp]
-                                  - (_emu_fl[_em][:_n_cmp] + _ls_centre / _ln10))
-                    else:
-                        _resid = (_obs_fl[:_n_cmp]
-                                  - _emu_fl[_em][:_n_cmp] * np.exp(_ls_centre))
-                    _residual_var = float(np.mean(_resid ** 2))
-                else:
-                    _residual_var = 1e-5
-                _la_centre = float(np.log(max(_residual_var, 1e-30)))
+                _sigma = np.asarray(_sigma, dtype=float)
+                _sigma = _sigma[np.isfinite(_sigma) & (_sigma > 0)]
+                if _sigma.size:
+                    _noise_var = float(np.median(_sigma ** 2))
+                    _la_centre = float(np.log(max(_noise_var, 1e-30)))
             except Exception:
                 pass  # keep fallback values
 
         # Round for cleaner slider display
-        _ls_centre = round(_ls_centre, 1)
-        _la_centre = round(_la_centre, 1)
+        _la_centre = round(_la_centre, 2)
 
         # Nuisance slider ranges centred on auto-detected values
         pg_av_slider = mo.ui.slider(
@@ -1270,21 +1326,21 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
             label="Av (Extinction)", show_value=True, full_width=True,
         )
         pg_logscale_slider = mo.ui.slider(
-            start=_ls_centre - 10.0, stop=_ls_centre + 10.0,
-            value=_ls_centre, step=0.1,
-            label="log_scale (ln flux scaling)", show_value=True, full_width=True,
+            start=10.0, stop=1000.0,
+            value=_distance_centre, step=1.0,
+            label="Distance (pc)", show_value=True, full_width=True,
         )
         pg_cheb1_slider = mo.ui.slider(
             start=-2.0, stop=2.0, value=0.0, step=0.01,
             label="cheb_1 (continuum tilt)", show_value=True, full_width=True,
         )
         pg_logamp_slider = mo.ui.slider(
-            start=_la_centre - 15.0, stop=_la_centre + 15.0,
-            value=_la_centre, step=0.5,
+            start=_la_centre - 5.0, stop=_la_centre + 5.0,
+            value=_la_centre, step=0.01,
             label="log_amp (ln GP amplitude)", show_value=True, full_width=True,
         )
         pg_logls_slider = mo.ui.slider(
-            start=0.0, stop=15.0, value=4.5, step=0.1,
+            start=0.0, stop=15.0, value=4.5, step=0.01,
             label="log_ls (ln GP length scale)", show_value=True, full_width=True,
         )
 
@@ -1303,11 +1359,42 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
         # wrapper is added for parameters stored on a log10 axis.
         _phys_sliders = []
         _sorted_phys_idx = sorted(list(grid_indices)) if grid_indices else []
+
+        def _clean_slider_number(_value, _decimals=4):
+            _value = float(_value)
+            if not np.isfinite(_value):
+                return 0.0
+            if _value == 0.0:
+                return 0.0
+            if 1e-4 <= abs(_value) < 1e6:
+                return float(f"{_value:.{_decimals}f}")
+            return float(f"{_value:.{_decimals}g}")
+
+        def _nice_slider_step(_lo, _hi, _target_steps=300):
+            _span = abs(float(_hi) - float(_lo))
+            if not np.isfinite(_span) or _span <= 0.0:
+                return 1e-6
+            _raw = _span / float(_target_steps)
+            _exp = np.floor(np.log10(_raw))
+            _frac = _raw / (10.0 ** _exp)
+            if _frac <= 1.0:
+                _nice = 1.0
+            elif _frac <= 2.0:
+                _nice = 2.0
+            elif _frac <= 5.0:
+                _nice = 5.0
+            else:
+                _nice = 10.0
+            return max(_clean_slider_number(_nice * (10.0 ** _exp)), 1e-12)
+
         for _pi, _pname in enumerate(emu.param_names):
             _lo = float(emu.min_params[_pi]) if hasattr(emu, 'min_params') else 0.0
             _hi = float(emu.max_params[_pi]) if hasattr(emu, 'max_params') else 1.0
             _mid = (_lo + _hi) / 2.0
-            _step = max((_hi - _lo) / 200.0, 1e-6)
+            _lo_ui = _clean_slider_number(_lo)
+            _hi_ui = _clean_slider_number(_hi)
+            _mid_ui = _clean_slider_number(_mid)
+            _step = _nice_slider_step(_lo_ui, _hi_ui)
 
             # Prefer the grid_indices mapping when it lines up; otherwise
             # fall back to parsing "paramN" directly from the axis name.
@@ -1319,16 +1406,16 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
                 if _m:
                     _db_idx = int(_m.group(1))
 
-            if _db_idx is not None and _db_idx in param_map_db:
-                _base_name = param_map_db[_db_idx][0]
-                _is_log = (len(param_map_db[_db_idx]) > 3
-                           and bool(param_map_db[_db_idx][3]))
+            if _db_idx is not None and _db_idx in _param_map_db:
+                _base_name = _param_map_db[_db_idx][0]
+                _is_log = (len(_param_map_db[_db_idx]) > 3
+                           and bool(_param_map_db[_db_idx][3]))
                 _label = f"log10({_base_name})" if _is_log else _base_name
             else:
                 _label = str(_pname)
 
             _phys_sliders.append(mo.ui.slider(
-                start=_lo, stop=_hi, value=_mid, step=_step,
+                start=_lo_ui, stop=_hi_ui, value=_mid_ui, step=_step,
                 label=_label, show_value=True, full_width=True,
             ))
         pg_phys_sliders = mo.ui.array(_phys_sliders)
@@ -1381,6 +1468,8 @@ def _(
     if (emu is not None and obs_data is not None
             and pg_av_slider is not None and pg_mid_params is not None):
         try:
+            from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
+
             from Starfish.transforms import extinct, resample
 
             _wl_min = wl_range_slider.value[0]
@@ -1406,6 +1495,14 @@ def _(
 
             _is_log = (obs_flux_scale.value == "log")
             _ln10 = np.log(10.0)
+            try:
+                _norm_factor = float(np.asarray(emu.norm_factor(_phys_params)).squeeze())
+            except Exception:
+                _norm_factor = 0.0 if _is_log else 1.0
+            if _is_log:
+                emu_flux_crop = emu_flux_crop + _norm_factor
+            else:
+                emu_flux_crop = emu_flux_crop * _norm_factor
 
             if _is_log:
                 # ── Log₁₀-space nuisance transforms (additive) ──────
@@ -1424,7 +1521,7 @@ def _(
                     _cheb_poly = np.clip(_cheb_poly, 1e-30, None)
                     emu_flux_crop = emu_flux_crop + np.log10(_cheb_poly)
 
-                _log_scale = pg_logscale_slider.value
+                _log_scale = _distance_to_log_scale(pg_logscale_slider.value)
                 emu_flux_crop = emu_flux_crop + _log_scale / _ln10
             else:
                 # ── Linear-space nuisance transforms (original) ──────
@@ -1439,7 +1536,7 @@ def _(
                     _cheb_poly = chebval(_scale_wl, [1.0, _cheb1])
                     emu_flux_crop = emu_flux_crop * _cheb_poly
 
-                _log_scale = pg_logscale_slider.value
+                _log_scale = _distance_to_log_scale(pg_logscale_slider.value)
                 emu_flux_crop = emu_flux_crop * np.exp(_log_scale)
 
             # GP uncertainty envelope (±1σ from GP amplitude)
@@ -1560,7 +1657,7 @@ def _(
 
             _lines = alt.Chart(_combined).mark_line(opacity=0.9).encode(
                 x=alt.X('Wavelength:Q', title='Wavelength (Å)'),
-                y=alt.Y('Flux:Q', title=_y_title, axis=alt.Axis(format=_y_format)),
+                y=alt.Y('Flux:Q', title=_y_title, axis=alt.Axis(format=_y_format), scale=alt.Scale(zero=False)),
                 color=alt.Color('Type:N', scale=_color_scale, legend=alt.Legend(title="Spectrum")),
                 tooltip=['Wavelength:Q', 'Flux:Q', 'Type:N'],
             )
@@ -1569,7 +1666,7 @@ def _(
                 opacity=0.15, color='orange',
             ).encode(
                 x=alt.X('Wavelength:Q'),
-                y=alt.Y('Lower:Q'),
+                y=alt.Y('Lower:Q', scale=alt.Scale(zero=False)),
                 y2=alt.Y2('Upper:Q'),
             )
 
@@ -1579,7 +1676,7 @@ def _(
                     opacity=0.10, color='cyan',
                 ).encode(
                     x=alt.X('Wavelength:Q'),
-                    y=alt.Y('Lower:Q'),
+                    y=alt.Y('Lower:Q', scale=alt.Scale(zero=False)),
                     y2=alt.Y2('Upper:Q'),
                 )
 
@@ -1587,7 +1684,7 @@ def _(
                 width="container",
                 height=400,
                 title=f"Playground: Emulated (midpoint params) vs Observation [{_scale_label}]",
-            ).interactive()
+            ).interactive(bind_y=False)
 
         except Exception as _e:
             _playground_chart = mo.callout(
@@ -1619,7 +1716,7 @@ def _(
                 "**Physical Parameters** tab to reshape the emulated spectrum by "
                 "varying the grid axes.\n\n"
                 "- **Av** — Interstellar dust extinction (magnitudes). Reddens and dims the spectrum.\n"
-                "- **log_scale** — Natural log of the flux scaling factor. Shifts the spectrum up/down.\n"
+                "- **Distance** — Source distance in parsecs. Internally converted to backend log_scale.\n"
                 "- **cheb_1** — Chebyshev c₁ coefficient. Applies a linear tilt to the continuum gradient.\n"
                 "- **log_amp** — GP covariance amplitude (affects uncertainty envelope, not the mean spectrum).\n"
                 "- **log_ls** — GP covariance length scale (affects uncertainty smoothness, not the mean spectrum)."
@@ -1659,9 +1756,8 @@ def _(mo):
 
 @app.cell
 def _(
-    alt,
-    build_bestfit_spectrum_altair,
     build_default_observation_sigma,
+    distance_prior_ack,
     Spectrum,
     SpectrumModel,
     build_synthetic_sirocco_sigma,
@@ -1697,6 +1793,8 @@ def _(
             )
         else:
             try:
+                from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
+
                 _wl_lo, _wl_hi = wl_range_slider.value
                 _mask = ((obs_data['wavelength'] >= _wl_lo)
                          & (obs_data['wavelength'] <= _wl_hi))
@@ -1769,7 +1867,7 @@ def _(
                 _phys = np.array(pg_phys_sliders.value, dtype=float)
                 _global = {
                     'Av': float(pg_av_slider.value),
-                    'log_scale': float(pg_logscale_slider.value),
+                    'log_scale': float(_distance_to_log_scale(pg_logscale_slider.value)),
                     'cheb': [float(pg_cheb1_slider.value)],
                     'global_cov': {
                         'log_amp': float(pg_logamp_slider.value),
@@ -1781,6 +1879,7 @@ def _(
                     data=_spec,
                     grid_params=list(_phys),
                     flux_scale=_scale,
+                    norm=True,
                     **_global,
                 )
 
@@ -1794,9 +1893,11 @@ def _(
                     if _hi > _lo:
                         _priors[_pname] = stats.uniform(loc=_lo, scale=_hi - _lo)
                 _priors['Av'] = stats.uniform(loc=0.0, scale=5.0)
+                _ls_a = _distance_to_log_scale(pg_logscale_slider.start)
+                _ls_b = _distance_to_log_scale(pg_logscale_slider.stop)
                 _priors['log_scale'] = stats.uniform(
-                    loc=pg_logscale_slider.start,
-                    scale=pg_logscale_slider.stop - pg_logscale_slider.start,
+                    loc=min(_ls_a, _ls_b),
+                    scale=abs(_ls_b - _ls_a),
                 )
                 _priors['cheb:1'] = stats.uniform(loc=-2.0, scale=4.0)
                 _priors['global_cov:log_amp'] = stats.uniform(
@@ -1825,7 +1926,7 @@ def _(
 
 
 @app.cell
-def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_scale, param_map_db, re, wl_range_slider):
+def _(build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
     # ── Stage 2: Prior & Parameter Setup ──
     # Build per-parameter UI widgets (fixed/free toggle, value, min, max) that
     # drive the prior construction in Stage 3.  Parameters fall into two groups:
@@ -1836,7 +1937,7 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
     #
     #   Inference / nuisance parameters — added on top of the grid axes:
     #       Av         – interstellar extinction in magnitudes
-    #       log_scale  – ln(flux scaling factor), absorbs distance/geometry
+    #       log_scale  – backend ln(flux scale), shown to users as Distance (pc)
     #       log_amp    – ln(GP global covariance amplitude)
     #       log_ls     – ln(GP global covariance length scale)
     #
@@ -1849,6 +1950,7 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
 
     # Parameter Mapping Dictionary
     if emu is not None:
+        _param_map_db = inf_param_map_db_for_grid(grid_selector.value if grid_selector is not None else None)
         current_names = []
         sorted_indices = sorted(list(grid_indices)) if grid_indices else []
 
@@ -1857,10 +1959,10 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
         # otherwise fall back to parsing the internal paramX labels directly.
         if len(sorted_indices) == len(emu.param_names):
              for idx in sorted_indices:
-                 if idx in param_map_db:
-                     _p_name = param_map_db[idx][0]
+                 if idx in _param_map_db:
+                     _p_name = _param_map_db[idx][0]
                      current_names.append(_p_name)
-                     if param_map_db[idx][3]:
+                     if _param_map_db[idx][3]:
                          log10_params.add(_p_name)
                  else:
                      current_names.append(f"Param {idx} (Unknown)")
@@ -1870,10 +1972,10 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
                 match = re.search(r'param(\d+)', _p)
                 if match:
                     idx = int(match.group(1))
-                    if idx in param_map_db:
-                        current_names.append(param_map_db[idx][0])
-                        if param_map_db[idx][3]:
-                            log10_params.add(param_map_db[idx][0])
+                    if idx in _param_map_db:
+                        current_names.append(_param_map_db[idx][0])
+                        if _param_map_db[idx][3]:
+                            log10_params.add(_param_map_db[idx][0])
                     else:
                         current_names.append(f"Param {idx}")
                 else:
@@ -1898,12 +2000,12 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
     # These are not part of the emulator grid but are optimised alongside
     # the grid parameters during MLE/MCMC.  They account for:
     #   Av        – dust reddening / extinction
-    #   log_scale – overall flux normalisation (distance + solid angle)
+    #   log_scale – backend distance/solid-angle scale, shown as Distance (pc)
     #   log_amp   – GP global covariance amplitude (model flexibility)
     #   log_ls    – GP global covariance length scale (smoothness)
     inf_params = [
         'Av',        # Extinction (magnitudes)
-        'log_scale', # Log Flux Scaling Factor (natural log)
+        'log_scale', # Distance in pc in the UI; backend stores natural-log flux scale
         'cheb_1',    # Chebyshev c1 coefficient (continuum tilt)
         'log_amp',   # GP Global Covariance Amplitude (natural log)
         'log_ls'     # GP Global Covariance Length Scale (natural log)
@@ -1917,60 +2019,52 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
         bounds['Av'] = [0.0, 2.0]
         defaults['Av'] = 0.0
 
-        # log_scale: natural log of flux scaling factor
-        # Auto-detect sensible centre from emulator/observation flux ratio.
-        _ls_default = 0.0
-        _la_default = -5.0
+        # log_scale is exposed as a distance prior. With SpectrumModel(norm=True),
+        # the emulator's stored normalisation is the 100 pc reference and
+        # backend log_scale=0 means Distance=100 pc.
+        _distance_default = 100.0
+        _la_default = -60.0 if obs_flux_scale.value == "linear" else -5.0
         if obs_data is not None:
             try:
                 _wl_lo, _wl_hi = wl_range_slider.value
-                _w_tmp, _ = emu(np.array([(lo + hi) / 2 for lo, hi in
-                    zip(emu.min_params, emu.max_params)]))
-                _X_tmp = emu.eigenspectra * emu.flux_std
-                _efl = (_w_tmp @ _X_tmp) + emu.flux_mean
-                _ewl = np.array(emu.wl)
-                _em_tmp = (_ewl >= _wl_lo) & (_ewl <= _wl_hi)
-                _emu_avg = np.mean(np.abs(_efl[_em_tmp])) if _em_tmp.any() else 1.0
-
                 _om_tmp = (obs_data['wavelength'] >= _wl_lo) & (obs_data['wavelength'] <= _wl_hi)
-                _ofl = np.array(obs_data[_om_tmp]['flux'])
-                _owl = np.array(obs_data[_om_tmp]['wavelength'])
+                _obs_sub = obs_data[_om_tmp]
+                _owl = np.array(_obs_sub['wavelength'])
+                _ofl_native = np.array(_obs_sub['flux'])
+                _sigma_source = (
+                    str(_obs_sub['sigma_source'].iat[0]).strip().lower()
+                    if 'sigma_source' in _obs_sub.columns and len(_obs_sub) > 0
+                    else None
+                )
+                if _sigma_source == 'synthetic_sirocco_continuum':
+                    _fallback_sigma, _ = build_synthetic_sirocco_sigma(_owl, _ofl_native)
+                else:
+                    _fallback_sigma, _ = build_default_observation_sigma(_owl, _ofl_native)
+                if 'error' in _obs_sub.columns:
+                    _sigma = np.array(_obs_sub['error'], dtype=float)
+                    _sigma = np.where(np.isfinite(_sigma) & (_sigma > 0), _sigma, _fallback_sigma)
+                else:
+                    _sigma = _fallback_sigma
+
                 _sc = obs_flux_scale.value
                 if _sc == 'log':
-                    _ofl = np.where(_ofl > 0, np.log10(_ofl),
-                                    np.log10(np.abs(_ofl) + 1e-30))
+                    _sigma = _sigma / (np.abs(_ofl_native) * np.log(10.0) + 1e-30)
                 elif _sc == 'continuum-normalised':
-                    _ct2, _ = fit_power_law_continuum(_owl, _ofl)
+                    _ct2, _ = fit_power_law_continuum(_owl, _ofl_native)
                     _ct2s = np.where(_ct2 > 0, _ct2, 1.0)
-                    _ofl = _ofl / _ct2s
+                    _sigma = _sigma / _ct2s
 
-                _obs_avg = np.mean(np.abs(_ofl)) if len(_ofl) > 0 else 1.0
-                if _sc == 'log':
-                    _emu_avg_lin = np.mean(np.abs(10.0 ** _efl[_em_tmp])) if _em_tmp.any() else 1.0
-                    _obs_avg_lin = np.mean(np.abs(np.array(obs_data[_om_tmp]['flux']))) if len(_ofl) > 0 else 1.0
-                    if _emu_avg_lin > 0 and _obs_avg_lin > 0:
-                        _ls_default = float(np.log(_obs_avg_lin / _emu_avg_lin))
-                else:
-                    if _emu_avg > 0 and _obs_avg > 0:
-                        _ls_default = float(np.log(_obs_avg / _emu_avg))
-                _n = min(len(_ofl), int(_em_tmp.sum()))
-                _ln10 = np.log(10.0)
-                if _n > 0:
-                    if _sc == 'log':
-                        _resid = _ofl[:_n] - (_efl[_em_tmp][:_n] + _ls_default / _ln10)
-                    else:
-                        _resid = _ofl[:_n] - _efl[_em_tmp][:_n] * np.exp(_ls_default)
-                    _resid_var = float(np.mean(_resid ** 2))
-                else:
-                    _resid_var = 1e-5
-                _la_default = float(np.log(max(_resid_var, 1e-30)))
+                _sigma = np.asarray(_sigma, dtype=float)
+                _sigma = _sigma[np.isfinite(_sigma) & (_sigma > 0)]
+                if _sigma.size:
+                    _noise_var = float(np.median(_sigma ** 2))
+                    _la_default = float(np.log(max(_noise_var, 1e-30)))
             except Exception:
                 pass
-        _ls_default = round(_ls_default, 1)
         _la_default = round(_la_default, 1)
 
-        bounds['log_scale'] = [_ls_default - 5.0, _ls_default + 5.0]
-        defaults['log_scale'] = _ls_default
+        bounds['log_scale'] = [90.0, 110.0]
+        defaults['log_scale'] = _distance_default
 
         # cheb_1: Chebyshev c1 coefficient – linear continuum tilt
         # Multiplies the model by a Chebyshev polynomial; c0 is fixed to 1.
@@ -1979,8 +2073,10 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
         defaults['cheb_1'] = 0.0
 
         # log_amp: GP global covariance amplitude (natural log)
-        # Normal prior: center ± 2σ defines the bounds displayed in the UI
-        bounds['log_amp'] = [_la_default - 5.0, _la_default + 5.0]
+        # Normal prior: center is tied to observational uncertainty, while the
+        # displayed range gives the optimizer room to discover extra model
+        # discrepancy without starting from arbitrary line mismatch.
+        bounds['log_amp'] = [_la_default - 4.0, _la_default + 4.0]
         defaults['log_amp'] = _la_default
 
         # log_ls: GP global covariance length scale (natural log)
@@ -1993,9 +2089,16 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
     _val_dict = {}
     w_min = {}
     w_max = {}
+    distance_prior_ack = mo.ui.checkbox(
+        value=False,
+        label="I have entered the target distance and uncertainty",
+    )
 
+    _fix_distance_for_shape_only = obs_flux_scale.value == "continuum-normalised"
     for _name in param_names:
-        _fix_dict[_name] = mo.ui.checkbox(value=False)
+        _fix_dict[_name] = mo.ui.checkbox(
+            value=(_name == 'log_scale' and _fix_distance_for_shape_only)
+        )
 
         mn, mx = bounds.get(_name, [0.0, 1.0])
         default = defaults.get(_name, 0.5)
@@ -2007,21 +2110,21 @@ def _(emu, fit_power_law_continuum, grid_indices, mo, np, obs_data, obs_flux_sca
     # Wrap in mo.ui.dictionary for Marimo reactivity
     w_fix = mo.ui.dictionary(_fix_dict) if _fix_dict else mo.ui.dictionary({})
     w_val = mo.ui.dictionary(_val_dict) if _val_dict else mo.ui.dictionary({})
-    return bounds, log10_params, param_names, w_fix, w_max, w_min, w_val
+    return bounds, distance_prior_ack, log10_params, param_names, w_fix, w_max, w_min, w_val
 
 
 @app.cell(hide_code=True)
-def _(bounds, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
+def _(bounds, distance_prior_ack, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
     # Render Parameter UI
     if not param_names:
          param_settings = mo.md("*Load an emulator to see parameters.*")
     else:
         # Parameters that use a normal prior instead of uniform
-        _normal_prior_params = {'log_amp'}
+        _normal_prior_params = {'log_amp', 'log_scale'}
 
         # Friendly display names
         _label_map = {
-            'log_scale': 'Log Scale (ln)',
+            'log_scale': 'Distance (pc)',
             'cheb_1': 'Continuum Tilt (c₁)',
             'log_amp': 'GP Log Amp (ln)',
             'log_ls': 'GP Log Length (ln)',
@@ -2038,7 +2141,7 @@ def _(bounds, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
 
         for _name in param_names:
             is_fixed = _fix_values.get(_name, False)
-            display_name = _label_map.get(_name, _name)
+            display_name = _label_map.get(_name) or str(_name)
             # Wrap log10-scaled parameters so the user knows the value is a logarithm
             if _name in log10_params and not display_name.startswith('log'):
                 display_name = f"log10({display_name})"
@@ -2091,6 +2194,8 @@ def _(bounds, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
             _sections.append(mo.md("---"))
             _sections.append(mo.md("#### Inference / Nuisance Parameters"))
             _sections.extend(_global_rows)
+            if 'log_scale' in param_names and not _fix_values.get('log_scale', False):
+                _sections.append(distance_prior_ack)
 
         param_settings = mo.vstack(_sections)
 
@@ -2100,7 +2205,7 @@ def _(bounds, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
             "Set prior distributions for each parameter. "
             "**Fix** a parameter to lock it at a specific value (tight δ-prior). "
             "Free parameters use **Uniform** priors (lower–upper) except "
-            "GP Log Amp which uses a **Normal** prior (center ± 2σ)."
+            "Distance and GP Log Amp, which use **Normal** priors (center ± 2σ)."
         ), kind="neutral"),
         param_settings
     ])
@@ -2122,13 +2227,15 @@ def _(mo):
     # next stage, allowing the notebook to remain correct under partial reruns.
     get_mle_model, set_mle_model = mo.state(None)       # fitted SpectrumModel
     get_mle_priors, set_mle_priors = mo.state(None)     # frozen scipy priors dict
+    get_mle_result, set_mle_result = mo.state(None)     # rendered Stage 3 summary/plot payload
     # MCMC State - stores results for export
     get_mcmc_samples, set_mcmc_samples = mo.state(None)     # (n_samples, n_dim) array
     get_mcmc_labels, set_mcmc_labels = mo.state(None)       # friendly parameter names
     get_mcmc_summary_df, set_mcmc_summary_df = mo.state(None) # ArviZ summary table
     get_mcmc_corner_meta, set_mcmc_corner_meta = mo.state(None) # corner-plot export metadata
     return (
-        get_mle_model, get_mle_priors, set_mle_model, set_mle_priors,
+        get_mle_model, get_mle_priors, get_mle_result,
+        set_mle_model, set_mle_priors, set_mle_result,
         get_mcmc_samples, set_mcmc_samples,
         get_mcmc_labels, set_mcmc_labels,
         get_mcmc_corner_meta, set_mcmc_corner_meta,
@@ -2181,16 +2288,25 @@ def _(mo):
 
 
 @app.cell
+def _(mo):
+    mle_show_ground_truth_spectrum = mo.ui.checkbox(
+        value=False,
+        label="Show ground-truth emulator spectrum",
+    )
+    return (mle_show_ground_truth_spectrum,)
+
+
+@app.cell
 def _(
-    alt,
-    build_bestfit_spectrum_altair,
     build_default_observation_sigma,
+    distance_prior_ack,
     Spectrum,
     SpectrumModel,
     build_synthetic_sirocco_sigma,
     emu,
     fit_power_law_continuum,
     ground_truth_params,
+    grid_selector,
     log10_params,
     mle_max_iter,
     mle_method,
@@ -2202,6 +2318,7 @@ def _(
     run_mle_btn,
     set_mle_model,
     set_mle_priors,
+    set_mle_result,
     stats,
     w_fix,
     w_max,
@@ -2216,8 +2333,24 @@ def _(
     fit_results = None
 
     if run_mle_btn.value:
+        set_mle_model(None)
+        set_mle_priors(None)
+        set_mle_result(None)
         if emu is None or obs_data is None:
             mo.stop(True, mo.md("Please load both an emulator and data."))
+        if ('log_scale' in param_names
+            and not w_fix.value.get('log_scale', False)
+            and not distance_prior_ack.value):
+            mo.stop(
+                True,
+                mo.callout(
+                    mo.md(
+                        "Confirm the Distance (pc) prior in Stage 2 before running MLE. "
+                        "The center is the target distance and the -2σ/+2σ fields define its uncertainty."
+                    ),
+                    kind="warn",
+                ),
+            )
 
         # Use a spinner rather than a static markdown block so the notebook keeps
         # surfacing progress while the optimizer and plotting code run.
@@ -2225,6 +2358,11 @@ def _(
             try:
                 from scipy.optimize import minimize as scipy_minimize
                 import time as _time
+                from Speculate_addons.distance_scale import (
+                    distance_prior_to_log_scale_prior as _distance_prior_to_log_scale_prior,
+                    distance_to_log_scale as _distance_to_log_scale,
+                    log_scale_to_distance_pc as _log_scale_to_distance_pc,
+                )
 
                 # Restrict the observation to the selected wavelength window before
                 # transforming fluxes and uncertainties onto the emulator scale.
@@ -2320,19 +2458,20 @@ def _(
                 if 'cheb_1' in param_names:
                     global_params['cheb'] = [w_val.value['cheb_1']]
 
-                # Handle log_scale (flux scaling)
-                # If user has fixed log_scale, use their value
-                # If free, let Starfish auto-calculate initially, then optimize
-                if 'log_scale' in param_names and w_fix.value['log_scale']:
-                    global_params['log_scale'] = w_val.value['log_scale']
+                # Handle Distance (pc) UI wrapper. Backend remains log_scale.
+                if 'log_scale' in param_names:
+                    global_params['log_scale'] = _distance_to_log_scale(
+                        w_val.value['log_scale']
+                    )
 
                 # 3. Initialize Model
                 _model = SpectrumModel(
-                       emulator=emu, 
-                       data=spec_data, 
-                       grid_params=grid_params_init,
-                       flux_scale=_flux_scale,
-                       **global_params
+                    emulator=emu,
+                    data=spec_data,
+                    grid_params=grid_params_init,
+                    flux_scale=_flux_scale,
+                    norm=True,
+                    **global_params,
                 )
 
                 # Translate the Stage 2 UI state into scipy prior objects and freeze
@@ -2362,23 +2501,21 @@ def _(
                         _mx = w_max['Av'].value
                         _priors['Av'] = stats.uniform(loc=_mn, scale=_mx - _mn)
 
-                # C. log_scale Prior (if not fixed and user wants to optimize it)
+                # C. Distance prior (backend key: log_scale)
                 if 'log_scale' in param_names:
+                    _distance_pc = float(w_val.value['log_scale'])
+                    _distance_lo = float(w_min['log_scale'].value)
+                    _distance_hi = float(w_max['log_scale'].value)
+                    _distance_sigma = max((_distance_hi - _distance_lo) / 4.0, 1e-12)
+                    _ls_loc, _ls_sigma = _distance_prior_to_log_scale_prior(
+                        _distance_pc, _distance_sigma
+                    )
                     if w_fix.value['log_scale']:
-                        _model.params['log_scale'] = w_val.value['log_scale']
+                        _model.params['log_scale'] = _ls_loc
                         _model.freeze('log_scale')
                     else:
-                        # Bootstrap log_scale from auto-calculation
-                        try:
-                            _ = _model()  # Trigger one evaluation
-                            if _model._log_scale is not None and np.isfinite(_model._log_scale):
-                                _model.params['log_scale'] = _model._log_scale
-                        except:
-                            _model.params['log_scale'] = 0.0
-
-                        _mn = w_min['log_scale'].value
-                        _mx = w_max['log_scale'].value
-                        _priors['log_scale'] = stats.uniform(loc=_mn, scale=_mx - _mn)
+                        _model.params['log_scale'] = _ls_loc
+                        _priors['log_scale'] = stats.norm(loc=_ls_loc, scale=_ls_sigma)
 
                 # D. GP Priors (log_amp and log_ls handled independently)
                 if 'log_amp' in param_names:
@@ -2498,30 +2635,8 @@ def _(
                         _simplex[:, _col_idx] = np.roll(
                             _simplex[:, _col_idx], _col_idx)
 
-                    # Bootstrap log_scale into the simplex
-                    if 'log_scale' in _active_labels:
-                        _ls_idx = _active_labels.index('log_scale')
-                        for _row in range(_N + 1):
-                            try:
-                                _model.set_param_vector(_simplex[_row])
-                                _ = _model()
-                                if (_model._log_scale is not None
-                                        and np.isfinite(_model._log_scale)):
-                                    _simplex[_row, _ls_idx] = _model._log_scale
-                            except Exception:
-                                pass
-
                     _centroid = _simplex.mean(axis=0)
                     _model.set_param_vector(_centroid)
-                else:
-                    # L-BFGS-B / CMA-ES: bootstrap log_scale at the starting point
-                    if 'log_scale' in _active_labels:
-                        try:
-                            _ = _model()
-                            if _model._log_scale is not None and np.isfinite(_model._log_scale):
-                                _model.params['log_scale'] = _model._log_scale
-                        except Exception:
-                            pass
 
                 # 5. Run MLE Optimization
                 # Warm up emulator caches (Cholesky factorisation etc.)
@@ -2578,20 +2693,39 @@ def _(
                     np.random.seed(None)
                     for _ in range(_n_restarts - 1):
                         _rnd = _lo_arr + np.random.rand(_N) * (_hi_arr - _lo_arr)
-                        # Bootstrap log_scale for random starts too
-                        if 'log_scale' in _active_labels:
-                            _ls_idx = _active_labels.index('log_scale')
-                            try:
-                                _model.set_param_vector(_rnd)
-                                _ = _model()
-                                if _model._log_scale is not None and np.isfinite(_model._log_scale):
-                                    _rnd[_ls_idx] = _model._log_scale
-                            except Exception:
-                                pass
                         _start_points.append(_rnd)
 
                 _global_best_x = _p0.copy()
                 _global_best_nit = 0
+                _restart_summaries = []
+
+                def _restart_param_label(_name):
+                    return f"log10({_name})" if _name in log10_params else _name
+
+                def _capture_restart_result(_restart_number, _solution):
+                    _model.set_param_vector(_solution.x)
+                    _values = {}
+                    for _i, _p in enumerate(phys_names):
+                        _values[_restart_param_label(_p)] = float(_model.grid_params[_i])
+                    _params = _model.params
+                    if 'Av' in _params:
+                        _values['Av'] = float(_params['Av'])
+                    if 'log_scale' in _params:
+                        _values['Distance (pc)'] = float(_log_scale_to_distance_pc(_params['log_scale']))
+                    elif hasattr(_model, '_log_scale') and _model._log_scale is not None:
+                        _values['Distance (pc) (auto)'] = float(_log_scale_to_distance_pc(_model._log_scale))
+                    if 'cheb:1' in _params:
+                        _values['cheb₁'] = float(_params['cheb:1'])
+                    if 'global_cov:log_amp' in _params:
+                        _values['ln(GP amp)'] = float(_params['global_cov:log_amp'])
+                    if 'global_cov:log_ls' in _params:
+                        _values['ln(GP length)'] = float(_params['global_cov:log_ls'])
+
+                    _restart_summaries.append({
+                        "restart": int(_restart_number),
+                        "nll": float(_solution.fun),
+                        "values": _values,
+                    })
 
                 for _restart_idx, _x0 in enumerate(_start_points):
                     _cur_restart[0] = _restart_idx + 1
@@ -2675,6 +2809,8 @@ def _(
                             nit=_es.result.iterations,
                         )
 
+                    _capture_restart_result(_cur_restart[0], _run_soln)
+
                     # Keep global best across restarts
                     if _run_soln.fun <= _global_best_f[0]:
                         _global_best_f[0] = _run_soln.fun
@@ -2702,22 +2838,110 @@ def _(
                     kind="success"
                 )
 
-                # 6. Plotting
+                # Resolve lookup-table truth labels once, then reuse them for both
+                # the validation table and the optional ground-truth spectrum.
+                from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map
+                _truth_label_map = {
+                    int(_idx): _label
+                    for _idx, (_label, _sirocco_key) in _benchmark_param_map(
+                        grid_selector.value if grid_selector is not None else None
+                    ).items()
+                }
+
+                def _truth_key_for(_display_name, _internal_label):
+                    if "Inclination" in _display_name:
+                        return "Inclination"
+                    _internal_text = str(_internal_label)
+                    if _internal_text.startswith("param") and _internal_text[5:].isdigit():
+                        return _truth_label_map.get(int(_internal_text[5:]), _display_name)
+                    return _display_name
+
+                def _format_nll(_value):
+                    try:
+                        _value = float(_value)
+                    except Exception:
+                        return "N/A"
+                    if not np.isfinite(_value):
+                        return "inf"
+                    return f"{_value:.2f}"
+
+                # 6. Plotting payload
                 import matplotlib.pyplot as _plt
                 _plot_flux, _plot_cov = _model()
                 if hasattr(_plot_flux, 'detach'):
                     _plot_flux = _plot_flux.detach().cpu().numpy()
                 if hasattr(_plot_cov, 'detach'):
                     _plot_cov = _plot_cov.detach().cpu().numpy()
-                _fig = build_bestfit_spectrum_altair(
-                    alt,
-                    wavelength=_model.data.wave,
-                    data_flux=_model.data.flux,
-                    model_flux=_plot_flux,
-                    model_cov_diag=_plot_cov,
-                    title=f"Best-Fit Model — {_model.data_name}",
-                    zoom_name="inference_mle_bestfit_zoom",
-                )
+                _plot_cov = np.asarray(_plot_cov, dtype=float)
+                _plot_cov_diag = np.diag(_plot_cov) if _plot_cov.ndim == 2 else _plot_cov.reshape(-1)
+                _mle_nll = float(_soln.fun)
+                _mle_plot_payload = {
+                    "wavelength": np.asarray(_model.data.wave, dtype=float).copy(),
+                    "data_flux": np.asarray(_model.data.flux, dtype=float).copy(),
+                    "model_flux": np.asarray(_plot_flux, dtype=float).copy(),
+                    "model_cov_diag": _plot_cov_diag.copy(),
+                    "title": f"Best-Fit Model — {_model.data_name}",
+                    "zoom_name": "inference_mle_bestfit_zoom",
+                    "model_label": f"MLE Best Fit (NLL={_format_nll(_mle_nll)})",
+                    "model_nll": _mle_nll,
+                    "ground_truth": None,
+                    "ground_truth_error": None,
+                }
+
+                if ground_truth_params:
+                    _truth_grid_values = []
+                    _missing_truth_keys = []
+                    for _i, _p in enumerate(phys_names):
+                        _gt_key = _truth_key_for(_p, emu.param_names[_i])
+                        if _gt_key in ground_truth_params:
+                            _truth_grid_values.append(float(ground_truth_params[_gt_key]))
+                        else:
+                            _missing_truth_keys.append(_gt_key)
+
+                    if not _missing_truth_keys:
+                        try:
+                            _truth_global_params = {}
+                            if 'Av' in _model.params:
+                                _truth_global_params['Av'] = float(_model.params['Av'])
+                            if 'log_scale' in _model.params:
+                                _truth_global_params['log_scale'] = float(_model.params['log_scale'])
+                            if 'cheb' in _model.params or 'cheb:1' in _model.params:
+                                _truth_global_params['cheb'] = [float(v) for v in _model.cheb]
+                            if ('global_cov:log_amp' in _model.params
+                                    and 'global_cov:log_ls' in _model.params):
+                                _truth_global_params['global_cov'] = {
+                                    'log_amp': float(_model.params['global_cov:log_amp']),
+                                    'log_ls': float(_model.params['global_cov:log_ls']),
+                                }
+
+                            _truth_model = SpectrumModel(
+                                emulator=emu,
+                                data=spec_data,
+                                grid_params=_truth_grid_values,
+                                flux_scale=_flux_scale,
+                                norm=True,
+                                **_truth_global_params,
+                            )
+                            _truth_nll = -float(_truth_model.log_likelihood(_priors))
+                            _truth_flux, _truth_cov = _truth_model()
+                            if hasattr(_truth_flux, 'detach'):
+                                _truth_flux = _truth_flux.detach().cpu().numpy()
+                            if hasattr(_truth_cov, 'detach'):
+                                _truth_cov = _truth_cov.detach().cpu().numpy()
+                            _mle_plot_payload["ground_truth"] = {
+                                "wavelength": np.asarray(_truth_model.data.wave, dtype=float).copy(),
+                                "flux": np.asarray(_truth_flux, dtype=float).copy(),
+                                "label": f"Ground Truth Emulator (NLL={_format_nll(_truth_nll)})",
+                                "color": "#009E73",
+                                "dash": [6, 3],
+                                "nll": _truth_nll,
+                            }
+                        except Exception as _gt_exc:
+                            _mle_plot_payload["ground_truth_error"] = str(_gt_exc)
+                    else:
+                        _mle_plot_payload["ground_truth_error"] = (
+                            "Missing truth values for: " + ", ".join(_missing_truth_keys)
+                        )
 
                 # 6b. Loss curve plot
                 if len(_nll_history) > 10:
@@ -2763,11 +2987,7 @@ def _(
                     _display_p = f"log10({_p})" if _p in log10_params else _p
                     _results_md += f"| **{_display_p}** | {fitted_val:.4f} | "
 
-                    # Resolve ground-truth key: inclination variants all map
-                    # to the single 'Inclination' entry in ground_truth_params.
-                    _gt_key = _p
-                    if 'Inclination' in _gt_key:
-                        _gt_key = 'Inclination'
+                    _gt_key = _truth_key_for(_p, emu.param_names[_i])
 
                     if ground_truth_params and _gt_key in ground_truth_params:
                         _gt_val = ground_truth_params[_gt_key]
@@ -2785,9 +3005,13 @@ def _(
                 if 'Av' in res_global:
                     _global_md += f"| **Av** | {res_global['Av']:.4f} |\n"
                 if 'log_scale' in res_global:
-                    _global_md += f"| **ln(scale)** | {res_global['log_scale']:.4f} |\n"
+                    from Speculate_addons.distance_scale import log_scale_to_distance_pc as _log_scale_to_distance_pc
+                    _distance_pc = _log_scale_to_distance_pc(res_global['log_scale'])
+                    _global_md += f"| **Distance (pc)** | {_distance_pc:.4f} |\n"
                 elif hasattr(_model, '_log_scale') and _model._log_scale is not None:
-                    _global_md += f"| **ln(scale) (auto)** | {_model._log_scale:.4f} |\n"
+                    from Speculate_addons.distance_scale import log_scale_to_distance_pc as _log_scale_to_distance_pc
+                    _distance_pc = _log_scale_to_distance_pc(_model._log_scale)
+                    _global_md += f"| **Distance (pc) (auto)** | {_distance_pc:.4f} |\n"
                 if 'cheb:1' in res_global:
                     _global_md += f"| **cheb₁** | {res_global['cheb:1']:.4f} |\n"
                 if 'global_cov:log_amp' in res_global:
@@ -2795,23 +3019,48 @@ def _(
                 if 'global_cov:log_ls' in res_global:
                     _global_md += f"| **ln(GP length)** | {res_global['global_cov:log_ls']:.4f} |\n"
 
-                # Keep the result view as a single stack so the fit summary, loss
-                # curve, and model figure stay coupled during reactive reruns.
-                _result_elements = [
-                    fit_status,
-                    mo.hstack([mo.md(_results_md), mo.md(_global_md)], align="start", gap="2rem"),
-                ]
-                if _fig_loss is not None:
-                    _result_elements.extend([
-                        mo.md("### Convergence"),
-                        _fig_loss
-                    ])
-                _result_elements.extend([
-                    mo.md("### Model Fit & Residuals"),
-                    _fig
-                ])
+                _restart_table_rows = None
+                if _restart_summaries:
+                    def _format_restart_value(_value):
+                        try:
+                            _value = float(_value)
+                        except Exception:
+                            return "-"
+                        if not np.isfinite(_value):
+                            return "inf"
+                        return f"{_value:.4f}"
 
-                fit_results = mo.vstack(_result_elements)
+                    _restart_columns = [
+                        f"Restart {_summary['restart']}"
+                        for _summary in _restart_summaries
+                    ]
+                    _restart_param_order = []
+                    for _summary in _restart_summaries:
+                        for _param_name in _summary["values"]:
+                            if _param_name not in _restart_param_order:
+                                _restart_param_order.append(_param_name)
+
+                    _nll_row = {"Parameter": "NLL"}
+                    for _column, _summary in zip(_restart_columns, _restart_summaries):
+                        _nll_row[_column] = _format_nll(_summary["nll"])
+                    _restart_table_rows = [_nll_row]
+
+                    for _param_name in _restart_param_order:
+                        _row = {"Parameter": _param_name}
+                        for _column, _summary in zip(_restart_columns, _restart_summaries):
+                            _row[_column] = _format_restart_value(
+                                _summary["values"].get(_param_name)
+                            )
+                        _restart_table_rows.append(_row)
+
+                set_mle_result({
+                    "fit_status": fit_status,
+                    "results_md": _results_md,
+                    "global_md": _global_md,
+                    "restart_table_rows": _restart_table_rows,
+                    "loss_fig": _fig_loss,
+                    "plot": _mle_plot_payload,
+                })
 
             except Exception as _e:
                 import traceback as _traceback
@@ -2820,8 +3069,97 @@ def _(
                 fit_results = fit_status
                 set_mle_model(None)
                 set_mle_priors(None)
+                set_mle_result({"error": True, "fit_status": fit_status})
 
-    fit_results if fit_results else mo.md("*Click 'Run MLE' to start inference*")
+    return
+
+
+@app.cell
+def _(
+    alt,
+    build_bestfit_spectrum_altair,
+    get_mle_result,
+    mle_show_ground_truth_spectrum,
+    mo,
+):
+    # Render the latest MLE result from stored arrays.  This keeps the
+    # validation overlay checkbox reactive without rerunning the optimizer.
+    _result = get_mle_result()
+    _mle_result_display = None
+    if _result is None:
+        _mle_result_display = mo.md("*Click 'Run MLE' to start inference*")
+    elif _result.get("error"):
+        _mle_result_display = _result["fit_status"]
+    else:
+        _plot = _result["plot"]
+        _gt_payload = _plot.get("ground_truth")
+        _show_gt = bool(_gt_payload) and bool(mle_show_ground_truth_spectrum.value)
+        _extra_series = [_gt_payload] if _show_gt else None
+
+        _fig = build_bestfit_spectrum_altair(
+            alt,
+            wavelength=_plot["wavelength"],
+            data_flux=_plot["data_flux"],
+            model_flux=_plot["model_flux"],
+            model_cov_diag=_plot["model_cov_diag"],
+            title=_plot["title"],
+            zoom_name=_plot["zoom_name"],
+            model_label=_plot["model_label"],
+            extra_flux_series=_extra_series,
+        )
+
+        _result_elements = [
+            _result["fit_status"],
+            mo.hstack([
+                mo.md(_result["results_md"]),
+                mo.md(_result["global_md"]),
+            ], align="start", gap="2rem"),
+        ]
+        if _result.get("restart_table_rows"):
+            _restart_rows = _result["restart_table_rows"]
+            _restart_columns = list(_restart_rows[0].keys()) if _restart_rows else []
+            _restart_align = {
+                _column: "left" if _column == "Parameter" else "right"
+                for _column in _restart_columns
+            }
+            _result_elements.append(
+                mo.accordion({
+                    f"{mo.icon('lucide:rotate-cw')} MLE Restart Best Fits": mo.ui.table(
+                        _restart_rows,
+                        selection=None,
+                        pagination=False,
+                        show_column_summaries=False,
+                        show_data_types=False,
+                        show_download=False,
+                        freeze_columns_left=["Parameter"],
+                        text_justify_columns=_restart_align,
+                        max_columns=None,
+                        page_size=len(_restart_rows),
+                    )
+                })
+            )
+        if _result.get("loss_fig") is not None:
+            _result_elements.extend([
+                mo.md("### Convergence"),
+                _result["loss_fig"],
+            ])
+        _result_elements.extend([
+            mo.md("### Model Fit & Residuals"),
+            _fig,
+        ])
+        if _gt_payload:
+            _result_elements.append(mle_show_ground_truth_spectrum)
+        elif _plot.get("ground_truth_error"):
+            _result_elements.append(
+                mo.callout(
+                    mo.md(f"Ground-truth emulator overlay unavailable: {_plot['ground_truth_error']}"),
+                    kind="warn",
+                )
+            )
+
+        _mle_result_display = mo.vstack(_result_elements)
+
+    _mle_result_display
     return
 
 
@@ -2866,7 +3204,7 @@ def _(emu, get_mle_model, mo, param_names, re):
             mcmc_label_map[_internal] = _friendly
         # Map global/nuisance params to friendly names
         mcmc_label_map['Av'] = 'Av'
-        mcmc_label_map['log_scale'] = 'log_scale'
+        mcmc_label_map['log_scale'] = 'Distance (pc)'
         mcmc_label_map['cheb:1'] = 'cheb_1'
         mcmc_label_map['global_cov:log_amp'] = 'GP log_amp'
         mcmc_label_map['global_cov:log_ls'] = 'GP log_ls'
@@ -2910,6 +3248,7 @@ def _(
     get_mle_model,
     get_mle_priors,
     ground_truth_params,
+    grid_selector,
     mcmc_burnin,
     mcmc_freeze,
     mcmc_label_map,
@@ -2980,6 +3319,7 @@ def _(
                 import matplotlib.pyplot as _plt
                 import matplotlib
                 import warnings as _warnings
+                from Speculate_addons.distance_scale import log_scale_to_distance_pc as _log_scale_to_distance_pc
                 matplotlib.rcParams['figure.max_open_warning'] = 50
                 _warnings.filterwarnings("ignore", module="arviz", message="More chains")
 
@@ -3056,12 +3396,26 @@ def _(
                 # _sampler.get_chain() shape: (nsteps, nwalkers, ndim)
                 _full_chain = _sampler.get_chain()
 
+                def _display_chain_values(_internal_label, _values):
+                    if _internal_label == 'log_scale':
+                        return _log_scale_to_distance_pc(_values)
+                    return _values
+
+                def _display_samples(_samples):
+                    _display = _samples.copy()
+                    for _idx, _label in enumerate(_model.labels):
+                        if _label == 'log_scale':
+                            _display[:, _idx] = _log_scale_to_distance_pc(_display[:, _idx])
+                    return _display
+
                 # Convert the raw emcee chain into ArviZ's (chains, draws) layout
                 # using friendly parameter names for all user-facing plots.
                 _friendly_labels = [_friendly(l) for l in _model.labels]
                 _full_dd = {}
-                for _i, _label in enumerate(_friendly_labels):
-                    _full_dd[_label] = _full_chain[:, :, _i].T  # (walkers, steps)
+                for _i, _internal_label in enumerate(_model.labels):
+                    _full_dd[_friendly(_internal_label)] = _display_chain_values(
+                        _internal_label, _full_chain[:, :, _i].T
+                    )  # (walkers, steps)
                 _full_data = _az.from_dict(posterior=_full_dd)
 
                 # Plot full chains (trace plot)
@@ -3100,6 +3454,7 @@ def _(
 
                 _burn_chain = _sampler.get_chain(discard=_burnin_used, thin=_thin_used)
                 _burn_samples = _burn_chain.reshape((-1, _ndim))
+                _burn_samples_display = _display_samples(_burn_samples)
 
                 _burnin_info = (
                     f"- **Manual burn-in requested:** {_burnin_manual}\n"
@@ -3117,8 +3472,10 @@ def _(
                 # Stage 17: Burnt chain trace, summary & posteriors
                 # ============================================================
                 _burn_dd = {}
-                for _i, _label in enumerate(_friendly_labels):
-                    _burn_dd[_label] = _burn_chain[:, :, _i].T  # (walkers, steps_after_burn)
+                for _i, _internal_label in enumerate(_model.labels):
+                    _burn_dd[_friendly(_internal_label)] = _display_chain_values(
+                        _internal_label, _burn_chain[:, :, _i].T
+                    )  # (walkers, steps_after_burn)
                 _burn_data = _az.from_dict(posterior=_burn_dd)
 
                 # Trace plot (post burn-in)
@@ -3133,7 +3490,7 @@ def _(
 
                 # Persist the post-burn samples and summary table so the export cells
                 # can write files without rerunning the sampler.
-                set_mcmc_samples(_burn_samples.copy())
+                set_mcmc_samples(_burn_samples_display.copy())
                 set_mcmc_labels(list(_friendly_labels))
                 set_mcmc_summary_df(_summary_df)
 
@@ -3155,15 +3512,28 @@ def _(
                 # Corner-plot truths are matched through the same friendly-name map
                 # used elsewhere, with all inclination variants collapsed onto the
                 # single lookup-table "Inclination" key.
+                from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map
+                _truth_label_map = {
+                    int(_idx): _label
+                    for _idx, (_label, _sirocco_key) in _benchmark_param_map(
+                        grid_selector.value if grid_selector is not None else None
+                    ).items()
+                }
+
+                def _truth_key_for(_display_name, _internal_label):
+                    if "Inclination" in _display_name:
+                        return "Inclination"
+                    _internal_text = str(_internal_label)
+                    if _internal_text.startswith("param") and _internal_text[5:].isdigit():
+                        return _truth_label_map.get(int(_internal_text[5:]), _display_name)
+                    return _display_name
+
                 _truths = None
                 if ground_truth_params:
                     _truths = []
                     _has_any = False
                     for _label in _model.labels:
-                        _gt_key = _friendly(_label)
-                        # Handle inclination variants → common key
-                        if 'Inclination' in _gt_key:
-                            _gt_key = 'Inclination'
+                        _gt_key = _truth_key_for(_friendly(_label), _label)
                         if _gt_key in ground_truth_params:
                             _truths.append(ground_truth_params[_gt_key])
                             _has_any = True
@@ -3173,14 +3543,18 @@ def _(
                         _truths = None
 
                 _fig_corner = _corner.corner(
-                    _burn_samples,
+                    _burn_samples_display,
                     labels=_friendly_labels,
                     show_titles=True,
                     quantiles=_corner_quantiles,
                     levels=_corner_levels,
                     title_fmt=".4f",
-                    truths=_truths
+                    truths=_truths,
+                    truth_color="#ff4444",
+                    truth_kwargs={"linewidth": 2},
                 )
+                for _ax in _fig_corner.axes:
+                    _ax.grid(False)
 
                 # Prior-range corner plot: axes span the full prior support so
                 # the user can judge posterior breadth relative to the prior.
@@ -3188,8 +3562,17 @@ def _(
                 for _label in _model.labels:
                     _pr = _priors.get(_label)
                     if _pr is not None and hasattr(_pr, 'interval'):
-                        _lo, _hi = _pr.interval(1.0)
-                        _prior_ranges.append((_lo, _hi))
+                        if getattr(getattr(_pr, 'dist', None), 'name', None) == 'norm':
+                            _lo = float(_pr.mean() - 4.0 * _pr.std())
+                            _hi = float(_pr.mean() + 4.0 * _pr.std())
+                        else:
+                            _lo, _hi = _pr.interval(1.0)
+                        if _label == 'log_scale':
+                            _d0 = _log_scale_to_distance_pc(_lo)
+                            _d1 = _log_scale_to_distance_pc(_hi)
+                            _prior_ranges.append((min(_d0, _d1), max(_d0, _d1)))
+                        else:
+                            _prior_ranges.append((_lo, _hi))
                     else:
                         _prior_ranges.append(None)
                 # Only build the second plot if we resolved at least one range
@@ -3197,15 +3580,19 @@ def _(
                     # Replace None entries with auto-range sentinel (corner uses 0.999 quantile)
                     _safe_ranges = [_r if _r is not None else (1.0,) for _r in _prior_ranges]
                     _fig_corner_prior = _corner.corner(
-                        _burn_samples,
+                        _burn_samples_display,
                         labels=_friendly_labels,
                         show_titles=True,
                         quantiles=_corner_quantiles,
                         levels=_corner_levels,
                         title_fmt=".4f",
                         truths=_truths,
+                        truth_color="#ff4444",
+                        truth_kwargs={"linewidth": 2},
                         range=_safe_ranges,
                     )
+                    for _ax in _fig_corner_prior.axes:
+                        _ax.grid(False)
                     _corner_display = mo.ui.tabs({
                         "Posterior (Auto Range)": _fig_corner,
                         "Full Prior Range": _fig_corner_prior,
@@ -3285,16 +3672,17 @@ def _(
 
                 for _i, _label in enumerate(_model.labels):
                     _display_name = _friendly(_label)
-                    _mean = np.mean(_burn_samples[:, _i])
-                    _std = np.std(_burn_samples[:, _i])
-                    _median = np.median(_burn_samples[:, _i])
+                    _display_vals = _display_chain_values(
+                        _label, _burn_samples[:, _i]
+                    )
+                    _mean = np.mean(_display_vals)
+                    _std = np.std(_display_vals)
+                    _median = np.median(_display_vals)
 
                     _results_md += f"| **{_display_name}** | {_mean:.4f} | {_std:.4f} | {_median:.4f} | "
 
                     if ground_truth_params:
-                        _gt_key = _display_name
-                        if 'Inclination' in _gt_key:
-                            _gt_key = 'Inclination'
+                        _gt_key = _truth_key_for(_display_name, _label)
                         if _gt_key in ground_truth_params:
                             _gt_val = ground_truth_params[_gt_key]
                             _delta_sigma = (_mean - _gt_val) / _std if _std > 0 else 0

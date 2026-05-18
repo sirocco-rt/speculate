@@ -13,7 +13,10 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-HF_MODEL_REPO_ID = "Sirocco-rt/speculate_cv_emulators"
+HF_MODEL_REPO_IDS = (
+    "Sirocco-rt/speculate_cv_emulators",
+    "Sirocco-rt/speculate_agn_emulators",
+)
 HF_MODEL_REPO_TYPE = "model"
 LOCAL_MODEL_DIR = "Grid-Emulator_Files"
 
@@ -66,11 +69,24 @@ def model_group(filename: str) -> str:
 
 
 def list_hf_model_files() -> list[str]:
-    """List supported Speculate model files in the public HF model repo."""
+    """List supported Speculate model files in configured HF model repos."""
     from huggingface_hub import list_repo_files
 
-    files = list_repo_files(repo_id=HF_MODEL_REPO_ID, repo_type=HF_MODEL_REPO_TYPE)
-    return sorted(filename for filename in files if is_supported_model(filename))
+    model_files: set[str] = set()
+    errors: list[str] = []
+    listed_any_repo = False
+    for repo_id in HF_MODEL_REPO_IDS:
+        try:
+            files = list_repo_files(repo_id=repo_id, repo_type=HF_MODEL_REPO_TYPE)
+        except Exception as exc:
+            errors.append(f"{repo_id}: {exc}")
+            continue
+        listed_any_repo = True
+        model_files.update(filename for filename in files if is_supported_model(filename))
+
+    if not listed_any_repo and errors:
+        raise RuntimeError("; ".join(errors))
+    return sorted(model_files)
 
 
 def list_local_model_files(destination_dir: str | Path = LOCAL_MODEL_DIR) -> list[str]:
@@ -115,11 +131,21 @@ def download_model_to_local(
             "error": None,
         }
 
-    cached_path = hf_hub_download(
-        repo_id=HF_MODEL_REPO_ID,
-        filename=filename,
-        repo_type=HF_MODEL_REPO_TYPE,
-    )
+    errors: list[str] = []
+    cached_path = None
+    for repo_id in HF_MODEL_REPO_IDS:
+        try:
+            cached_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                repo_type=HF_MODEL_REPO_TYPE,
+            )
+            break
+        except Exception as exc:
+            errors.append(f"{repo_id}: {exc}")
+    if cached_path is None:
+        raise RuntimeError("; ".join(errors))
+
     shutil.copy2(cached_path, destination)
     return {
         "filename": filename,
@@ -133,7 +159,7 @@ def ensure_quickfit_models_cached(
     destination_dir: str | Path = LOCAL_MODEL_DIR,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Ensure all public Quick Fit models are available in the local cache.
+    """Ensure configured Quick Fit models are available in the local cache.
 
     HF Space mode calls this before building Quick Fit model selectors, so the
     existing file-based ``np.load`` path can stay unchanged for local and hosted

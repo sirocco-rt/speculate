@@ -1,35 +1,226 @@
 import os
-import fnmatch
 import numpy as np
 from Starfish.grid_tools import GridInterface
-import sigfig
 from Speculate_addons.Spec_functions import fit_power_law_continuum        
+from Speculate_addons.grid_registry import (
+    default_parameter_value,
+    inclination_column as registry_inclination_column,
+    parameter_description_map,
+    parameter_points,
+)
+
+
+def _grid_index(grid_values, value):
+    """Return the unique index of ``value`` in one emulator grid axis."""
+    grid_values = np.asarray(grid_values)
+    matches = np.where(np.isclose(grid_values, value, rtol=1e-9, atol=1e-8))[0]
+    if len(matches) != 1:
+        raise ValueError(f"Parameter value {value} does not map uniquely to grid values {grid_values.tolist()}")
+    return int(matches[0])
+
+
+def _inclination_column_for_parameters(grid_name, model_parameters, parameters, usecols):
+    """Resolve the raw .spec flux column for a fixed or trainable inclination.
+
+    When inclination is part of ``model_parameters`` the actual angle arrives in
+    ``parameters`` and must be mapped through the registry.  When inclination is
+    fixed outside the emulator, the caller has already placed the correct flux
+    column in ``usecols``.  The Training Tool UI prevents multiple trainable
+    inclination axes, but direct API callers can still pass legacy defaults that
+    include more than one; in that case the lowest registered inclination axis is
+    used, matching the historical CV behavior.
+    """
+    descriptions = parameter_description_map(grid_name)
+    inclination_params = sorted(
+        param_id
+        for param_id, description in descriptions.items()
+        if "Inclination angle" in description and param_id in model_parameters
+    )
+
+    if inclination_params:
+        inclination_param_num = inclination_params[0]
+        inclination_param_index = list(model_parameters).index(inclination_param_num)
+        inclination_angle = parameters[inclination_param_index]
+        return registry_inclination_column(grid_name, inclination_angle)
+
+    return usecols[1]
+
+
+def _apply_flux_scale(wl_full, ind, flux, scale):
+    """Apply the training-time flux transform used by Speculate grids."""
+    if scale == 'log':
+        # Log training cannot accept zero or negative fluxes; floor only for the
+        # transform, leaving linear and continuum-normalised spectra unchanged.
+        flux = np.where(flux > 0, flux, 1e-30)
+        return np.log10(flux)
+    if scale == 'continuum-normalised':
+        # Continuum normalisation is computed only over the wavelength window
+        # used for training so the fitted continuum matches the output slice.
+        wl_sel = wl_full[:len(flux)][ind]
+        continuum, _ = fit_power_law_continuum(wl_sel, flux[ind])
+        flux[ind] = flux[ind] / np.where(continuum > 0, continuum, 1.0)
+    return flux
+
+
+def _maybe_smooth_flux(flux, smoothing):
+    """Apply the optional boxcar smoothing used by Training and Quick Fit."""
+    if not smoothing:
+        return flux
+    kernel = np.ones(5, dtype=np.float64)
+    return np.convolve(flux, kernel, mode='same') / np.convolve(np.ones_like(flux), kernel, mode='same')
+
+
+class Speculate_agn_grid_v1_3(GridInterface):
+    """
+    An Interface to the AGN v1.3 grid produced by Sirocco radiative transfer simulations.
+
+    Parameters 1-8 use the scaled Cartesian coordinates that define the grid;
+    parameters 9 and 10 expose sparse and full inclination axes respectively.
+    """
+
+    grid_name = 'speculate_agn_grid_v1.3'
+
+    def __init__(self, path, usecols, air=False, wl_range=(800,8000), model_parameters=(1,2,3,4,5,6,7,8,9,10), scale='linear', smoothing=False):
+        """Create an AGN grid reader for a selected parameter subset.
+
+        ``model_parameters`` may omit file-defining axes for lower-dimensional
+        emulators.  Missing physical axes are filled from registry defaults in
+        ``get_flux()``, while omitted inclination axes are handled by the fixed
+        flux column stored in ``usecols``.
+        """
+        self.model_parameters = model_parameters
+        self.scale = scale
+        self.smoothing = smoothing
+        self.usecols = usecols
+        self._skiprows_cache = {}
+
+        # Starfish expects the emulator-space points for exactly the exposed
+        # parameters.  The registry provides those points for both physical axes
+        # and inclination axes.
+        points = [parameter_points(self.grid_name, param_num) for param_num in model_parameters]
+        param_names = ["param{}".format(number) for number in model_parameters]
+
+        if self.scale == 'log':
+            flux_units = 'log(erg/s/cm^2/AA)'
+        else:
+            flux_units = 'erg/s/cm^2/AA'
+
+        super().__init__(
+            name=self.grid_name,
+            param_names=param_names,
+            points=points,
+            wave_units='AA',
+            flux_units=flux_units,
+            air=air,
+            wl_range=wl_range,
+            path=path,
+        )
+
+        try:
+            # Use run0 only to establish the wavelength array and wavelength
+            # mask.  Individual spectra are loaded later by load_flux().
+            wls_fname = os.path.join(self.path, 'run0.spec')
+            skiprows = self._get_skiprows(wls_fname)
+            wls = np.loadtxt(wls_fname, usecols=self.usecols[0], skiprows=skiprows, unpack=True)
+            wls = np.flip(wls)
+        except Exception as exc:
+            raise ValueError("Wavelength file improperly specified") from exc
+
+        self.wl_full = np.array(wls, dtype=np.float64)
+        self.ind = (self.wl_full >= self.wl_range[0]) & (
+            self.wl_full <= self.wl_range[1])
+        self.wl = self.wl_full[self.ind]
+
+    def get_flux(self, params):
+        """Return the AGN ``runN.spec`` path for emulator-space parameters.
+
+        The AGN file index is determined only by parameters 1-8.  Inclination is
+        a flux column inside the selected file, not part of the run number.
+        """
+        file_params = []
+        param_index = 0
+
+        for param_num in range(1, 9):
+            if param_num in self.model_parameters:
+                # Consume supplied emulator coordinates in model-parameter order.
+                file_params.append(params[param_index])
+                param_index += 1
+            else:
+                # Lower-dimensional emulators fix omitted file axes at the
+                # registry default (middle value, or high value for two-point axes).
+                file_params.append(default_parameter_value(self.grid_name, param_num))
+
+        # The run files are ordered as a row-major Cartesian product of physical
+        # axes 1-8.  Reconstruct the same mixed-radix index from the grid points.
+        grids = [parameter_points(self.grid_name, param_num) for param_num in range(1, 9)]
+        run_index = 0
+        for grid_values, value in zip(grids, file_params):
+            value_index = _grid_index(grid_values, value)
+            run_index = run_index * len(grid_values) + value_index
+
+        return os.path.join(self.path, f'run{run_index}.spec')
+
+    def parameters_description(self):
+        """Return human-readable labels for the selected AGN parameters."""
+        dictionary = parameter_description_map(self.grid_name)
+        return {
+            "param{}".format(i): dictionary[i]
+            for i in self.model_parameters
+        }
+
+    def _get_skiprows(self, filepath):
+        """Find and cache the first numeric row in an AGN .spec file."""
+        if filepath in self._skiprows_cache:
+            return self._skiprows_cache[filepath]
+        with open(filepath, 'r') as f:
+            for i, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('#'):
+                    continue
+                if line.startswith('Freq.'):
+                    continue
+                self._skiprows_cache[filepath] = i
+                return i
+        self._skiprows_cache[filepath] = 0
+        return 0
+
+    def load_flux(self, parameters, header=False, norm=False):
+        """Load one AGN spectrum for the requested parameters and inclination."""
+        file_path = self.get_flux(parameters)
+        inclination_column = _inclination_column_for_parameters(
+            self.grid_name, self.model_parameters, parameters, self.usecols
+        )
+
+        # All AGN .spec files share the same wavelength column convention:
+        # column 1 is Lambda, and columns 2+ are inclination fluxes.
+        skiprows = self._get_skiprows(file_path)
+        _wl, flux = np.loadtxt(file_path, usecols=(self.usecols[0], inclination_column), skiprows=skiprows, unpack=True)
+        flux = np.flip(flux)
+        flux = flux[:len(self.wl_full)]
+        flux = _maybe_smooth_flux(flux, self.smoothing)
+        flux = _apply_flux_scale(self.wl_full, self.ind, flux, self.scale)
+
+        hdr = {'inclination_column': inclination_column}
+        for i in range(len(self.param_names)):
+            hdr[self.param_names[i]] = parameters[i]
+
+        if(header):
+            return flux[self.ind], hdr
+        else:
+            return flux[self.ind]
         
 class Speculate_cv_bl_grid_v87f(GridInterface):
+    """Interface to the CV boundary-layer grid produced by Sirocco/PYTHON v87f.
+
+    The registry entry named by ``grid_name`` owns the parameter descriptions,
+    emulator-space grid points, default fixed axes, and inclination column map.
+    Parameters 1-8 determine the ``runN.spec`` file; parameters 9-11 select
+    sparse/mid/full inclination columns inside that file.
     """
-    An Interface to the CV BL grid produced by PYTHON v87f Radiative transfer simulations.
-    
-    The wavelengths in the spectra are in Angstrom and fluxes in erg/s/cm^2/Å
-    
-    Parameters of model
-    -------------------
-    1) Disk.mdot (msol/yr)
-    2) wind.mdot (Disk.mdot)
-    3) KWD.d (in_units_of_Rstar)
-    4) KWD.mdot_r_exponent
-    5) KWD.acceleration_length (cm)
-    6) KWD.acceleration_exponent
-    7) Boundary_layer.luminosity(ergs/s) = L_Disk * param_points_7, L_Disk = G * M_star * M_dotdisk / 2R_star
-    8) Boundary_layer.temp(K) = BL_Luminosity / (Stefan boltzmann law* 4•pi•R_wd^2 * H/R_wd)
-    9) Inclination angle - sparse (30, 55, 80 degrees)
-    10) Inclination angle - mid (30-80 degrees, 10° steps)
-    11) Inclination angle - full (30-85 degrees, 5° steps)
-    
-    Optional parameters
-    -------------------
-    Angle of Inclination - Amend value in function 'def load_flux' default's value
-    
-    """
+
+    grid_name = 'speculate_cv_bl_grid_v87f'
         
     def __init__(self, path, usecols, air=False, wl_range=(800,8000), model_parameters=(1,2,3,4,5,6,7,8,9,10,11), scale='linear', smoothing=False):
         """
@@ -51,49 +242,14 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
                 Default is False.
         """
         
-        # The grid points in the parameter space are defined, 
-        # param_points_1-3 correspond to the model parameters defined at the top in the respective order.
+        # The registry defines the emulator-space points for each selected axis.
         self.model_parameters = model_parameters
         self.scale = scale # Flux space scale 
         self.smoothing = smoothing # Gaussian smoothing toggle
         self.usecols = usecols # Wavelength and inclination tuple
         self._skiprows_cache = {}
         # self.skiprows = skiprows # Deprecated: calculated dynamically
-        points = []
-        if 1 in model_parameters:
-            param_points_1 = np.log10(np.array([3e-09, 1e-08, 3e-08]))
-            points.append(param_points_1)
-        if 2 in model_parameters:
-            param_points_2 = np.array([0.03, 0.1, 0.3])
-            points.append(param_points_2)
-        if 3 in model_parameters:
-            param_points_3 = np.log10(np.array([0.55, 5.5, 55.0]))
-            points.append(param_points_3)
-        if 4 in model_parameters:
-            param_points_4 = np.array([0.0, 0.25, 1.0])
-            points.append(param_points_4)
-        if 5 in model_parameters:
-            param_points_5 = np.log10(np.array([7.25182e+08, 7.25182e+09, 7.25182e+10]))
-            points.append(param_points_5)
-        if 6 in model_parameters:
-            param_points_6 = np.array([0.5, 1.5, 4.5])
-            points.append(param_points_6)
-        if 7 in model_parameters:
-            param_points_7 = np.array([0.0, 0.3, 1.0])
-            points.append(param_points_7)
-        if 8 in model_parameters:
-            param_points_8 = np.array([0.1, 0.3, 1.0])
-            points.append(param_points_8)
-        if 9 in model_parameters:
-            param_points_9 = np.array([30, 55, 80])  # Inclination angles in degrees (sparse)
-            points.append(param_points_9)
-        if 10 in model_parameters:
-            param_points_10 = np.array([30, 40, 50, 60, 70, 80])  # Every 10 degrees (30-80°)
-            points.append(param_points_10)
-        if 11 in model_parameters:
-            param_points_11 = np.array([30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85])  # Every 5 degrees (30-85°)
-            points.append(param_points_11)
-            
+        points = [parameter_points(self.grid_name, param_num) for param_num in model_parameters]
         param_names = ["param{}".format(number) for number in model_parameters] # formatting the parameter names
 
         # Inititalising the GridInterface with the KWD parameters.
@@ -103,7 +259,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             flux_units = 'erg/s/cm^2/AA'
             
         super().__init__(
-            name='speculate_cv_bl_grid_v87f',
+            name=self.grid_name,
             param_names=param_names,
             points=points,
             wave_units='AA',
@@ -119,8 +275,8 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             skiprows = self._get_skiprows(wls_fname)
             wls = np.loadtxt(wls_fname, usecols=self.usecols[0], skiprows=skiprows, unpack=True)
             wls = np.flip(wls)
-        except:
-            raise ValueError("Wavelength file improperly specified")
+        except Exception as exc:
+            raise ValueError("Wavelength file improperly specified") from exc
         
         # Truncating to the wavelength range to the provided values.
         self.wl_full = np.array(wls, dtype=np.float64) #wls[::-1]
@@ -140,23 +296,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             str: The path of the datafile corresponding to the input model parameters.
         """
         
-        # Parameter definitions for both file lookup (1-8) and full space (1-10)
-        param1_name = np.log10([3e-9, 1e-08, 3e-08]) # Disk.mdot
-        param2_name = [0.03, 0.1, 0.3] # wind.mdot (Disk.mdot)
-        param3_name = np.log10([0.55, 5.5, 55.0]) # KWD.d
-        param4_name = [0.0, 0.25, 1.0] # KWD.mdot_r_exponent
-        param5_name = np.log10([7.25182e+08, 7.25182e+09, 7.25182e+10]) # KWD.acceleration_length (cm)
-        param6_name = [0.5, 1.5, 4.5] # KWD.acceleration_exponent
-        param7_name = [0.0, 0.3, 1.0] # Boundary_layer.luminosity(ergs/s)
-        param8_name = [0.1, 0.3, 1.0] # Boundary_layer.temp(K)
-        param9_name = [30, 55, 80] # Inclination angle (degrees) - sparse
-        param10_name = [30, 40, 50, 60, 70, 80] # Inclination angle (degrees) - mid
-        param11_name = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85] # Inclination angle (degrees) - full (5° steps)
-        
-        # For file lookup: only parameters 1-8 (determines filename)
-        fixed_params = [param1_name[1], param2_name[1], param3_name[1], param4_name[1], param5_name[1], param6_name[1], param7_name[1], param8_name[1]]
-        
-        # Build the 8-parameter array for file lookup (excluding parameters 9 and 10)
+        # Build the 8-parameter array for file lookup (excluding inclination parameters).
         file_params = []
         param_index = 0
         
@@ -165,24 +305,17 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
                 file_params.append(params[param_index])
                 param_index += 1
             else:
-                # Use fixed middle value for missing parameters 1-8
-                file_params.append(fixed_params[param_num - 1])
-        
-        def _grid_index(grid_values, value):
-            grid_values = np.asarray(grid_values)
-            matches = np.where(np.isclose(grid_values, value, rtol=1e-9, atol=1e-8))[0]
-            if len(matches) != 1:
-                raise ValueError(f"Parameter value {value} does not map uniquely to grid values {grid_values.tolist()}")
-            return int(matches[0])
+                # Use the registry default value for omitted file-defining axes.
+                file_params.append(default_parameter_value(self.grid_name, param_num))
 
-        grids = [param1_name, param2_name, param3_name, param4_name, param5_name, param6_name, param7_name, param8_name]
+        grids = [parameter_points(self.grid_name, param_num) for param_num in range(1, 9)]
         run_index = 0
         for grid_values, value in zip(grids, file_params):
             value_index = _grid_index(grid_values, value)
             run_index = run_index * len(grid_values) + value_index
         file_name = f'run{run_index}.spec'
         
-        return self.path + file_name # returning the correct filename/path
+        return os.path.join(self.path, file_name) # returning the correct filename/path
 
     def parameters_description(self):
         """Provides a description of the model parameters used.
@@ -190,23 +323,11 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         Returns:
             dictionary: Description of the 'paramX' names
         """
-        dictionary = {
-            1:"Disk.mdot (msol/yr)",
-            2:"Wind.mdot (Disk.mdot)",
-            3:"KWD.d (in_units_of_Rstar)",
-            4:"KWD.mdot_r_exponent",
-            5:"KWD.acceleration_length (cm)",
-            6:"KWD.acceleration_exponent",
-            7:"Boundary_layer.luminosity(ergs /s)",
-            8:"Boundary_layer.temp(K)",
-            9:"Inclination angle - sparse (30, 55, 80 degrees)",
-            10:"Inclination angle - mid (30, 40, 50, 60, 70, 80 degrees)",
-            11:"Inclination angle - full (30-85 degrees, 5° steps)"
-            } # Description of the paramters
-        parameters_used = {}
-        for i in self.model_parameters:
-            parameters_used["param{}".format(i)] = dictionary[i]
-        return parameters_used
+        dictionary = parameter_description_map(self.grid_name)
+        return {
+            "param{}".format(i): dictionary[i]
+            for i in self.model_parameters
+        }
         
     def _get_skiprows(self, filepath):
         """
@@ -250,42 +371,25 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
         
         file_path = self.get_flux(parameters)
         
-        # Determine which column to use for inclination
-        # Check for any inclination parameter (9, 10, or 11)
-        inclination_params = [p for p in [9, 10, 11] if p in self.model_parameters]
+        inclination_column = _inclination_column_for_parameters(
+            self.grid_name, self.model_parameters, parameters, self.usecols
+        )
         
-        if inclination_params:
-            # Get the first inclination parameter found
-            inclination_param_num = inclination_params[0]
-            inclination_param_index = list(self.model_parameters).index(inclination_param_num)
-            inclination_angle = parameters[inclination_param_index]
-            
-            # Map inclination angle to column index (30°->2, 35°->3, ..., 85°->13)
-            inclination_column = int(2 + (inclination_angle - 30) / 5)
-        else:
-            # Use the default column from usecols if no inclination parameter in model_parameters
-            inclination_column = self.usecols[1]
-        
-        # Load flux using wavelength (column 0) and calculated inclination column
+        # Load flux using the configured wavelength column and calculated
+        # inclination column.  The wavelength array is already cached from run0;
+        # this read keeps loadtxt's two-column shape consistent across grids.
         # Optimized: Pre-scan for header length to avoid line-by-line comment checking in loadtxt
         skiprows = self._get_skiprows(file_path)
-        wl, flux = np.loadtxt(file_path, usecols=(0, inclination_column), skiprows=skiprows, unpack=True)
+        _wl, flux = np.loadtxt(file_path, usecols=(self.usecols[0], inclination_column), skiprows=skiprows, unpack=True)
         flux = np.flip(flux)
-        
+
         flux = flux[:len(self.wl_full)] # THIS CUT IS NEEDED, Random parameters appear in the grid space header leading to mismatching file lengths.
-        if self.smoothing:
-            kernel = np.ones(5, dtype=np.float64)
-            flux = np.convolve(flux, kernel, mode='same') / np.convolve(np.ones_like(flux), kernel, mode='same')
-        if self.scale == 'log':
-            flux = np.where(flux > 0, flux, 1e-30)  # Floor non-positive values to avoid log10(0) = -inf
-            flux = np.log10(flux) # logged 10 
-        if self.scale == 'continuum-normalised':
-            wl_sel = self.wl_full[:len(flux)][self.ind]
-            continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])
-            flux[self.ind] = flux[self.ind] / np.where(continuum > 0, continuum, 1.0)
-        
-        # TODO: Implement header if doing to use
-        hdr = {'inclination_column': inclination_column} # Header constructed 
+        flux = _maybe_smooth_flux(flux, self.smoothing)
+        flux = _apply_flux_scale(self.wl_full, self.ind, flux, self.scale)
+
+        # Header mirrors the selected emulator coordinates plus the raw .spec
+        # flux column used for this spectrum.
+        hdr = {'inclination_column': inclination_column}
         for i in range(len(self.param_names)):
             hdr[self.param_names[i]] = parameters[i]
 
@@ -295,28 +399,15 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             return flux[self.ind]
 
 class Speculate_cv_no_bl_grid_v87f(GridInterface):
+    """Interface to the CV no-boundary-layer grid produced by Sirocco/PYTHON v87f.
+
+    The registry entry named by ``grid_name`` owns the parameter descriptions,
+    emulator-space grid points, default fixed axes, and inclination column map.
+    Parameters 1-6 determine the ``runN.spec`` file; parameters 9-11 select
+    sparse/mid/full inclination columns inside that file.
     """
-    An Interface to the CV NO-BL grid produced by PYTHON v87f Radiative transfer simulations.
-    
-    The wavelengths in the spectra are in Angstrom and fluxes in erg/s/cm^2/AA
-    
-    Parameters of model
-    -------------------
-    1) Disk.mdot (msol/yr)
-    2) wind.mdot (Disk.mdot)
-    3) KWD.d (in_units_of_Rstar)
-    4) KWD.mdot_r_exponent
-    5) KWD.acceleration_length (cm)
-    6) KWD.acceleration_exponent
-    9) Inclination angle - sparse (30, 55, 80 degrees)
-    10) Inclination angle - mid (30-80 degrees, 10° steps)
-    11) Inclination angle - full (30-85 degrees, 5° steps)
-    
-    Optional parameters
-    -------------------
-    Angle of Inclination - Amend value in function 'def load_flux' default's value
-    
-    """
+
+    grid_name = 'speculate_cv_no-bl_grid_v87f'
         
     def __init__(self, path, usecols, air=False, wl_range=(800,8000), model_parameters=(1,2,3,4,5,6,9,10,11), scale='linear', smoothing=False):
         """
@@ -338,43 +429,14 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
                 Default is False.
         """
         
-        # The grid points in the parameter space are defined, 
-        # param_points_1-3 correspond to the model parameters defined at the top in the respective order.
+        # The registry defines the emulator-space points for each selected axis.
         self.model_parameters = model_parameters
         self.scale = scale # Flux space scale 
         self.smoothing = smoothing # Gaussian smoothing toggle
         self.usecols = usecols # Wavelength and inclination tuple
         self._skiprows_cache = {}
         # self.skiprows = skiprows # Deprecated: calculated dynamically
-        points = []
-        if 1 in model_parameters:
-            param_points_1 = np.log10(np.array([3e-09, 1e-08, 3e-08]))
-            points.append(param_points_1)
-        if 2 in model_parameters:
-            param_points_2 = np.array([0.03, 0.1, 0.3])
-            points.append(param_points_2)
-        if 3 in model_parameters:
-            param_points_3 = np.log10(np.array([0.55, 5.5, 55.0]))
-            points.append(param_points_3)
-        if 4 in model_parameters:
-            param_points_4 = np.array([0.0, 0.25, 1.0])
-            points.append(param_points_4)
-        if 5 in model_parameters:
-            param_points_5 = np.log10(np.array([7.25182e+08, 7.25182e+09, 7.25182e+10]))
-            points.append(param_points_5)
-        if 6 in model_parameters:
-            param_points_6 = np.array([0.5, 1.5, 4.5])
-            points.append(param_points_6)
-        if 9 in model_parameters:
-            param_points_9 = np.array([30, 55, 80])  # Inclination angles in degrees (sparse)
-            points.append(param_points_9)
-        if 10 in model_parameters:
-            param_points_10 = np.array([30, 40, 50, 60, 70, 80])  # Every 10 degrees (30-80°)
-            points.append(param_points_10)
-        if 11 in model_parameters:
-            param_points_11 = np.array([30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85])  # Every 5 degrees (30-85°)
-            points.append(param_points_11)
-            
+        points = [parameter_points(self.grid_name, param_num) for param_num in model_parameters]
         param_names = ["param{}".format(number) for number in model_parameters] # formatting the parameter names
 
         # Inititalising the GridInterface with the KWD parameters.
@@ -384,7 +446,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             flux_units = 'erg/s/cm^2/AA'
             
         super().__init__(
-            name='speculate_cv_no-bl_grid_v87f',
+            name=self.grid_name,
             param_names=param_names,
             points=points,
             wave_units='AA',
@@ -400,8 +462,8 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             skiprows = self._get_skiprows(wls_fname)
             wls = np.loadtxt(wls_fname, usecols=self.usecols[0], skiprows=skiprows, unpack=True)
             wls = np.flip(wls)
-        except:
-            raise ValueError("Wavelength file improperly specified")
+        except Exception as exc:
+            raise ValueError("Wavelength file improperly specified") from exc
         
         # Truncating to the wavelength range to the provided values.
         self.wl_full = np.array(wls, dtype=np.float64) #wls[::-1]
@@ -421,21 +483,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             str: The path of the datafile corresponding to the input model parameters.
         """
         
-        # Parameter definitions for both file lookup (1-8) and full space (1-10)
-        param1_name = np.log10([3e-9, 1e-08, 3e-08]) # Disk.mdot
-        param2_name = [0.03, 0.1, 0.3] # wind.mdot (Disk.mdot)
-        param3_name = np.log10([0.55, 5.5, 55.0]) # KWD.d
-        param4_name = [0.0, 0.25, 1.0] # KWD.mdot_r_exponent
-        param5_name = np.log10([7.25182e+08, 7.25182e+09, 7.25182e+10]) # KWD.acceleration_length (cm)
-        param6_name = [0.5, 1.5, 4.5] # KWD.acceleration_exponent
-        param9_name = [30, 55, 80] # Inclination angle (degrees) - sparse
-        param10_name = [30, 40, 50, 60, 70, 80] # Inclination angle (degrees) - mid
-        param11_name = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85] # Inclination angle (degrees) - full (5° steps)
-        
-        # For file lookup: only parameters 1-6 (determines filename)
-        fixed_params = [param1_name[1], param2_name[1], param3_name[1], param4_name[1], param5_name[1], param6_name[1]]
-        
-        # Build the 8-parameter array for file lookup (excluding parameters 9 and 10)
+        # Build the 6-parameter array for file lookup (excluding inclination parameters).
         file_params = []
         param_index = 0
         
@@ -444,17 +492,10 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
                 file_params.append(params[param_index])
                 param_index += 1
             else:
-                # Use fixed middle value for missing parameters 1-6
-                file_params.append(fixed_params[param_num - 1])
-        
-        def _grid_index(grid_values, value):
-            grid_values = np.asarray(grid_values)
-            matches = np.where(np.isclose(grid_values, value, rtol=1e-9, atol=1e-8))[0]
-            if len(matches) != 1:
-                raise ValueError(f"Parameter value {value} does not map uniquely to grid values {grid_values.tolist()}")
-            return int(matches[0])
+                # Use the registry default value for omitted file-defining axes.
+                file_params.append(default_parameter_value(self.grid_name, param_num))
 
-        grids = [param1_name, param2_name, param3_name, param4_name, param5_name, param6_name]
+        grids = [parameter_points(self.grid_name, param_num) for param_num in range(1, 7)]
         run_index = 0
         for grid_values, value in zip(grids, file_params):
             value_index = _grid_index(grid_values, value)
@@ -462,7 +503,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         file_name = f'run{run_index}.spec'
     
         
-        return self.path + file_name # returning the correct filename/path
+        return os.path.join(self.path, file_name) # returning the correct filename/path
 
     def parameters_description(self):
         """Provides a description of the model parameters used.
@@ -470,21 +511,11 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         Returns:
             dictionary: Description of the 'paramX' names
         """
-        dictionary = {
-            1:"Disk.mdot (msol/yr)",
-            2:"Wind.mdot (Disk.mdot)",
-            3:"KWD.d (in_units_of_Rstar)",
-            4:"KWD.mdot_r_exponent",
-            5:"KWD.acceleration_length (cm)",
-            6:"KWD.acceleration_exponent",
-            9:"Inclination angle - sparse (30, 55, 80 degrees)",
-            10:"Inclination angle - mid (30, 40, 50, 60, 70, 80 degrees)",
-            11:"Inclination angle - full (30-85 degrees, 5° steps)"
-            } # Description of the paramters
-        parameters_used = {}
-        for i in self.model_parameters:
-            parameters_used["param{}".format(i)] = dictionary[i]
-        return parameters_used
+        dictionary = parameter_description_map(self.grid_name)
+        return {
+            "param{}".format(i): dictionary[i]
+            for i in self.model_parameters
+        }
         
     def _get_skiprows(self, filepath):
         """
@@ -528,42 +559,25 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
         
         file_path = self.get_flux(parameters)
         
-        # Determine which column to use for inclination
-        # Check for any inclination parameter (9, 10, or 11)
-        inclination_params = [p for p in [9, 10, 11] if p in self.model_parameters]
+        inclination_column = _inclination_column_for_parameters(
+            self.grid_name, self.model_parameters, parameters, self.usecols
+        )
         
-        if inclination_params:
-            # Get the first inclination parameter found
-            inclination_param_num = inclination_params[0]
-            inclination_param_index = list(self.model_parameters).index(inclination_param_num)
-            inclination_angle = parameters[inclination_param_index]
-            
-            # Map inclination angle to column index (30°->2, 35°->3, ..., 85°->13)
-            inclination_column = int(2 + (inclination_angle - 30) / 5)
-        else:
-            # Use the default column from usecols if no inclination parameter in model_parameters
-            inclination_column = self.usecols[1]
-        
-        # Load flux using wavelength (column 0) and calculated inclination column
+        # Load flux using the configured wavelength column and calculated
+        # inclination column.  The wavelength array is already cached from run0;
+        # this read keeps loadtxt's two-column shape consistent across grids.
         # Optimized: Pre-scan for header length to avoid line-by-line comment checking in loadtxt
         skiprows = self._get_skiprows(file_path)
-        wl, flux = np.loadtxt(file_path, usecols=(0, inclination_column), skiprows=skiprows, unpack=True)
+        _wl, flux = np.loadtxt(file_path, usecols=(self.usecols[0], inclination_column), skiprows=skiprows, unpack=True)
         flux = np.flip(flux)
-        
+
         flux = flux[:len(self.wl_full)] # THIS CUT IS NEEDED, Random parameters appear in the grid space header leading to mismatching file lengths.
-        if self.smoothing:
-            kernel = np.ones(5, dtype=np.float64)
-            flux = np.convolve(flux, kernel, mode='same') / np.convolve(np.ones_like(flux), kernel, mode='same')
-        if self.scale == 'log':
-            flux = np.where(flux > 0, flux, 1e-30)  # Floor non-positive values to avoid log10(0) = -inf
-            flux = np.log10(flux) # logged 10 
-        if self.scale == 'continuum-normalised':
-            wl_sel = self.wl_full[:len(flux)][self.ind]
-            continuum, _ = fit_power_law_continuum(wl_sel, flux[self.ind])
-            flux[self.ind] = flux[self.ind] / np.where(continuum > 0, continuum, 1.0)
-        
-        # TODO: Implement header if doing to use
-        hdr = {'inclination_column': inclination_column} # Header constructed 
+        flux = _maybe_smooth_flux(flux, self.smoothing)
+        flux = _apply_flux_scale(self.wl_full, self.ind, flux, self.scale)
+
+        # Header mirrors the selected emulator coordinates plus the raw .spec
+        # flux column used for this spectrum.
+        hdr = {'inclination_column': inclination_column}
         for i in range(len(self.param_names)):
             hdr[self.param_names[i]] = parameters[i]
 

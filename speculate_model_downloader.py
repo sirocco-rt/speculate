@@ -148,7 +148,7 @@ def _():
 
     from huggingface_hub import list_datasets, list_repo_files, hf_hub_download
     from Speculate_addons.hf_model_registry import (
-        HF_MODEL_REPO_ID,
+        HF_MODEL_REPO_IDS,
         download_model_to_local,
         is_gp_model,
         is_quickfit_model,
@@ -165,7 +165,7 @@ def _():
     ORG_ID = "Sirocco-rt"
     REPO_TYPE = "dataset"
     return (
-        HF_MODEL_REPO_ID,
+        HF_MODEL_REPO_IDS,
         ORG_ID,
         REPO_TYPE,
         download_model_to_local,
@@ -514,6 +514,7 @@ def _(
     # Execute the chosen workflow: download only, download+extract, or extract
     # already-cached files from the local HuggingFace cache.
     download_results = []
+    _workflow_status = mo.md("")
 
     if (download_only_button.value or download_and_decompress_button.value) and files_to_download:
         extraction_dir = f"sirocco_grids/{dataset_dropdown.value}/"
@@ -568,9 +569,9 @@ def _(
                             mo.output.append(mo.md(f"{mo.icon('lucide:x-circle')} Failed to decompress `{filename}`: {e}"))
                     bar.update()
 
-            mo.md(f"### {mo.icon('lucide:check-circle')} Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
+            _workflow_status = mo.md(f"### {mo.icon('lucide:check-circle')} Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
         else:
-            mo.md(f"### {mo.icon('lucide:check-circle')} Download complete!\n\nFiles cached by HuggingFace (use 'Decompress' to extract)")
+            _workflow_status = mo.md(f"### {mo.icon('lucide:check-circle')} Download complete!\n\nFiles cached by HuggingFace (use 'Decompress' to extract)")
 
     elif decompress_only_button.value and files_to_download:
         # Rehydrate raw .spec files from archives that should already exist in the
@@ -615,7 +616,8 @@ def _(
                     mo.output.append(mo.md(f"{mo.icon('lucide:x-circle')} Failed to decompress `{filename}`: {e}"))
                 bar.update()
 
-        mo.md(f"### {mo.icon('lucide:check-circle')} Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
+        _workflow_status = mo.md(f"### {mo.icon('lucide:check-circle')} Complete!\n\nFiles saved to: `{os.path.abspath(extraction_dir)}`")
+    _workflow_status
     return
 
 
@@ -633,7 +635,7 @@ def _(mo):
 
 @app.cell
 def _(
-    HF_MODEL_REPO_ID,
+    HF_MODEL_REPO_IDS,
     is_gp_model,
     is_quickfit_model,
     list_hf_model_files,
@@ -645,12 +647,14 @@ def _(
         _n_gp = sum(1 for _f in hf_model_files if is_gp_model(_f))
         _n_qf = sum(1 for _f in hf_model_files if is_quickfit_model(_f))
         if hf_model_files:
+            _repo_text = ", ".join(f"`{_repo}`" for _repo in HF_MODEL_REPO_IDS)
             model_repo_status = mo.md(
                 f"{mo.icon('lucide:check-circle')} Found **{len(hf_model_files)}** models "
-                f"in `{HF_MODEL_REPO_ID}` (**{_n_gp}** GP, **{_n_qf}** Quick Fit)"
+                f"across {_repo_text} (**{_n_gp}** GP, **{_n_qf}** Quick Fit)"
             )
         else:
-            model_repo_status = mo.md(f"{mo.icon('lucide:triangle-alert')} No supported `.npz` models found in `{HF_MODEL_REPO_ID}`")
+            _repo_text = ", ".join(f"`{_repo}`" for _repo in HF_MODEL_REPO_IDS)
+            model_repo_status = mo.md(f"{mo.icon('lucide:triangle-alert')} No supported `.npz` models found in {_repo_text}")
     except Exception as e:
         hf_model_files = []
         model_repo_status = mo.md(f"{mo.icon('lucide:x-circle')} Error fetching model list: {e}")
@@ -745,6 +749,7 @@ def _(
     models_to_download,
     os,
 ):
+    _download_status = mo.md("")
     if model_download_button.value and models_to_download:
         _downloaded = []
         _skipped = []
@@ -771,7 +776,8 @@ def _(
             f"- Failed: **{len(_failed)}**",
             f"- Location: `{os.path.abspath('Grid-Emulator_Files')}`",
         ]
-        mo.md("\n".join(_lines))
+        _download_status = mo.md("\n".join(_lines))
+    _download_status
     return
 
 
