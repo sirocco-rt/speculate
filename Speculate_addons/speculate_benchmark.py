@@ -2524,13 +2524,34 @@ def run_tier3_single(
             "flux": sirocco_flux_plot,
             "label": sirocco_transform_label,
         }
-
         _bf_wl = np.asarray(bestfit_spec.get("wavelength", []), dtype=np.float64)
         _bf_data = np.asarray(bestfit_spec.get("data_flux", []), dtype=np.float64)
         _bf_model = np.asarray(bestfit_spec.get("model_flux", []), dtype=np.float64)
         _model_sigma = np.asarray(model.data.sigma, dtype=np.float64)
+        sirocco_interp_plot = np.asarray([], dtype=np.float64)
+        if len(_bf_wl) and len(sirocco_wl) and len(sirocco_flux_plot):
+            _overlap = (_bf_wl >= np.min(sirocco_wl)) & (_bf_wl <= np.max(sirocco_wl))
+            if np.any(_overlap):
+                _sirocco_plot_wl = _bf_wl[_overlap]
+                sirocco_interp_plot = np.interp(
+                    _sirocco_plot_wl,
+                    sirocco_wl,
+                    sirocco_flux_plot,
+                )
+                sirocco_plot = {
+                    "wavelength": _sirocco_plot_wl,
+                    "flux": sirocco_interp_plot,
+                    "label": sirocco_transform_label,
+                }
+            else:
+                sirocco_plot = {
+                    "wavelength": [],
+                    "flux": [],
+                    "label": sirocco_transform_label,
+                }
         if len(_bf_wl) and len(_bf_data) and len(_model_sigma):
-            sirocco_interp_plot = np.interp(_bf_wl, sirocco_wl, sirocco_flux_plot)
+            if len(sirocco_interp_plot) != len(_bf_wl):
+                sirocco_interp_plot = np.interp(_bf_wl, sirocco_wl, sirocco_flux_plot)
             _n_sirocco = min(len(_bf_data), len(_model_sigma), len(sirocco_interp_plot))
             n_dof_sirocco = _n_sirocco - len(internal_labels)
             sirocco_reduced_chi2 = float(
@@ -2540,7 +2561,8 @@ def run_tier3_single(
                 ) / max(n_dof_sirocco, 1)
             )
         if len(_bf_wl) and len(_bf_data) and len(_bf_model):
-            sirocco_interp_plot = np.interp(_bf_wl, sirocco_wl, sirocco_flux_plot)
+            if len(sirocco_interp_plot) != len(_bf_wl):
+                sirocco_interp_plot = np.interp(_bf_wl, sirocco_wl, sirocco_flux_plot)
             denom = np.maximum(np.abs(_bf_data), 1e-30)
             emulator_sirocco_frac_rmse = float(
                 np.sqrt(np.nanmean(((_bf_model - sirocco_interp_plot) / denom) ** 2))

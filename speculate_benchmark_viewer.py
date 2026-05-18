@@ -2106,9 +2106,29 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
 
     _extra = []
     if len(_sirocco_wl) and len(_sirocco_flux):
+        _sirocco_order = np.argsort(_sirocco_wl)
+        _sirocco_wl = _sirocco_wl[_sirocco_order]
+        _sirocco_flux = _sirocco_flux[_sirocco_order]
+        _finite_sirocco = np.isfinite(_sirocco_wl) & np.isfinite(_sirocco_flux)
+        _sirocco_wl = _sirocco_wl[_finite_sirocco]
+        _sirocco_flux = _sirocco_flux[_finite_sirocco]
+
+    if len(_wl) and len(_sirocco_wl) and len(_sirocco_flux):
+        _sirocco_overlap = (_wl >= np.min(_sirocco_wl)) & (_wl <= np.max(_sirocco_wl))
+        _sirocco_plot_wl = _wl[_sirocco_overlap]
+        _sirocco_plot_flux = np.interp(
+            _sirocco_plot_wl,
+            _sirocco_wl,
+            _sirocco_flux,
+        )
+    else:
+        _sirocco_plot_wl = np.array([])
+        _sirocco_plot_flux = np.array([])
+
+    if len(_sirocco_plot_wl) and len(_sirocco_plot_flux):
         _extra.append({
-            "wavelength": _sirocco_wl,
-            "flux": _sirocco_flux,
+            "wavelength": _sirocco_plot_wl,
+            "flux": _sirocco_plot_flux,
             "label": _sirocco_label,
             "color": "#9467bd",
             "dash": [6, 3],
