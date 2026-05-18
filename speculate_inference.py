@@ -54,6 +54,7 @@ def _():
         not hasattr(spec_functions, "build_default_observation_sigma")
         or not hasattr(spec_functions, "build_bestfit_spectrum_altair")
         or not hasattr(spec_functions, "enable_speculate_altair_theme")
+        or "model_label" not in spec_functions.build_bestfit_spectrum_altair.__code__.co_varnames
     ):
         spec_functions = importlib.reload(spec_functions)
 
@@ -1755,8 +1756,6 @@ def _(mo):
 
 @app.cell
 def _(
-    alt,
-    build_bestfit_spectrum_altair,
     build_default_observation_sigma,
     distance_prior_ack,
     Spectrum,
@@ -2228,13 +2227,15 @@ def _(mo):
     # next stage, allowing the notebook to remain correct under partial reruns.
     get_mle_model, set_mle_model = mo.state(None)       # fitted SpectrumModel
     get_mle_priors, set_mle_priors = mo.state(None)     # frozen scipy priors dict
+    get_mle_result, set_mle_result = mo.state(None)     # rendered Stage 3 summary/plot payload
     # MCMC State - stores results for export
     get_mcmc_samples, set_mcmc_samples = mo.state(None)     # (n_samples, n_dim) array
     get_mcmc_labels, set_mcmc_labels = mo.state(None)       # friendly parameter names
     get_mcmc_summary_df, set_mcmc_summary_df = mo.state(None) # ArviZ summary table
     get_mcmc_corner_meta, set_mcmc_corner_meta = mo.state(None) # corner-plot export metadata
     return (
-        get_mle_model, get_mle_priors, set_mle_model, set_mle_priors,
+        get_mle_model, get_mle_priors, get_mle_result,
+        set_mle_model, set_mle_priors, set_mle_result,
         get_mcmc_samples, set_mcmc_samples,
         get_mcmc_labels, set_mcmc_labels,
         get_mcmc_corner_meta, set_mcmc_corner_meta,
@@ -2287,9 +2288,16 @@ def _(mo):
 
 
 @app.cell
+def _(mo):
+    mle_show_ground_truth_spectrum = mo.ui.checkbox(
+        value=False,
+        label="Show ground-truth emulator spectrum",
+    )
+    return (mle_show_ground_truth_spectrum,)
+
+
+@app.cell
 def _(
-    alt,
-    build_bestfit_spectrum_altair,
     build_default_observation_sigma,
     distance_prior_ack,
     Spectrum,
@@ -2310,6 +2318,7 @@ def _(
     run_mle_btn,
     set_mle_model,
     set_mle_priors,
+    set_mle_result,
     stats,
     w_fix,
     w_max,
@@ -2324,6 +2333,9 @@ def _(
     fit_results = None
 
     if run_mle_btn.value:
+        set_mle_model(None)
+        set_mle_priors(None)
+        set_mle_result(None)
         if emu is None or obs_data is None:
             mo.stop(True, mo.md("Please load both an emulator and data."))
         if ('log_scale' in param_names
@@ -2794,22 +2806,110 @@ def _(
                     kind="success"
                 )
 
-                # 6. Plotting
+                # Resolve lookup-table truth labels once, then reuse them for both
+                # the validation table and the optional ground-truth spectrum.
+                from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map
+                _truth_label_map = {
+                    int(_idx): _label
+                    for _idx, (_label, _sirocco_key) in _benchmark_param_map(
+                        grid_selector.value if grid_selector is not None else None
+                    ).items()
+                }
+
+                def _truth_key_for(_display_name, _internal_label):
+                    if "Inclination" in _display_name:
+                        return "Inclination"
+                    _internal_text = str(_internal_label)
+                    if _internal_text.startswith("param") and _internal_text[5:].isdigit():
+                        return _truth_label_map.get(int(_internal_text[5:]), _display_name)
+                    return _display_name
+
+                def _format_nll(_value):
+                    try:
+                        _value = float(_value)
+                    except Exception:
+                        return "N/A"
+                    if not np.isfinite(_value):
+                        return "inf"
+                    return f"{_value:.2f}"
+
+                # 6. Plotting payload
                 import matplotlib.pyplot as _plt
                 _plot_flux, _plot_cov = _model()
                 if hasattr(_plot_flux, 'detach'):
                     _plot_flux = _plot_flux.detach().cpu().numpy()
                 if hasattr(_plot_cov, 'detach'):
                     _plot_cov = _plot_cov.detach().cpu().numpy()
-                _fig = build_bestfit_spectrum_altair(
-                    alt,
-                    wavelength=_model.data.wave,
-                    data_flux=_model.data.flux,
-                    model_flux=_plot_flux,
-                    model_cov_diag=_plot_cov,
-                    title=f"Best-Fit Model — {_model.data_name}",
-                    zoom_name="inference_mle_bestfit_zoom",
-                )
+                _plot_cov = np.asarray(_plot_cov, dtype=float)
+                _plot_cov_diag = np.diag(_plot_cov) if _plot_cov.ndim == 2 else _plot_cov.reshape(-1)
+                _mle_nll = float(_soln.fun)
+                _mle_plot_payload = {
+                    "wavelength": np.asarray(_model.data.wave, dtype=float).copy(),
+                    "data_flux": np.asarray(_model.data.flux, dtype=float).copy(),
+                    "model_flux": np.asarray(_plot_flux, dtype=float).copy(),
+                    "model_cov_diag": _plot_cov_diag.copy(),
+                    "title": f"Best-Fit Model — {_model.data_name}",
+                    "zoom_name": "inference_mle_bestfit_zoom",
+                    "model_label": f"MLE Best Fit (NLL={_format_nll(_mle_nll)})",
+                    "model_nll": _mle_nll,
+                    "ground_truth": None,
+                    "ground_truth_error": None,
+                }
+
+                if ground_truth_params:
+                    _truth_grid_values = []
+                    _missing_truth_keys = []
+                    for _i, _p in enumerate(phys_names):
+                        _gt_key = _truth_key_for(_p, emu.param_names[_i])
+                        if _gt_key in ground_truth_params:
+                            _truth_grid_values.append(float(ground_truth_params[_gt_key]))
+                        else:
+                            _missing_truth_keys.append(_gt_key)
+
+                    if not _missing_truth_keys:
+                        try:
+                            _truth_global_params = {}
+                            if 'Av' in _model.params:
+                                _truth_global_params['Av'] = float(_model.params['Av'])
+                            if 'log_scale' in _model.params:
+                                _truth_global_params['log_scale'] = float(_model.params['log_scale'])
+                            if 'cheb' in _model.params or 'cheb:1' in _model.params:
+                                _truth_global_params['cheb'] = [float(v) for v in _model.cheb]
+                            if ('global_cov:log_amp' in _model.params
+                                    and 'global_cov:log_ls' in _model.params):
+                                _truth_global_params['global_cov'] = {
+                                    'log_amp': float(_model.params['global_cov:log_amp']),
+                                    'log_ls': float(_model.params['global_cov:log_ls']),
+                                }
+
+                            _truth_model = SpectrumModel(
+                                emulator=emu,
+                                data=spec_data,
+                                grid_params=_truth_grid_values,
+                                flux_scale=_flux_scale,
+                                norm=True,
+                                **_truth_global_params,
+                            )
+                            _truth_nll = -float(_truth_model.log_likelihood(_priors))
+                            _truth_flux, _truth_cov = _truth_model()
+                            if hasattr(_truth_flux, 'detach'):
+                                _truth_flux = _truth_flux.detach().cpu().numpy()
+                            if hasattr(_truth_cov, 'detach'):
+                                _truth_cov = _truth_cov.detach().cpu().numpy()
+                            _mle_plot_payload["ground_truth"] = {
+                                "wavelength": np.asarray(_truth_model.data.wave, dtype=float).copy(),
+                                "flux": np.asarray(_truth_flux, dtype=float).copy(),
+                                "label": f"Ground Truth Emulator (NLL={_format_nll(_truth_nll)})",
+                                "color": "#009E73",
+                                "dash": [6, 3],
+                                "nll": _truth_nll,
+                            }
+                        except Exception as _gt_exc:
+                            _mle_plot_payload["ground_truth_error"] = str(_gt_exc)
+                    else:
+                        _mle_plot_payload["ground_truth_error"] = (
+                            "Missing truth values for: " + ", ".join(_missing_truth_keys)
+                        )
 
                 # 6b. Loss curve plot
                 if len(_nll_history) > 10:
@@ -2850,22 +2950,6 @@ def _(
                 else:
                     _results_md += "\n|-----------|--------|\n"
 
-                from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map
-                _truth_label_map = {
-                    int(_idx): _label
-                    for _idx, (_label, _sirocco_key) in _benchmark_param_map(
-                        grid_selector.value if grid_selector is not None else None
-                    ).items()
-                }
-
-                def _truth_key_for(_display_name, _internal_label):
-                    if "Inclination" in _display_name:
-                        return "Inclination"
-                    _internal_text = str(_internal_label)
-                    if _internal_text.startswith("param") and _internal_text[5:].isdigit():
-                        return _truth_label_map.get(int(_internal_text[5:]), _display_name)
-                    return _display_name
-
                 for _i, _p in enumerate(phys_names):
                     fitted_val = res_grid[_i]
                     _display_p = f"log10({_p})" if _p in log10_params else _p
@@ -2903,23 +2987,13 @@ def _(
                 if 'global_cov:log_ls' in res_global:
                     _global_md += f"| **ln(GP length)** | {res_global['global_cov:log_ls']:.4f} |\n"
 
-                # Keep the result view as a single stack so the fit summary, loss
-                # curve, and model figure stay coupled during reactive reruns.
-                _result_elements = [
-                    fit_status,
-                    mo.hstack([mo.md(_results_md), mo.md(_global_md)], align="start", gap="2rem"),
-                ]
-                if _fig_loss is not None:
-                    _result_elements.extend([
-                        mo.md("### Convergence"),
-                        _fig_loss
-                    ])
-                _result_elements.extend([
-                    mo.md("### Model Fit & Residuals"),
-                    _fig
-                ])
-
-                fit_results = mo.vstack(_result_elements)
+                set_mle_result({
+                    "fit_status": fit_status,
+                    "results_md": _results_md,
+                    "global_md": _global_md,
+                    "loss_fig": _fig_loss,
+                    "plot": _mle_plot_payload,
+                })
 
             except Exception as _e:
                 import traceback as _traceback
@@ -2928,8 +3002,74 @@ def _(
                 fit_results = fit_status
                 set_mle_model(None)
                 set_mle_priors(None)
+                set_mle_result({"error": True, "fit_status": fit_status})
 
-    fit_results if fit_results else mo.md("*Click 'Run MLE' to start inference*")
+    return
+
+
+@app.cell
+def _(
+    alt,
+    build_bestfit_spectrum_altair,
+    get_mle_result,
+    mle_show_ground_truth_spectrum,
+    mo,
+):
+    # Render the latest MLE result from stored arrays.  This keeps the
+    # validation overlay checkbox reactive without rerunning the optimizer.
+    _result = get_mle_result()
+    _mle_result_display = None
+    if _result is None:
+        _mle_result_display = mo.md("*Click 'Run MLE' to start inference*")
+    elif _result.get("error"):
+        _mle_result_display = _result["fit_status"]
+    else:
+        _plot = _result["plot"]
+        _gt_payload = _plot.get("ground_truth")
+        _show_gt = bool(_gt_payload) and bool(mle_show_ground_truth_spectrum.value)
+        _extra_series = [_gt_payload] if _show_gt else None
+
+        _fig = build_bestfit_spectrum_altair(
+            alt,
+            wavelength=_plot["wavelength"],
+            data_flux=_plot["data_flux"],
+            model_flux=_plot["model_flux"],
+            model_cov_diag=_plot["model_cov_diag"],
+            title=_plot["title"],
+            zoom_name=_plot["zoom_name"],
+            model_label=_plot["model_label"],
+            extra_flux_series=_extra_series,
+        )
+
+        _result_elements = [
+            _result["fit_status"],
+            mo.hstack([
+                mo.md(_result["results_md"]),
+                mo.md(_result["global_md"]),
+            ], align="start", gap="2rem"),
+        ]
+        if _result.get("loss_fig") is not None:
+            _result_elements.extend([
+                mo.md("### Convergence"),
+                _result["loss_fig"],
+            ])
+        _result_elements.extend([
+            mo.md("### Model Fit & Residuals"),
+            _fig,
+        ])
+        if _gt_payload:
+            _result_elements.append(mle_show_ground_truth_spectrum)
+        elif _plot.get("ground_truth_error"):
+            _result_elements.append(
+                mo.callout(
+                    mo.md(f"Ground-truth emulator overlay unavailable: {_plot['ground_truth_error']}"),
+                    kind="warn",
+                )
+            )
+
+        _mle_result_display = mo.vstack(_result_elements)
+
+    _mle_result_display
     return
 
 
