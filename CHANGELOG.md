@@ -2,6 +2,43 @@
 
 <!-- version list -->
 
+## v0.3.0 (2026-05-18)
+
+### Bug Fixes
+
+- **benchmark**: Tier 3 AMD hdware threads for sirocco and log_scale scaling fix
+  ([`78c45df`](https://github.com/sirocco-rt/speculate/commit/78c45dfce1b1aa9f525cee358b8b8e6ff3d33b53))
+
+- **benchmark**: When running tier 3 only
+  ([`af42b30`](https://github.com/sirocco-rt/speculate/commit/af42b308dc73842b08e5271c49e751b0edf3f6d3))
+
+- **quick**: Faster grid interpolation
+  ([`4c7b5fa`](https://github.com/sirocco-rt/speculate/commit/4c7b5fa61c26bac47ae75a861967291f1a98e4e4))
+
+- **training**: Unexpected fix to UI refresh on training complete
+  ([`1e20b04`](https://github.com/sirocco-rt/speculate/commit/1e20b04e0522fed9ed69db557200d1a804d36edc))
+
+### Features
+
+- Coverting log_scale parameter to Distance in UI,
+  ([`38bb8cb`](https://github.com/sirocco-rt/speculate/commit/38bb8cb1aa75fdcc2fcdec2845d3c82574901016))
+
+- **benchmark**: MLE stored and plotted results to the Tier 2 benchmark
+  ([`0190812`](https://github.com/sirocco-rt/speculate/commit/0190812c90eccdb4a4ab2f8d4ad430c305232865))
+
+- **benchmark**: Partial restarts for tier 3
+  ([`dc8bf14`](https://github.com/sirocco-rt/speculate/commit/dc8bf14baa55db2c1dfc800276e713a3a8e3d6ee))
+
+- **inference**: Adding ground truth emulated model to MLE best-fit plot
+  ([`26ae31a`](https://github.com/sirocco-rt/speculate/commit/26ae31ac3dd44656f77b3b56e8550e3339e8b191))
+
+- **inference**: MLE Restart table of best parameters
+  ([`9eb487d`](https://github.com/sirocco-rt/speculate/commit/9eb487da88fd25a265843a334c7b352737a1c10c))
+
+- **infernce**: GPU cache memory displayed.
+  ([`2f7abeb`](https://github.com/sirocco-rt/speculate/commit/2f7abeb5da0ea3ac54eba3fcbd078f67ff18e510))
+
+
 ## v0.2.0 (2026-05-03)
 
 ### Bug Fixes
