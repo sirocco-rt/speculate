@@ -2361,6 +2361,7 @@ def _(
                 from Speculate_addons.distance_scale import (
                     distance_prior_to_log_scale_prior as _distance_prior_to_log_scale_prior,
                     distance_to_log_scale as _distance_to_log_scale,
+                    log_scale_to_distance_pc as _log_scale_to_distance_pc,
                 )
 
                 # Restrict the observation to the selected wavelength window before
@@ -2696,6 +2697,35 @@ def _(
 
                 _global_best_x = _p0.copy()
                 _global_best_nit = 0
+                _restart_summaries = []
+
+                def _restart_param_label(_name):
+                    return f"log10({_name})" if _name in log10_params else _name
+
+                def _capture_restart_result(_restart_number, _solution):
+                    _model.set_param_vector(_solution.x)
+                    _values = {}
+                    for _i, _p in enumerate(phys_names):
+                        _values[_restart_param_label(_p)] = float(_model.grid_params[_i])
+                    _params = _model.params
+                    if 'Av' in _params:
+                        _values['Av'] = float(_params['Av'])
+                    if 'log_scale' in _params:
+                        _values['Distance (pc)'] = float(_log_scale_to_distance_pc(_params['log_scale']))
+                    elif hasattr(_model, '_log_scale') and _model._log_scale is not None:
+                        _values['Distance (pc) (auto)'] = float(_log_scale_to_distance_pc(_model._log_scale))
+                    if 'cheb:1' in _params:
+                        _values['cheb₁'] = float(_params['cheb:1'])
+                    if 'global_cov:log_amp' in _params:
+                        _values['ln(GP amp)'] = float(_params['global_cov:log_amp'])
+                    if 'global_cov:log_ls' in _params:
+                        _values['ln(GP length)'] = float(_params['global_cov:log_ls'])
+
+                    _restart_summaries.append({
+                        "restart": int(_restart_number),
+                        "nll": float(_solution.fun),
+                        "values": _values,
+                    })
 
                 for _restart_idx, _x0 in enumerate(_start_points):
                     _cur_restart[0] = _restart_idx + 1
@@ -2778,6 +2808,8 @@ def _(
                             message="CMA-ES terminated",
                             nit=_es.result.iterations,
                         )
+
+                    _capture_restart_result(_cur_restart[0], _run_soln)
 
                     # Keep global best across restarts
                     if _run_soln.fun <= _global_best_f[0]:
@@ -2987,10 +3019,45 @@ def _(
                 if 'global_cov:log_ls' in res_global:
                     _global_md += f"| **ln(GP length)** | {res_global['global_cov:log_ls']:.4f} |\n"
 
+                _restart_table_rows = None
+                if _restart_summaries:
+                    def _format_restart_value(_value):
+                        try:
+                            _value = float(_value)
+                        except Exception:
+                            return "-"
+                        if not np.isfinite(_value):
+                            return "inf"
+                        return f"{_value:.4f}"
+
+                    _restart_columns = [
+                        f"Restart {_summary['restart']}"
+                        for _summary in _restart_summaries
+                    ]
+                    _restart_param_order = []
+                    for _summary in _restart_summaries:
+                        for _param_name in _summary["values"]:
+                            if _param_name not in _restart_param_order:
+                                _restart_param_order.append(_param_name)
+
+                    _nll_row = {"Parameter": "NLL"}
+                    for _column, _summary in zip(_restart_columns, _restart_summaries):
+                        _nll_row[_column] = _format_nll(_summary["nll"])
+                    _restart_table_rows = [_nll_row]
+
+                    for _param_name in _restart_param_order:
+                        _row = {"Parameter": _param_name}
+                        for _column, _summary in zip(_restart_columns, _restart_summaries):
+                            _row[_column] = _format_restart_value(
+                                _summary["values"].get(_param_name)
+                            )
+                        _restart_table_rows.append(_row)
+
                 set_mle_result({
                     "fit_status": fit_status,
                     "results_md": _results_md,
                     "global_md": _global_md,
+                    "restart_table_rows": _restart_table_rows,
                     "loss_fig": _fig_loss,
                     "plot": _mle_plot_payload,
                 })
@@ -3048,6 +3115,29 @@ def _(
                 mo.md(_result["global_md"]),
             ], align="start", gap="2rem"),
         ]
+        if _result.get("restart_table_rows"):
+            _restart_rows = _result["restart_table_rows"]
+            _restart_columns = list(_restart_rows[0].keys()) if _restart_rows else []
+            _restart_align = {
+                _column: "left" if _column == "Parameter" else "right"
+                for _column in _restart_columns
+            }
+            _result_elements.append(
+                mo.accordion({
+                    f"{mo.icon('lucide:rotate-cw')} MLE Restart Best Fits": mo.ui.table(
+                        _restart_rows,
+                        selection=None,
+                        pagination=False,
+                        show_column_summaries=False,
+                        show_data_types=False,
+                        show_download=False,
+                        freeze_columns_left=["Parameter"],
+                        text_justify_columns=_restart_align,
+                        max_columns=None,
+                        page_size=len(_restart_rows),
+                    )
+                })
+            )
         if _result.get("loss_fig") is not None:
             _result_elements.extend([
                 mo.md("### Convergence"),
