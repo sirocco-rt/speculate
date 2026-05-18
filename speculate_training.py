@@ -1570,6 +1570,7 @@ def _(
 ):
     # This cell resolves the on-disk filenames, reports the planned training
     # configuration, and creates the processed grid file on demand.
+    active_training_config = None
     emu_exists = False
     emu_file_name = ""
     grid_file_name = ""
@@ -1599,6 +1600,40 @@ def _(
         fixed_inc = int(fixed_inclination_selector.value) if fixed_inclination_selector is not None else 55
         fixed_inc_tag = f"_{fixed_inc}inc" if inclination_fixed else ""
         grid_file_name = f"{base_name}grid_{model_parameters_str}_{scale}{smooth_tag}{fixed_inc_tag}_{wl_range[0]}-{wl_range[1]}AA"
+
+        _grid_config = grid_configs.get(grid_name, {})
+        _inclination_param_ids = set(_grid_config.get("inclination_param_ids", ()))
+        _physical_params = [
+            param_id for param_id in model_parameters
+            if param_id not in _inclination_param_ids
+        ]
+        _trainable_inclinations = [
+            param_id for param_id in model_parameters
+            if param_id in _inclination_param_ids
+        ]
+        _inclination_choice = (
+            f"param:{_trainable_inclinations[0]}"
+            if _trainable_inclinations
+            else f"fixed:{fixed_inc}"
+        )
+        active_training_config = {
+            "grid_name": grid_name,
+            "params": list(model_parameters),
+            "physical_params": _physical_params,
+            "inclination_choice": _inclination_choice,
+            "fixed_inclination": fixed_inc,
+            "wl_min": int(wl_range[0]),
+            "wl_max": int(wl_range[1]),
+            "scale": scale,
+            "smoothing": bool(smoothing),
+            "n_components": int(n_components.value),
+            "method": method.value,
+            "max_iter": int(max_iter.value),
+            "strict_weight_fit": bool(strict_weight_fit.value),
+            "per_component": bool(per_component.value),
+            "refine_lambda_xi": bool(refine_lambda_xi.value),
+            "kernel": kernel_selector.value,
+        }
 
         # Determine emulator file name based on Speculate_dev.py conventions
         if not inclination_fixed:
@@ -1754,7 +1789,7 @@ def _(
         training_setup_display = mo.vstack([config_md, results_md, emu_status])
 
     training_setup_display
-    return emu_file_name, grid_file_name
+    return active_training_config, emu_file_name, grid_file_name
 
 
 @app.cell
@@ -1768,6 +1803,7 @@ def _(mo):
 @app.cell
 def _(
     Emulator,
+    active_training_config,
     alt,
     clear_trained_emu_cache,
     continue_train_button,
@@ -1787,6 +1823,7 @@ def _(
     refine_lambda_xi,
     set_console_logs,
     set_diagnostics_emu_display,
+    set_loaded_emu_config,
     set_loss_history,
     set_trained_emu,
     set_training_status,
@@ -2010,17 +2047,20 @@ def _(
                 emu.save(f'Grid-Emulator_Files/{emu_file_name}.npz')
                 print(f"Emulator saved to Grid-Emulator_Files/{emu_file_name}.npz")
                 training_complete = True
+                if active_training_config is not None:
+                    set_loaded_emu_config(dict(active_training_config))
                 set_trained_emu(emu)
                 set_diagnostics_emu_display(emu_file_name)
-
-                # Trigger button update
-                set_training_trigger(lambda v: v + 1)
 
                 # Save persistent state
                 set_console_logs("".join(log_buffer))
                 # Also save loss history
                 if hasattr(emu, 'loss_history'):
                     set_loss_history(list(emu.loss_history))
+
+                # Trigger button update after state needed by rebuilt controls
+                # is already available.
+                set_training_trigger(lambda v: v + 1)
 
             # Create result display
             train_result = mo.md(f"""
