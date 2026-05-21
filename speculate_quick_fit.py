@@ -3909,6 +3909,22 @@ def _(
 
         _global_best_x = _p0.copy()
         _global_best_nit = 0
+        _restart_summaries = []
+
+        def _capture_restart_result(_restart_number, _solution):
+            _full_params = np.array(_vals, dtype=np.float64)
+            for _ai, _gi in enumerate(_active_idx):
+                if _ai < len(_solution.x):
+                    _full_params[_gi] = float(_solution.x[_ai])
+
+            _restart_summaries.append({
+                "restart": int(_restart_number),
+                "chi2": float(_solution.fun),
+                "values": {
+                    _labels[_i]: float(_full_params[_i])
+                    for _i in range(len(_labels))
+                },
+            })
 
         for _restart_idx, _x0 in enumerate(_start_points):
             _cur_restart[0] = _restart_idx + 1
@@ -3973,6 +3989,8 @@ def _(
                     bounds=_bounds,
                     options=dict(maxiter=int(qf_max_iter.value), ftol=1e-15, gtol=1e-12),
                 )
+
+            _capture_restart_result(_cur_restart[0], _run_soln)
 
             if _run_soln.fun <= _global_best_f[0]:
                 _global_best_f[0] = _run_soln.fun
@@ -4055,6 +4073,43 @@ def _(
     for _ai, _gi in enumerate(_active_idx):
         _best_full[_gi] = _soln.x[_ai]
 
+    _restart_table_rows = None
+    if _restart_summaries:
+        def _format_restart_value(_value):
+            try:
+                _value = float(_value)
+            except Exception:
+                return "-"
+            if not np.isfinite(_value):
+                return "inf"
+            return f"{_value:.6f}"
+
+        def _format_restart_chi2(_value):
+            try:
+                _value = float(_value)
+            except Exception:
+                return "N/A"
+            if not np.isfinite(_value):
+                return "inf"
+            return f"{_value:.2f}"
+
+        _restart_columns = [
+            f"Restart {_summary['restart']}"
+            for _summary in _restart_summaries
+        ]
+        _chi2_row = {"Parameter": "χ²"}
+        for _column, _summary in zip(_restart_columns, _restart_summaries):
+            _chi2_row[_column] = _format_restart_chi2(_summary["chi2"])
+        _restart_table_rows = [_chi2_row]
+
+        for _param_name in _labels:
+            _row = {"Parameter": _param_name}
+            for _column, _summary in zip(_restart_columns, _restart_summaries):
+                _row[_column] = _format_restart_value(
+                    _summary["values"].get(_param_name)
+                )
+            _restart_table_rows.append(_row)
+
     qf_mle_result = {
         "best_params": _best_full,
         "active_idx": _active_idx,
@@ -4069,6 +4124,7 @@ def _(
         "labels": _labels,
         "n_physical": _n_phys,
         "n_restarts": _n_restarts,
+        "restart_table_rows": _restart_table_rows,
     }
     return (qf_mle_result,)
 
@@ -4273,7 +4329,34 @@ def _(mo, np, pd, qf_mle_result):
         })
 
     _df = pd.DataFrame(_rows)
-    mo.ui.table(_df, label="Parameter Summary", selection=None)
+    _summary_table = mo.ui.table(_df, label="Parameter Summary", selection=None)
+    _outputs = [_summary_table]
+
+    _restart_rows = qf_mle_result.get("restart_table_rows")
+    if _restart_rows:
+        _restart_columns = list(_restart_rows[0].keys()) if _restart_rows else []
+        _restart_align = {
+            _column: "left" if _column == "Parameter" else "right"
+            for _column in _restart_columns
+        }
+        _outputs.append(
+            mo.accordion({
+                f"{mo.icon('lucide:rotate-cw')} MLE Restart Best Fits": mo.ui.table(
+                    _restart_rows,
+                    selection=None,
+                    pagination=False,
+                    show_column_summaries=False,
+                    show_data_types=False,
+                    show_download=False,
+                    freeze_columns_left=["Parameter"],
+                    text_justify_columns=_restart_align,
+                    max_columns=None,
+                    page_size=len(_restart_rows),
+                )
+            })
+        )
+
+    mo.vstack(_outputs)
     return
 
 
