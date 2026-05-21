@@ -2522,7 +2522,7 @@ def _(
 
     def _export_quickfit(_):
         np.savez_compressed(_out_path, **_build_save_dict())
-        mo.status.toast(f"Exported to {_out_path}", kind="success")
+        mo.status.toast(f"Exported to {_out_path}")
 
     _type_label = {"nn": "NN", "grid_interp": "Grid Interp"}.get(_source, _source)
 
@@ -3532,6 +3532,7 @@ def _(np, torch):
 
 @app.cell
 def _(
+    get_qf_playground_target,
     mo,
     np,
     qf_inf_emu_data,
@@ -3676,6 +3677,19 @@ def _(
 
     # Default slider widgets — created unconditionally so downstream cells
     # always receive valid references even before a model is loaded.
+    _pg_target = get_qf_playground_target() or {}
+    if not isinstance(_pg_target, dict):
+        _pg_target = {}
+
+    def _target_value(_key, _default, _lo, _hi):
+        try:
+            _value = float(_pg_target.get(_key, _default))
+        except Exception:
+            _value = float(_default)
+        if not np.isfinite(_value):
+            _value = float(_default)
+        return float(np.clip(_value, _lo, _hi))
+
     qf_pg_av = mo.ui.slider(start=0.0, stop=5.0, value=0.0, step=0.01,
                              label="Av (Extinction)", show_value=True, full_width=True)
     qf_pg_logscale = mo.ui.slider(start=10.0, stop=1000.0, value=100.0, step=1.0,
@@ -3691,12 +3705,25 @@ def _(
     _mid_params = (_min_p + _max_p) / 2.0
     _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
 
-    qf_pg_av = mo.ui.slider(start=0.0, stop=5.0, value=0.0, step=0.01,
+    _source_file = qf_inf_emu_data.get("source_file")
+    if _pg_target.get("source_file") and _pg_target.get("source_file") != _source_file:
+        _pg_target = {}
+
+    _target_phys = _pg_target.get("phys")
+    if _target_phys is not None:
+        try:
+            _target_phys = np.asarray(_target_phys, dtype=float)
+            if _target_phys.shape[0] != len(_min_p):
+                _target_phys = None
+        except Exception:
+            _target_phys = None
+
+    qf_pg_av = mo.ui.slider(start=0.0, stop=5.0, value=_target_value("Av", 0.0, 0.0, 5.0), step=0.01,
                              label="Av (Extinction)", show_value=True, full_width=True)
     qf_pg_logscale = mo.ui.slider(start=10.0, stop=1000.0,
-                                   value=100.0, step=1.0,
+                                   value=_target_value("Distance (pc)", 100.0, 10.0, 1000.0), step=1.0,
                                    label="Distance (pc)", show_value=True, full_width=True)
-    qf_pg_cheb1 = mo.ui.slider(start=-2.0, stop=2.0, value=0.0, step=0.01,
+    qf_pg_cheb1 = mo.ui.slider(start=-2.0, stop=2.0, value=_target_value("cheb_1", 0.0, -2.0, 2.0), step=0.01,
                                 label="cheb_1 (continuum tilt)", show_value=True, full_width=True)
 
     # ── Physical parameter sliders ──
@@ -3740,6 +3767,8 @@ def _(
         _lo = float(_min_p[_pi])
         _hi = float(_max_p[_pi])
         _mid = (_lo + _hi) / 2.0
+        if _target_phys is not None:
+            _mid = float(np.clip(_target_phys[_pi], _lo, _hi))
         _lo_ui = _clean_slider_number(_lo)
         _hi_ui = _clean_slider_number(_hi)
         _mid_ui = _clean_slider_number(_mid)
@@ -4494,6 +4523,12 @@ def _(mo):
 
 
 @app.cell
+def _(mo):
+    get_qf_playground_target, set_qf_playground_target = mo.state(None)
+    return get_qf_playground_target, set_qf_playground_target
+
+
+@app.cell
 def _(
     alt,
     chebval,
@@ -4512,6 +4547,7 @@ def _(
     qf_obs_scale_selector,
     qf_predict_flux,
     qf_transform_observation_data,
+    set_qf_playground_target,
 ):
     if qf_mle_result is None:
         mo.stop(True, mo.md("*Run Quick Fit to see results.*"))
@@ -4654,7 +4690,24 @@ def _(
         kind="success" if qf_mle_result['success'] else "warn"
     )
 
-    mo.vstack([_status, _overlay_chart, _resid_chart + _zero_line])
+    def _send_mle_to_playground(_):
+        set_qf_playground_target({
+            "source": "quick_fit_mle",
+            "source_file": qf_inf_emu_data.get("source_file"),
+            "phys": [float(_v) for _v in _phys],
+            "Av": float(_av),
+            "Distance (pc)": float(_distance_pc),
+            "cheb_1": float(_cheb1),
+        })
+        mo.status.toast("Loaded MLE best fit into the Parameter Playground")
+
+    _playground_btn = mo.ui.button(
+        label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
+        on_click=_send_mle_to_playground,
+        kind="success",
+    )
+
+    mo.vstack([_status, _playground_btn, _overlay_chart, _resid_chart + _zero_line])
     return
 
 
@@ -4797,7 +4850,7 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
         _df = pd.DataFrame(_rows)
         _path = os.path.join(_dir, f"quickfit_{_src_file}_params.csv")
         _df.to_csv(_path, index=False)
-        mo.status.toast(f"Saved {_path}", kind="success")
+        mo.status.toast(f"Saved {_path}")
 
     def _export_json(_):
         _dir = "exports"
@@ -4830,7 +4883,7 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
         _path = os.path.join(_dir, f"quickfit_{_src_file}_summary.json")
         with open(_path, 'w') as f:
             json.dump(_out, f, indent=2)
-        mo.status.toast(f"Saved {_path}", kind="success")
+        mo.status.toast(f"Saved {_path}")
 
     def _export_pf(_):
         _dir = "exports"
@@ -4900,7 +4953,7 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
                 header_lines=header,
                 observer_angles=[_observer_angle] if _observer_angle is not None else None,
             )
-            mo.status.toast(f"Exported {_pf_path}", kind="success")
+            mo.status.toast(f"Exported {_pf_path}")
         except Exception as _e:
             mo.status.toast(f".pf export failed: {_e}", kind="danger")
 

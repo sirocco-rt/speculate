@@ -1253,7 +1253,28 @@ def _(mo):
 
 
 @app.cell
-def _(build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
+def _(mo):
+    get_inf_playground_target, set_inf_playground_target = mo.state(None)
+    return get_inf_playground_target, set_inf_playground_target
+
+
+@app.cell
+def _(
+    build_default_observation_sigma,
+    build_synthetic_sirocco_sigma,
+    emu,
+    fit_power_law_continuum,
+    get_inf_playground_target,
+    grid_indices,
+    grid_selector,
+    inf_param_map_db_for_grid,
+    mo,
+    np,
+    obs_data,
+    obs_flux_scale,
+    re,
+    wl_range_slider,
+):
     # ── Parameter Playground ──
     # Interactive sliders for the nuisance/inference parameters and the
     # physical grid axes so the user can visually explore how each shifts
@@ -1264,14 +1285,40 @@ def _(build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, fit_p
     # they stay sensible regardless of emmulator training transform.
 
     _playground_ui = mo.md("*Load an emulator and observation data to use the playground.*")
+    _pg_target = get_inf_playground_target() or {}
+    if not isinstance(_pg_target, dict):
+        _pg_target = {}
+
+    def _target_value(_key, _default, _lo, _hi):
+        try:
+            _value = float(_pg_target.get(_key, _default))
+        except Exception:
+            _value = float(_default)
+        if not np.isfinite(_value):
+            _value = float(_default)
+        return float(np.clip(_value, _lo, _hi))
 
     if emu is not None:
-        _param_map_db = inf_param_map_db_for_grid(grid_selector.value if grid_selector is not None else None)
+        _selected_grid = grid_selector.value if grid_selector is not None else None
+        if _pg_target.get("grid_name") and _pg_target.get("grid_name") != _selected_grid:
+            _pg_target = {}
+        _param_map_db = inf_param_map_db_for_grid(_selected_grid)
         # Midpoint physical parameters for preview
         if hasattr(emu, 'min_params') and hasattr(emu, 'max_params'):
             pg_mid_params = (np.array(emu.min_params) + np.array(emu.max_params)) / 2.0
         else:
             pg_mid_params = np.zeros(len(emu.param_names))
+
+        _target_phys = _pg_target.get("phys")
+        if _target_phys is not None:
+            try:
+                _target_phys = np.asarray(_target_phys, dtype=float)
+                if _target_phys.shape[0] != len(emu.param_names):
+                    _pg_target = {}
+                    _target_phys = None
+            except Exception:
+                _pg_target = {}
+                _target_phys = None
 
         # --- Auto-compute log_amp centre from observational uncertainty ---
         # GP amplitude is a residual/noise scale. It should be tied to the data
@@ -1319,28 +1366,36 @@ def _(build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, fit_p
 
         # Round for cleaner slider display
         _la_centre = round(_la_centre, 2)
+        try:
+            _logamp_default = float(_pg_target.get("log_amp", _la_centre))
+        except Exception:
+            _logamp_default = _la_centre
+        if not np.isfinite(_logamp_default):
+            _logamp_default = _la_centre
+        _logamp_start = min(_la_centre - 5.0, _logamp_default - 1.0)
+        _logamp_stop = max(_la_centre + 5.0, _logamp_default + 1.0)
 
         # Nuisance slider ranges centred on auto-detected values
         pg_av_slider = mo.ui.slider(
-            start=0.0, stop=5.0, value=0.0, step=0.01,
+            start=0.0, stop=5.0, value=_target_value("Av", 0.0, 0.0, 5.0), step=0.01,
             label="Av (Extinction)", show_value=True, full_width=True,
         )
         pg_logscale_slider = mo.ui.slider(
             start=10.0, stop=1000.0,
-            value=_distance_centre, step=1.0,
+            value=_target_value("Distance (pc)", _distance_centre, 10.0, 1000.0), step=1.0,
             label="Distance (pc)", show_value=True, full_width=True,
         )
         pg_cheb1_slider = mo.ui.slider(
-            start=-2.0, stop=2.0, value=0.0, step=0.01,
+            start=-2.0, stop=2.0, value=_target_value("cheb_1", 0.0, -2.0, 2.0), step=0.01,
             label="cheb_1 (continuum tilt)", show_value=True, full_width=True,
         )
         pg_logamp_slider = mo.ui.slider(
-            start=_la_centre - 5.0, stop=_la_centre + 5.0,
-            value=_la_centre, step=0.01,
+            start=_logamp_start, stop=_logamp_stop,
+            value=_logamp_default, step=0.01,
             label="log_amp (ln GP amplitude)", show_value=True, full_width=True,
         )
         pg_logls_slider = mo.ui.slider(
-            start=0.0, stop=15.0, value=4.5, step=0.01,
+            start=0.0, stop=15.0, value=_target_value("log_ls", 4.5, 0.0, 15.0), step=0.01,
             label="log_ls (ln GP length scale)", show_value=True, full_width=True,
         )
 
@@ -1391,6 +1446,8 @@ def _(build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, fit_p
             _lo = float(emu.min_params[_pi]) if hasattr(emu, 'min_params') else 0.0
             _hi = float(emu.max_params[_pi]) if hasattr(emu, 'max_params') else 1.0
             _mid = (_lo + _hi) / 2.0
+            if _target_phys is not None:
+                _mid = float(np.clip(_target_phys[_pi], _lo, _hi))
             _lo_ui = _clean_slider_number(_lo)
             _hi_ui = _clean_slider_number(_hi)
             _mid_ui = _clean_slider_number(_mid)
@@ -3019,6 +3076,23 @@ def _(
                 if 'global_cov:log_ls' in res_global:
                     _global_md += f"| **ln(GP length)** | {res_global['global_cov:log_ls']:.4f} |\n"
 
+                _playground_distance_pc = 100.0
+                if 'log_scale' in res_global:
+                    _playground_distance_pc = float(_log_scale_to_distance_pc(res_global['log_scale']))
+                elif hasattr(_model, '_log_scale') and _model._log_scale is not None:
+                    _playground_distance_pc = float(_log_scale_to_distance_pc(_model._log_scale))
+
+                _playground_payload = {
+                    "source": "inference_mle",
+                    "grid_name": grid_selector.value if grid_selector is not None else None,
+                    "phys": [float(_v) for _v in res_grid],
+                    "Av": float(res_global.get('Av', 0.0)),
+                    "Distance (pc)": _playground_distance_pc,
+                    "cheb_1": float(res_global.get('cheb:1', 0.0)),
+                    "log_amp": float(res_global.get('global_cov:log_amp', -60.0)),
+                    "log_ls": float(res_global.get('global_cov:log_ls', 4.5)),
+                }
+
                 _restart_table_rows = None
                 if _restart_summaries:
                     def _format_restart_value(_value):
@@ -3057,6 +3131,7 @@ def _(
                     "fit_status": fit_status,
                     "results_md": _results_md,
                     "global_md": _global_md,
+                    "playground_payload": _playground_payload,
                     "restart_table_rows": _restart_table_rows,
                     "loss_fig": _fig_loss,
                     "plot": _mle_plot_payload,
@@ -3081,6 +3156,7 @@ def _(
     get_mle_result,
     mle_show_ground_truth_spectrum,
     mo,
+    set_inf_playground_target,
 ):
     # Render the latest MLE result from stored arrays.  This keeps the
     # validation overlay checkbox reactive without rerunning the optimizer.
@@ -3108,8 +3184,19 @@ def _(
             extra_flux_series=_extra_series,
         )
 
+        def _send_mle_to_playground(_):
+            set_inf_playground_target(_result["playground_payload"])
+            mo.status.toast("Loaded MLE best fit into the Parameter Playground")
+
+        _playground_button = mo.ui.button(
+            label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
+            on_click=_send_mle_to_playground,
+            kind="success",
+        )
+
         _result_elements = [
             _result["fit_status"],
+            _playground_button,
             mo.hstack([
                 mo.md(_result["results_md"]),
                 mo.md(_result["global_md"]),
@@ -3261,6 +3348,7 @@ def _(
     set_mcmc_corner_meta,
     set_mcmc_samples,
     set_mcmc_summary_df,
+    set_inf_playground_target,
     stats,
 ):
     # ── Stage 4: MCMC Posterior Exploration ──
@@ -3642,6 +3730,23 @@ def _(
                     _mcmc_means[_label] = float(np.mean(_burn_samples[:, _i]))
                 _model.set_param_dict(_mcmc_means)
 
+                _mcmc_global = _model.params
+                _mcmc_distance_pc = 100.0
+                if 'log_scale' in _mcmc_global:
+                    _mcmc_distance_pc = float(_log_scale_to_distance_pc(_mcmc_global['log_scale']))
+                elif hasattr(_model, '_log_scale') and _model._log_scale is not None:
+                    _mcmc_distance_pc = float(_log_scale_to_distance_pc(_model._log_scale))
+                _mcmc_playground_payload = {
+                    "source": "inference_mcmc",
+                    "grid_name": grid_selector.value if grid_selector is not None else None,
+                    "phys": [float(_v) for _v in _model.grid_params],
+                    "Av": float(_mcmc_global.get('Av', 0.0)),
+                    "Distance (pc)": _mcmc_distance_pc,
+                    "cheb_1": float(_mcmc_global.get('cheb:1', 0.0)),
+                    "log_amp": float(_mcmc_global.get('global_cov:log_amp', -60.0)),
+                    "log_ls": float(_mcmc_global.get('global_cov:log_ls', 4.5)),
+                }
+
                 _plot_flux, _plot_cov = _model()
                 if hasattr(_plot_flux, 'detach'):
                     _plot_flux = _plot_flux.detach().cpu().numpy()
@@ -3705,6 +3810,16 @@ def _(
                     kind="success"
                 )
 
+                def _send_mcmc_to_playground(_):
+                    set_inf_playground_target(_mcmc_playground_payload)
+                    mo.status.toast("Loaded MCMC posterior mean into the Parameter Playground")
+
+                _playground_button = mo.ui.button(
+                    label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
+                    on_click=_send_mcmc_to_playground,
+                    kind="success",
+                )
+
                 _chain_accordion = mo.accordion({
                     f"{mo.icon('lucide:link')} Raw MCMC Chains (Full)": mo.vstack([
                         mo.md("Walker traces for all parameters before burn-in removal."),
@@ -3724,6 +3839,7 @@ def _(
 
                 mcmc_results = mo.vstack([
                     _status_callout,
+                    _playground_button,
                     mo.md(_results_md),
                     _chain_accordion,
                     mo.md("### Corner Plot"),
