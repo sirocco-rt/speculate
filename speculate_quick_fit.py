@@ -2810,6 +2810,17 @@ def _(mo):
 
 
 @app.cell
+def _(mo):
+    qf_data_source_selector = mo.ui.dropdown(
+        options=["Observation File", "Test Grid (Validation)"],
+        value="Observation File",
+        label="Data Source:",
+        full_width=True,
+    )
+    return (qf_data_source_selector,)
+
+
+@app.cell
 def _(get_qf_last_uploaded_obs, get_qf_obs_refresh, mo, os):
     _ = get_qf_obs_refresh()
     _obs_dir = "observation_files"
@@ -2843,6 +2854,150 @@ def _(get_qf_last_uploaded_obs, get_qf_obs_refresh, mo, os):
 
 
 @app.cell
+def _(
+    get_qf_obs_refresh,
+    mo,
+    os,
+    pd,
+    qf_data_source_selector,
+    qf_inf_emu_data,
+    qf_inf_model_selector,
+):
+    _ = get_qf_obs_refresh()
+    qf_test_grid_files = []
+    qf_test_grid_params_df = None
+    qf_test_grid_info = {
+        "available": False,
+        "grid_name": None,
+        "test_grid_name": None,
+        "test_grid_path": None,
+        "repo_id": None,
+        "source": None,
+        "message": "Select Test Grid data source and load a Quick Fit model to browse validation spectra.",
+    }
+
+    if "Test Grid" in qf_data_source_selector.value:
+        import re as _re
+        from Speculate_addons.grid_registry import get_grid_config as _get_grid_config
+        from Speculate_addons.grid_registry import infer_grid_name as _infer_grid_name
+
+        _grid_name = None
+        if qf_inf_emu_data is not None:
+            _grid_name = qf_inf_emu_data.get("grid_name")
+        if not _grid_name and qf_inf_model_selector is not None:
+            _grid_name = _infer_grid_name(qf_inf_model_selector.value)
+
+        _grid_config = _get_grid_config(_grid_name)
+        if _grid_config is None:
+            qf_test_grid_info["message"] = "Load a trained Quick Fit model before selecting a validation spectrum."
+        else:
+            _test_grid_name = _grid_config.get("test_grid_name") or str(_grid_name).replace("_grid_", "_testgrid_")
+            _test_grid_path = os.path.join("sirocco_grids", _test_grid_name)
+            _repo_id = f"sirocco-rt/{_test_grid_name}"
+            qf_test_grid_info.update({
+                "grid_name": _grid_name,
+                "test_grid_name": _test_grid_name,
+                "test_grid_path": _test_grid_path,
+                "repo_id": _repo_id,
+                "message": "",
+            })
+
+            def _run_number_from_name(_name):
+                _match = _re.search(r"run(\d+)", str(_name))
+                return int(_match.group(1)) if _match else None
+
+            _local_by_run = {}
+            if os.path.isdir(_test_grid_path):
+                for _filename in os.listdir(_test_grid_path):
+                    if _filename.endswith((".spec", ".spec.xz")):
+                        _run_number = _run_number_from_name(_filename)
+                        if _run_number is not None:
+                            _local_by_run.setdefault(_run_number, _filename)
+
+            _lookup_path = os.path.join(_test_grid_path, "grid_run_lookup_table.parquet")
+            if os.path.exists(_lookup_path):
+                qf_test_grid_params_df = pd.read_parquet(_lookup_path)
+            else:
+                try:
+                    from huggingface_hub import hf_hub_download as _hf_hub_download
+
+                    os.makedirs(_test_grid_path, exist_ok=True)
+                    _downloaded_lookup = _hf_hub_download(
+                        repo_id=_repo_id,
+                        filename="grid_run_lookup_table.parquet",
+                        repo_type="dataset",
+                        local_dir=_test_grid_path,
+                    )
+                    qf_test_grid_params_df = pd.read_parquet(_downloaded_lookup)
+                except Exception as _exc:
+                    qf_test_grid_info["message"] = (
+                        "No local lookup table was found and HuggingFace metadata "
+                        f"could not be downloaded for `{_test_grid_name}`: {_exc}"
+                    )
+
+            if qf_test_grid_params_df is not None:
+                _run_col = "Run Number" if "Run Number" in qf_test_grid_params_df.columns else None
+                if _run_col is not None:
+                    _run_numbers = sorted({int(_run) for _run in qf_test_grid_params_df[_run_col]})
+                    qf_test_grid_files = [f"run{_run}.spec" for _run in _run_numbers]
+            elif _local_by_run:
+                qf_test_grid_files = [_local_by_run[_run] for _run in sorted(_local_by_run)]
+
+            if qf_test_grid_files:
+                _source = "local files with HuggingFace fallback" if _local_by_run else "HuggingFace"
+                qf_test_grid_info.update({
+                    "available": True,
+                    "source": _source,
+                    "message": (
+                        f"Found {len(qf_test_grid_files)} validation spectra for `{_test_grid_name}` "
+                        f"from {_source}."
+                    ),
+                })
+            elif not qf_test_grid_info.get("message"):
+                qf_test_grid_info["message"] = f"No validation spectra were found for `{_test_grid_name}`."
+
+    return qf_test_grid_files, qf_test_grid_info, qf_test_grid_params_df
+
+
+@app.cell
+def _(mo, qf_inf_emu_data, qf_test_grid_files, qf_test_grid_info):
+    from Speculate_addons.grid_registry import default_fixed_inclination as _default_fixed_inclination
+    from Speculate_addons.grid_registry import inclination_values as _inclination_values
+
+    if qf_test_grid_files:
+        qf_test_run_selector = mo.ui.dropdown(
+            options=qf_test_grid_files,
+            value=qf_test_grid_files[0],
+            label="Select Test Grid Spectrum:",
+            full_width=True,
+        )
+    else:
+        qf_test_run_selector = mo.ui.dropdown(
+            options={"— No test-grid spectra available —": ""},
+            value="— No test-grid spectra available —",
+            label="Select Test Grid Spectrum:",
+            full_width=True,
+        )
+
+    _grid_name = qf_test_grid_info.get("grid_name")
+    _inclinations = _inclination_values(_grid_name) if _grid_name else [55]
+    _fixed_inclination = None
+    if qf_inf_emu_data is not None:
+        _fixed_inclination = qf_inf_emu_data.get("fixed_inclination")
+    _default_inclination = _fixed_inclination
+    if _default_inclination is None or int(round(float(_default_inclination))) not in _inclinations:
+        _default_inclination = _default_fixed_inclination(_grid_name)
+
+    qf_test_inclination_selector = mo.ui.dropdown(
+        options=[str(_value) for _value in _inclinations],
+        value=str(int(round(float(_default_inclination)))),
+        label="Inclination (°):",
+        full_width=True,
+    )
+    return qf_test_inclination_selector, qf_test_run_selector
+
+
+@app.cell
 def _(mo, os, qf_obs_uploader, set_qf_last_uploaded_obs, set_qf_obs_refresh):
     if qf_obs_uploader.value:
         _obs_dir = "observation_files"
@@ -2864,11 +3019,130 @@ def _(mo, os, qf_obs_uploader, set_qf_last_uploaded_obs, set_qf_obs_refresh):
 
 
 @app.cell
-def _(mo, np, os, pd, qf_obs_selector):
+def _(
+    mo,
+    np,
+    os,
+    pd,
+    qf_data_source_selector,
+    qf_obs_selector,
+    qf_test_grid_info,
+    qf_test_grid_params_df,
+    qf_test_inclination_selector,
+    qf_test_run_selector,
+):
     qf_obs_data = None
+    qf_data_source_info = ""
     _obs_dir = "observation_files"
+    _is_test_grid = "Test Grid" in qf_data_source_selector.value
+    _test_run_value = str(qf_test_run_selector.value or "")
 
-    if qf_obs_selector.value and qf_obs_selector.value != "":
+    if _is_test_grid and _test_run_value.startswith("run"):
+        try:
+            import io as _io
+            import lzma as _lzma
+            import re as _re
+            from Speculate_addons.Spec_functions import build_synthetic_sirocco_sigma as _build_synthetic_sirocco_sigma
+            from Speculate_addons.grid_registry import inclination_column as _inclination_column
+            from Speculate_addons.grid_registry import lookup_row_to_emulator_values as _lookup_row_to_emulator_values
+
+            _grid_name = qf_test_grid_info.get("grid_name")
+            _test_grid_name = qf_test_grid_info.get("test_grid_name")
+            _test_grid_path = qf_test_grid_info.get("test_grid_path")
+            _repo_id = qf_test_grid_info.get("repo_id")
+            _run_match = _re.search(r"run(\d+)", _test_run_value)
+            if _run_match is None:
+                raise ValueError("Select a valid test-grid run.")
+            _run_number = int(_run_match.group(1))
+
+            def _ensure_spec_path(_run_number):
+                _candidates = []
+                if _test_grid_path:
+                    _candidates.extend([
+                        os.path.join(_test_grid_path, f"run{_run_number}.spec"),
+                        os.path.join(_test_grid_path, f"run{_run_number}.spec.xz"),
+                    ])
+                for _candidate in _candidates:
+                    if os.path.exists(_candidate):
+                        return _candidate
+                if not _repo_id or not _test_grid_path:
+                    raise FileNotFoundError(f"No local file for run{_run_number}.spec")
+
+                from huggingface_hub import hf_hub_download as _hf_hub_download
+
+                os.makedirs(_test_grid_path, exist_ok=True)
+                _errors = []
+                for _filename in (f"run{_run_number}.spec.xz", f"run{_run_number}.spec"):
+                    try:
+                        return _hf_hub_download(
+                            repo_id=_repo_id,
+                            filename=_filename,
+                            repo_type="dataset",
+                            local_dir=_test_grid_path,
+                        )
+                    except Exception as _exc:
+                        _errors.append(f"{_filename}: {_exc}")
+                raise FileNotFoundError("; ".join(_errors))
+
+            def _load_spec_array(_path):
+                if str(_path).endswith(".xz"):
+                    with _lzma.open(_path, "rt", encoding="utf-8") as _file:
+                        _raw_lines = _file.readlines()
+                else:
+                    with open(_path, "r", encoding="utf-8") as _file:
+                        _raw_lines = _file.readlines()
+                _lines = []
+                for _line in _raw_lines:
+                    if isinstance(_line, str):
+                        _lines.append(_line)
+                    else:
+                        _lines.append(bytes(_line).decode("utf-8"))
+                _data_start = None
+                for _idx, _line in enumerate(_lines):
+                    _stripped = _line.strip()
+                    if not _stripped or _stripped.startswith("#") or _stripped.startswith("Freq."):
+                        continue
+                    _data_start = _idx
+                    break
+                if _data_start is None:
+                    raise ValueError(f"No numeric spectrum rows found in {_path}")
+                return np.loadtxt(_io.StringIO("".join(_lines[_data_start:])), unpack=True)
+
+            _spec_path = _ensure_spec_path(_run_number)
+            _data_raw = _load_spec_array(_spec_path)
+            _inc_val = int(qf_test_inclination_selector.value)
+            _inc_col_idx = _inclination_column(_grid_name, _inc_val)
+            _wavelengths = np.flip(_data_raw[1])
+            _fluxes = np.flip(_data_raw[_inc_col_idx])
+            _sigma, _continuum = _build_synthetic_sirocco_sigma(_wavelengths, _fluxes)
+            _df = pd.DataFrame({
+                "wavelength": _wavelengths,
+                "flux": _fluxes,
+                "error": _sigma,
+                "continuum": _continuum,
+                "sigma_source": "synthetic_sirocco_continuum",
+            })
+            _df = _df.sort_values("wavelength", ascending=True).reset_index(drop=True)
+
+            if qf_test_grid_params_df is not None and "Run Number" in qf_test_grid_params_df.columns:
+                _gt_row = qf_test_grid_params_df[qf_test_grid_params_df["Run Number"].astype(int) == _run_number]
+                if len(_gt_row) > 0:
+                    _df.attrs["ground_truth_params"] = _lookup_row_to_emulator_values(
+                        _grid_name,
+                        _gt_row.iloc[0],
+                        _inc_val,
+                    )
+
+            _df.attrs["is_test_grid"] = True
+            _df.attrs["source_label"] = f"{_test_grid_name}/run{_run_number}.spec @ {_inc_val}°"
+            qf_obs_data = _df
+            qf_data_source_info = f"Test Grid: {_df.attrs['source_label']}"
+        except Exception as e:
+            mo.output.replace(
+                mo.callout(mo.md(f"Error loading test-grid spectrum: {e}"), kind="danger")
+            )
+
+    elif qf_obs_selector.value and qf_obs_selector.value != "":
         try:
             _path = os.path.join(_obs_dir, qf_obs_selector.value)
             _df = pd.read_csv(_path)
@@ -2880,7 +3154,10 @@ def _(mo, np, os, pd, qf_obs_selector):
                     _df['sigma_source'] = _df['sigma_source'].astype(str).str.lower()
                 elif 'error' not in _df.columns:
                     _df['sigma_source'] = 'uploaded_default_continuum'
+                _df.attrs["is_test_grid"] = False
+                _df.attrs["source_label"] = qf_obs_selector.value
                 qf_obs_data = _df
+                qf_data_source_info = f"Observation: {qf_obs_selector.value}"
             else:
                 mo.output.replace(
                     mo.callout(mo.md("CSV must have 'Wavelength' and 'Flux' columns."), kind="danger")
@@ -2889,7 +3166,7 @@ def _(mo, np, os, pd, qf_obs_selector):
             mo.output.replace(
                 mo.callout(mo.md(f"Error reading file: {e}"), kind="danger")
             )
-    return (qf_obs_data,)
+    return qf_data_source_info, qf_obs_data
 
 
 @app.cell
@@ -2955,6 +3232,8 @@ def _(
     mo,
     np,
     os,
+    qf_data_source_info,
+    qf_data_source_selector,
     qf_inf_emu_data,
     qf_inf_is_grid_interp,
     qf_inf_model_picker,
@@ -2965,6 +3244,9 @@ def _(
     qf_obs_scale_selector,
     qf_obs_selector,
     qf_obs_uploader,
+    qf_param_map_db_for_grid,
+    qf_test_inclination_selector,
+    qf_test_run_selector,
 ):
     _model_status = mo.md("")
     if qf_inf_models is not None and qf_inf_emu_data is not None:
@@ -3005,22 +3287,95 @@ def _(
 
     _obs_status = mo.md("")
     if qf_obs_data is not None:
+        _is_test_grid = bool(qf_obs_data.attrs.get("is_test_grid", False))
+        if _is_test_grid:
+            _source_label = qf_obs_data.attrs.get("source_label", qf_data_source_info)
+        else:
+            _source_label = qf_data_source_info or qf_obs_data.attrs.get("source_label", qf_obs_selector.value)
+        _heading = "Test Grid Spectrum Loaded" if _is_test_grid else "Observation Loaded"
+        _ground_truth_md = ""
+        if _is_test_grid:
+            _truth_values = dict(qf_obs_data.attrs.get("ground_truth_params") or {})
+
+            def _format_truth_value(_value):
+                try:
+                    _value = float(_value)
+                except Exception:
+                    return str(_value)
+                if not np.isfinite(_value):
+                    return "N/A"
+                return f"{_value:.4g}"
+
+            def _normalise_truth_label(_label):
+                import re as _re
+                _text = str(_label).strip()
+                if _text.lower().startswith("log10(") and _text.endswith(")"):
+                    _text = _text[6:-1]
+                return _re.sub(r"[^a-z0-9]+", "", _text.lower())
+
+            def _truth_lookup(_display_name):
+                if "inclination" in str(_display_name).lower() and "Inclination" in _truth_values:
+                    return _truth_values["Inclination"]
+                _normalised = {
+                    _normalise_truth_label(_key): _value
+                    for _key, _value in _truth_values.items()
+                }
+                return _normalised.get(_normalise_truth_label(_display_name))
+
+            _truth_parts = []
+            if qf_inf_emu_data is not None:
+                _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
+                for _param_name in qf_inf_emu_data.get("param_names", []):
+                    _digits = "".join(_char for _char in str(_param_name) if _char.isdigit())
+                    _idx = int(_digits) if _digits else None
+                    if _idx in _param_map_db:
+                        _base = _param_map_db[_idx][0]
+                        _is_log = len(_param_map_db[_idx]) > 3 and _param_map_db[_idx][3]
+                        _display_name = f"log10({_base})" if _is_log else _base
+                    else:
+                        _display_name = str(_param_name)
+                    _truth_value = _truth_lookup(_display_name)
+                    if _truth_value is not None:
+                        _truth_parts.append(f"`{_display_name}` = {_format_truth_value(_truth_value)}")
+            _truth_parts.extend(["`Av` = 0", "`Distance (pc)` = 100", "`cheb_1` = 0"])
+            if _truth_parts:
+                _ground_truth_lines = "\n".join(
+                    f"              - {_truth_part}"
+                    for _truth_part in _truth_parts
+                )
+                _ground_truth_md = f"\n            - **Ground Truth:**\n{_ground_truth_lines}"
+
         _obs_status = mo.callout(
             mo.md(f"""
-            **Observation Loaded:** `{qf_obs_selector.value}`
-            - **Points:** {len(qf_obs_data)}
+            **{_heading}:** `{_source_label}`
+            - **Points:** {len(qf_obs_data)}{_ground_truth_md}
             """),
             kind="success"
         )
 
+    _is_test_grid_source = "Test Grid" in qf_data_source_selector.value
     _stage3_controls = []
     if qf_inf_model_picker is not None:
         _stage3_controls.append(qf_inf_model_picker)
+    _stage3_controls.extend([_model_status, mo.md("---"), qf_data_source_selector])
+    if _is_test_grid_source:
+        _stage3_controls.append(
+            mo.callout(
+                mo.md(
+                    "Test grid spectra are used for the training of neural network "
+                    "emulators. As a result, performance here **may** be more optimistic "
+                    "than for an unknown observation."
+                ),
+                kind="warn",
+            )
+        )
+        _stage3_controls.append(
+            mo.hstack([qf_test_run_selector, qf_test_inclination_selector], widths=[3, 1], align="end")
+        )
+    else:
+        _stage3_controls.extend([qf_obs_selector, qf_obs_uploader])
+
     _stage3_controls.extend([
-        _model_status,
-        mo.md("---"),
-        qf_obs_selector,
-        qf_obs_uploader,
         mo.hstack([qf_inf_wl_slider, qf_obs_scale_selector], widths=[3, 1], align="end"),
         mo.md("---"),
         _obs_status,
@@ -3229,13 +3584,14 @@ def _(
         _max_inputs.append(mo.ui.number(value=round(_hi, 4), step=0.001, label="Max"))
 
     _model_flux_scale = str(qf_inf_emu_data.get("scale", "linear"))
+    _is_test_grid_data = bool(qf_obs_data is not None and qf_obs_data.attrs.get("is_test_grid", False))
     _fix_distance_for_shape_only = (
         qf_obs_scale_selector.value == "continuum-normalised"
         or _model_flux_scale == "continuum-normalised"
     )
     _nuisance = [
-        ("Av",        0.0,         0.0,               2.0, False),
-        ("Distance (pc)", 100.0, 90.0, 110.0, _fix_distance_for_shape_only),
+        ("Av",        0.0,         0.0,               2.0, _is_test_grid_data),
+        ("Distance (pc)", 100.0, 90.0, 110.0, _is_test_grid_data or _fix_distance_for_shape_only),
         ("cheb_1",    0.0,         -0.5,              0.5, True),
     ]
     for _name, _val, _lo, _hi, _fixed_default in _nuisance:
@@ -4303,7 +4659,7 @@ def _(
 
 
 @app.cell
-def _(mo, np, pd, qf_mle_result):
+def _(mo, np, pd, qf_mle_result, qf_obs_data):
     if qf_mle_result is None:
         mo.stop(True, mo.md(""))
 
@@ -4311,6 +4667,41 @@ def _(mo, np, pd, qf_mle_result):
     _best = qf_mle_result["best_params"]
     _active_idx = qf_mle_result["active_idx"]
     _e_err = qf_mle_result["ensemble_errors"]
+    _has_ground_truth = bool(qf_obs_data is not None and qf_obs_data.attrs.get("is_test_grid", False))
+    _truth_values = dict(qf_obs_data.attrs.get("ground_truth_params") or {}) if _has_ground_truth else {}
+
+    def _format_summary_value(_value):
+        try:
+            _value = float(_value)
+        except Exception:
+            return str(_value)
+        if not np.isfinite(_value):
+            return "—"
+        return f"{_value:.6f}"
+
+    def _normalise_truth_label(_label):
+        import re as _re
+        _text = str(_label).strip()
+        if _text.lower().startswith("log10(") and _text.endswith(")"):
+            _text = _text[6:-1]
+        return _re.sub(r"[^a-z0-9]+", "", _text.lower())
+
+    def _truth_lookup(_display_name):
+        _name = str(_display_name)
+        _name_lower = _name.lower()
+        if _name == "Av":
+            return 0.0
+        if _name == "Distance (pc)":
+            return 100.0
+        if _name == "cheb_1":
+            return 0.0
+        if "inclination" in _name_lower and "Inclination" in _truth_values:
+            return _truth_values["Inclination"]
+        _normalised = {
+            _normalise_truth_label(_key): _value
+            for _key, _value in _truth_values.items()
+        }
+        return _normalised.get(_normalise_truth_label(_display_name))
 
     _rows = []
     _ai = 0
@@ -4322,11 +4713,21 @@ def _(mo, np, pd, qf_mle_result):
         else:
             _ee = np.nan
 
-        _rows.append({
+        _row = {
             "Parameter": _name,
             "Best Fit": f"{_val:.6f}",
             "±1σ (Ensemble)": f"{_ee:.6f}" if np.isfinite(_ee) else "—",
-        })
+        }
+        if _has_ground_truth:
+            _truth_val = _truth_lookup(_name)
+            if _truth_val is None:
+                _row["Ground Truth"] = "—"
+                _row["Δ"] = "—"
+            else:
+                _delta = float(_val) - float(_truth_val)
+                _row["Ground Truth"] = _format_summary_value(_truth_val)
+                _row["Δ"] = f"{_delta:+.6f}"
+        _rows.append(_row)
 
     _df = pd.DataFrame(_rows)
     _summary_table = mo.ui.table(_df, label="Parameter Summary", selection=None)
