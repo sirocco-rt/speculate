@@ -1453,13 +1453,24 @@ def _(
         _use_optuna = qf_optuna_checkbox.value
         _n_ensemble = 3
 
-        # 90/10 random train/validation split (fixed seed for reproducibility).
+        # Single/final NN training uses the full quasi-regular grid.  Optuna
+        # search and ensemble members use fixed 90/10 train/validation splits
+        # drawn from that same grid; the external testgrid dataset is never
+        # consumed by this training cell.
         _n_samples = len(X_norm)
-        _rng = np.random.RandomState(42)
-        _perm_idx = _rng.permutation(_n_samples)
-        _split = max(1, int(_n_samples * 0.1))
-        _val_idx = _perm_idx[:_split]
-        _train_idx = _perm_idx[_split:]
+        _full_idx = np.arange(_n_samples)
+
+        def _make_train_val_split(seed):
+            if _n_samples < 2:
+                return _full_idx, None
+            _rng = np.random.RandomState(seed)
+            _perm_idx = _rng.permutation(_n_samples)
+            _split = min(max(1, int(_n_samples * 0.1)), _n_samples - 1)
+            _val_idx = _perm_idx[:_split]
+            _train_idx = _perm_idx[_split:]
+            return _train_idx, _val_idx
+
+        _optuna_train_idx, _optuna_val_idx = _make_train_val_split(42)
 
         # Resolve device once: GPU if user toggled on and CUDA available, else CPU.
         _device = torch.device("cuda" if qf_use_gpu.value and torch.cuda.is_available() else "cpu")
@@ -1469,16 +1480,20 @@ def _(
                              max_epochs, train_idx, val_idx, X_norm, Y_weights,
                              y_mean, y_std, seed=42, trial=None,
                              epoch_callback=None):
-            """Train a single QuickFitNN and return (model, best_val_loss, train_losses, val_losses).
+            """Train one QuickFitNN and return (model, best_loss, train_losses, val_losses).
 
             Implements mini-batch gradient descent with early stopping (patience=50).
+            If *val_idx* is None, all selected samples are used for training and
+            the best checkpoint is tracked by training loss instead of validation
+            loss, so no validation-loss curve is generated.
             Optionally integrates with Optuna for pruning unpromising trials.
             Supports three LR schedulers: cosine annealing, reduce-on-plateau, one-cycle.
             If *epoch_callback* is provided, it is called every 50 epochs as
-            ``epoch_callback(epoch, max_epochs, best_val_loss, train_losses, val_losses)``.
+            ``epoch_callback(epoch, max_epochs, best_loss, train_losses, val_losses)``.
             """
             torch.manual_seed(seed)
             np.random.seed(seed)
+            _has_validation = val_idx is not None and len(val_idx) > 0
 
             _Xt = torch.tensor(X_norm, dtype=torch.float32).to(_device)
             if out_norm == "standard":
@@ -1510,10 +1525,10 @@ def _(
 
             _Xtr = _Xt[train_idx]
             _Ytr = _Yt[train_idx]
-            _Xval = _Xt[val_idx]
-            _Yval = _Yt[val_idx]
+            _Xval = _Xt[val_idx] if _has_validation else None
+            _Yval = _Yt[val_idx] if _has_validation else None
 
-            _best_val = float("inf")
+            _best_loss = float("inf")
             _best_state = None
             _patience_counter = 0
             _train_losses = []
@@ -1538,21 +1553,25 @@ def _(
                         if _onecycle_step_count < _steps:
                             _scheduler.step()
 
-                _train_losses.append(_epoch_train_loss / max(_n_batches, 1))
+                _train_loss = _epoch_train_loss / max(_n_batches, 1)
+                _train_losses.append(_train_loss)
 
                 if sched_name == "cosine_annealing" and _scheduler is not None:
                     _scheduler.step()
 
-                _model.eval()
-                with torch.no_grad():
-                    _val_loss = nn.functional.mse_loss(_model(_Xval), _Yval).item()
-                _val_losses.append(_val_loss)
+                if _has_validation:
+                    _model.eval()
+                    with torch.no_grad():
+                        _metric_loss = nn.functional.mse_loss(_model(_Xval), _Yval).item()
+                    _val_losses.append(_metric_loss)
+                else:
+                    _metric_loss = _train_loss
 
                 if sched_name == "reduce_on_plateau" and _scheduler is not None:
-                    _scheduler.step(_val_loss)
+                    _scheduler.step(_metric_loss)
 
-                if _val_loss < _best_val - 1e-8:
-                    _best_val = _val_loss
+                if _metric_loss < _best_loss - 1e-8:
+                    _best_loss = _metric_loss
                     _best_state = {k: v.clone() for k, v in _model.state_dict().items()}
                     _patience_counter = 0
                 else:
@@ -1561,11 +1580,11 @@ def _(
                     break
 
                 if epoch_callback is not None and _ep % 50 == 0:
-                    epoch_callback(_ep + 1, max_epochs, _best_val, _train_losses, _val_losses)
+                    epoch_callback(_ep + 1, max_epochs, _best_loss, _train_losses, _val_losses)
 
                 if trial is not None:
                     import optuna
-                    trial.report(_val_loss, _ep)
+                    trial.report(_metric_loss, _ep)
                     if trial.should_prune():
                         raise optuna.TrialPruned()
 
@@ -1573,7 +1592,7 @@ def _(
                 _model.load_state_dict(_best_state)
             # Always return model on CPU for inference/export compatibility.
             _model.cpu().eval()
-            return _model, _best_val, _train_losses, _val_losses
+            return _model, _best_loss, _train_losses, _val_losses
 
         if _use_optuna:
             # ── Optuna Hyperparameter Search ─────────────────────────────
@@ -1666,7 +1685,7 @@ def _(
                 _, _val_loss, _, _ = _train_single_nn(
                     n_in, n_out, _hidden, _act, _dp, _dp_strat, _bn, _skip,
                     _opt_name, _lr, _wd, _bs, _sched, _out_norm,
-                    _max_epochs, _train_idx, _val_idx, X_norm, Y_weights,
+                    _max_epochs, _optuna_train_idx, _optuna_val_idx, X_norm, Y_weights,
                     y_mean, y_std, seed=trial.number * 137 + 42, trial=trial,
                     epoch_callback=_optuna_epoch_cb,
                 )
@@ -1772,10 +1791,10 @@ def _(
                     f"with optimal defaults...**"
                 ))
             qf_trained_models = []
-            _full_idx = np.arange(_n_samples)  # Train ensemble on ALL data
             _ensemble_val_histories = []
             _ensemble_train_histories = []
             _ens_val_losses = []
+            _ensemble_split_seeds = []
 
             # Colours for ensemble member loss curves.
             _member_colours = ["#3b82f6", "#ef4444", "#22c55e", "#f59e0b", "#a855f7"]
@@ -1840,6 +1859,8 @@ def _(
                     mo.output.replace(_status)
 
             for _seed in range(_n_ensemble):
+                _member_seed = _seed * 137 + 42
+                _member_train_idx, _member_val_idx = _make_train_val_split(_member_seed)
                 _model, _loss, _tl, _vl = _train_single_nn(
                     n_in, n_out, _hidden,
                     _hp.get("activation", "ReLU"), _hp.get("dropout", 0.01),
@@ -1847,14 +1868,15 @@ def _(
                     _hp.get("skip_connections", False), _hp.get("optimizer", "adamw"),
                     _hp.get("lr", 1.5e-3), _hp.get("weight_decay", 5e-3),
                     _hp.get("batch_size", 128), _hp.get("lr_scheduler", "reduce_on_plateau"),
-                    _out_norm, _max_epochs, _full_idx, _val_idx,
-                    X_norm, Y_weights, y_mean, y_std, seed=_seed * 137 + 42,
+                    _out_norm, _max_epochs, _member_train_idx, _member_val_idx,
+                    X_norm, Y_weights, y_mean, y_std, seed=_member_seed,
                     epoch_callback=_ens_epoch_cb,
                 )
                 qf_trained_models.append(_model)
                 _ens_val_losses.append(_loss)
                 _ensemble_val_histories.append(_vl)
                 _ensemble_train_histories.append(_tl)
+                _ensemble_split_seeds.append(_member_seed)
 
             # Show final ensemble chart.
             _ens_elapsed = _fmt_elapsed(_ens_t0)
@@ -1873,6 +1895,8 @@ def _(
                 "hparams": qf_best_hparams,
                 "hidden_sizes": _hidden,
                 "ensemble": True,
+                "training_split": "per_member_90_10",
+                "ensemble_split_seeds": _ensemble_split_seeds,
                 "ensemble_val_histories": _ensemble_val_histories,
                 "ensemble_train_histories": _ensemble_train_histories,
             }
@@ -1892,22 +1916,25 @@ def _(
 
             def _build_nn_chart(_train_losses, _val_losses, _ep, _mx, _best, _elapsed_str=""):
                 """Build a live Altair chart of the NN training loss."""
-                _n = len(_train_losses)
-                _epochs = list(range(1, _n + 1))
-                _df = pd.DataFrame({
-                    "Epoch": _epochs * 2,
-                    "Loss": list(_train_losses) + list(_val_losses),
-                    "Series": ["Train MSE"] * _n + ["Val MSE"] * _n,
-                })
-                _title = f"NN Training — Epoch {_ep}/{_mx} | Best Val MSE: {_best:.2e}"
+                if not _train_losses:
+                    return None
+                _rows = []
+                for _i, _tl in enumerate(_train_losses):
+                    _rows.append({"Epoch": _i + 1, "Loss": _tl, "Series": "Train MSE"})
+                for _i, _vl in enumerate(_val_losses):
+                    _rows.append({"Epoch": _i + 1, "Loss": _vl, "Series": "Val MSE"})
+                _df = pd.DataFrame(_rows)
+                _metric_label = "Val MSE" if _val_losses else "Train MSE"
+                _title = f"NN Training — Epoch {_ep}/{_mx} | Best {_metric_label}: {_best:.2e}"
                 if _elapsed_str:
                     _title += f" [{_elapsed_str}]"
+                _series_domain = ["Train MSE"] + (["Val MSE"] if _val_losses else [])
+                _series_range = ["#3b82f6"] + (["#ef4444"] if _val_losses else [])
                 _base = alt.Chart(_df).mark_line().encode(
                     x=alt.X("Epoch:Q"),
                     y=alt.Y("Loss:Q", scale=alt.Scale(zero=False), title="MSE Loss"),
                     color=alt.Color("Series:N",
-                                    scale=alt.Scale(domain=["Train MSE", "Val MSE"],
-                                                    range=["#3b82f6", "#ef4444"]),
+                                    scale=alt.Scale(domain=_series_domain, range=_series_range),
                                     legend=alt.Legend(title="")),
                 ).properties(
                     title=_title,
@@ -1926,17 +1953,19 @@ def _(
                 _el = _nn_fmt_elapsed()
                 if qf_live_plot.value:
                     _chart = _build_nn_chart(train_losses, val_losses, ep, mx, best_loss, _el)
-                    _status = mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network...** "
-                                    f"Epoch {ep}/{mx} | Best Val MSE: {best_loss:.2e} | {_el}")
-                    mo.output.replace(mo.vstack([_status, _chart]))
+                    _metric_label = "Val MSE" if val_losses else "Train MSE"
+                    _status = mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network on full grid...** "
+                                    f"Epoch {ep}/{mx} | Best {_metric_label}: {best_loss:.2e} | {_el}")
+                    mo.output.replace(mo.vstack([_status, _chart]) if _chart is not None else _status)
                 else:
-                    _status = mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network...** "
-                                    f"Epoch {ep}/{mx} | Best Val MSE: {best_loss:.2e} | {_el}")
+                    _metric_label = "Val MSE" if val_losses else "Train MSE"
+                    _status = mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network on full grid...** "
+                                    f"Epoch {ep}/{mx} | Best {_metric_label}: {best_loss:.2e} | {_el}")
                     mo.output.replace(_status)
 
-            mo.output.replace(mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network...**"))
+            mo.output.replace(mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network on full grid...**"))
 
-            _model, _val_loss, _nn_train_losses, _nn_val_losses = _train_single_nn(
+            _model, _best_loss, _nn_train_losses, _nn_val_losses = _train_single_nn(
                 n_in, n_out, _hidden,
                 _hp["activation"], _hp["dropout"],
                 _hp["dropout_strategy"], _hp["batch_norm"],
@@ -1944,7 +1973,7 @@ def _(
                 _hp["lr"], _hp["weight_decay"],
                 _hp["batch_size"], _hp["lr_scheduler"],
                 _hp["output_norm"], _max_epochs,
-                _train_idx, _val_idx, X_norm, Y_weights, y_mean, y_std,
+                _full_idx, None, X_norm, Y_weights, y_mean, y_std,
                 epoch_callback=_nn_epoch_cb,
             )
 
@@ -1952,10 +1981,10 @@ def _(
             _nn_elapsed = _nn_fmt_elapsed()
             if _nn_train_losses:
                 _final_chart = _build_nn_chart(_nn_train_losses, _nn_val_losses,
-                                               len(_nn_train_losses), _max_epochs, _val_loss, _nn_elapsed)
+                                               len(_nn_train_losses), _max_epochs, _best_loss, _nn_elapsed)
                 mo.output.replace(mo.vstack([
                     mo.md(f"{mo.icon('lucide:check-circle')} **Training complete!** "
-                          f"Best Val MSE: {_val_loss:.2e} after {len(_nn_train_losses)} epochs ({_nn_elapsed})"),
+                          f"Best Train MSE: {_best_loss:.2e} after {len(_nn_train_losses)} epochs ({_nn_elapsed})"),
                     _final_chart,
                 ]))
 
@@ -1964,10 +1993,12 @@ def _(
             qf_train_info = {
                 "source": "nn",
                 "n_models": 1,
-                "best_val_mse": _val_loss,
+                "best_train_mse": _best_loss,
+                "best_val_mse": None,
                 "hparams": qf_best_hparams,
                 "hidden_sizes": _hidden,
                 "ensemble": False,
+                "training_split": "full_grid",
                 "train_losses": _nn_train_losses,
                 "val_losses": _nn_val_losses,
             }
@@ -1986,6 +2017,7 @@ def _(
     alt,
     mo,
     np,
+    os,
     pd,
     qf_param_map_db_for_grid,
     qf_input_scaler,
@@ -2082,12 +2114,433 @@ def _(
         _r2 = 1 - _ss_res / np.where(_ss_tot > 0, _ss_tot, 1.0)
         _r2_title = "Per-Component R² (Predicted vs Grid)"
 
+    # The first R^2 score is the historical training-summary diagnostic.  It is
+    # intentionally labelled as "Regular Grid" because it is computed from the
+    # processed grid used to build the PCA basis and train the surrogate, not
+    # from the paired external testgrid spectra.
+    _regular_r2_label = (
+        "Regular Grid LOO PCA-weight R²"
+        if _source == "grid_interp"
+        else "Regular Grid PCA-weight R²"
+    )
+
+    _regular_flux_r2_label = (
+        "Regular Grid LOO Flux R²"
+        if _source == "grid_interp"
+        else "Regular Grid Flux R²"
+    )
+
+    def _summarise_r2_values(_values):
+        """Return the compact R² statistics shown in the summary callout.
+
+        Each diagnostic produces a vector of individual R² values: one value per
+        PCA component for the PCA-weight score, or one value per spectrum for
+        the flux-space scores.  The Bottom 5% value is the 5th percentile of
+        that vector, so it marks the lower-tail score threshold just above the
+        worst few individual components or spectra.
+        """
+        _values = np.asarray(_values, dtype=np.float64)
+        _values = _values[np.isfinite(_values)]
+        if len(_values) == 0:
+            return None
+        return {
+            "n_values": int(len(_values)),
+            "mean": float(_values.mean()),
+            "min": float(_values.min()),
+            "bottom5": float(np.percentile(_values, 5)),
+        }
+
+    _regular_r2_stats = _summarise_r2_values(_r2)
+    if _regular_r2_stats is not None:
+        _regular_r2_line = (
+            f"- **{_regular_r2_label}:** Mean {_regular_r2_stats['mean']:.6f} | "
+            f"Min {_regular_r2_stats['min']:.6f} | Bottom 5% {_regular_r2_stats['bottom5']:.6f}"
+        )
+    else:
+        _regular_r2_line = f"- **{_regular_r2_label}:** not available"
+
+    def _weights_to_flux(_weights):
+        """Convert PCA weights back to Quick Fit's trained flux space.
+
+        The PCA model was trained after per-spectrum scale removal and
+        per-wavelength standardisation.  This inverse transform therefore
+        returns spectra in that same scale-removed flux space.  It does not add
+        back each spectrum's original absolute normalisation, which is exactly
+        the space used by the training summary and testgrid diagnostic.
+        """
+        _weights = np.asarray(_weights, dtype=np.float64)
+        return (_weights @ (qf_pca_data["eigenspectra"] * qf_pca_data["flux_std"])) + qf_pca_data["flux_mean"]
+
+    def _compute_regular_grid_flux_r2(_true_weights, _pred_weights, _score_mode):
+        """Score regular-grid surrogate error after PCA reconstruction.
+
+        The existing regular-grid R² above is computed component-by-component
+        in PCA-weight space.  This companion metric is the intermediate check:
+        project the same true and predicted weights back into spectra, then
+        compute one flux-curve R² value per regular-grid spectrum.
+
+        The original pre-PCA processed flux matrix is not stored in
+        qf_pca_data, so this metric isolates the surrogate or LOO interpolation
+        error inside the retained PCA subspace.  The PCA truncation error
+        against the original grid is still shown separately by the RMSE envelope
+        below.
+        """
+        _truth_flux = _weights_to_flux(_true_weights)
+        _pred_flux = _weights_to_flux(_pred_weights)
+
+        # Match the testgrid flux diagnostic: score each spectrum along the
+        # wavelength axis, then report mean and worst-case behaviour.  This
+        # keeps all flux-space R² summaries interpretable in the same way.
+        _ss_res_spec = np.sum((_truth_flux - _pred_flux) ** 2, axis=1)
+        _ss_tot_spec = np.sum((_truth_flux - _truth_flux.mean(axis=1, keepdims=True)) ** 2, axis=1)
+        _r2_spec = 1 - _ss_res_spec / np.where(_ss_tot_spec > 0, _ss_tot_spec, 1.0)
+        _r2_stats = _summarise_r2_values(_r2_spec)
+        if _r2_stats is None:
+            return None
+
+        return {
+            "score_mode": _score_mode,
+            "n_spectra": _r2_stats["n_values"],
+            "mean": _r2_stats["mean"],
+            "min": _r2_stats["min"],
+            "bottom5": _r2_stats["bottom5"],
+        }
+
+    def _predict_pca_weights(_params):
+        """Evaluate the trained Quick Fit surrogate and return PCA weights.
+
+        Quick Fit models learn the map from emulator-space parameters to PCA
+        weights.  The testgrid diagnostic therefore first predicts weights, then
+        reconstructs spectra using the same PCA basis as the training summary.
+        Ensemble models are reduced to their mean prediction here, matching the
+        default inference path.
+        """
+        _params = np.asarray(_params, dtype=np.float32)
+        if _params.ndim == 1:
+            _params = _params.reshape(1, -1)
+
+        if _source == "grid_interp":
+            # Grid interpolation models store one RegularGridInterpolator per
+            # PCA component, and they consume raw emulator-space coordinates.
+            return np.column_stack([
+                np.asarray(_interp(_params)).reshape(-1)
+                for _interp in qf_trained_models
+            ]).astype(np.float32)
+
+        # Neural networks consume min-max normalised coordinates and, when
+        # output normalisation is enabled, emit standardised PCA weights that
+        # must be transformed back to the PCA-weight scale.
+        _X_norm_pred = (_params - qf_input_scaler["min"]) / qf_input_scaler["range"]
+        _Xt_pred = torch.tensor(_X_norm_pred, dtype=torch.float32)
+        _pred_runs = []
+        for _model in qf_trained_models:
+            _model.eval()
+            with torch.no_grad():
+                _pred = _model(_Xt_pred).numpy()
+            if qf_output_scaler is not None:
+                _pred = _pred * qf_output_scaler["std"] + qf_output_scaler["mean"]
+            _pred_runs.append(_pred)
+        return np.mean(_pred_runs, axis=0)
+
+    def _compute_test_grid_flux_r2():
+        """Compare local test-grid spectra to emulator predictions at truth.
+
+        This is a lightweight generalisation diagnostic, not a full inference
+        run.  It avoids MLE, distance/extinction nuisance parameters, and MCMC.
+        Instead, each testgrid spectrum is compared directly to the Quick Fit
+        spectrum predicted at that row's lookup-table ground-truth parameters.
+
+        The routine is deliberately local-only for spectra and lookup metadata;
+        training should not trigger large HuggingFace downloads behind the
+        user's back.  If local files are missing, the UI reports the diagnostic
+        as unavailable instead of blocking model training.
+        """
+        try:
+            import io as _io
+            import lzma as _lzma
+
+            # Reuse the same low-level flux transform helpers used by the grid
+            # interfaces when building the regular-grid NPZ.  That keeps the
+            # testgrid comparison in the same linear/log/continuum-normalised
+            # and optional smoothing space as the trained PCA model.
+            from Speculate_addons.Spec_gridinterfaces import (
+                _apply_flux_scale as _apply_training_flux_scale,
+                _maybe_smooth_flux as _maybe_smooth_training_flux,
+            )
+            # Registry helpers provide the paired testgrid name, inclination
+            # columns, and physical-to-emulator-space lookup-table transforms.
+            from Speculate_addons.grid_registry import (
+                get_grid_config as _get_grid_config,
+                inclination_column as _inclination_column,
+                inclination_values as _inclination_values,
+                lookup_row_to_emulator_values as _lookup_row_to_emulator_values,
+                parameter_label_map as _parameter_label_map,
+            )
+
+            # The training grid name stored in qf_pca_data determines which
+            # paired *_testgrid_* dataset is scientifically comparable.
+            _grid_name = qf_pca_data.get("grid_name")
+            _grid_config = _get_grid_config(_grid_name)
+            if _grid_config is None:
+                return None, "unknown grid"
+
+            _test_grid_name = _grid_config.get("test_grid_name") or str(_grid_name).replace("_grid_", "_testgrid_")
+            _test_grid_path = os.path.join("sirocco_grids", _test_grid_name)
+            _lookup_path = os.path.join(_test_grid_path, "grid_run_lookup_table.parquet")
+            if not os.path.exists(_lookup_path):
+                return None, f"no local lookup table for `{_test_grid_name}`"
+
+            # The lookup table links each runN.spec file to its known Sirocco
+            # simulation inputs.  Those physical values are later converted to
+            # the emulator-coordinate system used by the Quick Fit model.
+            _lookup_df = pd.read_parquet(_lookup_path)
+            if "Run Number" not in _lookup_df.columns:
+                return None, f"lookup table for `{_test_grid_name}` has no Run Number column"
+
+            # A Quick Fit model can either expose inclination as a trained input
+            # axis, or bake in one fixed inclination column at grid-build time.
+            # Testgrid scoring mirrors that choice: score every supported
+            # inclination for trainable-inclination models, otherwise score only
+            # the fixed inclination saved with the model.
+            _selected_param_ids = [int(_pid) for _pid in qf_pca_data.get("selected_param_indices", [])]
+            _inclination_param_ids = {int(_pid) for _pid in _grid_config.get("inclination_param_ids", set())}
+            _selected_inclination_ids = [
+                _pid for _pid in _selected_param_ids
+                if _pid in _inclination_param_ids
+            ]
+            if _selected_inclination_ids:
+                _inclinations = _inclination_values(_grid_name, _selected_inclination_ids[0])
+            else:
+                _fixed_inclination = qf_pca_data.get("fixed_inclination")
+                if _fixed_inclination is None or not np.isfinite(float(_fixed_inclination)):
+                    _fixed_inclination = _grid_config.get("default_fixed_inclination", 55)
+                _inclinations = [int(round(float(_fixed_inclination)))]
+
+            _param_labels = _parameter_label_map(_grid_name)
+
+            def _canonical_label(_text):
+                # Lookup-table conversion returns friendly labels such as
+                # "disk.mdot" or "KWD.d".  The parameter registry uses the same
+                # labels, but canonicalising avoids punctuation/case mismatches.
+                return re.sub(r"[^a-z0-9]+", "", str(_text).lower())
+
+            def _spec_path(_run_number):
+                # Score only spectra that are already present locally.  Stage 3
+                # may download individual spectra on demand, but this summary
+                # metric should remain a cheap local diagnostic.
+                for _suffix in (".spec", ".spec.xz"):
+                    _candidate = os.path.join(_test_grid_path, f"run{_run_number}{_suffix}")
+                    if os.path.exists(_candidate):
+                        return _candidate
+                return None
+
+            def _load_spec_array(_path):
+                # Sirocco .spec files contain a text header followed by numeric
+                # columns.  The first two columns are frequency and wavelength;
+                # later columns are fluxes at registered inclination angles.
+                if str(_path).endswith(".xz"):
+                    with _lzma.open(_path, "rt", encoding="utf-8") as _file:
+                        _raw_lines = _file.readlines()
+                else:
+                    with open(_path, "r", encoding="utf-8") as _file:
+                        _raw_lines = _file.readlines()
+                # Normalise lines to text for both plain and compressed files;
+                # this also keeps static analysis from treating the list as a
+                # bytes-or-str union when StringIO is built below.
+                _lines = []
+                for _line in _raw_lines:
+                    if isinstance(_line, str):
+                        _lines.append(_line)
+                    else:
+                        _lines.append(bytes(_line).decode("utf-8"))
+                # Skip comments, blanks, and the "Freq." column-label row, then
+                # let numpy parse the remaining numeric block.
+                _data_start = None
+                for _idx, _line in enumerate(_lines):
+                    _stripped = _line.strip()
+                    if not _stripped or _stripped.startswith("#") or _stripped.startswith("Freq."):
+                        continue
+                    _data_start = _idx
+                    break
+                if _data_start is None:
+                    raise ValueError(f"No numeric spectrum rows found in {_path}")
+                return np.loadtxt(_io.StringIO("".join(_lines[_data_start:])), unpack=True)
+
+            # Compare only over the exact wavelength support of the trained
+            # Quick Fit PCA model.  The raw .spec grid may be wider than the
+            # selected model wavelength window.
+            _wl_model = np.asarray(qf_pca_data["wl"], dtype=np.float64)
+            _wl_lo = float(_wl_model.min())
+            _wl_hi = float(_wl_model.max())
+            _flux_rows = []
+            _param_rows = []
+            _failures = 0
+
+            for _, _row in _lookup_df.iterrows():
+                # One lookup row corresponds to one runN.spec file.  The loop
+                # may produce multiple scored spectra from that row when
+                # inclination is a trainable Quick Fit parameter.
+                _run_number = int(_row["Run Number"])
+                _path = _spec_path(_run_number)
+                if _path is None:
+                    _failures += len(_inclinations)
+                    continue
+                try:
+                    _data_raw = _load_spec_array(_path)
+                    _wl_full = np.flip(np.asarray(_data_raw[1], dtype=np.float64))
+                    _wl_mask = (_wl_full >= _wl_lo) & (_wl_full <= _wl_hi)
+                    if not np.any(_wl_mask):
+                        _failures += len(_inclinations)
+                        continue
+
+                    for _inclination in _inclinations:
+                        _truth_values = _lookup_row_to_emulator_values(_grid_name, _row, _inclination)
+                        _truth_by_label = {
+                            _canonical_label(_key): float(_value)
+                            for _key, _value in _truth_values.items()
+                        }
+
+                        # Build the model input vector in the same selected
+                        # parameter order used during training.  Non-inclination
+                        # values come from the lookup table after registry
+                        # conversion into emulator space; inclination is the
+                        # current .spec flux-column angle.
+                        _params = []
+                        for _param_id in _selected_param_ids:
+                            if _param_id in _inclination_param_ids:
+                                _params.append(float(_inclination))
+                                continue
+                            _label_key = _canonical_label(_param_labels.get(_param_id, f"param{_param_id}"))
+                            if _label_key not in _truth_by_label:
+                                raise KeyError(f"No test-grid truth value for parameter {_param_id}")
+                            _params.append(_truth_by_label[_label_key])
+
+                        _flux_col = _inclination_column(_grid_name, _inclination)
+                        _flux_full = np.flip(np.asarray(_data_raw[_flux_col], dtype=np.float64))
+                        # Reapply the training-time preprocessing to the raw
+                        # testgrid flux so the comparison is made in the same
+                        # flux representation that the PCA model saw.
+                        _flux_full = _maybe_smooth_training_flux(_flux_full, bool(qf_pca_data.get("smoothing", False)))
+                        _flux_full = _apply_training_flux_scale(
+                            _wl_full,
+                            _wl_mask,
+                            _flux_full.copy(),
+                            qf_pca_data.get("scale", "linear"),
+                        )
+                        _flux_selected = _flux_full[_wl_mask]
+                        _wl_selected = _wl_full[_wl_mask]
+                        # The raw spectrum and processed grid usually share the
+                        # same wavelength samples.  Interpolate only as a guard
+                        # against small wavelength-grid differences.
+                        if len(_flux_selected) != len(_wl_model) or not np.allclose(_wl_selected, _wl_model):
+                            _flux_selected = np.interp(_wl_model, _wl_selected, _flux_selected)
+
+                        _flux_rows.append(_flux_selected)
+                        _param_rows.append(_params)
+                except Exception:
+                    # Keep the summary robust: one malformed or missing testgrid
+                    # spectrum should not invalidate the trained model output.
+                    _failures += len(_inclinations)
+                    continue
+
+            if not _flux_rows:
+                return None, f"no local test-grid spectra could be processed for `{_test_grid_name}`"
+
+            # Mirror the PCA preprocessing from training.  Before per-wavelength
+            # standardisation, Quick Fit removes each spectrum's overall flux
+            # scale: subtract the mean in log space, divide by the mean in linear
+            # and continuum-normalised space.  The predicted spectra below are
+            # reconstructed in this same scale-removed PCA space.
+            _truth_flux = np.asarray(_flux_rows, dtype=np.float64)
+            _truth_norm = _truth_flux.mean(axis=1, dtype=np.float64)
+            if qf_pca_data.get("scale") == "log":
+                _truth_compare = _truth_flux - _truth_norm[:, np.newaxis]
+            else:
+                _truth_norm = np.where(_truth_norm != 0, _truth_norm, 1.0)
+                _truth_compare = _truth_flux / _truth_norm[:, np.newaxis]
+
+            # Predict PCA weights at the testgrid truth parameters and project
+            # them through the stored PCA basis back into flux space.  This is
+            # the cheap at-truth emulator check that avoids the full inference
+            # procedure.
+            _pred_weights = _predict_pca_weights(np.asarray(_param_rows, dtype=np.float32))
+            _pred_flux = _weights_to_flux(_pred_weights)
+            # Compute one R^2 value per spectrum along the wavelength axis,
+            # then report the mean and worst case.  This is deliberately a
+            # flux-curve score, not a parameter-recovery or likelihood score.
+            _ss_res_spec = np.sum((_truth_compare - _pred_flux) ** 2, axis=1)
+            _ss_tot_spec = np.sum((_truth_compare - _truth_compare.mean(axis=1, keepdims=True)) ** 2, axis=1)
+            _r2_spec = 1 - _ss_res_spec / np.where(_ss_tot_spec > 0, _ss_tot_spec, 1.0)
+            _r2_stats = _summarise_r2_values(_r2_spec)
+            if _r2_stats is None:
+                return None, f"test-grid R² was non-finite for `{_test_grid_name}`"
+
+            # Return a compact summary for the callout and for qf_train_info so
+            # exported/debug views can distinguish regular-grid and testgrid
+            # diagnostics later.
+            return {
+                "test_grid_name": _test_grid_name,
+                "n_spectra": _r2_stats["n_values"],
+                "n_failed": int(_failures),
+                "mean": _r2_stats["mean"],
+                "min": _r2_stats["min"],
+                "bottom5": _r2_stats["bottom5"],
+                "inclinations": [int(_inc) for _inc in _inclinations],
+            }, ""
+        except Exception as _exc:
+            return None, str(_exc)
+
+    if _source == "grid_interp":
+        _regular_grid_flux_r2 = _compute_regular_grid_flux_r2(_loo_true, _loo_pred, "loo")
+    else:
+        _regular_grid_flux_r2 = _compute_regular_grid_flux_r2(_Y_true, _mean_pred, "fit")
+
+    if _regular_grid_flux_r2 is not None:
+        _regular_grid_flux_r2_line = (
+            f"- **{_regular_flux_r2_label}:** Mean {_regular_grid_flux_r2['mean']:.6f} | "
+            f"Min {_regular_grid_flux_r2['min']:.6f} | Bottom 5% {_regular_grid_flux_r2['bottom5']:.6f} "
+            f"({_regular_grid_flux_r2['n_spectra']} spectra)"
+        )
+    else:
+        _regular_grid_flux_r2_line = f"- **{_regular_flux_r2_label}:** not available"
+
+    _test_grid_r2, _test_grid_r2_note = _compute_test_grid_flux_r2()
+    if _test_grid_r2 is not None:
+        _test_grid_r2_line = (
+            f"- **Test Grid Flux R²:** Mean {_test_grid_r2['mean']:.6f} | "
+            f"Min {_test_grid_r2['min']:.6f} | Bottom 5% {_test_grid_r2['bottom5']:.6f} "
+            f"({_test_grid_r2['n_spectra']} spectra from `{_test_grid_r2['test_grid_name']}`)"
+        )
+        if _test_grid_r2.get("n_failed", 0):
+            _test_grid_r2_line += f"; skipped {_test_grid_r2['n_failed']} spectra"
+    else:
+        _test_grid_r2_line = f"- **Test Grid Flux R²:** not available ({_test_grid_r2_note})"
+
+    # Store both diagnostics explicitly.  The regular-grid metric is in
+    # PCA-weight space, while the testgrid metric is in flux space at known
+    # lookup-table truth.  Keeping both names prevents downstream code or docs
+    # from treating them as interchangeable validation scores.
+    if _regular_r2_stats is not None:
+        qf_train_info["regular_grid_r2_mean"] = float(_regular_r2_stats["mean"])
+        qf_train_info["regular_grid_r2_min"] = float(_regular_r2_stats["min"])
+        qf_train_info["regular_grid_r2_bottom5"] = float(_regular_r2_stats["bottom5"])
+    qf_train_info["regular_grid_r2_label"] = _regular_r2_label
+    qf_train_info["regular_grid_flux_r2"] = _regular_grid_flux_r2
+    qf_train_info["regular_grid_flux_r2_label"] = _regular_flux_r2_label
+    if _regular_grid_flux_r2 is not None:
+        qf_train_info["regular_grid_flux_r2_mean"] = float(_regular_grid_flux_r2["mean"])
+        qf_train_info["regular_grid_flux_r2_min"] = float(_regular_grid_flux_r2["min"])
+        qf_train_info["regular_grid_flux_r2_bottom5"] = float(_regular_grid_flux_r2["bottom5"])
+    qf_train_info["test_grid_flux_r2"] = _test_grid_r2
+
     _summary = mo.callout(
         mo.md(f"""
         **Training Complete** — {_type_label}
         - **Models:** {qf_train_info['n_models']}
         - **PCA:** {qf_pca_data['n_components']} components, {qf_pca_data['variance_explained']:.2f}% variance ({'log' if qf_pca_data['scale'] == 'log' else qf_pca_data['scale']} scale{', smoothed' if qf_pca_data['smoothing'] else ''})
-        - **Mean R²:** {float(_r2.mean()):.6f} | **Min R²:** {float(_r2.min()):.6f}
+        {_regular_r2_line}
+        {_regular_grid_flux_r2_line}
+        {_test_grid_r2_line}
         {'- _R² computed via leave-one-out cross-validation (neighbor interpolation)_' if _source == 'grid_interp' else ''}
         """),
         kind="success"
@@ -2812,7 +3265,7 @@ def _(mo):
 @app.cell
 def _(mo):
     qf_data_source_selector = mo.ui.dropdown(
-        options=["Observation File", "Test Grid (Validation)"],
+        options=["Observation File", "Test Grid"],
         value="Observation File",
         label="Data Source:",
         full_width=True,
@@ -2873,7 +3326,7 @@ def _(
         "test_grid_path": None,
         "repo_id": None,
         "source": None,
-        "message": "Select Test Grid data source and load a Quick Fit model to browse validation spectra.",
+        "message": "Select Test Grid data source and load a Quick Fit model to browse test-grid spectra.",
     }
 
     if "Test Grid" in qf_data_source_selector.value:
@@ -2889,7 +3342,7 @@ def _(
 
         _grid_config = _get_grid_config(_grid_name)
         if _grid_config is None:
-            qf_test_grid_info["message"] = "Load a trained Quick Fit model before selecting a validation spectrum."
+            qf_test_grid_info["message"] = "Load a trained Quick Fit model before selecting a test-grid spectrum."
         else:
             _test_grid_name = _grid_config.get("test_grid_name") or str(_grid_name).replace("_grid_", "_testgrid_")
             _test_grid_path = os.path.join("sirocco_grids", _test_grid_name)
@@ -2949,12 +3402,12 @@ def _(
                     "available": True,
                     "source": _source,
                     "message": (
-                        f"Found {len(qf_test_grid_files)} validation spectra for `{_test_grid_name}` "
+                        f"Found {len(qf_test_grid_files)} test-grid spectra for `{_test_grid_name}` "
                         f"from {_source}."
                     ),
                 })
             elif not qf_test_grid_info.get("message"):
-                qf_test_grid_info["message"] = f"No validation spectra were found for `{_test_grid_name}`."
+                qf_test_grid_info["message"] = f"No test-grid spectra were found for `{_test_grid_name}`."
 
     return qf_test_grid_files, qf_test_grid_info, qf_test_grid_params_df
 
@@ -3359,16 +3812,6 @@ def _(
         _stage3_controls.append(qf_inf_model_picker)
     _stage3_controls.extend([_model_status, mo.md("---"), qf_data_source_selector])
     if _is_test_grid_source:
-        _stage3_controls.append(
-            mo.callout(
-                mo.md(
-                    "Test grid spectra are used for the training of neural network "
-                    "emulators. As a result, performance here **may** be more optimistic "
-                    "than for an unknown observation."
-                ),
-                kind="warn",
-            )
-        )
         _stage3_controls.append(
             mo.hstack([qf_test_run_selector, qf_test_inclination_selector], widths=[3, 1], align="end")
         )
