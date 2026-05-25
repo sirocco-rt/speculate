@@ -2815,11 +2815,25 @@ class Emulator:
             print("V11 rebuild complete.", flush=True)
 
         total_elapsed = time.time() - self._training_start_time
+        final_total_loss = None
+        if self._v11 is not None or self._v11_gpu is not None:
+            try:
+                # The per-component optimizer records component-local losses;
+                # the rebuilt V11 gives the total objective for the final model.
+                final_total_loss = -self.log_likelihood()
+            except Exception as exc:
+                self.log.warning(f"Could not evaluate final total NLL: {exc}")
+
+        loss_summary = (
+            f"Final total loss: {final_total_loss:.2f}"
+            if final_total_loss is not None
+            else f"Best component loss: {self._best_loss:.2f}"
+        )
         print(f"\nPer-component training complete")
         print(
             f"Total time: {total_elapsed:.1f}s | "
             f"Total iters: {self._iteration_count} | "
-            f"Best total loss: {self._best_loss:.2f}"
+            f"{loss_summary}"
         )
 
         self._trained = True
@@ -3165,6 +3179,11 @@ class Emulator:
                 for ls in self.lengthscales
             ]
         )
-        output += f"\nLog Likelihood: {self.log_likelihood():.2f}\n" if (self._v11 is not None or self._v11_gpu is not None) else ""
+        if self._v11 is not None or self._v11_gpu is not None:
+            # Training minimizes the negative log-likelihood, so report both
+            # signs here to match the live loss curve and avoid ambiguity.
+            log_likelihood = self.log_likelihood()
+            output += f"\nFinal Log Likelihood: {log_likelihood:.2f}\n"
+            output += f"Final Negative Log Likelihood: {-log_likelihood:.2f}\n"
         output += "\n[V11 not materialized — log likelihood unavailable]\n" if (self._v11 is None and self._v11_gpu is None) else ""
         return output

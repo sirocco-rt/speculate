@@ -1944,6 +1944,11 @@ def _(
 
                     emu = Emulator.load(emu_path)
 
+                    saved_per_component = bool(getattr(emu, 'per_component', False))
+                    saved_strict_weight_fit = bool(getattr(emu, 'strict_weight_fit', False))
+                    emu.per_component = bool(per_component.value)
+                    emu.strict_weight_fit = bool(strict_weight_fit.value)
+
                     # Guard: warn if the UI kernel selector differs from the
                     # kernel baked into the saved emulator.  Training always
                     # uses the kernel stored in the .npz, so a mismatch would
@@ -1952,6 +1957,11 @@ def _(
                         print(f"⚠️  Kernel mismatch — loaded emulator uses '{emu.kernel}', "
                               f"but UI has '{kernel_selector.value}' selected. "
                               f"Continuing with the emulator's original kernel ('{emu.kernel}').")
+
+                    if saved_per_component != emu.per_component or saved_strict_weight_fit != emu.strict_weight_fit:
+                        print("Continue settings override saved training flags:")
+                        print(f"  per_component: {saved_per_component} → {emu.per_component}")
+                        print(f"  strict_weight_fit: {saved_strict_weight_fit} → {emu.strict_weight_fit}")
 
                     # Preserve existing loss history so the plot is cumulative
                     prev_history = list(emu.loss_history) if hasattr(emu, 'loss_history') and emu.loss_history else []
@@ -2492,8 +2502,8 @@ def _(alt, get_loss_history, get_trained_emu, gp_figure, mo, pd):
         chart = line
 
     # ── Emulator summary (mirrors the training-log __repr__ output) ──
-    # Uses loss_history for the best NLL instead of calling log_likelihood()
-    # (which would require an expensive V11 Cholesky factorisation).
+    # Prefer the materialized-V11 total objective when available.  For very
+    # large models without V11, fall back to the recorded optimizer values.
     _emu_summary = mo.md("")
     if _emu is not None:
         _s = "Emulator\n" + "-" * 40 + "\n"
@@ -2524,8 +2534,23 @@ def _(alt, get_loss_history, get_trained_emu, gp_figure, mo, pd):
             _s += _hdr + "\n"
         for _i, _ls in enumerate(_emu.lengthscales):
             _s += f"  Comp {_i:2d}: [ " + "  ".join(f"{l:.4f}" for l in _ls) + " ]\n"
+        _final_log_likelihood = None
+        if getattr(_emu, '_v11', None) is not None or getattr(_emu, '_v11_gpu', None) is not None:
+            try:
+                # Per-component loss_history stores component-local optimizer
+                # evaluations.  A materialized V11 is the authoritative total.
+                _final_log_likelihood = _emu.log_likelihood()
+            except Exception:
+                _final_log_likelihood = None
+        if _final_log_likelihood is not None:
+            _final_nll = -_final_log_likelihood
+            _s += f"\nFinal Total NLL: {_final_nll:.2f}\n"
+            _s += f"Final Log Likelihood: {_final_log_likelihood:.2f}\n"
+        elif len(loss_data) > 0:
+            _best_nll = min(loss_data)
+            _s += f"\nBest Recorded Loss: {_best_nll:.2f}\n"
+            _s += f"Recorded Loss Sign-Flipped: {-_best_nll:.2f}\n"
         if len(loss_data) > 0:
-            _s += f"\nBest NLL:       {min(loss_data):.2f}\n"
             _s += f"Iterations:     {len(loss_data)}\n"
         _emu_summary = mo.accordion(
             {f"{mo.icon('lucide:cpu')} Emulator Summary": mo.md(f"```\n{_s}```")}
