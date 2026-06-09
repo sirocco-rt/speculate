@@ -479,11 +479,17 @@ def _(mo):
 
 @app.cell
 def _(
+    get_flux_scale_mode,
     get_run_index,
+    get_selected_inclination,
+    get_wavelength_window,
     inclination_angles,
     mo,
     num_runs,
+    set_flux_scale_mode,
     set_run_index,
+    set_selected_inclination,
+    set_wavelength_window,
     wavelengths,
 ):
     # Run file selector slider with built-in editable input
@@ -505,31 +511,46 @@ def _(
         on_change=set_run_index
     )
 
+    # Preserve the other controls when the run index changes through the
+    # parameter dropdowns. Without these state-backed defaults, the entire
+    # control row resets to its initial values on every spectrum jump.
+    _selected_inclination = get_selected_inclination()
+    if _selected_inclination not in inclination_angles:
+        _selected_inclination = inclination_angles[0] if inclination_angles else None
+
     # Inclination angle selector
     inclination_selector = mo.ui.dropdown(
         options={f"{angle}°": angle for angle in inclination_angles},
-        value=f"{inclination_angles[0]}°" if inclination_angles else None,
-        label="Inclination Angle:"
+        value=f"{_selected_inclination}°" if _selected_inclination is not None else None,
+        label="Inclination Angle:",
+        on_change=set_selected_inclination,
     )
 
     # Wavelength range selector - exclude first and last 10 Å to avoid Sirocco artifacts
     wl_min_limit = float(wavelengths.min() + 10)
     wl_max_limit = float(wavelengths.max() - 10)
+    _wavelength_window = get_wavelength_window() or [wl_min_limit, wl_max_limit]
+    _wl_start = max(wl_min_limit, min(float(_wavelength_window[0]), wl_max_limit))
+    _wl_stop = max(wl_min_limit, min(float(_wavelength_window[1]), wl_max_limit))
+    if _wl_start > _wl_stop:
+        _wl_start, _wl_stop = wl_min_limit, wl_max_limit
 
     wavelength_range = mo.ui.range_slider(
         start=wl_min_limit,
         stop=wl_max_limit,
-        value=[wl_min_limit, wl_max_limit],
+        value=[_wl_start, _wl_stop],
         step=1.0,
         label="Wavelength Range (Å):",
-        show_value=True
+        show_value=True,
+        on_change=set_wavelength_window,
     )
 
 
     flux_scale_selector = mo.ui.dropdown(
         options=["linear", "log", "continuum-normalised"],
-        value="linear",
-        label="Flux Scale:"
+        value=get_flux_scale_mode(),
+        label="Flux Scale:",
+        on_change=set_flux_scale_mode,
     )
 
     mo.hstack([
@@ -547,9 +568,10 @@ def _(
 
 
 @app.cell
-def _(run_slider):
-    # Use slider value directly - the built-in input is already integrated
-    current_run_index = run_slider.value
+def _(get_run_index):
+    # The shared run-index state is the single source of truth for both the
+    # sequential slider and the parameter-dropdown navigation.
+    current_run_index = get_run_index()
     return (current_run_index,)
 
 
@@ -560,7 +582,7 @@ def _(mo):
     show_fixed = mo.ui.checkbox(value=True, label="Show Fixed Spectra")
     show_obs = mo.ui.checkbox(value=False, label="Show Observational Spectra")
     use_dimensionless = mo.ui.checkbox(value=False, label="Dimensionless Data")
-    use_smoothing = mo.ui.checkbox(value=True, label="Smooth Data (Boxcar=5)")
+    use_smoothing = mo.ui.checkbox(value=True, label="Smooth Data (Gaussian σ=10)")
     show_grid = mo.ui.checkbox(value=True, label="Show Grid")
 
     mo.hstack([show_current, show_fixed, show_obs, use_dimensionless, use_smoothing, show_grid], justify="space-between")
@@ -580,21 +602,33 @@ def _(mo):
     # pinned_spectra  – list of (run_index, inclination) tuples shown as
     #                   fixed background traces in the plot
     # run_index       – shared slider ↔ parameter-dropdown position
+    # inclination     – currently selected viewing angle
+    # flux_scale      – active y-axis transform mode
+    # wavelength_range – current wavelength crop used by the plot
     # cache_tracker   – set of file paths downloaded from HuggingFace so
     #                   the grid-switch cell can clean up stale archives
     get_pinned_spectra, set_pinned_spectra = mo.state([])
 
     # Initialize state for current run index (synced between slider and parameters)
     get_run_index, set_run_index = mo.state(0)
+    get_selected_inclination, set_selected_inclination = mo.state(None)
+    get_flux_scale_mode, set_flux_scale_mode = mo.state("linear")
+    get_wavelength_window, set_wavelength_window = mo.state(None)
 
     # Initialize cache tracker for HuggingFace downloads
     cache_tracker_state = mo.state(set())
     return (
         cache_tracker_state,
+        get_flux_scale_mode,
         get_pinned_spectra,
         get_run_index,
+        get_selected_inclination,
+        get_wavelength_window,
+        set_flux_scale_mode,
         set_pinned_spectra,
+        set_selected_inclination,
         set_run_index,
+        set_wavelength_window,
     )
 
 
@@ -790,18 +824,19 @@ def _(
     wavelength_range,
     wavelengths,
 ):
+    from scipy.ndimage import gaussian_filter1d as _gaussian_filter1d
+
     # Filter and transform every plotted series through the same wavelength mask
     # so pinned, current, and observational spectra share one x-axis domain.
     wl_min, wl_max = wavelength_range.value
     wl_mask = (wavelengths >= wl_min) & (wavelengths <= wl_max)
     filtered_wavelengths = wavelengths[wl_mask]
 
-    # Apply the optional rolling mean uniformly to every spectrum type before any
-    # normalization, so visual comparisons stay consistent.
+    # Apply the same Gaussian smoothing used by Training so the inspector view
+    # matches the spectra that feed the emulator pipeline.
     def smooth_flux(flux_array):
         if use_smoothing.value:
-            # Use min_periods=1 to handle edges without dropping data
-            return pd.Series(flux_array).rolling(window=5, center=True, min_periods=1).mean().values
+            return _gaussian_filter1d(np.asarray(flux_array, dtype=np.float64), 10)
         return flux_array
 
     # Apply the selected flux-scale transformation to an already-smoothed spectrum.
@@ -818,6 +853,15 @@ def _(
     # Collect each visible series as a dataframe and concatenate them into the
     # long-form layout Altair expects for layered categorical plotting.
     plot_data_list = []
+    _flux_axis_title = (
+        "Normalized Flux (dimensionless)"
+        if use_dimensionless.value else
+        "Flux at 100pc [erg/s/cm^2/Å]"
+        if _scale_mode == 'linear' else
+        "log10(Flux at 100pc [erg/s/cm^2/Å])"
+        if _scale_mode == 'log' else
+        "Flux (continuum normalised)"
+    )
 
     # 1. Add Pinned spectra first (background)
     num_pinned_to_plot = len(pinned_spectra_indices)
@@ -936,9 +980,7 @@ def _(
                    scale=alt.Scale(zero=False),
                    axis=alt.Axis(grid=show_grid.value)),
             y=alt.Y('Flux:Q', 
-                    title=('Flux' if _scale_mode == 'linear'
-                           else 'log₁₀(Flux)' if _scale_mode == 'log'
-                           else 'Flux / Continuum') if not use_dimensionless.value else 'Normalized Flux',
+                      title=_flux_axis_title,
                     scale=alt.Scale(zero=False),
                     axis=alt.Axis(format='~e', grid=show_grid.value)),
             color=alt.condition(
@@ -1133,10 +1175,15 @@ def _(mo):
     # File upload for observational spectra
     obs_file_uploader = mo.ui.file(
         kind="area",
-        label="Drag and drop a new observational spectra (CSV)",
+        label="**Drag and drop a new observational spectra (CSV)**",
         multiple=False
     )
-    return (obs_file_uploader,)
+
+    file_upload_ui = mo.vstack([
+         obs_file_uploader,
+         mo.md("<center><small>Format: CSV with headers `WAVELENGTH`, `FLUX`, and optionally `ERROR`</small></center>")
+    ])
+    return file_upload_ui, obs_file_uploader
 
 
 @app.cell
@@ -1224,13 +1271,12 @@ def _(mo, obs_file_selector, os, set_obs_refresh):
 
 
 @app.cell
-def _(delete_obs_btn, mo, obs_file_selector, obs_file_uploader):
+def _(delete_obs_btn, file_upload_ui, mo, obs_file_selector):
     # Select observational spectrum - Layout
     mo.vstack([
         mo.md("## Observational Data:"),
         mo.hstack([obs_file_selector, delete_obs_btn], align="end"),
-        obs_file_uploader,
-        mo.md("Data must be in CSV format with 'Wavelength', then 'Flux' columns.")
+        file_upload_ui,
     ])
     return
 

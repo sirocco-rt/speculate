@@ -514,7 +514,7 @@ def _(mo):
 
     file_upload_ui = mo.vstack([
          obs_file_uploader,
-         mo.md("<center><small>Format: CSV with headers `Wavelength` and `Flux`</small></center>")
+         mo.md("<center><small>Format: CSV with headers `WAVELENGTH`, `FLUX`, and optionally `ERROR`</small></center>")
     ])
     return (
         data_source_selector,
@@ -1963,12 +1963,18 @@ def _(
                 )
                 _priors['global_cov:log_ls'] = stats.uniform(loc=0.0, scale=15.0)
 
-                _ll = float(_model.log_likelihood(_priors))
+                _ll = float(_model.log_likelihood(_priors)) 
+                _ll_without_prior = float(_model.log_likelihood())
                 _nll = -_ll
+                _nll_without_prior = -_ll_without_prior
+                _diff = -1*(_nll - _nll_without_prior)
                 pg_nll_result = mo.callout(
                     mo.md(
                         f"**NLL = {_nll:.4f}** "
-                        f"(log-likelihood = {_ll:.4f})\n\n"
+                        f"(log-likelihood = {_ll:.4f})\n\n" 
+                        f"(Without priors: NLL = {_nll_without_prior:.4f}\n\n"
+                        f"log-likelihood = {_ll_without_prior:.4f})\n\n"
+                        f"Difference due to priors: {_diff:.4f}\n\n"
                         f"Evaluated at current playground slider values."
                     ),
                     kind="success" if np.isfinite(_nll) else "danger",

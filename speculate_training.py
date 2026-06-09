@@ -703,6 +703,7 @@ def _(available_grids, get_loaded_emu_config, mo, update_loaded_emu_config):
     mo.md("### 1. Grid Selection")
 
     _cfg = get_loaded_emu_config()
+    grid_selection_ui = mo.md("")
 
     if available_grids:
         # Find the label for the loaded grid, or fall back to the no-BL grid
@@ -728,12 +729,19 @@ def _(available_grids, get_loaded_emu_config, mo, update_loaded_emu_config):
                 remove_keys=("params", "physical_params", "inclination_choice", "fixed_inclination"),
             )
         )
-        mo.vstack([
-            grid_selector,
-            mo.md(f"{mo.icon('lucide:check-circle')} Found **{len(available_grids)}** grid(s) in `sirocco_grids/`")
+        _grid_info = mo.accordion({
+            f"{mo.icon('lucide:info')} Grid options": mo.md(
+                "Grid availability and parameter coverage are documented in the "
+                "**Speculate wiki** page **Grid Inspector - Available Grids**. "
+                "Use that page to check the current supported grids."
+            ),
+        })
+        grid_selection_ui = mo.vstack([
+            mo.md(f"{mo.icon('lucide:check-circle')} Found **{len(available_grids)}** grid(s) in `sirocco_grids/`"),
+            mo.hstack([grid_selector, _grid_info], justify="space-between", align="center", gap=0.5),
         ])
     else:
-        mo.callout(
+        grid_selection_ui = mo.callout(
             mo.md(f"""
             {mo.icon('lucide:triangle-alert')} **No grids found in `sirocco_grids/` folder**
 
@@ -742,7 +750,8 @@ def _(available_grids, get_loaded_emu_config, mo, update_loaded_emu_config):
             kind="warn"
         )
         grid_selector = None
-    grid_selector
+        
+    grid_selection_ui
     return (grid_selector,)
 
 
@@ -1167,7 +1176,7 @@ def _(get_loaded_emu_config, mo, update_loaded_emu_config):
         on_change=update_loaded_emu_config("scale")
     )
 
-    use_smoothing = mo.ui.checkbox(value=_cfg['smoothing'] if _cfg and 'smoothing' in _cfg else False, label="Smooth Spectra (Boxcar=5)", on_change=update_loaded_emu_config("smoothing", bool))
+    use_smoothing = mo.ui.checkbox(value=_cfg['smoothing'] if _cfg and 'smoothing' in _cfg else False, label="Smooth Spectra (Gaussian σ=10)", on_change=update_loaded_emu_config("smoothing", bool))
 
     n_components = mo.ui.slider(start=2, stop=30, value=max(2, min(30, _cfg['n_components'])) if _cfg and 'n_components' in _cfg else 10, step=1, label="PCA Components:",show_value=True, on_change=update_loaded_emu_config("n_components", lambda value: int(value)))
 
@@ -1214,7 +1223,7 @@ def _(
                 f"{mo.icon('lucide:info')} Scale & Smoothing": mo.md(
                     "**Flux Scale**: Possible transformations to the input spectra before PCA may help capture features more efficiently."
                     "Linear, log and continuum-normalised options are standard choices.\n\n"
-                    "**Smoothing**: Applying a boxcar smoothing (width=5) can help reduce high-frequency noise in the spectra, which may improve PCA reconstruction quality for some grids. However, it also slightly blurs spectral features, so use with caution."
+                    "**Smoothing**: Applying a Gaussian smoothing filter (σ=10) can suppress high-frequency noise in the spectra before PCA. This may improve reconstruction performance, but it will also broaden sharp spectral features, so enable it deliberately."
                 ),
             }),
         ], align="center", gap=0.5),
@@ -1653,7 +1662,7 @@ def _(
             f"- **Inclination parameter:** {f'Fixed {fixed_inc}°' if inclination_fixed else 'Trainable'}",
             f"- **Wavelength Range:** {wl_range[0]}-{wl_range[1]} Å",
             f"- **Flux Scale:** {scale}",
-            f"- **Smoothing:** {'Yes (Gaussian σ=50)' if smoothing else 'No'}",
+            f"- **Smoothing:** {'Yes (Gaussian σ=10)' if smoothing else 'No'}",
             f"- **PCA Components:** {n_components.value}",
             f"- **Method:** {method.value}",
             f"- **Max Iterations:** {max_iter.value}",

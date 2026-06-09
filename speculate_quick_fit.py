@@ -622,7 +622,7 @@ def _(mo):
     #
     # Wavelength range: restricts which part of the spectrum is used for PCA/training.
     # Flux scale: how spectra are represented (linear, log, continuum-normalised, etc.).
-    # Smoothing: optional boxcar-5 smoothing to reduce noise in raw spectra.
+    # Smoothing: optional Gaussian smoothing (sigma=10) to reduce noise in raw spectra.
     # PCA components: how many principal components to retain (2-30).
     # Model type: "Neural Network" or "Grid Interpolation (Linear)".
     #   - NN: learns a mapping from parameters → PCA weights via a feedforward network.
@@ -649,7 +649,7 @@ def _(mo):
 
     qf_use_smoothing = mo.ui.checkbox(
         value=False,
-        label="Smooth Spectra (Boxcar=5)",
+        label="Smooth Spectra (Gaussian σ=10)",
     )
 
     qf_n_components = mo.ui.slider(
@@ -2595,7 +2595,7 @@ def _(
     ).properties(
         width="container", height=200,
         title="Per-Wavelength Reconstruction Error"
-    )
+    ).interactive(bind_y=False)
 
     # ── Assemble summary output ──────────────────────────────────────────
     _elements = [_summary, _rmse_chart]
@@ -3303,7 +3303,11 @@ def _(get_qf_last_uploaded_obs, get_qf_obs_refresh, mo, os):
         label="**Drag and drop an observational spectrum (CSV)**",
         multiple=False,
     )
-    return qf_obs_selector, qf_obs_uploader
+    qf_file_upload_ui = mo.vstack([
+         qf_obs_uploader,
+         mo.md("<center><small>Format: CSV with headers `WAVELENGTH`, `FLUX`, and optionally `ERROR`</small></center>")
+    ])
+    return qf_file_upload_ui, qf_obs_selector, qf_obs_uploader
 
 
 @app.cell
@@ -3816,7 +3820,7 @@ def _(
             mo.hstack([qf_test_run_selector, qf_test_inclination_selector], widths=[3, 1], align="end")
         )
     else:
-        _stage3_controls.extend([qf_obs_selector, qf_obs_uploader])
+        _stage3_controls.extend([qf_obs_selector, qf_file_upload_ui])
 
     _stage3_controls.extend([
         mo.hstack([qf_inf_wl_slider, qf_obs_scale_selector], widths=[3, 1], align="end"),
@@ -4002,6 +4006,10 @@ def _(
     _fixed_inclination = qf_inf_emu_data.get("fixed_inclination")
     _n_params = len(_param_names)
     _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
+    qf_distance_prior_ack = mo.ui.checkbox(
+        value=False,
+        label="I have entered the target distance and uncertainty",
+    )
 
     _fixed_toggles = []
     _value_inputs = []
@@ -4052,7 +4060,26 @@ def _(
         "mins": _min_inputs,
         "maxs": _max_inputs,
         "n_physical": _n_params,
+        "distance_prior_ack": qf_distance_prior_ack,
+        "fixed_inclination": _fixed_inclination,
+        "fix_distance_for_shape_only": _fix_distance_for_shape_only,
     }
+    return (qf_param_config,)
+
+
+@app.cell
+def _(mo, qf_param_config):
+    if qf_param_config is None:
+        mo.stop(True, mo.md(""))
+
+    _labels = qf_param_config["labels"]
+    _fixed_toggles = qf_param_config["fixed"]
+    _value_inputs = qf_param_config["values"]
+    _min_inputs = qf_param_config["mins"]
+    _max_inputs = qf_param_config["maxs"]
+    _distance_prior_ack = qf_param_config["distance_prior_ack"]
+    _fixed_inclination = qf_param_config.get("fixed_inclination")
+    _fix_distance_for_shape_only = qf_param_config.get("fix_distance_for_shape_only", False)
 
     _config_elements = []
     for _i, _name in enumerate(_labels):
@@ -4068,6 +4095,16 @@ def _(
     _config_accordion = mo.accordion({
         f"{mo.icon('lucide:sliders-horizontal')} Parameter Configuration": mo.vstack(_config_elements)
     }, lazy=True)
+
+    # Marimo only allows reactive widget-value reads in downstream cells, so the
+    # distance acknowledgement display logic lives here rather than in the widget
+    # creation cell above.
+    _distance_idx = next((i for i, _label in enumerate(_labels) if _label == "Distance (pc)"), None)
+    if _distance_idx is not None and not _fixed_toggles[_distance_idx].value:
+        _config_accordion = mo.vstack([
+            _config_accordion,
+            _distance_prior_ack,
+        ])
 
     if _fixed_inclination is not None:
         _config_output = mo.vstack([
@@ -4093,7 +4130,7 @@ def _(
         ])
 
     _config_output
-    return (qf_param_config,)
+    return
 
 
 @app.cell
@@ -4602,6 +4639,22 @@ def _(
     _mins = [m.value for m in qf_param_config["mins"]]
     _maxs = [m.value for m in qf_param_config["maxs"]]
     _n_phys = qf_param_config["n_physical"]
+    _distance_prior_ack = qf_param_config.get("distance_prior_ack")
+
+    if ("Distance (pc)" in _labels
+        and _distance_prior_ack is not None
+        and not _fixed[_labels.index("Distance (pc)")]
+        and not _distance_prior_ack.value):
+        mo.stop(
+            True,
+            mo.callout(
+                mo.md(
+                    "Confirm the Distance (pc) prior in the parameter configuration before running Quick Fit. "
+                    "The center is the target distance and the min/max fields define its uncertainty range."
+                ),
+                kind="warn",
+            ),
+        )
 
     _active_idx = [i for i in range(len(_labels)) if not _fixed[i]]
     _active_labels = [_labels[i] for i in _active_idx]

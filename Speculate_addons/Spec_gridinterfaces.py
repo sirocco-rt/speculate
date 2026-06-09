@@ -1,5 +1,6 @@
 import os
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 from Starfish.grid_tools import GridInterface
 from Speculate_addons.Spec_functions import fit_power_law_continuum        
 from Speculate_addons.grid_registry import (
@@ -63,11 +64,10 @@ def _apply_flux_scale(wl_full, ind, flux, scale):
 
 
 def _maybe_smooth_flux(flux, smoothing):
-    """Apply the optional boxcar smoothing used by Training and Quick Fit."""
+    """Apply the optional Gaussian smoothing used by Training and Quick Fit."""
     if not smoothing:
         return flux
-    kernel = np.ones(5, dtype=np.float64)
-    return np.convolve(flux, kernel, mode='same') / np.convolve(np.ones_like(flux), kernel, mode='same')
+    return gaussian_filter1d(np.asarray(flux, dtype=np.float64), 10)
 
 
 class Speculate_agn_grid_v1_3(GridInterface):
@@ -238,7 +238,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             model_parameters (tuple, optional): Specifiy the parameters 
                 you wish to fit by adding intergers to the tuple. 
             
-            smoothing (bool, optional): Whether to apply Gaussian smoothing (sigma=50) to spectra.
+            smoothing (bool, optional): Whether to apply Gaussian smoothing (sigma=10) to spectra.
                 Default is False.
         """
         
@@ -425,7 +425,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             model_parameters (tuple, optional): Specifiy the parameters 
                 you wish to fit by adding intergers to the tuple. 
             
-            smoothing (bool, optional): Whether to apply Gaussian smoothing (sigma=50) to spectra.
+            smoothing (bool, optional): Whether to apply Gaussian smoothing (sigma=10) to spectra.
                 Default is False.
         """
         
