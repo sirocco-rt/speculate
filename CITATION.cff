@@ -1,0 +1,55 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: 'Speculate: The Sirocco Spectral Emulator'
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Austen G. W.
+    family-names: Wallis
+    email: A.Wallis@soton.ac.uk
+    affiliation: University of Southampton
+    orcid: 'https://orcid.org/0000-0003-0770-9015'
+  - given-names: Christian
+    family-names: Knigge
+    email: C.Knigge@soton.ac.uk
+    affiliation: University of Southampton
+    orcid: 'https://orcid.org/0000-0002-1116-2553'
+  - name: The Sirocco Collaboration
+  - family-names: Long
+    given-names: Knox
+    orcid: https://orcid.org/0000-0002-4134-864X
+    affiliation: "Space Telescope Science Institute"
+    email: long@stsci.edu
+  - family-names: Sim
+    given-names: Stuart
+    orcid: https://orcid.org/0000-0002-9774-1192
+    affiliation: "Queens University Belfast"
+    email: s.sim@qub.ac.uk
+  - family-names: Matthews
+    given-names: James
+    orcid: https://orcid.org/0000-0001-7560-4747
+    affiliation: "University of Oxford"
+    email: james.matthews@physics.ox.ac.uk
+  - family-names: Ward
+    given-names: Madeleine-Mai
+    orcid: https://orcid.org/0009-0009-8478-1396
+  - family-names: Scepi
+    given-names: Nicholas
+    orcid: https://orcid.org/0000-0003-3909-2486
+  - family-names: Mosallanezhad
+    given-names: Amin
+    orcid: https://orcid.org/0000-0002-4601-7073
+    affiliation: "University of Southampton"
+repository-code: 'https://github.com/sirocco-rt/speculate'
+url: 'https://huggingface.co/spaces/Sirocco-rt/Speculate'
+abstract: >-
+  Speculate is our synthetic spectral library and emulator
+  tool that enables rapid, approximate inference of Sirocco
+  parameters for an observation.
+license: GPL-3.0
+version: 0.3.0
+date-released: '2026-05-18'
