@@ -22,7 +22,7 @@
 
 import marimo
 
-__generated_with = "0.19.7"
+__generated_with = "0.23.1"
 app = marimo.App(
     width="full",
     app_title="Speculate Grid Inspector",
@@ -41,6 +41,7 @@ async def _(mo):
 @app.cell(hide_code=True)
 def _():
     import marimo as mo
+
     return (mo,)
 
 
@@ -559,12 +560,7 @@ def _(
         inclination_selector, 
         flux_scale_selector
     ], justify='space-between')
-    return (
-        flux_scale_selector,
-        inclination_selector,
-        run_slider,
-        wavelength_range,
-    )
+    return flux_scale_selector, inclination_selector, wavelength_range
 
 
 @app.cell
@@ -626,8 +622,8 @@ def _(mo):
         get_wavelength_window,
         set_flux_scale_mode,
         set_pinned_spectra,
-        set_selected_inclination,
         set_run_index,
+        set_selected_inclination,
         set_wavelength_window,
     )
 

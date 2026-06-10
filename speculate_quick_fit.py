@@ -3702,6 +3702,7 @@ def _(
     qf_obs_selector,
     qf_obs_uploader,
     qf_param_map_db_for_grid,
+    set_qf_playground_target,
     qf_test_inclination_selector,
     qf_test_run_selector,
 ):
@@ -3780,6 +3781,7 @@ def _(
                 return _normalised.get(_normalise_truth_label(_display_name))
 
             _truth_parts = []
+            _truth_phys = []
             if qf_inf_emu_data is not None:
                 _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
                 for _param_name in qf_inf_emu_data.get("param_names", []):
@@ -3793,7 +3795,10 @@ def _(
                         _display_name = str(_param_name)
                     _truth_value = _truth_lookup(_display_name)
                     if _truth_value is not None:
+                        _truth_phys.append(float(_truth_value))
                         _truth_parts.append(f"`{_display_name}` = {_format_truth_value(_truth_value)}")
+                    else:
+                        _truth_phys.append(None)
             _truth_parts.extend(["`Av` = 0", "`Distance (pc)` = 100", "`cheb_1` = 0"])
             if _truth_parts:
                 _ground_truth_lines = "\n".join(
@@ -3809,6 +3814,27 @@ def _(
             """),
             kind="success"
         )
+        if (_is_test_grid and qf_inf_emu_data is not None and _truth_phys
+                and all(_value is not None for _value in _truth_phys)):
+            def _send_ground_truth_to_playground(_):
+                set_qf_playground_target({
+                    "source": "test_grid_ground_truth",
+                    "source_file": qf_inf_emu_data.get("source_file"),
+                    "phys": [float(_value) for _value in _truth_phys],
+                    "Av": 0.0,
+                    "Distance (pc)": 100.0,
+                    "cheb_1": 0.0,
+                })
+                mo.status.toast("Loaded ground truth into the Parameter Playground")
+
+            _obs_status = mo.vstack([
+                _obs_status,
+                mo.ui.button(
+                    label=f"{mo.icon('lucide:sliders-horizontal')} Export ground truth to parameter playground",
+                    on_click=_send_ground_truth_to_playground,
+                    kind="success",
+                ),
+            ])
 
     _is_test_grid_source = "Test Grid" in qf_data_source_selector.value
     _stage3_controls = []

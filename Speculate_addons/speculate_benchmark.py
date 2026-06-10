@@ -40,6 +40,12 @@ from Speculate_addons.grid_registry import (
     infer_grid_name,
     lookup_row_to_emulator_values,
 )
+from Speculate_addons.gp_covariance import (
+    GP_LOG_AMP_PRIOR_SIGMA,
+    bounds_for_frozen_prior,
+    estimate_log_amp_centre_from_sigma,
+    global_covariance_diagnostics,
+)
 
 log = logging.getLogger(__name__)
 
@@ -92,7 +98,6 @@ TIER2_FRIENDLY_LABELS = {
     "global_cov:log_amp": "GP log_amp",
     "global_cov:log_ls": "GP log_ls",
 }
-
 
 def build_tier2_label_map(param_names: Sequence[str], grid_name: Optional[str] = None) -> Dict[str, str]:
     """Return friendly labels for Tier 2 grid and nuisance parameters."""
@@ -192,6 +197,7 @@ def _model_likelihood_diagnostics(model, priors: Optional[dict] = None) -> dict:
         ll_no_prior = float(-0.5 * (logdet + sqmah))
         ll = float(ll_no_prior + prior_lp)
         cov_diag = np.diag(cov)
+        gp_diagnostics = global_covariance_diagnostics(model, priors, residual)
         return {
             "nll": float(-ll),
             "ll": ll,
@@ -212,6 +218,8 @@ def _model_likelihood_diagnostics(model, priors: Optional[dict] = None) -> dict:
             "n_points": int(data_flux.size),
             "params": _snapshot_model_params(model),
             "prior_terms": prior_terms,
+            "gp_covariance_warning": bool(gp_diagnostics.get("warning", False)),
+            "global_covariance_diagnostics": gp_diagnostics,
         }
     except Exception as exc:
         return {
@@ -442,18 +450,6 @@ def _extract_ground_truth(
     return {name: float(all_values[name]) for name in friendly_names if name in all_values}
 
 
-def _get_loc_scale(dist):
-    """Extract loc and scale from a frozen scipy distribution."""
-    args = dist.args
-    kwds = dist.kwds
-    if len(args) >= 2:
-        return args[0], args[1]
-    elif len(args) == 1:
-        return args[0], kwds.get("scale", 1.0)
-    else:
-        return kwds.get("loc", 0.0), kwds.get("scale", 1.0)
-
-
 def _simplex_column_uniform(loc, scale, N):
     """Evenly spaced points across a truncated uniform range."""
     mn = loc
@@ -527,12 +523,54 @@ def _resolve_tier3_wl_range(
     return max(wl_min, emu_min), min(wl_max, emu_max)
 
 
+def _tier3_distance_prior_to_log_scale(distance_prior_pc: Optional[dict]):
+    """Convert a user-facing Tier 3 distance prior to backend log-scale inputs."""
+    if not distance_prior_pc:
+        return None, {}, {}
+
+    from Speculate_addons.distance_scale import distance_to_log_scale
+
+    mean_pc = float(distance_prior_pc["mean_pc"])
+    min_pc = float(distance_prior_pc["min_pc"])
+    max_pc = float(distance_prior_pc["max_pc"])
+    if not all(np.isfinite(v) and v > 0 for v in (mean_pc, min_pc, max_pc)):
+        raise ValueError("Tier 3 distance prior values must be finite positive parsecs.")
+    if min_pc >= max_pc:
+        raise ValueError("Tier 3 distance prior min_pc must be smaller than max_pc.")
+    if not (min_pc <= mean_pc <= max_pc):
+        raise ValueError("Tier 3 distance prior mean_pc must lie within [min_pc, max_pc].")
+
+    log_scale_mean = float(distance_to_log_scale(mean_pc))
+    log_scale_at_min_distance = float(distance_to_log_scale(min_pc))
+    log_scale_at_max_distance = float(distance_to_log_scale(max_pc))
+    log_scale_min = min(log_scale_at_min_distance, log_scale_at_max_distance)
+    log_scale_max = max(log_scale_at_min_distance, log_scale_at_max_distance)
+    if log_scale_min == log_scale_max:
+        raise ValueError("Tier 3 distance prior maps to a zero-width log_scale prior.")
+
+    metadata = {
+        "mean_pc": mean_pc,
+        "min_pc": min_pc,
+        "max_pc": max_pc,
+        "log_scale_mean": log_scale_mean,
+        "log_scale_min": log_scale_min,
+        "log_scale_max": log_scale_max,
+    }
+    prior_overrides = {
+        "log_scale": stats.uniform(loc=log_scale_min, scale=log_scale_max - log_scale_min),
+    }
+    initial_params = {"log_scale": log_scale_mean}
+    return metadata, prior_overrides, initial_params
+
+
 def run_mle_single(
     emu,
     wl: np.ndarray,
     flux: np.ndarray,
     sigma: np.ndarray,
     priors: Optional[dict] = None,
+    prior_overrides: Optional[dict] = None,
+    initial_params: Optional[Dict[str, float]] = None,
     flux_scale: str = "linear",
     max_iter: int = 10_000,
     freeze_av: bool = True,
@@ -552,6 +590,14 @@ def run_mle_single(
         Observation wavelength, flux, and uncertainty.
     priors : dict or None
         Priors dict (internal param names → scipy frozen distributions).
+    prior_overrides : dict or None
+        Optional distributions that replace matching entries after the default
+        prior set is built.  This is used by Tier 3 to keep normal grid,
+        extinction, continuum, and GP priors while customising only distance.
+    initial_params : dict or None
+        Optional starting values keyed by internal parameter name.  Values are
+        applied after any automatic bootstrap so user-specified nuisance starts,
+        such as a target distance converted to ``log_scale``, seed CMA-ES.
     flux_scale : str
         'linear', 'log', or 'continuum-normalised'.
     max_iter : int
@@ -571,9 +617,10 @@ def run_mle_single(
     n_restarts : int
         Number of CMA-ES restarts.  The first restart starts from the
         bootstrapped midpoint; subsequent restarts use random starting
-        points drawn uniformly from the prior bounds (with log_scale
-        re-bootstrapped at each).  The best result across all restarts
-        is returned.
+        points drawn uniformly from the prior bounds.  ``log_scale`` is
+        re-bootstrapped at each restart unless an explicit ``log_scale`` prior
+        override or starting value was supplied.  The best result across all
+        restarts is returned.
 
     Returns
     -------
@@ -583,7 +630,11 @@ def run_mle_single(
     from Starfish.spectrum import Spectrum
     from Starfish.models import SpectrumModel
 
-    if fixed_log_scale is None and flux_scale == "continuum-normalised":
+    prior_overrides = dict(prior_overrides or {})
+    initial_params = dict(initial_params or {})
+    _custom_log_scale = "log_scale" in prior_overrides or "log_scale" in initial_params
+
+    if fixed_log_scale is None and flux_scale == "continuum-normalised" and not _custom_log_scale:
         fixed_log_scale = 0.0
 
     # Match the observation onto the emulator's training scale before building a
@@ -643,7 +694,10 @@ def run_mle_single(
     # Bootstrap log_scale from auto-calculation *before* building priors
     # so we can centre the log_scale prior on the data-informed value.
     _bootstrapped_ls = float(fixed_log_scale) if fixed_log_scale is not None else -25.0
-    if fixed_log_scale is None:
+    if _custom_log_scale and "log_scale" in initial_params:
+        _bootstrapped_ls = float(initial_params["log_scale"])
+        model.params["log_scale"] = _bootstrapped_ls
+    elif fixed_log_scale is None:
         try:
             _ = model()
             if model._log_scale is not None and np.isfinite(model._log_scale):
@@ -671,27 +725,27 @@ def run_mle_single(
             )
         # Chebyshev c1 continuum tilt — small correction for gradient mismatch
         priors["cheb:1"] = stats.uniform(loc=-0.5, scale=1.0)
-        # GP log_amp: auto-detect centre from residual variance between the
-        # bootstrapped model and the data, so it adapts to any flux scale.
-        _la_centre = -55.0  # fallback for linear-scale raw flux
-        try:
-            model.params["log_scale"] = _bootstrapped_ls
-            _model_result = model()
-            _model_flux = _model_result[0] if isinstance(_model_result, tuple) else _model_result
-            if hasattr(_model_flux, 'detach'):
-                _model_flux = _model_flux.detach().cpu().numpy()
-            _data_flux = np.array(spec.fluxes)
-            _n = min(len(_data_flux), len(_model_flux))
-            _resid = _data_flux[:_n] - _model_flux[:_n]
-            _resid_var = float(np.mean(_resid ** 2))
-            if _resid_var > 0:
-                _la_centre = float(np.log(max(_resid_var, 1e-30)))
-        except Exception:
-            pass
-        _la_centre = round(_la_centre, 1)
-        priors["global_cov:log_amp"] = stats.norm(loc=_la_centre, scale=2.5)
+        # GP log_amp is a covariance variance scale. Centre it on the
+        # propagated observational uncertainty rather than residuals against a
+        # midpoint model, otherwise a poor starting spectrum can teach the GP to
+        # forgive the whole fit.
+        _la_centre = estimate_log_amp_centre_from_sigma(sigma, fallback=-55.0)
+        model.params["global_cov:log_amp"] = _la_centre
+        priors["global_cov:log_amp"] = stats.norm(
+            loc=_la_centre,
+            scale=GP_LOG_AMP_PRIOR_SIGMA,
+        )
         # GP log_ls: [1, 8] — matches inference tool optimised range
         priors["global_cov:log_ls"] = stats.uniform(loc=1.0, scale=7.0)
+    else:
+        priors = dict(priors)
+
+    if prior_overrides:
+        priors.update(prior_overrides)
+
+    for _label, _value in initial_params.items():
+        if _label in model.params:
+            model.params[_label] = float(_value)
 
     _applied_freezes = _apply_freeze_settings(model, _requested_freeze)
 
@@ -732,13 +786,11 @@ def run_mle_single(
     for label in active_labels:
         if label in priors:
             dist = priors[label]
-            loc, sc = _get_loc_scale(dist)
-            if dist.dist.name == "uniform":
-                lo_bounds.append(loc)
-                hi_bounds.append(loc + sc)
-            elif dist.dist.name == "norm":
-                lo_bounds.append(loc - 4 * sc)
-                hi_bounds.append(loc + 4 * sc)
+            prior_bounds = bounds_for_frozen_prior(label, dist)
+            if prior_bounds is not None:
+                lo, hi = prior_bounds
+                lo_bounds.append(lo)
+                hi_bounds.append(hi)
             else:
                 cv = model.get_param_vector()[active_labels.index(label)]
                 lo_bounds.append(cv - abs(cv) * 0.5)
@@ -750,7 +802,7 @@ def run_mle_single(
 
     # Bootstrap log_scale at the starting point so the optimizer begins
     # with a data-informed normalisation.
-    if "log_scale" in active_labels:
+    if "log_scale" in active_labels and not _custom_log_scale:
         try:
             _ = model()  # triggers auto log_scale calc
             if model._log_scale is not None and np.isfinite(model._log_scale):
@@ -796,7 +848,7 @@ def run_mle_single(
         for _ri in range(n_restarts - 1):
             rnd = lo_arr + np.random.rand(N) * (hi_arr - lo_arr)
             # Bootstrap log_scale for random starts too
-            if "log_scale" in active_labels:
+            if "log_scale" in active_labels and not _custom_log_scale:
                 ls_idx = active_labels.index("log_scale")
                 try:
                     model.set_param_vector(rnd)
@@ -1520,9 +1572,15 @@ def run_tier2(
             "mcmc_converged": mcmc_result["converged"],
             "n_effective": mcmc_result["n_effective"],
             "mle_grid_params": mle_result["grid_params"],
+            "mle_nll": mle_result.get("nll"),
+            "mle_optimizer_nll": mle_result.get("optimizer_nll"),
             "mle_all_params": mle_result.get("all_params", {}),
+            "mle_likelihood_diagnostics": mle_result.get("mle_likelihood_diagnostics", {}),
             "mle_freeze_settings": mle_result.get("freeze_params", {}),
             "mle_frozen_params": mle_result.get("frozen_params", []),
+            "posterior_mean_likelihood_diagnostics": mcmc_result.get(
+                "posterior_mean_likelihood_diagnostics", {}
+            ),
             "mcmc_freeze_settings": mcmc_result.get("freeze_params", {}),
             "mcmc_frozen_params": mcmc_result.get("frozen_params", []),
             "mcmc_frozen_param_values": mcmc_result.get("frozen_param_values", {}),
@@ -2251,6 +2309,7 @@ def run_tier3_single(
     obs_csv: str,
     flux_scale: str = "linear",
     wl_range: Optional[Tuple[float, float]] = None,
+    distance_prior_pc: Optional[dict] = None,
     max_mle_iter: int = 5000,
     mle_restarts: int = 5,
     n_ppc_draws: int = 100,
@@ -2281,6 +2340,10 @@ def run_tier3_single(
         Observation fitting window in Angstrom.  When None, Tier 3 fits over
         the selected emulator's wavelength coverage.  Explicit ranges must sit
         inside that coverage to avoid spline extrapolation.
+    distance_prior_pc : dict or None
+        User-facing distance prior for this observation with ``mean_pc``,
+        ``min_pc``, and ``max_pc``.  Tier 3 converts these parsec values to the
+        backend ``log_scale`` initial value and uniform prior bounds before MLE.
     sirocco_cpus : int
         Number of CPUs to use when launching Sirocco.  Values above 1 use
         ``mpirun -np N sirocco <pf>``.
@@ -2302,6 +2365,9 @@ def run_tier3_single(
     artifact_dir = Path(output_dir or "exports")
     artifact_dir.mkdir(parents=True, exist_ok=True)
     wl_range = _resolve_tier3_wl_range(emu, wl_range)
+    distance_prior_meta, prior_overrides, initial_params = _tier3_distance_prior_to_log_scale(
+        distance_prior_pc
+    )
 
     if grid_name is None and (require_sirocco or run_sirocco):
         raise ValueError("Tier 3 Sirocco workflow requires a grid_name for .pf export.")
@@ -2342,6 +2408,8 @@ def run_tier3_single(
         freeze_av=False,
         n_restarts=mle_restarts,
         iteration_callback=mle_iteration_callback,
+        prior_overrides=prior_overrides,
+        initial_params=initial_params,
     )
     model = mle["model"]
     priors = mle["priors"]
@@ -2446,6 +2514,14 @@ def run_tier3_single(
         "emulator_wl_range": list(_emulator_wavelength_bounds(emu)),
         "tier3_time_s": None,
     }
+    if distance_prior_meta is not None:
+        result["distance_prior_pc"] = distance_prior_meta
+        result["prior_ranges"] = {
+            "Distance (pc)": [
+                distance_prior_meta["min_pc"],
+                distance_prior_meta["max_pc"],
+            ]
+        }
 
     # Export a Sirocco .pf file from the posterior-mean parameters
     if grid_name is not None:
@@ -2605,6 +2681,7 @@ def run_tier3_single(
         "emulator_wl_range": result["emulator_wl_range"],
         "sirocco_transform_params": sirocco_transforms,
         "sirocco_transform_label": sirocco_transform_label,
+        "distance_prior_pc": distance_prior_meta,
         "metrics": {
             "reduced_chi2": reduced_chi2,
             "ppc_coverage": ppc_in,
@@ -2986,6 +3063,13 @@ def build_report_card(
                     _entry["prior_ranges"] = _p["prior_ranges"]
                 if "mle_all_params" in _p and _p["mle_all_params"]:
                     _entry["mle_all_params"] = _p["mle_all_params"]
+                if "mle_likelihood_diagnostics" in _p and _p["mle_likelihood_diagnostics"]:
+                    _entry["mle_likelihood_diagnostics"] = _p["mle_likelihood_diagnostics"]
+                if ("posterior_mean_likelihood_diagnostics" in _p
+                        and _p["posterior_mean_likelihood_diagnostics"]):
+                    _entry["posterior_mean_likelihood_diagnostics"] = _p[
+                        "posterior_mean_likelihood_diagnostics"
+                    ]
                 if "mle_freeze_settings" in _p and _p["mle_freeze_settings"]:
                     _entry["mle_freeze_settings"] = _p["mle_freeze_settings"]
                 if "mle_frozen_params" in _p and _p["mle_frozen_params"]:
@@ -3016,6 +3100,8 @@ def build_report_card(
                 "mle_all_params",
                 "mcmc_summary",
                 "labels",
+                "distance_prior_pc",
+                "prior_ranges",
                 "wl_range",
                 "emulator_wl_range",
                 "export_dir",

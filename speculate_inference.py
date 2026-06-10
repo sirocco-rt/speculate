@@ -47,6 +47,13 @@ def _():
     import pathlib
     import scipy.stats as stats
     from Speculate_addons import Spec_functions as spec_functions
+    from Speculate_addons.gp_covariance import (
+        GP_LOG_AMP_PRIOR_SIGMA,
+        bounds_for_frozen_prior,
+        estimate_log_amp_centre_from_sigma,
+        get_frozen_dist_loc_scale,
+        global_covariance_diagnostics,
+    )
 
     # Marimo can keep an older helper module cached across notebook reloads.
     # If a newly added helper is missing, reload the module before binding names.
@@ -87,13 +94,18 @@ def _():
     mo.hstack([title_col, logo_col], justify="space-between", align="center")
     return (
         Emulator,
+        GP_LOG_AMP_PRIOR_SIGMA,
         Spectrum,
         SpectrumModel,
         alt,
+        bounds_for_frozen_prior,
         build_bestfit_spectrum_altair,
         build_default_observation_sigma,
         build_synthetic_sirocco_sigma,
+        estimate_log_amp_centre_from_sigma,
         fit_power_law_continuum,
+        get_frozen_dist_loc_scale,
+        global_covariance_diagnostics,
         mo,
         np,
         os,
@@ -1136,6 +1148,7 @@ def _(
     obs_plot_accordion,
     param_info_accordion,
     status_widget,
+    set_inf_playground_target,
     test_inclination_selector,
     test_run_selector,
     wl_range_slider,
@@ -1182,10 +1195,76 @@ def _(
     # back to the lookup table loaded from the paired test grid.
     gt_display = None
     if ground_truth_params and _is_test_grid:
+        from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map
+
         gt_lines = ["**Ground Truth Parameters:**"]
         for k, v in ground_truth_params.items():
             gt_lines.append(f"- **{k}**: {v:.4f}")
-        gt_display = mo.callout(mo.md("\n".join(gt_lines)), kind="info")
+
+        _truth_label_map = {
+            int(_idx): _label
+            for _idx, (_label, _sirocco_key) in _benchmark_param_map(
+                grid_selector.value if grid_selector is not None else None
+            ).items()
+        }
+
+        def _truth_key_for_playground(_param_name):
+            _name = str(_param_name)
+            if "inclination" in _name.lower():
+                return "Inclination"
+            _digits = "".join(_char for _char in _name if _char.isdigit())
+            if _digits:
+                return _truth_label_map.get(int(_digits), _name)
+            return _name
+
+        _truth_phys = None
+        _missing_truth_keys = []
+        if emu is not None:
+            _truth_phys = []
+            for _param_name in emu.param_names:
+                _truth_key = _truth_key_for_playground(_param_name)
+                if _truth_key in ground_truth_params:
+                    _truth_phys.append(float(ground_truth_params[_truth_key]))
+                else:
+                    _missing_truth_keys.append(_truth_key)
+            if _missing_truth_keys:
+                _truth_phys = None
+
+        _gt_body = mo.callout(mo.md("\n".join(gt_lines)), kind="info")
+        if _truth_phys is not None:
+            def _send_ground_truth_to_playground(_):
+                set_inf_playground_target({
+                    "source": "test_grid_ground_truth",
+                    "grid_name": grid_selector.value if grid_selector is not None else None,
+                    "phys": [float(_value) for _value in _truth_phys],
+                    "Av": 0.0,
+                    "Distance (pc)": 100.0,
+                    "cheb_1": 0.0,
+                })
+                mo.status.toast("Loaded ground truth into the Parameter Playground")
+
+            _gt_export_btn = mo.ui.button(
+                label=f"{mo.icon('lucide:sliders-horizontal')} Export ground truth to parameter playground",
+                on_click=_send_ground_truth_to_playground,
+                kind="success",
+            )
+            gt_display = mo.vstack([_gt_body, _gt_export_btn])
+        elif emu is None:
+            gt_display = mo.vstack([
+                _gt_body,
+                mo.callout(
+                    mo.md("Load an emulator to export ground truth into the Parameter Playground."),
+                    kind="neutral",
+                ),
+            ])
+        else:
+            gt_display = mo.vstack([
+                _gt_body,
+                mo.callout(
+                    mo.md("Ground truth could not be matched to every loaded emulator parameter."),
+                    kind="warn",
+                ),
+            ])
 
     # Layout Construction
 
@@ -1263,6 +1342,7 @@ def _(
     build_default_observation_sigma,
     build_synthetic_sirocco_sigma,
     emu,
+    estimate_log_amp_centre_from_sigma,
     fit_power_law_continuum,
     get_inf_playground_target,
     grid_indices,
@@ -1356,11 +1436,11 @@ def _(
                     _ct_safe = np.where(_ct > 0, _ct, 1.0)
                     _sigma = _sigma / _ct_safe
 
-                _sigma = np.asarray(_sigma, dtype=float)
-                _sigma = _sigma[np.isfinite(_sigma) & (_sigma > 0)]
-                if _sigma.size:
-                    _noise_var = float(np.median(_sigma ** 2))
-                    _la_centre = float(np.log(max(_noise_var, 1e-30)))
+                _la_centre = estimate_log_amp_centre_from_sigma(
+                    _sigma,
+                    fallback=_la_centre,
+                    decimals=2,
+                )
             except Exception:
                 pass  # keep fallback values
 
@@ -1989,7 +2069,7 @@ def _(
 
 
 @app.cell
-def _(build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
+def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, estimate_log_amp_centre_from_sigma, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
     # ── Stage 2: Prior & Parameter Setup ──
     # Build per-parameter UI widgets (fixed/free toggle, value, min, max) that
     # drive the prior construction in Stage 3.  Parameters fall into two groups:
@@ -2117,11 +2197,10 @@ def _(build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, fit_p
                     _ct2s = np.where(_ct2 > 0, _ct2, 1.0)
                     _sigma = _sigma / _ct2s
 
-                _sigma = np.asarray(_sigma, dtype=float)
-                _sigma = _sigma[np.isfinite(_sigma) & (_sigma > 0)]
-                if _sigma.size:
-                    _noise_var = float(np.median(_sigma ** 2))
-                    _la_default = float(np.log(max(_noise_var, 1e-30)))
+                _la_default = estimate_log_amp_centre_from_sigma(
+                    _sigma,
+                    fallback=_la_default,
+                )
             except Exception:
                 pass
         _la_default = round(_la_default, 1)
@@ -2139,7 +2218,8 @@ def _(build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, fit_p
         # Normal prior: center is tied to observational uncertainty, while the
         # displayed range gives the optimizer room to discover extra model
         # discrepancy without starting from arbitrary line mismatch.
-        bounds['log_amp'] = [_la_default - 4.0, _la_default + 4.0]
+        _log_amp_half_width = 2.0 * GP_LOG_AMP_PRIOR_SIGMA
+        bounds['log_amp'] = [_la_default - _log_amp_half_width, _la_default + _log_amp_half_width]
         defaults['log_amp'] = _la_default
 
         # log_ls: GP global covariance length scale (natural log)
@@ -2365,9 +2445,12 @@ def _(
     distance_prior_ack,
     Spectrum,
     SpectrumModel,
+    bounds_for_frozen_prior,
     build_synthetic_sirocco_sigma,
     emu,
     fit_power_law_continuum,
+    get_frozen_dist_loc_scale,
+    global_covariance_diagnostics,
     ground_truth_params,
     grid_selector,
     log10_params,
@@ -2622,31 +2705,17 @@ def _(
                 _active_labels = list(_model.labels)
                 _N = len(_active_labels)
 
-                def _get_loc_scale(dist):
-                    """Extract loc and scale from a frozen scipy distribution,
-                    regardless of whether it was built with positional or keyword args."""
-                    args = dist.args
-                    kwds = dist.kwds
-                    if len(args) >= 2:
-                        return args[0], args[1]
-                    elif len(args) == 1:
-                        return args[0], kwds.get('scale', 1.0)
-                    else:
-                        return kwds.get('loc', 0.0), kwds.get('scale', 1.0)
-
                 # Derive per-parameter bounds from the priors (used by all methods).
                 _lo_bounds = []
                 _hi_bounds = []
                 for _label in _active_labels:
                     if _label in _priors:
                         _dist = _priors[_label]
-                        _loc, _sc = _get_loc_scale(_dist)
-                        if _dist.dist.name == 'uniform':
-                            _lo_bounds.append(_loc)
-                            _hi_bounds.append(_loc + _sc)
-                        elif _dist.dist.name == 'norm':
-                            _lo_bounds.append(_loc - 4 * _sc)
-                            _hi_bounds.append(_loc + 4 * _sc)
+                        _prior_bounds = bounds_for_frozen_prior(_label, _dist)
+                        if _prior_bounds is not None:
+                            _lo, _hi = _prior_bounds
+                            _lo_bounds.append(_lo)
+                            _hi_bounds.append(_hi)
                         else:
                             _cv = _model.get_param_vector()[_active_labels.index(_label)]
                             _lo_bounds.append(_cv - abs(_cv) * 0.5)
@@ -2680,7 +2749,7 @@ def _(
                     for _col_idx, _label in enumerate(_active_labels):
                         if _label in _priors:
                             _dist = _priors[_label]
-                            _loc, _sc = _get_loc_scale(_dist)
+                            _loc, _sc = get_frozen_dist_loc_scale(_dist)
                             if _dist.dist.name == 'uniform':
                                 _col = _simplex_column_uniform(_loc, _sc, _N)
                             elif _dist.dist.name == 'norm':
@@ -2937,10 +3006,16 @@ def _(
                     _plot_cov = _plot_cov.detach().cpu().numpy()
                 _plot_cov = np.asarray(_plot_cov, dtype=float)
                 _plot_cov_diag = np.diag(_plot_cov) if _plot_cov.ndim == 2 else _plot_cov.reshape(-1)
+                _plot_data_flux = np.asarray(_model.data.flux, dtype=float)
+                _gp_covariance_diagnostics = global_covariance_diagnostics(
+                    _model,
+                    _priors,
+                    np.asarray(_plot_flux, dtype=float) - _plot_data_flux,
+                )
                 _mle_nll = float(_soln.fun)
                 _mle_plot_payload = {
                     "wavelength": np.asarray(_model.data.wave, dtype=float).copy(),
-                    "data_flux": np.asarray(_model.data.flux, dtype=float).copy(),
+                    "data_flux": _plot_data_flux.copy(),
                     "model_flux": np.asarray(_plot_flux, dtype=float).copy(),
                     "model_cov_diag": _plot_cov_diag.copy(),
                     "title": f"Best-Fit Model — {_model.data_name}",
@@ -3138,6 +3213,7 @@ def _(
                     "results_md": _results_md,
                     "global_md": _global_md,
                     "playground_payload": _playground_payload,
+                    "gp_covariance_diagnostics": _gp_covariance_diagnostics,
                     "restart_table_rows": _restart_table_rows,
                     "loss_fig": _fig_loss,
                     "plot": _mle_plot_payload,
@@ -3208,6 +3284,17 @@ def _(
                 mo.md(_result["global_md"]),
             ], align="start", gap="2rem"),
         ]
+        _gp_diag = _result.get("gp_covariance_diagnostics") or {}
+        if _gp_diag.get("warning"):
+            _gp_msg = (
+                "The fitted GP covariance may be absorbing model-data mismatch. "
+                f"log_amp={_gp_diag.get('log_amp', float('nan')):.3g}, "
+                f"log_amp - ln(residual variance)="
+                f"{_gp_diag.get('log_amp_minus_residual_log_variance', float('nan')):.3g}."
+            )
+            if _gp_diag.get("log_ls_at_upper_bound"):
+                _gp_msg += " log_ls is at the upper prior bound."
+            _result_elements.append(mo.callout(mo.md(_gp_msg), kind="warn"))
         if _result.get("restart_table_rows"):
             _restart_rows = _result["restart_table_rows"]
             _restart_columns = list(_restart_rows[0].keys()) if _restart_rows else []
