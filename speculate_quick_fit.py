@@ -3166,6 +3166,21 @@ def _(
                     _sorted_norm = np.lexsort(_gp_norm.T[::-1])
                     _grid_shape_norm = [len(a) for a in _axes_norm]
                     _nf_grid = _nf[_sorted_norm].reshape(_grid_shape_norm)
+                    # Linear-scale norm factors are per-spectrum mean fluxes that
+                    # vary by orders of magnitude across the log-spaced grid axes,
+                    # making them strongly convex in parameter space.  Linear
+                    # interpolation of a convex function overshoots between grid
+                    # nodes (the chord lies above the curve), which produced a
+                    # systematic ~5-10% continuum offset at off-grid (test-grid)
+                    # points.  Interpolating in log10 space (geometric
+                    # interpolation) removes that bias.  Log-scale emulators
+                    # store mean log-flux offsets, which are already geometric
+                    # in flux and may be negative, so those stay in linear space.
+                    if qf_inf_emu_data["scale"] != "log" and np.all(_nf_grid > 0):
+                        qf_inf_emu_data["norm_factor_interp_space"] = "log10"
+                        _nf_grid = np.log10(_nf_grid)
+                    else:
+                        qf_inf_emu_data["norm_factor_interp_space"] = "linear"
                     qf_inf_emu_data["norm_factor_interpolator"] = RegularGridInterpolator(
                         _axes_norm, _nf_grid, method="linear",
                         bounds_error=False, fill_value=None,
@@ -3962,7 +3977,13 @@ def _(np, torch):
             _interp = emu_data.get("norm_factor_interpolator")
             if _interp is not None:
                 try:
-                    return float(np.asarray(_interp(X_raw)).squeeze())
+                    _value = float(np.asarray(_interp(X_raw)).squeeze())
+                    # Undo the log10 transform when the interpolator was built
+                    # in geometric space (linear-scale emulators) so callers
+                    # always receive a multiplicative flux factor.
+                    if emu_data.get("norm_factor_interp_space") == "log10":
+                        _value = float(10.0 ** _value)
+                    return _value
                 except Exception:
                     pass
             _stored = emu_data.get("norm_factors")

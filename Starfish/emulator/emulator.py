@@ -437,9 +437,25 @@ class Emulator:
         self._grid_points_norm = (grid_points - self._param_min) / self._param_range
         
         # Create optimal interpolator (RegularGrid if possible, LinearND fallback)
-        # Uses ORIGINAL-space grid_points for physical-space interpolation
+        # Uses ORIGINAL-space grid_points for physical-space interpolation.
+        #
+        # For linear / continuum-normalised flux scales the factors are
+        # per-spectrum mean fluxes, which vary by orders of magnitude across
+        # the log-spaced grid axes and are strongly convex in parameter space.
+        # Linear interpolation of a convex function overshoots between grid
+        # nodes (the chord lies above the curve), producing a systematic
+        # continuum offset at off-grid parameters.  Interpolating log10(factor)
+        # (geometric interpolation) removes that bias.  Log-scale emulators
+        # store additive mean-log-flux offsets, which are already geometric in
+        # flux and may be negative, so those stay in linear space.
+        if self.flux_scale != "log" and np.all(np.asarray(factors) > 0):
+            self._factor_interp_space = "log10"
+            interp_factors = np.log10(np.asarray(factors, dtype=np.float64))
+        else:
+            self._factor_interp_space = "linear"
+            interp_factors = factors
         self.factor_interpolator = _create_optimal_interpolator(
-            grid_points, factors, logger=self.log
+            grid_points, interp_factors, logger=self.log
         )
 
         self.dv = calculate_dv(wavelength)
@@ -2044,9 +2060,19 @@ class Emulator:
         factor: float
             The interpolated preprocessing factor. For non-log models this is
             multiplicative; for log models it is additive.
+
+        Notes
+        -----
+        Multiplicative (non-log) factors are interpolated in log10 space and
+        exponentiated here, because linearly interpolating mean fluxes that
+        span orders of magnitude systematically overestimates the continuum
+        level between grid nodes.
         """
         _params = np.asarray(params)
-        return self.factor_interpolator(_params)
+        _factor = self.factor_interpolator(_params)
+        if getattr(self, "_factor_interp_space", "linear") == "log10":
+            _factor = 10.0 ** _factor
+        return _factor
 
     def determine_chunk_log(self, wavelength: Sequence[float], buffer: float = 50):
         """
