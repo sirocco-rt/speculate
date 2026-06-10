@@ -574,11 +574,15 @@ def _(get_run_index):
 @app.cell
 def _(mo):
     # Visibility and display options
+    # Smoothing sigma comes from the shared constant so the label matches the
+    # kernel applied in the plotting cell below (and in Training/Quick Fit).
+    from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _smooth_sigma
+
     show_current = mo.ui.checkbox(value=True, label="Show Current Spectrum")
     show_fixed = mo.ui.checkbox(value=True, label="Show Fixed Spectra")
     show_obs = mo.ui.checkbox(value=False, label="Show Observational Spectra")
     use_dimensionless = mo.ui.checkbox(value=False, label="Dimensionless Data")
-    use_smoothing = mo.ui.checkbox(value=True, label="Smooth Data (Gaussian σ=10)")
+    use_smoothing = mo.ui.checkbox(value=True, label=f"Smooth Data (Gaussian σ={_smooth_sigma:g})")
     show_grid = mo.ui.checkbox(value=True, label="Show Grid")
 
     mo.hstack([show_current, show_fixed, show_obs, use_dimensionless, use_smoothing, show_grid], justify="space-between")
@@ -821,6 +825,8 @@ def _(
     wavelengths,
 ):
     from scipy.ndimage import gaussian_filter1d as _gaussian_filter1d
+    # Same kernel strength as Training/Quick Fit grid processing.
+    from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _smooth_sigma_plot
 
     # Filter and transform every plotted series through the same wavelength mask
     # so pinned, current, and observational spectra share one x-axis domain.
@@ -832,7 +838,7 @@ def _(
     # matches the spectra that feed the emulator pipeline.
     def smooth_flux(flux_array):
         if use_smoothing.value:
-            return _gaussian_filter1d(np.asarray(flux_array, dtype=np.float64), 10)
+            return _gaussian_filter1d(np.asarray(flux_array, dtype=np.float64), _smooth_sigma_plot)
         return flux_array
 
     # Apply the selected flux-scale transformation to an already-smoothed spectrum.

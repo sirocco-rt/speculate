@@ -2725,6 +2725,12 @@ def _(
                         _lo_bounds.append(_cv - abs(_cv) * 0.5 - 1e-6)
                         _hi_bounds.append(_cv + abs(_cv) * 0.5 + 1e-6)
 
+                # Shared (min, max) pairs for every bounded optimizer. All three
+                # methods must respect the same box — in particular the asymmetric
+                # log_amp ceiling — so the GP amplitude cannot blow up to absorb
+                # model-data mismatch under any optimizer choice.
+                _bounds_list = list(zip(_lo_bounds, _hi_bounds))
+
                 _simplex = None
                 if _opt_method == "Nelder-Mead":
                     # Build an initial simplex spanning the prior volume.
@@ -2871,6 +2877,9 @@ def _(
                     if _opt_method == "Nelder-Mead":
                         # For restart 0 use the pre-built simplex; for later
                         # restarts use adaptive simplex from the random x0.
+                        # bounds= makes scipy clip the simplex (including the
+                        # initial one, which spans centre±2σ for normal priors
+                        # and can exceed the asymmetric log_amp ceiling).
                         _nm_opts = dict(maxiter=_max_iter, disp=False, adaptive=True)
                         if _restart_idx == 0 and _simplex is not None:
                             _nm_opts["initial_simplex"] = _simplex
@@ -2878,11 +2887,11 @@ def _(
                             _nll_with_callback,
                             _x0,
                             method="Nelder-Mead",
+                            bounds=_bounds_list,
                             options=_nm_opts,
                         )
 
                     elif _opt_method == "L-BFGS-B":
-                        _bounds_list = list(zip(_lo_bounds, _hi_bounds))
                         _run_soln = scipy_minimize(
                             _nll_with_callback,
                             _x0,
@@ -3292,6 +3301,11 @@ def _(
                 f"log_amp - ln(residual variance)="
                 f"{_gp_diag.get('log_amp_minus_residual_log_variance', float('nan')):.3g}."
             )
+            if _gp_diag.get("log_amp_at_upper_bound"):
+                _gp_msg += (
+                    " log_amp is pinned at its upper optimizer bound — the GP "
+                    "variance ceiling is limiting how much mismatch it can absorb."
+                )
             if _gp_diag.get("log_ls_at_upper_bound"):
                 _gp_msg += " log_ls is at the upper prior bound."
             _result_elements.append(mo.callout(mo.md(_gp_msg), kind="warn"))

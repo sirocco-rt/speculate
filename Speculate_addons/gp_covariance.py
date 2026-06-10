@@ -14,8 +14,16 @@ import numpy as np
 
 
 GP_LOG_AMP_PRIOR_SIGMA = 2.5
-GP_LOG_AMP_BOUND_BELOW_CENTRE = 8.0
-GP_LOG_AMP_BOUND_ABOVE_CENTRE = 4.0
+# Hard optimizer bounds are expressed in units of the prior sigma so that
+# user-adjusted prior widths rescale the box constraints consistently.
+# At the default sigma=2.5 these multipliers reproduce the original fixed
+# offsets of -8 (below) and +4 (above) around the noise-calibrated centre.
+GP_LOG_AMP_BOUND_SIGMAS_BELOW = 3.2
+GP_LOG_AMP_BOUND_SIGMAS_ABOVE = 1.6
+# Absolute tolerance (ln-variance units) for flagging a fitted log_amp as
+# pinned against its upper optimizer bound. Bounded optimizers asymptote
+# against the box constraint rather than landing exactly on it.
+GP_LOG_AMP_BOUND_TOL = 0.05
 GP_LOG_AMP_RESIDUAL_WARNING_MARGIN = float(np.log(10.0))
 GP_LOG_LS_BOUND_TOL = 1e-6
 
@@ -53,12 +61,25 @@ def estimate_log_amp_centre_from_sigma(
     return round(float(np.log(max(noise_var, 1e-30))), decimals)
 
 
-def log_amp_optimizer_bounds(center: float) -> tuple[float, float]:
-    """Return conservative MLE bounds around a noise-calibrated ``log_amp``."""
+def log_amp_optimizer_bounds(
+    center: float,
+    sigma: float = GP_LOG_AMP_PRIOR_SIGMA,
+) -> tuple[float, float]:
+    """Return conservative MLE bounds around a noise-calibrated ``log_amp``.
+
+    The asymmetric box keeps the fitted GP variance within
+    ``exp(+1.6 sigma)`` of the centre (~55x the noise variance at the default
+    width) while leaving generous room below. Bounds scale with the prior
+    sigma so widening or narrowing the prior in the UI consistently widens or
+    narrows the hard constraint as well.
+    """
     center = float(center)
+    sigma = float(sigma)
+    if not np.isfinite(sigma) or sigma <= 0:
+        sigma = GP_LOG_AMP_PRIOR_SIGMA
     return (
-        center - GP_LOG_AMP_BOUND_BELOW_CENTRE,
-        center + GP_LOG_AMP_BOUND_ABOVE_CENTRE,
+        center - GP_LOG_AMP_BOUND_SIGMAS_BELOW * sigma,
+        center + GP_LOG_AMP_BOUND_SIGMAS_ABOVE * sigma,
     )
 
 
@@ -69,7 +90,9 @@ def bounds_for_frozen_prior(label: str, dist) -> Optional[tuple[float, float]]:
         return float(loc), float(loc + scale)
     if dist.dist.name == "norm":
         if label == "global_cov:log_amp":
-            return log_amp_optimizer_bounds(float(loc))
+            # Pass the prior's own sigma so user-widened/narrowed priors
+            # move the hard box constraints with them.
+            return log_amp_optimizer_bounds(float(loc), float(scale))
         return float(loc - 4 * scale), float(loc + 4 * scale)
     return None
 
@@ -104,7 +127,17 @@ def global_covariance_diagnostics(model, priors: Optional[dict], residual: np.nd
         prior = priors["global_cov:log_amp"]
         if getattr(prior, "dist", None) is not None and prior.dist.name == "norm":
             prior_center, prior_sigma = get_frozen_dist_loc_scale(prior)
-            log_amp_bounds = list(log_amp_optimizer_bounds(float(prior_center)))
+            log_amp_bounds = list(
+                log_amp_optimizer_bounds(float(prior_center), float(prior_sigma))
+            )
+
+    # Pinned-at-bound detection: hitting the upper box constraint is the
+    # designed failure mode when the GP tries to absorb model-data mismatch,
+    # so surface it explicitly rather than leaving it implicit in the value.
+    log_amp_at_upper_bound = bool(
+        log_amp_bounds is not None
+        and log_amp >= log_amp_bounds[1] - GP_LOG_AMP_BOUND_TOL
+    )
 
     log_ls_at_upper_bound = False
     log_ls_upper_bound = None
@@ -120,7 +153,7 @@ def global_covariance_diagnostics(model, priors: Optional[dict], residual: np.nd
                 )
         diagnostics["log_ls"] = log_ls
 
-    warning = bool(log_amp_above_residual or log_ls_at_upper_bound)
+    warning = bool(log_amp_above_residual or log_amp_at_upper_bound or log_ls_at_upper_bound)
     diagnostics.update({
         "warning": warning,
         "log_amp": log_amp,
@@ -131,6 +164,7 @@ def global_covariance_diagnostics(model, priors: Optional[dict], residual: np.nd
         "noise_log_variance_median": noise_log_var,
         "log_amp_minus_residual_log_variance": log_amp_minus_residual_log_var,
         "log_amp_above_residual_variance_10x": log_amp_above_residual,
+        "log_amp_at_upper_bound": log_amp_at_upper_bound,
         "log_ls_at_upper_bound": log_ls_at_upper_bound,
         "log_ls_upper_bound": log_ls_upper_bound,
         "log_amp_prior_center": float(prior_center) if prior_center is not None else None,

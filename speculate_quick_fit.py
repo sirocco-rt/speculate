@@ -620,9 +620,14 @@ def _(mo):
     # Stage 1 configuration widgets for training.
     # These are all defined in one cell so marimo creates them in a single pass.
     #
+    # Smoothing sigma is shared with the grid-processing kernel so the checkbox
+    # label always reflects the actual smoothing strength.
+    from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _qf_smooth_sigma
+
     # Wavelength range: restricts which part of the spectrum is used for PCA/training.
     # Flux scale: how spectra are represented (linear, log, continuum-normalised, etc.).
-    # Smoothing: optional Gaussian smoothing (sigma=10) to reduce noise in raw spectra.
+    # Smoothing: optional Gaussian smoothing (sigma set by GAUSSIAN_SMOOTHING_SIGMA
+    #   in Spec_gridinterfaces) to reduce noise in raw spectra.
     # PCA components: how many principal components to retain (2-30).
     # Model type: "Neural Network" or "Grid Interpolation (Linear)".
     #   - NN: learns a mapping from parameters → PCA weights via a feedforward network.
@@ -649,7 +654,7 @@ def _(mo):
 
     qf_use_smoothing = mo.ui.checkbox(
         value=False,
-        label="Smooth Spectra (Gaussian σ=10)",
+        label=f"Smooth Spectra (Gaussian σ={_qf_smooth_sigma:g})",
     )
 
     qf_n_components = mo.ui.slider(

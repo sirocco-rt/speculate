@@ -1163,6 +1163,10 @@ def _(grid_configs, grid_selector, mo, n_components, params):
 
 @app.cell
 def _(get_loaded_emu_config, mo, update_loaded_emu_config):
+    # Smoothing sigma is defined once in Spec_gridinterfaces so the checkbox
+    # label always matches the kernel actually applied during grid processing.
+    from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _smooth_sigma
+
     _cfg = get_loaded_emu_config()
     _scales = ["linear", "log", "continuum-normalised"]
 
@@ -1176,7 +1180,7 @@ def _(get_loaded_emu_config, mo, update_loaded_emu_config):
         on_change=update_loaded_emu_config("scale")
     )
 
-    use_smoothing = mo.ui.checkbox(value=_cfg['smoothing'] if _cfg and 'smoothing' in _cfg else False, label="Smooth Spectra (Gaussian σ=10)", on_change=update_loaded_emu_config("smoothing", bool))
+    use_smoothing = mo.ui.checkbox(value=_cfg['smoothing'] if _cfg and 'smoothing' in _cfg else False, label=f"Smooth Spectra (Gaussian σ={_smooth_sigma:g})", on_change=update_loaded_emu_config("smoothing", bool))
 
     n_components = mo.ui.slider(start=2, stop=30, value=max(2, min(30, _cfg['n_components'])) if _cfg and 'n_components' in _cfg else 10, step=1, label="PCA Components:",show_value=True, on_change=update_loaded_emu_config("n_components", lambda value: int(value)))
 
@@ -1204,6 +1208,9 @@ def _(
 ):
     mo.md("### 3. Wavelength Range, Scale & PCA Components")
 
+    # Pull the shared smoothing sigma so the info text tracks the real kernel.
+    from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _smooth_sigma_info
+
     # Display result using state
     pca_result_display = mo.md(f"_{get_pca_result()}_")
 
@@ -1223,7 +1230,7 @@ def _(
                 f"{mo.icon('lucide:info')} Scale & Smoothing": mo.md(
                     "**Flux Scale**: Possible transformations to the input spectra before PCA may help capture features more efficiently."
                     "Linear, log and continuum-normalised options are standard choices.\n\n"
-                    "**Smoothing**: Applying a Gaussian smoothing filter (σ=10) can suppress high-frequency noise in the spectra before PCA. This may improve reconstruction performance, but it will also broaden sharp spectral features, so enable it deliberately."
+                    "**Smoothing**: Applying a Gaussian smoothing filter (σ=" + f"{_smooth_sigma_info:g}" + ") can suppress high-frequency noise in the spectra before PCA. This may improve reconstruction performance, but it will also slightly broaden sharp spectral features, so enable it deliberately."
                 ),
             }),
         ], align="center", gap=0.5),
@@ -1655,6 +1662,9 @@ def _(
         grid_file_path_check = f'Grid-Emulator_Files/{grid_file_name}.npz'
         process_grid_auto = not os.path.isfile(grid_file_path_check)
 
+        # Shared smoothing sigma keeps this summary in sync with the kernel.
+        from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _smooth_sigma_cfg
+
         _config_lines = [
             f"- **Grid:** `{grid_name}`",
             f"- **Grid Path:** `{grid_path}`",
@@ -1662,7 +1672,7 @@ def _(
             f"- **Inclination parameter:** {f'Fixed {fixed_inc}°' if inclination_fixed else 'Trainable'}",
             f"- **Wavelength Range:** {wl_range[0]}-{wl_range[1]} Å",
             f"- **Flux Scale:** {scale}",
-            f"- **Smoothing:** {'Yes (Gaussian σ=10)' if smoothing else 'No'}",
+            f"- **Smoothing:** {f'Yes (Gaussian σ={_smooth_sigma_cfg:g})' if smoothing else 'No'}",
             f"- **PCA Components:** {n_components.value}",
             f"- **Method:** {method.value}",
             f"- **Max Iterations:** {max_iter.value}",
