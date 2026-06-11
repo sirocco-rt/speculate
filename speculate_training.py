@@ -703,6 +703,7 @@ def _(available_grids, get_loaded_emu_config, mo, update_loaded_emu_config):
     mo.md("### 1. Grid Selection")
 
     _cfg = get_loaded_emu_config()
+    grid_selection_ui = mo.md("")
 
     if available_grids:
         # Find the label for the loaded grid, or fall back to the no-BL grid
@@ -728,12 +729,19 @@ def _(available_grids, get_loaded_emu_config, mo, update_loaded_emu_config):
                 remove_keys=("params", "physical_params", "inclination_choice", "fixed_inclination"),
             )
         )
-        mo.vstack([
-            grid_selector,
-            mo.md(f"{mo.icon('lucide:check-circle')} Found **{len(available_grids)}** grid(s) in `sirocco_grids/`")
+        _grid_info = mo.accordion({
+            f"{mo.icon('lucide:info')} Grid options": mo.md(
+                "Grid availability and parameter coverage are documented in the "
+                "**Speculate wiki** page **Grid Inspector - Available Grids**. "
+                "Use that page to check the current supported grids."
+            ),
+        })
+        grid_selection_ui = mo.vstack([
+            mo.md(f"{mo.icon('lucide:check-circle')} Found **{len(available_grids)}** grid(s) in `sirocco_grids/`"),
+            mo.hstack([grid_selector, _grid_info], justify="space-between", align="center", gap=0.5),
         ])
     else:
-        mo.callout(
+        grid_selection_ui = mo.callout(
             mo.md(f"""
             {mo.icon('lucide:triangle-alert')} **No grids found in `sirocco_grids/` folder**
 
@@ -742,7 +750,8 @@ def _(available_grids, get_loaded_emu_config, mo, update_loaded_emu_config):
             kind="warn"
         )
         grid_selector = None
-    grid_selector
+        
+    grid_selection_ui
     return (grid_selector,)
 
 
@@ -1154,6 +1163,10 @@ def _(grid_configs, grid_selector, mo, n_components, params):
 
 @app.cell
 def _(get_loaded_emu_config, mo, update_loaded_emu_config):
+    # Smoothing sigma is defined once in Spec_gridinterfaces so the checkbox
+    # label always matches the kernel actually applied during grid processing.
+    from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _smooth_sigma
+
     _cfg = get_loaded_emu_config()
     _scales = ["linear", "log", "continuum-normalised"]
 
@@ -1167,7 +1180,7 @@ def _(get_loaded_emu_config, mo, update_loaded_emu_config):
         on_change=update_loaded_emu_config("scale")
     )
 
-    use_smoothing = mo.ui.checkbox(value=_cfg['smoothing'] if _cfg and 'smoothing' in _cfg else False, label="Smooth Spectra (Boxcar=5)", on_change=update_loaded_emu_config("smoothing", bool))
+    use_smoothing = mo.ui.checkbox(value=_cfg['smoothing'] if _cfg and 'smoothing' in _cfg else False, label=f"Smooth Spectra (Gaussian σ={_smooth_sigma:g})", on_change=update_loaded_emu_config("smoothing", bool))
 
     n_components = mo.ui.slider(start=2, stop=30, value=max(2, min(30, _cfg['n_components'])) if _cfg and 'n_components' in _cfg else 10, step=1, label="PCA Components:",show_value=True, on_change=update_loaded_emu_config("n_components", lambda value: int(value)))
 
@@ -1195,6 +1208,9 @@ def _(
 ):
     mo.md("### 3. Wavelength Range, Scale & PCA Components")
 
+    # Pull the shared smoothing sigma so the info text tracks the real kernel.
+    from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _smooth_sigma_info
+
     # Display result using state
     pca_result_display = mo.md(f"_{get_pca_result()}_")
 
@@ -1214,7 +1230,7 @@ def _(
                 f"{mo.icon('lucide:info')} Scale & Smoothing": mo.md(
                     "**Flux Scale**: Possible transformations to the input spectra before PCA may help capture features more efficiently."
                     "Linear, log and continuum-normalised options are standard choices.\n\n"
-                    "**Smoothing**: Applying a boxcar smoothing (width=5) can help reduce high-frequency noise in the spectra, which may improve PCA reconstruction quality for some grids. However, it also slightly blurs spectral features, so use with caution."
+                    "**Smoothing**: Applying a Gaussian smoothing filter (σ=" + f"{_smooth_sigma_info:g}" + ") can suppress high-frequency noise in the spectra before PCA. This may improve reconstruction performance, but it will also slightly broaden sharp spectral features, so enable it deliberately."
                 ),
             }),
         ], align="center", gap=0.5),
@@ -1646,6 +1662,9 @@ def _(
         grid_file_path_check = f'Grid-Emulator_Files/{grid_file_name}.npz'
         process_grid_auto = not os.path.isfile(grid_file_path_check)
 
+        # Shared smoothing sigma keeps this summary in sync with the kernel.
+        from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _smooth_sigma_cfg
+
         _config_lines = [
             f"- **Grid:** `{grid_name}`",
             f"- **Grid Path:** `{grid_path}`",
@@ -1653,7 +1672,7 @@ def _(
             f"- **Inclination parameter:** {f'Fixed {fixed_inc}°' if inclination_fixed else 'Trainable'}",
             f"- **Wavelength Range:** {wl_range[0]}-{wl_range[1]} Å",
             f"- **Flux Scale:** {scale}",
-            f"- **Smoothing:** {'Yes (Gaussian σ=50)' if smoothing else 'No'}",
+            f"- **Smoothing:** {f'Yes (Gaussian σ={_smooth_sigma_cfg:g})' if smoothing else 'No'}",
             f"- **PCA Components:** {n_components.value}",
             f"- **Method:** {method.value}",
             f"- **Max Iterations:** {max_iter.value}",
@@ -1944,6 +1963,11 @@ def _(
 
                     emu = Emulator.load(emu_path)
 
+                    saved_per_component = bool(getattr(emu, 'per_component', False))
+                    saved_strict_weight_fit = bool(getattr(emu, 'strict_weight_fit', False))
+                    emu.per_component = bool(per_component.value)
+                    emu.strict_weight_fit = bool(strict_weight_fit.value)
+
                     # Guard: warn if the UI kernel selector differs from the
                     # kernel baked into the saved emulator.  Training always
                     # uses the kernel stored in the .npz, so a mismatch would
@@ -1952,6 +1976,11 @@ def _(
                         print(f"⚠️  Kernel mismatch — loaded emulator uses '{emu.kernel}', "
                               f"but UI has '{kernel_selector.value}' selected. "
                               f"Continuing with the emulator's original kernel ('{emu.kernel}').")
+
+                    if saved_per_component != emu.per_component or saved_strict_weight_fit != emu.strict_weight_fit:
+                        print("Continue settings override saved training flags:")
+                        print(f"  per_component: {saved_per_component} → {emu.per_component}")
+                        print(f"  strict_weight_fit: {saved_strict_weight_fit} → {emu.strict_weight_fit}")
 
                     # Preserve existing loss history so the plot is cumulative
                     prev_history = list(emu.loss_history) if hasattr(emu, 'loss_history') and emu.loss_history else []
@@ -2492,8 +2521,8 @@ def _(alt, get_loss_history, get_trained_emu, gp_figure, mo, pd):
         chart = line
 
     # ── Emulator summary (mirrors the training-log __repr__ output) ──
-    # Uses loss_history for the best NLL instead of calling log_likelihood()
-    # (which would require an expensive V11 Cholesky factorisation).
+    # Prefer the materialized-V11 total objective when available.  For very
+    # large models without V11, fall back to the recorded optimizer values.
     _emu_summary = mo.md("")
     if _emu is not None:
         _s = "Emulator\n" + "-" * 40 + "\n"
@@ -2524,8 +2553,23 @@ def _(alt, get_loss_history, get_trained_emu, gp_figure, mo, pd):
             _s += _hdr + "\n"
         for _i, _ls in enumerate(_emu.lengthscales):
             _s += f"  Comp {_i:2d}: [ " + "  ".join(f"{l:.4f}" for l in _ls) + " ]\n"
+        _final_log_likelihood = None
+        if getattr(_emu, '_v11', None) is not None or getattr(_emu, '_v11_gpu', None) is not None:
+            try:
+                # Per-component loss_history stores component-local optimizer
+                # evaluations.  A materialized V11 is the authoritative total.
+                _final_log_likelihood = _emu.log_likelihood()
+            except Exception:
+                _final_log_likelihood = None
+        if _final_log_likelihood is not None:
+            _final_nll = -_final_log_likelihood
+            _s += f"\nFinal Total NLL: {_final_nll:.2f}\n"
+            _s += f"Final Log Likelihood: {_final_log_likelihood:.2f}\n"
+        elif len(loss_data) > 0:
+            _best_nll = min(loss_data)
+            _s += f"\nBest Recorded Loss: {_best_nll:.2f}\n"
+            _s += f"Recorded Loss Sign-Flipped: {-_best_nll:.2f}\n"
         if len(loss_data) > 0:
-            _s += f"\nBest NLL:       {min(loss_data):.2f}\n"
             _s += f"Iterations:     {len(loss_data)}\n"
         _emu_summary = mo.accordion(
             {f"{mo.icon('lucide:cpu')} Emulator Summary": mo.md(f"```\n{_s}```")}

@@ -2919,6 +2919,61 @@ def _(emu_picker, glob, mo, os, re):
 
 
 @app.cell(hide_code=True)
+def _(mo, obs_picker, os, tier_picker):
+    # Tier 3 needs per-observation distance priors because observational
+    # spectra do not share the synthetic 100 pc reference scale used by test
+    # grids.  The widgets stay keyed by observation path so the run cell can
+    # pass the correct pc prior to each independent Tier 3 fit.
+    _known_distance_priors_pc = {
+        "ixvel": (88.8, 85.6, 92.0),
+        "rwsex": (150.0, 113.0, 187.0),
+        "rwtri": (306.0, 296.0, 316.0),
+        "uxuma": (263.5, 233.1, 293.9),
+        "v3885sgr": (135.9, 127.6, 144.2),
+    }
+
+    def _distance_defaults_for_observation(_obs_path):
+        """Return known pc prior defaults from the observation filename."""
+        _stem = os.path.splitext(os.path.basename(_obs_path))[0].lower()
+        _normalised = "".join(_ch for _ch in _stem if _ch.isalnum())
+        for _key, _defaults in _known_distance_priors_pc.items():
+            if _key in _normalised:
+                return _defaults
+        return (100.0, 90.0, 110.0)
+
+    tier3_distance_prior_widgets = {}
+    tier3_distance_prior_controls = mo.md("")
+
+    _selected_tiers = set(tier_picker.value or [])
+    _tier3_selected = 3 in _selected_tiers or "Tier 3" in _selected_tiers
+    _obs_paths = list(obs_picker.value or [])
+    if _tier3_selected and _obs_paths:
+        _rows = []
+        for _obs_path in _obs_paths:
+            _mean_pc, _min_pc, _max_pc = _distance_defaults_for_observation(_obs_path)
+            _widgets = {
+                "mean_pc": mo.ui.number(value=_mean_pc, step=0.1, label="Mean (pc)"),
+                "min_pc": mo.ui.number(value=_min_pc, step=0.1, label="Min (pc)"),
+                "max_pc": mo.ui.number(value=_max_pc, step=0.1, label="Max (pc)"),
+            }
+            tier3_distance_prior_widgets[_obs_path] = _widgets
+            _rows.append(
+                mo.hstack([
+                    mo.md(f"**{os.path.basename(_obs_path)}**"),
+                    _widgets["mean_pc"],
+                    _widgets["min_pc"],
+                    _widgets["max_pc"],
+                ], justify="start", gap="0.5rem")
+            )
+
+        tier3_distance_prior_controls = mo.accordion({
+            f"{mo.icon('lucide:sliders-horizontal')} Tier 3 Distance Priors": mo.vstack(_rows)
+        }, lazy=False)
+
+    return tier3_distance_prior_controls, tier3_distance_prior_widgets
+
+
+@app.cell(hide_code=True)
 def _(
     emu_grid_info,
     emu_picker,
@@ -2930,6 +2985,7 @@ def _(
     mo,
     obs_picker,
     sirocco_cpu_slider,
+    tier3_distance_prior_controls,
     tier_picker,
 ):
     mo.vstack([
@@ -2937,6 +2993,7 @@ def _(
         mo.vstack([tier_picker, emu_picker, flux_scale_picker], gap=1),
         emu_grid_info,
         mo.hstack([obs_picker], gap=1),
+        tier3_distance_prior_controls,
         mo.vstack([inclination_picker, max_spectra_slider, mle_restarts_slider, mcmc_steps_slider], gap=1),
         sirocco_cpu_slider,
     ])
@@ -3113,6 +3170,7 @@ def _(
     sirocco_cpu_slider,
     tier2_mcmc_freeze,
     tier2_mle_freeze,
+    tier3_distance_prior_widgets,
     tier_picker,
     time,
 ):
@@ -3215,6 +3273,7 @@ def _(
         _tier1_result = None
         _tier2_result = None
         _tier3_results = None
+        _tier3_distance_priors_pc = None
         _tier3_checkpoint_path_to_remove = None
 
         # ---- Tier 1 (spinner — single LOO cross-validation pass) ----
@@ -3692,12 +3751,39 @@ def _(
             _obs_list = list(obs_picker.value)
             _tier3_results = []
 
+            def _read_tier3_distance_prior(_obs_path):
+                """Read and validate the pc distance prior widgets for one observation."""
+                _widgets = tier3_distance_prior_widgets.get(_obs_path) or {}
+                _prior = {
+                    "mean_pc": float(_widgets.get("mean_pc").value) if _widgets.get("mean_pc") else 100.0,
+                    "min_pc": float(_widgets.get("min_pc").value) if _widgets.get("min_pc") else 90.0,
+                    "max_pc": float(_widgets.get("max_pc").value) if _widgets.get("max_pc") else 110.0,
+                }
+                _vals = [_prior["mean_pc"], _prior["min_pc"], _prior["max_pc"]]
+                if not all(_np.isfinite(_v) and _v > 0 for _v in _vals):
+                    raise ValueError(
+                        f"Tier 3 distance prior for {os.path.basename(_obs_path)} must be finite and positive."
+                    )
+                if _prior["min_pc"] >= _prior["max_pc"]:
+                    raise ValueError(
+                        f"Tier 3 distance prior for {os.path.basename(_obs_path)} needs Min < Max."
+                    )
+                if not (_prior["min_pc"] <= _prior["mean_pc"] <= _prior["max_pc"]):
+                    raise ValueError(
+                        f"Tier 3 distance prior mean for {os.path.basename(_obs_path)} must lie within Min/Max."
+                    )
+                return _prior
+
             # ---- Checkpoint / Resume ----
             # Tier 3 observations are independent but expensive: each completed
             # observation writes one JSONL checkpoint row so interrupted runs can
             # resume by skipping completed fitting + Sirocco modelling.
             _emu_stem = os.path.basename(emu_picker.value or "").replace(".npz", "") or "emulator"
             _obs_keys = [str(_Path(_obs).expanduser().resolve()) for _obs in _obs_list]
+            _tier3_distance_priors_pc = {
+                str(_Path(_obs).expanduser().resolve()): _read_tier3_distance_prior(_obs)
+                for _obs in _obs_list
+            }
             _tier3_checkpoint_config = {
                 "schema_version": 1,
                 "emulator": str(_Path(_emu_path).expanduser().resolve()),
@@ -3710,6 +3796,7 @@ def _(
                 "mcmc_burnin": int(_mcmc_burnin_val),
                 "sirocco_cpus": int(sirocco_cpu_slider.value),
                 "observations": sorted(_obs_keys),
+                "distance_priors_pc": _tier3_distance_priors_pc,
             }
             _tier3_checkpoint_hash = _hashlib.sha256(
                 _json.dumps(_tier3_checkpoint_config, sort_keys=True).encode("utf-8")
@@ -3778,6 +3865,7 @@ def _(
                 for _obs_i, _obs_path in enumerate(_obs_list, start=1):
                     _obs_name = os.path.basename(_obs_path)
                     _obs_key = str(_Path(_obs_path).expanduser().resolve())
+                    _distance_prior_pc = _tier3_distance_priors_pc.get(_obs_key)
                     if _obs_key in _resumed_tier3_results:
                         _tier3_results.append(_resumed_tier3_results[_obs_key])
                         continue
@@ -3835,6 +3923,7 @@ def _(
                         _emu, _obs_path,
                         flux_scale=_flux_scale,
                         wl_range=_tier3_wl_range,
+                        distance_prior_pc=_distance_prior_pc,
                         mle_restarts=mle_restarts_slider.value,
                         mcmc_walkers=_mcmc_walkers_val,
                         mcmc_steps=_mcmc_steps_val,
@@ -3891,6 +3980,7 @@ def _(
             "sirocco_cpus": sirocco_cpu_slider.value,
             "tier3_export_dir": _tier3_export_dir if 3 in _tiers else None,
             "tier3_wl_range": list(_tier3_wl_range) if 3 in _tiers else None,
+            "tier3_distance_priors_pc": _tier3_distance_priors_pc if 3 in _tiers else None,
             "tier2_mle_freeze": dict(_tier2_mle_freeze_settings),
             "tier2_mcmc_freeze": dict(_tier2_mcmc_freeze_settings),
         }

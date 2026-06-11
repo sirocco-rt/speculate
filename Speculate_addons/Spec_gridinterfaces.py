@@ -1,5 +1,6 @@
 import os
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 from Starfish.grid_tools import GridInterface
 from Speculate_addons.Spec_functions import fit_power_law_continuum        
 from Speculate_addons.grid_registry import (
@@ -62,12 +63,25 @@ def _apply_flux_scale(wl_full, ind, flux, scale):
     return flux
 
 
+# Single source of truth for the optional pre-PCA Gaussian smoothing strength
+# (in pixels). Training, Quick Fit, and the Grid Inspector all import this so
+# the functional smoothing and every UI label stay in sync — change it here
+# only. Chosen close in effective bandwidth to the legacy boxcar(width=5)
+# (sigma-equivalent ~1.44 px); larger sigmas wash out line features and
+# artificially inflate PCA explained variance (e.g. sigma=10 -> 100% with
+# 30 components on red-optical grids).
+GAUSSIAN_SMOOTHING_SIGMA = 2.0
+
+
 def _maybe_smooth_flux(flux, smoothing):
-    """Apply the optional boxcar smoothing used by Training and Quick Fit."""
+    """Apply the optional Gaussian smoothing used by Training and Quick Fit.
+
+    Uses a ``GAUSSIAN_SMOOTHING_SIGMA``-pixel Gaussian kernel; see the
+    constant's comment above for how the default was chosen.
+    """
     if not smoothing:
         return flux
-    kernel = np.ones(5, dtype=np.float64)
-    return np.convolve(flux, kernel, mode='same') / np.convolve(np.ones_like(flux), kernel, mode='same')
+    return gaussian_filter1d(np.asarray(flux, dtype=np.float64), GAUSSIAN_SMOOTHING_SIGMA)
 
 
 class Speculate_agn_grid_v1_3(GridInterface):
@@ -238,7 +252,7 @@ class Speculate_cv_bl_grid_v87f(GridInterface):
             model_parameters (tuple, optional): Specifiy the parameters 
                 you wish to fit by adding intergers to the tuple. 
             
-            smoothing (bool, optional): Whether to apply Gaussian smoothing (sigma=50) to spectra.
+            smoothing (bool, optional): Whether to apply Gaussian smoothing (sigma=2) to spectra.
                 Default is False.
         """
         
@@ -425,7 +439,7 @@ class Speculate_cv_no_bl_grid_v87f(GridInterface):
             model_parameters (tuple, optional): Specifiy the parameters 
                 you wish to fit by adding intergers to the tuple. 
             
-            smoothing (bool, optional): Whether to apply Gaussian smoothing (sigma=50) to spectra.
+            smoothing (bool, optional): Whether to apply Gaussian smoothing (sigma=2) to spectra.
                 Default is False.
         """
         

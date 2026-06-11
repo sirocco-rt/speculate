@@ -4,7 +4,7 @@
     "columns": 22,
     "rowHeight": 20,
     "maxWidth": 1200,
-    "bordered": true,
+    "bordered": false,
     "cells": [
       {
         "position": [
@@ -207,7 +207,7 @@
       {
         "position": [
           0,
-          106,
+          83,
           14,
           7
         ]

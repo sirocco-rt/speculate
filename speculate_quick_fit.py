@@ -620,9 +620,14 @@ def _(mo):
     # Stage 1 configuration widgets for training.
     # These are all defined in one cell so marimo creates them in a single pass.
     #
+    # Smoothing sigma is shared with the grid-processing kernel so the checkbox
+    # label always reflects the actual smoothing strength.
+    from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _qf_smooth_sigma
+
     # Wavelength range: restricts which part of the spectrum is used for PCA/training.
     # Flux scale: how spectra are represented (linear, log, continuum-normalised, etc.).
-    # Smoothing: optional boxcar-5 smoothing to reduce noise in raw spectra.
+    # Smoothing: optional Gaussian smoothing (sigma set by GAUSSIAN_SMOOTHING_SIGMA
+    #   in Spec_gridinterfaces) to reduce noise in raw spectra.
     # PCA components: how many principal components to retain (2-30).
     # Model type: "Neural Network" or "Grid Interpolation (Linear)".
     #   - NN: learns a mapping from parameters → PCA weights via a feedforward network.
@@ -649,7 +654,7 @@ def _(mo):
 
     qf_use_smoothing = mo.ui.checkbox(
         value=False,
-        label="Smooth Spectra (Boxcar=5)",
+        label=f"Smooth Spectra (Gaussian σ={_qf_smooth_sigma:g})",
     )
 
     qf_n_components = mo.ui.slider(
@@ -1453,13 +1458,24 @@ def _(
         _use_optuna = qf_optuna_checkbox.value
         _n_ensemble = 3
 
-        # 90/10 random train/validation split (fixed seed for reproducibility).
+        # Single/final NN training uses the full quasi-regular grid.  Optuna
+        # search and ensemble members use fixed 90/10 train/validation splits
+        # drawn from that same grid; the external testgrid dataset is never
+        # consumed by this training cell.
         _n_samples = len(X_norm)
-        _rng = np.random.RandomState(42)
-        _perm_idx = _rng.permutation(_n_samples)
-        _split = max(1, int(_n_samples * 0.1))
-        _val_idx = _perm_idx[:_split]
-        _train_idx = _perm_idx[_split:]
+        _full_idx = np.arange(_n_samples)
+
+        def _make_train_val_split(seed):
+            if _n_samples < 2:
+                return _full_idx, None
+            _rng = np.random.RandomState(seed)
+            _perm_idx = _rng.permutation(_n_samples)
+            _split = min(max(1, int(_n_samples * 0.1)), _n_samples - 1)
+            _val_idx = _perm_idx[:_split]
+            _train_idx = _perm_idx[_split:]
+            return _train_idx, _val_idx
+
+        _optuna_train_idx, _optuna_val_idx = _make_train_val_split(42)
 
         # Resolve device once: GPU if user toggled on and CUDA available, else CPU.
         _device = torch.device("cuda" if qf_use_gpu.value and torch.cuda.is_available() else "cpu")
@@ -1469,16 +1485,20 @@ def _(
                              max_epochs, train_idx, val_idx, X_norm, Y_weights,
                              y_mean, y_std, seed=42, trial=None,
                              epoch_callback=None):
-            """Train a single QuickFitNN and return (model, best_val_loss, train_losses, val_losses).
+            """Train one QuickFitNN and return (model, best_loss, train_losses, val_losses).
 
             Implements mini-batch gradient descent with early stopping (patience=50).
+            If *val_idx* is None, all selected samples are used for training and
+            the best checkpoint is tracked by training loss instead of validation
+            loss, so no validation-loss curve is generated.
             Optionally integrates with Optuna for pruning unpromising trials.
             Supports three LR schedulers: cosine annealing, reduce-on-plateau, one-cycle.
             If *epoch_callback* is provided, it is called every 50 epochs as
-            ``epoch_callback(epoch, max_epochs, best_val_loss, train_losses, val_losses)``.
+            ``epoch_callback(epoch, max_epochs, best_loss, train_losses, val_losses)``.
             """
             torch.manual_seed(seed)
             np.random.seed(seed)
+            _has_validation = val_idx is not None and len(val_idx) > 0
 
             _Xt = torch.tensor(X_norm, dtype=torch.float32).to(_device)
             if out_norm == "standard":
@@ -1510,10 +1530,10 @@ def _(
 
             _Xtr = _Xt[train_idx]
             _Ytr = _Yt[train_idx]
-            _Xval = _Xt[val_idx]
-            _Yval = _Yt[val_idx]
+            _Xval = _Xt[val_idx] if _has_validation else None
+            _Yval = _Yt[val_idx] if _has_validation else None
 
-            _best_val = float("inf")
+            _best_loss = float("inf")
             _best_state = None
             _patience_counter = 0
             _train_losses = []
@@ -1538,21 +1558,25 @@ def _(
                         if _onecycle_step_count < _steps:
                             _scheduler.step()
 
-                _train_losses.append(_epoch_train_loss / max(_n_batches, 1))
+                _train_loss = _epoch_train_loss / max(_n_batches, 1)
+                _train_losses.append(_train_loss)
 
                 if sched_name == "cosine_annealing" and _scheduler is not None:
                     _scheduler.step()
 
-                _model.eval()
-                with torch.no_grad():
-                    _val_loss = nn.functional.mse_loss(_model(_Xval), _Yval).item()
-                _val_losses.append(_val_loss)
+                if _has_validation:
+                    _model.eval()
+                    with torch.no_grad():
+                        _metric_loss = nn.functional.mse_loss(_model(_Xval), _Yval).item()
+                    _val_losses.append(_metric_loss)
+                else:
+                    _metric_loss = _train_loss
 
                 if sched_name == "reduce_on_plateau" and _scheduler is not None:
-                    _scheduler.step(_val_loss)
+                    _scheduler.step(_metric_loss)
 
-                if _val_loss < _best_val - 1e-8:
-                    _best_val = _val_loss
+                if _metric_loss < _best_loss - 1e-8:
+                    _best_loss = _metric_loss
                     _best_state = {k: v.clone() for k, v in _model.state_dict().items()}
                     _patience_counter = 0
                 else:
@@ -1561,11 +1585,11 @@ def _(
                     break
 
                 if epoch_callback is not None and _ep % 50 == 0:
-                    epoch_callback(_ep + 1, max_epochs, _best_val, _train_losses, _val_losses)
+                    epoch_callback(_ep + 1, max_epochs, _best_loss, _train_losses, _val_losses)
 
                 if trial is not None:
                     import optuna
-                    trial.report(_val_loss, _ep)
+                    trial.report(_metric_loss, _ep)
                     if trial.should_prune():
                         raise optuna.TrialPruned()
 
@@ -1573,7 +1597,7 @@ def _(
                 _model.load_state_dict(_best_state)
             # Always return model on CPU for inference/export compatibility.
             _model.cpu().eval()
-            return _model, _best_val, _train_losses, _val_losses
+            return _model, _best_loss, _train_losses, _val_losses
 
         if _use_optuna:
             # ── Optuna Hyperparameter Search ─────────────────────────────
@@ -1666,7 +1690,7 @@ def _(
                 _, _val_loss, _, _ = _train_single_nn(
                     n_in, n_out, _hidden, _act, _dp, _dp_strat, _bn, _skip,
                     _opt_name, _lr, _wd, _bs, _sched, _out_norm,
-                    _max_epochs, _train_idx, _val_idx, X_norm, Y_weights,
+                    _max_epochs, _optuna_train_idx, _optuna_val_idx, X_norm, Y_weights,
                     y_mean, y_std, seed=trial.number * 137 + 42, trial=trial,
                     epoch_callback=_optuna_epoch_cb,
                 )
@@ -1772,10 +1796,10 @@ def _(
                     f"with optimal defaults...**"
                 ))
             qf_trained_models = []
-            _full_idx = np.arange(_n_samples)  # Train ensemble on ALL data
             _ensemble_val_histories = []
             _ensemble_train_histories = []
             _ens_val_losses = []
+            _ensemble_split_seeds = []
 
             # Colours for ensemble member loss curves.
             _member_colours = ["#3b82f6", "#ef4444", "#22c55e", "#f59e0b", "#a855f7"]
@@ -1840,6 +1864,8 @@ def _(
                     mo.output.replace(_status)
 
             for _seed in range(_n_ensemble):
+                _member_seed = _seed * 137 + 42
+                _member_train_idx, _member_val_idx = _make_train_val_split(_member_seed)
                 _model, _loss, _tl, _vl = _train_single_nn(
                     n_in, n_out, _hidden,
                     _hp.get("activation", "ReLU"), _hp.get("dropout", 0.01),
@@ -1847,14 +1873,15 @@ def _(
                     _hp.get("skip_connections", False), _hp.get("optimizer", "adamw"),
                     _hp.get("lr", 1.5e-3), _hp.get("weight_decay", 5e-3),
                     _hp.get("batch_size", 128), _hp.get("lr_scheduler", "reduce_on_plateau"),
-                    _out_norm, _max_epochs, _full_idx, _val_idx,
-                    X_norm, Y_weights, y_mean, y_std, seed=_seed * 137 + 42,
+                    _out_norm, _max_epochs, _member_train_idx, _member_val_idx,
+                    X_norm, Y_weights, y_mean, y_std, seed=_member_seed,
                     epoch_callback=_ens_epoch_cb,
                 )
                 qf_trained_models.append(_model)
                 _ens_val_losses.append(_loss)
                 _ensemble_val_histories.append(_vl)
                 _ensemble_train_histories.append(_tl)
+                _ensemble_split_seeds.append(_member_seed)
 
             # Show final ensemble chart.
             _ens_elapsed = _fmt_elapsed(_ens_t0)
@@ -1873,6 +1900,8 @@ def _(
                 "hparams": qf_best_hparams,
                 "hidden_sizes": _hidden,
                 "ensemble": True,
+                "training_split": "per_member_90_10",
+                "ensemble_split_seeds": _ensemble_split_seeds,
                 "ensemble_val_histories": _ensemble_val_histories,
                 "ensemble_train_histories": _ensemble_train_histories,
             }
@@ -1892,22 +1921,25 @@ def _(
 
             def _build_nn_chart(_train_losses, _val_losses, _ep, _mx, _best, _elapsed_str=""):
                 """Build a live Altair chart of the NN training loss."""
-                _n = len(_train_losses)
-                _epochs = list(range(1, _n + 1))
-                _df = pd.DataFrame({
-                    "Epoch": _epochs * 2,
-                    "Loss": list(_train_losses) + list(_val_losses),
-                    "Series": ["Train MSE"] * _n + ["Val MSE"] * _n,
-                })
-                _title = f"NN Training — Epoch {_ep}/{_mx} | Best Val MSE: {_best:.2e}"
+                if not _train_losses:
+                    return None
+                _rows = []
+                for _i, _tl in enumerate(_train_losses):
+                    _rows.append({"Epoch": _i + 1, "Loss": _tl, "Series": "Train MSE"})
+                for _i, _vl in enumerate(_val_losses):
+                    _rows.append({"Epoch": _i + 1, "Loss": _vl, "Series": "Val MSE"})
+                _df = pd.DataFrame(_rows)
+                _metric_label = "Val MSE" if _val_losses else "Train MSE"
+                _title = f"NN Training — Epoch {_ep}/{_mx} | Best {_metric_label}: {_best:.2e}"
                 if _elapsed_str:
                     _title += f" [{_elapsed_str}]"
+                _series_domain = ["Train MSE"] + (["Val MSE"] if _val_losses else [])
+                _series_range = ["#3b82f6"] + (["#ef4444"] if _val_losses else [])
                 _base = alt.Chart(_df).mark_line().encode(
                     x=alt.X("Epoch:Q"),
                     y=alt.Y("Loss:Q", scale=alt.Scale(zero=False), title="MSE Loss"),
                     color=alt.Color("Series:N",
-                                    scale=alt.Scale(domain=["Train MSE", "Val MSE"],
-                                                    range=["#3b82f6", "#ef4444"]),
+                                    scale=alt.Scale(domain=_series_domain, range=_series_range),
                                     legend=alt.Legend(title="")),
                 ).properties(
                     title=_title,
@@ -1926,17 +1958,19 @@ def _(
                 _el = _nn_fmt_elapsed()
                 if qf_live_plot.value:
                     _chart = _build_nn_chart(train_losses, val_losses, ep, mx, best_loss, _el)
-                    _status = mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network...** "
-                                    f"Epoch {ep}/{mx} | Best Val MSE: {best_loss:.2e} | {_el}")
-                    mo.output.replace(mo.vstack([_status, _chart]))
+                    _metric_label = "Val MSE" if val_losses else "Train MSE"
+                    _status = mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network on full grid...** "
+                                    f"Epoch {ep}/{mx} | Best {_metric_label}: {best_loss:.2e} | {_el}")
+                    mo.output.replace(mo.vstack([_status, _chart]) if _chart is not None else _status)
                 else:
-                    _status = mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network...** "
-                                    f"Epoch {ep}/{mx} | Best Val MSE: {best_loss:.2e} | {_el}")
+                    _metric_label = "Val MSE" if val_losses else "Train MSE"
+                    _status = mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network on full grid...** "
+                                    f"Epoch {ep}/{mx} | Best {_metric_label}: {best_loss:.2e} | {_el}")
                     mo.output.replace(_status)
 
-            mo.output.replace(mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network...**"))
+            mo.output.replace(mo.md(f"{mo.icon('lucide:brain')} **Training single Neural Network on full grid...**"))
 
-            _model, _val_loss, _nn_train_losses, _nn_val_losses = _train_single_nn(
+            _model, _best_loss, _nn_train_losses, _nn_val_losses = _train_single_nn(
                 n_in, n_out, _hidden,
                 _hp["activation"], _hp["dropout"],
                 _hp["dropout_strategy"], _hp["batch_norm"],
@@ -1944,7 +1978,7 @@ def _(
                 _hp["lr"], _hp["weight_decay"],
                 _hp["batch_size"], _hp["lr_scheduler"],
                 _hp["output_norm"], _max_epochs,
-                _train_idx, _val_idx, X_norm, Y_weights, y_mean, y_std,
+                _full_idx, None, X_norm, Y_weights, y_mean, y_std,
                 epoch_callback=_nn_epoch_cb,
             )
 
@@ -1952,10 +1986,10 @@ def _(
             _nn_elapsed = _nn_fmt_elapsed()
             if _nn_train_losses:
                 _final_chart = _build_nn_chart(_nn_train_losses, _nn_val_losses,
-                                               len(_nn_train_losses), _max_epochs, _val_loss, _nn_elapsed)
+                                               len(_nn_train_losses), _max_epochs, _best_loss, _nn_elapsed)
                 mo.output.replace(mo.vstack([
                     mo.md(f"{mo.icon('lucide:check-circle')} **Training complete!** "
-                          f"Best Val MSE: {_val_loss:.2e} after {len(_nn_train_losses)} epochs ({_nn_elapsed})"),
+                          f"Best Train MSE: {_best_loss:.2e} after {len(_nn_train_losses)} epochs ({_nn_elapsed})"),
                     _final_chart,
                 ]))
 
@@ -1964,10 +1998,12 @@ def _(
             qf_train_info = {
                 "source": "nn",
                 "n_models": 1,
-                "best_val_mse": _val_loss,
+                "best_train_mse": _best_loss,
+                "best_val_mse": None,
                 "hparams": qf_best_hparams,
                 "hidden_sizes": _hidden,
                 "ensemble": False,
+                "training_split": "full_grid",
                 "train_losses": _nn_train_losses,
                 "val_losses": _nn_val_losses,
             }
@@ -1986,6 +2022,7 @@ def _(
     alt,
     mo,
     np,
+    os,
     pd,
     qf_param_map_db_for_grid,
     qf_input_scaler,
@@ -2082,12 +2119,433 @@ def _(
         _r2 = 1 - _ss_res / np.where(_ss_tot > 0, _ss_tot, 1.0)
         _r2_title = "Per-Component R² (Predicted vs Grid)"
 
+    # The first R^2 score is the historical training-summary diagnostic.  It is
+    # intentionally labelled as "Regular Grid" because it is computed from the
+    # processed grid used to build the PCA basis and train the surrogate, not
+    # from the paired external testgrid spectra.
+    _regular_r2_label = (
+        "Regular Grid LOO PCA-weight R²"
+        if _source == "grid_interp"
+        else "Regular Grid PCA-weight R²"
+    )
+
+    _regular_flux_r2_label = (
+        "Regular Grid LOO Flux R²"
+        if _source == "grid_interp"
+        else "Regular Grid Flux R²"
+    )
+
+    def _summarise_r2_values(_values):
+        """Return the compact R² statistics shown in the summary callout.
+
+        Each diagnostic produces a vector of individual R² values: one value per
+        PCA component for the PCA-weight score, or one value per spectrum for
+        the flux-space scores.  The Bottom 5% value is the 5th percentile of
+        that vector, so it marks the lower-tail score threshold just above the
+        worst few individual components or spectra.
+        """
+        _values = np.asarray(_values, dtype=np.float64)
+        _values = _values[np.isfinite(_values)]
+        if len(_values) == 0:
+            return None
+        return {
+            "n_values": int(len(_values)),
+            "mean": float(_values.mean()),
+            "min": float(_values.min()),
+            "bottom5": float(np.percentile(_values, 5)),
+        }
+
+    _regular_r2_stats = _summarise_r2_values(_r2)
+    if _regular_r2_stats is not None:
+        _regular_r2_line = (
+            f"- **{_regular_r2_label}:** Mean {_regular_r2_stats['mean']:.6f} | "
+            f"Min {_regular_r2_stats['min']:.6f} | Bottom 5% {_regular_r2_stats['bottom5']:.6f}"
+        )
+    else:
+        _regular_r2_line = f"- **{_regular_r2_label}:** not available"
+
+    def _weights_to_flux(_weights):
+        """Convert PCA weights back to Quick Fit's trained flux space.
+
+        The PCA model was trained after per-spectrum scale removal and
+        per-wavelength standardisation.  This inverse transform therefore
+        returns spectra in that same scale-removed flux space.  It does not add
+        back each spectrum's original absolute normalisation, which is exactly
+        the space used by the training summary and testgrid diagnostic.
+        """
+        _weights = np.asarray(_weights, dtype=np.float64)
+        return (_weights @ (qf_pca_data["eigenspectra"] * qf_pca_data["flux_std"])) + qf_pca_data["flux_mean"]
+
+    def _compute_regular_grid_flux_r2(_true_weights, _pred_weights, _score_mode):
+        """Score regular-grid surrogate error after PCA reconstruction.
+
+        The existing regular-grid R² above is computed component-by-component
+        in PCA-weight space.  This companion metric is the intermediate check:
+        project the same true and predicted weights back into spectra, then
+        compute one flux-curve R² value per regular-grid spectrum.
+
+        The original pre-PCA processed flux matrix is not stored in
+        qf_pca_data, so this metric isolates the surrogate or LOO interpolation
+        error inside the retained PCA subspace.  The PCA truncation error
+        against the original grid is still shown separately by the RMSE envelope
+        below.
+        """
+        _truth_flux = _weights_to_flux(_true_weights)
+        _pred_flux = _weights_to_flux(_pred_weights)
+
+        # Match the testgrid flux diagnostic: score each spectrum along the
+        # wavelength axis, then report mean and worst-case behaviour.  This
+        # keeps all flux-space R² summaries interpretable in the same way.
+        _ss_res_spec = np.sum((_truth_flux - _pred_flux) ** 2, axis=1)
+        _ss_tot_spec = np.sum((_truth_flux - _truth_flux.mean(axis=1, keepdims=True)) ** 2, axis=1)
+        _r2_spec = 1 - _ss_res_spec / np.where(_ss_tot_spec > 0, _ss_tot_spec, 1.0)
+        _r2_stats = _summarise_r2_values(_r2_spec)
+        if _r2_stats is None:
+            return None
+
+        return {
+            "score_mode": _score_mode,
+            "n_spectra": _r2_stats["n_values"],
+            "mean": _r2_stats["mean"],
+            "min": _r2_stats["min"],
+            "bottom5": _r2_stats["bottom5"],
+        }
+
+    def _predict_pca_weights(_params):
+        """Evaluate the trained Quick Fit surrogate and return PCA weights.
+
+        Quick Fit models learn the map from emulator-space parameters to PCA
+        weights.  The testgrid diagnostic therefore first predicts weights, then
+        reconstructs spectra using the same PCA basis as the training summary.
+        Ensemble models are reduced to their mean prediction here, matching the
+        default inference path.
+        """
+        _params = np.asarray(_params, dtype=np.float32)
+        if _params.ndim == 1:
+            _params = _params.reshape(1, -1)
+
+        if _source == "grid_interp":
+            # Grid interpolation models store one RegularGridInterpolator per
+            # PCA component, and they consume raw emulator-space coordinates.
+            return np.column_stack([
+                np.asarray(_interp(_params)).reshape(-1)
+                for _interp in qf_trained_models
+            ]).astype(np.float32)
+
+        # Neural networks consume min-max normalised coordinates and, when
+        # output normalisation is enabled, emit standardised PCA weights that
+        # must be transformed back to the PCA-weight scale.
+        _X_norm_pred = (_params - qf_input_scaler["min"]) / qf_input_scaler["range"]
+        _Xt_pred = torch.tensor(_X_norm_pred, dtype=torch.float32)
+        _pred_runs = []
+        for _model in qf_trained_models:
+            _model.eval()
+            with torch.no_grad():
+                _pred = _model(_Xt_pred).numpy()
+            if qf_output_scaler is not None:
+                _pred = _pred * qf_output_scaler["std"] + qf_output_scaler["mean"]
+            _pred_runs.append(_pred)
+        return np.mean(_pred_runs, axis=0)
+
+    def _compute_test_grid_flux_r2():
+        """Compare local test-grid spectra to emulator predictions at truth.
+
+        This is a lightweight generalisation diagnostic, not a full inference
+        run.  It avoids MLE, distance/extinction nuisance parameters, and MCMC.
+        Instead, each testgrid spectrum is compared directly to the Quick Fit
+        spectrum predicted at that row's lookup-table ground-truth parameters.
+
+        The routine is deliberately local-only for spectra and lookup metadata;
+        training should not trigger large HuggingFace downloads behind the
+        user's back.  If local files are missing, the UI reports the diagnostic
+        as unavailable instead of blocking model training.
+        """
+        try:
+            import io as _io
+            import lzma as _lzma
+
+            # Reuse the same low-level flux transform helpers used by the grid
+            # interfaces when building the regular-grid NPZ.  That keeps the
+            # testgrid comparison in the same linear/log/continuum-normalised
+            # and optional smoothing space as the trained PCA model.
+            from Speculate_addons.Spec_gridinterfaces import (
+                _apply_flux_scale as _apply_training_flux_scale,
+                _maybe_smooth_flux as _maybe_smooth_training_flux,
+            )
+            # Registry helpers provide the paired testgrid name, inclination
+            # columns, and physical-to-emulator-space lookup-table transforms.
+            from Speculate_addons.grid_registry import (
+                get_grid_config as _get_grid_config,
+                inclination_column as _inclination_column,
+                inclination_values as _inclination_values,
+                lookup_row_to_emulator_values as _lookup_row_to_emulator_values,
+                parameter_label_map as _parameter_label_map,
+            )
+
+            # The training grid name stored in qf_pca_data determines which
+            # paired *_testgrid_* dataset is scientifically comparable.
+            _grid_name = qf_pca_data.get("grid_name")
+            _grid_config = _get_grid_config(_grid_name)
+            if _grid_config is None:
+                return None, "unknown grid"
+
+            _test_grid_name = _grid_config.get("test_grid_name") or str(_grid_name).replace("_grid_", "_testgrid_")
+            _test_grid_path = os.path.join("sirocco_grids", _test_grid_name)
+            _lookup_path = os.path.join(_test_grid_path, "grid_run_lookup_table.parquet")
+            if not os.path.exists(_lookup_path):
+                return None, f"no local lookup table for `{_test_grid_name}`"
+
+            # The lookup table links each runN.spec file to its known Sirocco
+            # simulation inputs.  Those physical values are later converted to
+            # the emulator-coordinate system used by the Quick Fit model.
+            _lookup_df = pd.read_parquet(_lookup_path)
+            if "Run Number" not in _lookup_df.columns:
+                return None, f"lookup table for `{_test_grid_name}` has no Run Number column"
+
+            # A Quick Fit model can either expose inclination as a trained input
+            # axis, or bake in one fixed inclination column at grid-build time.
+            # Testgrid scoring mirrors that choice: score every supported
+            # inclination for trainable-inclination models, otherwise score only
+            # the fixed inclination saved with the model.
+            _selected_param_ids = [int(_pid) for _pid in qf_pca_data.get("selected_param_indices", [])]
+            _inclination_param_ids = {int(_pid) for _pid in _grid_config.get("inclination_param_ids", set())}
+            _selected_inclination_ids = [
+                _pid for _pid in _selected_param_ids
+                if _pid in _inclination_param_ids
+            ]
+            if _selected_inclination_ids:
+                _inclinations = _inclination_values(_grid_name, _selected_inclination_ids[0])
+            else:
+                _fixed_inclination = qf_pca_data.get("fixed_inclination")
+                if _fixed_inclination is None or not np.isfinite(float(_fixed_inclination)):
+                    _fixed_inclination = _grid_config.get("default_fixed_inclination", 55)
+                _inclinations = [int(round(float(_fixed_inclination)))]
+
+            _param_labels = _parameter_label_map(_grid_name)
+
+            def _canonical_label(_text):
+                # Lookup-table conversion returns friendly labels such as
+                # "disk.mdot" or "KWD.d".  The parameter registry uses the same
+                # labels, but canonicalising avoids punctuation/case mismatches.
+                return re.sub(r"[^a-z0-9]+", "", str(_text).lower())
+
+            def _spec_path(_run_number):
+                # Score only spectra that are already present locally.  Stage 3
+                # may download individual spectra on demand, but this summary
+                # metric should remain a cheap local diagnostic.
+                for _suffix in (".spec", ".spec.xz"):
+                    _candidate = os.path.join(_test_grid_path, f"run{_run_number}{_suffix}")
+                    if os.path.exists(_candidate):
+                        return _candidate
+                return None
+
+            def _load_spec_array(_path):
+                # Sirocco .spec files contain a text header followed by numeric
+                # columns.  The first two columns are frequency and wavelength;
+                # later columns are fluxes at registered inclination angles.
+                if str(_path).endswith(".xz"):
+                    with _lzma.open(_path, "rt", encoding="utf-8") as _file:
+                        _raw_lines = _file.readlines()
+                else:
+                    with open(_path, "r", encoding="utf-8") as _file:
+                        _raw_lines = _file.readlines()
+                # Normalise lines to text for both plain and compressed files;
+                # this also keeps static analysis from treating the list as a
+                # bytes-or-str union when StringIO is built below.
+                _lines = []
+                for _line in _raw_lines:
+                    if isinstance(_line, str):
+                        _lines.append(_line)
+                    else:
+                        _lines.append(bytes(_line).decode("utf-8"))
+                # Skip comments, blanks, and the "Freq." column-label row, then
+                # let numpy parse the remaining numeric block.
+                _data_start = None
+                for _idx, _line in enumerate(_lines):
+                    _stripped = _line.strip()
+                    if not _stripped or _stripped.startswith("#") or _stripped.startswith("Freq."):
+                        continue
+                    _data_start = _idx
+                    break
+                if _data_start is None:
+                    raise ValueError(f"No numeric spectrum rows found in {_path}")
+                return np.loadtxt(_io.StringIO("".join(_lines[_data_start:])), unpack=True)
+
+            # Compare only over the exact wavelength support of the trained
+            # Quick Fit PCA model.  The raw .spec grid may be wider than the
+            # selected model wavelength window.
+            _wl_model = np.asarray(qf_pca_data["wl"], dtype=np.float64)
+            _wl_lo = float(_wl_model.min())
+            _wl_hi = float(_wl_model.max())
+            _flux_rows = []
+            _param_rows = []
+            _failures = 0
+
+            for _, _row in _lookup_df.iterrows():
+                # One lookup row corresponds to one runN.spec file.  The loop
+                # may produce multiple scored spectra from that row when
+                # inclination is a trainable Quick Fit parameter.
+                _run_number = int(_row["Run Number"])
+                _path = _spec_path(_run_number)
+                if _path is None:
+                    _failures += len(_inclinations)
+                    continue
+                try:
+                    _data_raw = _load_spec_array(_path)
+                    _wl_full = np.flip(np.asarray(_data_raw[1], dtype=np.float64))
+                    _wl_mask = (_wl_full >= _wl_lo) & (_wl_full <= _wl_hi)
+                    if not np.any(_wl_mask):
+                        _failures += len(_inclinations)
+                        continue
+
+                    for _inclination in _inclinations:
+                        _truth_values = _lookup_row_to_emulator_values(_grid_name, _row, _inclination)
+                        _truth_by_label = {
+                            _canonical_label(_key): float(_value)
+                            for _key, _value in _truth_values.items()
+                        }
+
+                        # Build the model input vector in the same selected
+                        # parameter order used during training.  Non-inclination
+                        # values come from the lookup table after registry
+                        # conversion into emulator space; inclination is the
+                        # current .spec flux-column angle.
+                        _params = []
+                        for _param_id in _selected_param_ids:
+                            if _param_id in _inclination_param_ids:
+                                _params.append(float(_inclination))
+                                continue
+                            _label_key = _canonical_label(_param_labels.get(_param_id, f"param{_param_id}"))
+                            if _label_key not in _truth_by_label:
+                                raise KeyError(f"No test-grid truth value for parameter {_param_id}")
+                            _params.append(_truth_by_label[_label_key])
+
+                        _flux_col = _inclination_column(_grid_name, _inclination)
+                        _flux_full = np.flip(np.asarray(_data_raw[_flux_col], dtype=np.float64))
+                        # Reapply the training-time preprocessing to the raw
+                        # testgrid flux so the comparison is made in the same
+                        # flux representation that the PCA model saw.
+                        _flux_full = _maybe_smooth_training_flux(_flux_full, bool(qf_pca_data.get("smoothing", False)))
+                        _flux_full = _apply_training_flux_scale(
+                            _wl_full,
+                            _wl_mask,
+                            _flux_full.copy(),
+                            qf_pca_data.get("scale", "linear"),
+                        )
+                        _flux_selected = _flux_full[_wl_mask]
+                        _wl_selected = _wl_full[_wl_mask]
+                        # The raw spectrum and processed grid usually share the
+                        # same wavelength samples.  Interpolate only as a guard
+                        # against small wavelength-grid differences.
+                        if len(_flux_selected) != len(_wl_model) or not np.allclose(_wl_selected, _wl_model):
+                            _flux_selected = np.interp(_wl_model, _wl_selected, _flux_selected)
+
+                        _flux_rows.append(_flux_selected)
+                        _param_rows.append(_params)
+                except Exception:
+                    # Keep the summary robust: one malformed or missing testgrid
+                    # spectrum should not invalidate the trained model output.
+                    _failures += len(_inclinations)
+                    continue
+
+            if not _flux_rows:
+                return None, f"no local test-grid spectra could be processed for `{_test_grid_name}`"
+
+            # Mirror the PCA preprocessing from training.  Before per-wavelength
+            # standardisation, Quick Fit removes each spectrum's overall flux
+            # scale: subtract the mean in log space, divide by the mean in linear
+            # and continuum-normalised space.  The predicted spectra below are
+            # reconstructed in this same scale-removed PCA space.
+            _truth_flux = np.asarray(_flux_rows, dtype=np.float64)
+            _truth_norm = _truth_flux.mean(axis=1, dtype=np.float64)
+            if qf_pca_data.get("scale") == "log":
+                _truth_compare = _truth_flux - _truth_norm[:, np.newaxis]
+            else:
+                _truth_norm = np.where(_truth_norm != 0, _truth_norm, 1.0)
+                _truth_compare = _truth_flux / _truth_norm[:, np.newaxis]
+
+            # Predict PCA weights at the testgrid truth parameters and project
+            # them through the stored PCA basis back into flux space.  This is
+            # the cheap at-truth emulator check that avoids the full inference
+            # procedure.
+            _pred_weights = _predict_pca_weights(np.asarray(_param_rows, dtype=np.float32))
+            _pred_flux = _weights_to_flux(_pred_weights)
+            # Compute one R^2 value per spectrum along the wavelength axis,
+            # then report the mean and worst case.  This is deliberately a
+            # flux-curve score, not a parameter-recovery or likelihood score.
+            _ss_res_spec = np.sum((_truth_compare - _pred_flux) ** 2, axis=1)
+            _ss_tot_spec = np.sum((_truth_compare - _truth_compare.mean(axis=1, keepdims=True)) ** 2, axis=1)
+            _r2_spec = 1 - _ss_res_spec / np.where(_ss_tot_spec > 0, _ss_tot_spec, 1.0)
+            _r2_stats = _summarise_r2_values(_r2_spec)
+            if _r2_stats is None:
+                return None, f"test-grid R² was non-finite for `{_test_grid_name}`"
+
+            # Return a compact summary for the callout and for qf_train_info so
+            # exported/debug views can distinguish regular-grid and testgrid
+            # diagnostics later.
+            return {
+                "test_grid_name": _test_grid_name,
+                "n_spectra": _r2_stats["n_values"],
+                "n_failed": int(_failures),
+                "mean": _r2_stats["mean"],
+                "min": _r2_stats["min"],
+                "bottom5": _r2_stats["bottom5"],
+                "inclinations": [int(_inc) for _inc in _inclinations],
+            }, ""
+        except Exception as _exc:
+            return None, str(_exc)
+
+    if _source == "grid_interp":
+        _regular_grid_flux_r2 = _compute_regular_grid_flux_r2(_loo_true, _loo_pred, "loo")
+    else:
+        _regular_grid_flux_r2 = _compute_regular_grid_flux_r2(_Y_true, _mean_pred, "fit")
+
+    if _regular_grid_flux_r2 is not None:
+        _regular_grid_flux_r2_line = (
+            f"- **{_regular_flux_r2_label}:** Mean {_regular_grid_flux_r2['mean']:.6f} | "
+            f"Min {_regular_grid_flux_r2['min']:.6f} | Bottom 5% {_regular_grid_flux_r2['bottom5']:.6f} "
+            f"({_regular_grid_flux_r2['n_spectra']} spectra)"
+        )
+    else:
+        _regular_grid_flux_r2_line = f"- **{_regular_flux_r2_label}:** not available"
+
+    _test_grid_r2, _test_grid_r2_note = _compute_test_grid_flux_r2()
+    if _test_grid_r2 is not None:
+        _test_grid_r2_line = (
+            f"- **Test Grid Flux R²:** Mean {_test_grid_r2['mean']:.6f} | "
+            f"Min {_test_grid_r2['min']:.6f} | Bottom 5% {_test_grid_r2['bottom5']:.6f} "
+            f"({_test_grid_r2['n_spectra']} spectra from `{_test_grid_r2['test_grid_name']}`)"
+        )
+        if _test_grid_r2.get("n_failed", 0):
+            _test_grid_r2_line += f"; skipped {_test_grid_r2['n_failed']} spectra"
+    else:
+        _test_grid_r2_line = f"- **Test Grid Flux R²:** not available ({_test_grid_r2_note})"
+
+    # Store both diagnostics explicitly.  The regular-grid metric is in
+    # PCA-weight space, while the testgrid metric is in flux space at known
+    # lookup-table truth.  Keeping both names prevents downstream code or docs
+    # from treating them as interchangeable validation scores.
+    if _regular_r2_stats is not None:
+        qf_train_info["regular_grid_r2_mean"] = float(_regular_r2_stats["mean"])
+        qf_train_info["regular_grid_r2_min"] = float(_regular_r2_stats["min"])
+        qf_train_info["regular_grid_r2_bottom5"] = float(_regular_r2_stats["bottom5"])
+    qf_train_info["regular_grid_r2_label"] = _regular_r2_label
+    qf_train_info["regular_grid_flux_r2"] = _regular_grid_flux_r2
+    qf_train_info["regular_grid_flux_r2_label"] = _regular_flux_r2_label
+    if _regular_grid_flux_r2 is not None:
+        qf_train_info["regular_grid_flux_r2_mean"] = float(_regular_grid_flux_r2["mean"])
+        qf_train_info["regular_grid_flux_r2_min"] = float(_regular_grid_flux_r2["min"])
+        qf_train_info["regular_grid_flux_r2_bottom5"] = float(_regular_grid_flux_r2["bottom5"])
+    qf_train_info["test_grid_flux_r2"] = _test_grid_r2
+
     _summary = mo.callout(
         mo.md(f"""
         **Training Complete** — {_type_label}
         - **Models:** {qf_train_info['n_models']}
         - **PCA:** {qf_pca_data['n_components']} components, {qf_pca_data['variance_explained']:.2f}% variance ({'log' if qf_pca_data['scale'] == 'log' else qf_pca_data['scale']} scale{', smoothed' if qf_pca_data['smoothing'] else ''})
-        - **Mean R²:** {float(_r2.mean()):.6f} | **Min R²:** {float(_r2.min()):.6f}
+        {_regular_r2_line}
+        {_regular_grid_flux_r2_line}
+        {_test_grid_r2_line}
         {'- _R² computed via leave-one-out cross-validation (neighbor interpolation)_' if _source == 'grid_interp' else ''}
         """),
         kind="success"
@@ -2142,7 +2600,7 @@ def _(
     ).properties(
         width="container", height=200,
         title="Per-Wavelength Reconstruction Error"
-    )
+    ).interactive(bind_y=False)
 
     # ── Assemble summary output ──────────────────────────────────────────
     _elements = [_summary, _rmse_chart]
@@ -2522,7 +2980,7 @@ def _(
 
     def _export_quickfit(_):
         np.savez_compressed(_out_path, **_build_save_dict())
-        mo.status.toast(f"Exported to {_out_path}", kind="success")
+        mo.status.toast(f"Exported to {_out_path}")
 
     _type_label = {"nn": "NN", "grid_interp": "Grid Interp"}.get(_source, _source)
 
@@ -2708,6 +3166,21 @@ def _(
                     _sorted_norm = np.lexsort(_gp_norm.T[::-1])
                     _grid_shape_norm = [len(a) for a in _axes_norm]
                     _nf_grid = _nf[_sorted_norm].reshape(_grid_shape_norm)
+                    # Linear-scale norm factors are per-spectrum mean fluxes that
+                    # vary by orders of magnitude across the log-spaced grid axes,
+                    # making them strongly convex in parameter space.  Linear
+                    # interpolation of a convex function overshoots between grid
+                    # nodes (the chord lies above the curve), which produced a
+                    # systematic ~5-10% continuum offset at off-grid (test-grid)
+                    # points.  Interpolating in log10 space (geometric
+                    # interpolation) removes that bias.  Log-scale emulators
+                    # store mean log-flux offsets, which are already geometric
+                    # in flux and may be negative, so those stay in linear space.
+                    if qf_inf_emu_data["scale"] != "log" and np.all(_nf_grid > 0):
+                        qf_inf_emu_data["norm_factor_interp_space"] = "log10"
+                        _nf_grid = np.log10(_nf_grid)
+                    else:
+                        qf_inf_emu_data["norm_factor_interp_space"] = "linear"
                     qf_inf_emu_data["norm_factor_interpolator"] = RegularGridInterpolator(
                         _axes_norm, _nf_grid, method="linear",
                         bounds_error=False, fill_value=None,
@@ -2810,6 +3283,17 @@ def _(mo):
 
 
 @app.cell
+def _(mo):
+    qf_data_source_selector = mo.ui.dropdown(
+        options=["Observation File", "Test Grid"],
+        value="Observation File",
+        label="Data Source:",
+        full_width=True,
+    )
+    return (qf_data_source_selector,)
+
+
+@app.cell
 def _(get_qf_last_uploaded_obs, get_qf_obs_refresh, mo, os):
     _ = get_qf_obs_refresh()
     _obs_dir = "observation_files"
@@ -2839,7 +3323,155 @@ def _(get_qf_last_uploaded_obs, get_qf_obs_refresh, mo, os):
         label="**Drag and drop an observational spectrum (CSV)**",
         multiple=False,
     )
-    return qf_obs_selector, qf_obs_uploader
+    qf_file_upload_ui = mo.vstack([
+         qf_obs_uploader,
+         mo.md("<center><small>Format: CSV with headers `WAVELENGTH`, `FLUX`, and optionally `ERROR`</small></center>")
+    ])
+    return qf_file_upload_ui, qf_obs_selector, qf_obs_uploader
+
+
+@app.cell
+def _(
+    get_qf_obs_refresh,
+    mo,
+    os,
+    pd,
+    qf_data_source_selector,
+    qf_inf_emu_data,
+    qf_inf_model_selector,
+):
+    _ = get_qf_obs_refresh()
+    qf_test_grid_files = []
+    qf_test_grid_params_df = None
+    qf_test_grid_info = {
+        "available": False,
+        "grid_name": None,
+        "test_grid_name": None,
+        "test_grid_path": None,
+        "repo_id": None,
+        "source": None,
+        "message": "Select Test Grid data source and load a Quick Fit model to browse test-grid spectra.",
+    }
+
+    if "Test Grid" in qf_data_source_selector.value:
+        import re as _re
+        from Speculate_addons.grid_registry import get_grid_config as _get_grid_config
+        from Speculate_addons.grid_registry import infer_grid_name as _infer_grid_name
+
+        _grid_name = None
+        if qf_inf_emu_data is not None:
+            _grid_name = qf_inf_emu_data.get("grid_name")
+        if not _grid_name and qf_inf_model_selector is not None:
+            _grid_name = _infer_grid_name(qf_inf_model_selector.value)
+
+        _grid_config = _get_grid_config(_grid_name)
+        if _grid_config is None:
+            qf_test_grid_info["message"] = "Load a trained Quick Fit model before selecting a test-grid spectrum."
+        else:
+            _test_grid_name = _grid_config.get("test_grid_name") or str(_grid_name).replace("_grid_", "_testgrid_")
+            _test_grid_path = os.path.join("sirocco_grids", _test_grid_name)
+            _repo_id = f"sirocco-rt/{_test_grid_name}"
+            qf_test_grid_info.update({
+                "grid_name": _grid_name,
+                "test_grid_name": _test_grid_name,
+                "test_grid_path": _test_grid_path,
+                "repo_id": _repo_id,
+                "message": "",
+            })
+
+            def _run_number_from_name(_name):
+                _match = _re.search(r"run(\d+)", str(_name))
+                return int(_match.group(1)) if _match else None
+
+            _local_by_run = {}
+            if os.path.isdir(_test_grid_path):
+                for _filename in os.listdir(_test_grid_path):
+                    if _filename.endswith((".spec", ".spec.xz")):
+                        _run_number = _run_number_from_name(_filename)
+                        if _run_number is not None:
+                            _local_by_run.setdefault(_run_number, _filename)
+
+            _lookup_path = os.path.join(_test_grid_path, "grid_run_lookup_table.parquet")
+            if os.path.exists(_lookup_path):
+                qf_test_grid_params_df = pd.read_parquet(_lookup_path)
+            else:
+                try:
+                    from huggingface_hub import hf_hub_download as _hf_hub_download
+
+                    os.makedirs(_test_grid_path, exist_ok=True)
+                    _downloaded_lookup = _hf_hub_download(
+                        repo_id=_repo_id,
+                        filename="grid_run_lookup_table.parquet",
+                        repo_type="dataset",
+                        local_dir=_test_grid_path,
+                    )
+                    qf_test_grid_params_df = pd.read_parquet(_downloaded_lookup)
+                except Exception as _exc:
+                    qf_test_grid_info["message"] = (
+                        "No local lookup table was found and HuggingFace metadata "
+                        f"could not be downloaded for `{_test_grid_name}`: {_exc}"
+                    )
+
+            if qf_test_grid_params_df is not None:
+                _run_col = "Run Number" if "Run Number" in qf_test_grid_params_df.columns else None
+                if _run_col is not None:
+                    _run_numbers = sorted({int(_run) for _run in qf_test_grid_params_df[_run_col]})
+                    qf_test_grid_files = [f"run{_run}.spec" for _run in _run_numbers]
+            elif _local_by_run:
+                qf_test_grid_files = [_local_by_run[_run] for _run in sorted(_local_by_run)]
+
+            if qf_test_grid_files:
+                _source = "local files with HuggingFace fallback" if _local_by_run else "HuggingFace"
+                qf_test_grid_info.update({
+                    "available": True,
+                    "source": _source,
+                    "message": (
+                        f"Found {len(qf_test_grid_files)} test-grid spectra for `{_test_grid_name}` "
+                        f"from {_source}."
+                    ),
+                })
+            elif not qf_test_grid_info.get("message"):
+                qf_test_grid_info["message"] = f"No test-grid spectra were found for `{_test_grid_name}`."
+
+    return qf_test_grid_files, qf_test_grid_info, qf_test_grid_params_df
+
+
+@app.cell
+def _(mo, qf_inf_emu_data, qf_test_grid_files, qf_test_grid_info):
+    from Speculate_addons.grid_registry import default_fixed_inclination as _default_fixed_inclination
+    from Speculate_addons.grid_registry import inclination_values as _inclination_values
+
+    if qf_test_grid_files:
+        qf_test_run_selector = mo.ui.dropdown(
+            options=qf_test_grid_files,
+            value=qf_test_grid_files[0],
+            label="Select Test Grid Spectrum:",
+            full_width=True,
+        )
+    else:
+        qf_test_run_selector = mo.ui.dropdown(
+            options={"— No test-grid spectra available —": ""},
+            value="— No test-grid spectra available —",
+            label="Select Test Grid Spectrum:",
+            full_width=True,
+        )
+
+    _grid_name = qf_test_grid_info.get("grid_name")
+    _inclinations = _inclination_values(_grid_name) if _grid_name else [55]
+    _fixed_inclination = None
+    if qf_inf_emu_data is not None:
+        _fixed_inclination = qf_inf_emu_data.get("fixed_inclination")
+    _default_inclination = _fixed_inclination
+    if _default_inclination is None or int(round(float(_default_inclination))) not in _inclinations:
+        _default_inclination = _default_fixed_inclination(_grid_name)
+
+    qf_test_inclination_selector = mo.ui.dropdown(
+        options=[str(_value) for _value in _inclinations],
+        value=str(int(round(float(_default_inclination)))),
+        label="Inclination (°):",
+        full_width=True,
+    )
+    return qf_test_inclination_selector, qf_test_run_selector
 
 
 @app.cell
@@ -2864,11 +3496,130 @@ def _(mo, os, qf_obs_uploader, set_qf_last_uploaded_obs, set_qf_obs_refresh):
 
 
 @app.cell
-def _(mo, np, os, pd, qf_obs_selector):
+def _(
+    mo,
+    np,
+    os,
+    pd,
+    qf_data_source_selector,
+    qf_obs_selector,
+    qf_test_grid_info,
+    qf_test_grid_params_df,
+    qf_test_inclination_selector,
+    qf_test_run_selector,
+):
     qf_obs_data = None
+    qf_data_source_info = ""
     _obs_dir = "observation_files"
+    _is_test_grid = "Test Grid" in qf_data_source_selector.value
+    _test_run_value = str(qf_test_run_selector.value or "")
 
-    if qf_obs_selector.value and qf_obs_selector.value != "":
+    if _is_test_grid and _test_run_value.startswith("run"):
+        try:
+            import io as _io
+            import lzma as _lzma
+            import re as _re
+            from Speculate_addons.Spec_functions import build_synthetic_sirocco_sigma as _build_synthetic_sirocco_sigma
+            from Speculate_addons.grid_registry import inclination_column as _inclination_column
+            from Speculate_addons.grid_registry import lookup_row_to_emulator_values as _lookup_row_to_emulator_values
+
+            _grid_name = qf_test_grid_info.get("grid_name")
+            _test_grid_name = qf_test_grid_info.get("test_grid_name")
+            _test_grid_path = qf_test_grid_info.get("test_grid_path")
+            _repo_id = qf_test_grid_info.get("repo_id")
+            _run_match = _re.search(r"run(\d+)", _test_run_value)
+            if _run_match is None:
+                raise ValueError("Select a valid test-grid run.")
+            _run_number = int(_run_match.group(1))
+
+            def _ensure_spec_path(_run_number):
+                _candidates = []
+                if _test_grid_path:
+                    _candidates.extend([
+                        os.path.join(_test_grid_path, f"run{_run_number}.spec"),
+                        os.path.join(_test_grid_path, f"run{_run_number}.spec.xz"),
+                    ])
+                for _candidate in _candidates:
+                    if os.path.exists(_candidate):
+                        return _candidate
+                if not _repo_id or not _test_grid_path:
+                    raise FileNotFoundError(f"No local file for run{_run_number}.spec")
+
+                from huggingface_hub import hf_hub_download as _hf_hub_download
+
+                os.makedirs(_test_grid_path, exist_ok=True)
+                _errors = []
+                for _filename in (f"run{_run_number}.spec.xz", f"run{_run_number}.spec"):
+                    try:
+                        return _hf_hub_download(
+                            repo_id=_repo_id,
+                            filename=_filename,
+                            repo_type="dataset",
+                            local_dir=_test_grid_path,
+                        )
+                    except Exception as _exc:
+                        _errors.append(f"{_filename}: {_exc}")
+                raise FileNotFoundError("; ".join(_errors))
+
+            def _load_spec_array(_path):
+                if str(_path).endswith(".xz"):
+                    with _lzma.open(_path, "rt", encoding="utf-8") as _file:
+                        _raw_lines = _file.readlines()
+                else:
+                    with open(_path, "r", encoding="utf-8") as _file:
+                        _raw_lines = _file.readlines()
+                _lines = []
+                for _line in _raw_lines:
+                    if isinstance(_line, str):
+                        _lines.append(_line)
+                    else:
+                        _lines.append(bytes(_line).decode("utf-8"))
+                _data_start = None
+                for _idx, _line in enumerate(_lines):
+                    _stripped = _line.strip()
+                    if not _stripped or _stripped.startswith("#") or _stripped.startswith("Freq."):
+                        continue
+                    _data_start = _idx
+                    break
+                if _data_start is None:
+                    raise ValueError(f"No numeric spectrum rows found in {_path}")
+                return np.loadtxt(_io.StringIO("".join(_lines[_data_start:])), unpack=True)
+
+            _spec_path = _ensure_spec_path(_run_number)
+            _data_raw = _load_spec_array(_spec_path)
+            _inc_val = int(qf_test_inclination_selector.value)
+            _inc_col_idx = _inclination_column(_grid_name, _inc_val)
+            _wavelengths = np.flip(_data_raw[1])
+            _fluxes = np.flip(_data_raw[_inc_col_idx])
+            _sigma, _continuum = _build_synthetic_sirocco_sigma(_wavelengths, _fluxes)
+            _df = pd.DataFrame({
+                "wavelength": _wavelengths,
+                "flux": _fluxes,
+                "error": _sigma,
+                "continuum": _continuum,
+                "sigma_source": "synthetic_sirocco_continuum",
+            })
+            _df = _df.sort_values("wavelength", ascending=True).reset_index(drop=True)
+
+            if qf_test_grid_params_df is not None and "Run Number" in qf_test_grid_params_df.columns:
+                _gt_row = qf_test_grid_params_df[qf_test_grid_params_df["Run Number"].astype(int) == _run_number]
+                if len(_gt_row) > 0:
+                    _df.attrs["ground_truth_params"] = _lookup_row_to_emulator_values(
+                        _grid_name,
+                        _gt_row.iloc[0],
+                        _inc_val,
+                    )
+
+            _df.attrs["is_test_grid"] = True
+            _df.attrs["source_label"] = f"{_test_grid_name}/run{_run_number}.spec @ {_inc_val}°"
+            qf_obs_data = _df
+            qf_data_source_info = f"Test Grid: {_df.attrs['source_label']}"
+        except Exception as e:
+            mo.output.replace(
+                mo.callout(mo.md(f"Error loading test-grid spectrum: {e}"), kind="danger")
+            )
+
+    elif qf_obs_selector.value and qf_obs_selector.value != "":
         try:
             _path = os.path.join(_obs_dir, qf_obs_selector.value)
             _df = pd.read_csv(_path)
@@ -2880,7 +3631,10 @@ def _(mo, np, os, pd, qf_obs_selector):
                     _df['sigma_source'] = _df['sigma_source'].astype(str).str.lower()
                 elif 'error' not in _df.columns:
                     _df['sigma_source'] = 'uploaded_default_continuum'
+                _df.attrs["is_test_grid"] = False
+                _df.attrs["source_label"] = qf_obs_selector.value
                 qf_obs_data = _df
+                qf_data_source_info = f"Observation: {qf_obs_selector.value}"
             else:
                 mo.output.replace(
                     mo.callout(mo.md("CSV must have 'Wavelength' and 'Flux' columns."), kind="danger")
@@ -2889,7 +3643,7 @@ def _(mo, np, os, pd, qf_obs_selector):
             mo.output.replace(
                 mo.callout(mo.md(f"Error reading file: {e}"), kind="danger")
             )
-    return (qf_obs_data,)
+    return qf_data_source_info, qf_obs_data
 
 
 @app.cell
@@ -2955,6 +3709,8 @@ def _(
     mo,
     np,
     os,
+    qf_data_source_info,
+    qf_data_source_selector,
     qf_inf_emu_data,
     qf_inf_is_grid_interp,
     qf_inf_model_picker,
@@ -2965,6 +3721,10 @@ def _(
     qf_obs_scale_selector,
     qf_obs_selector,
     qf_obs_uploader,
+    qf_param_map_db_for_grid,
+    set_qf_playground_target,
+    qf_test_inclination_selector,
+    qf_test_run_selector,
 ):
     _model_status = mo.md("")
     if qf_inf_models is not None and qf_inf_emu_data is not None:
@@ -3005,22 +3765,110 @@ def _(
 
     _obs_status = mo.md("")
     if qf_obs_data is not None:
+        _is_test_grid = bool(qf_obs_data.attrs.get("is_test_grid", False))
+        if _is_test_grid:
+            _source_label = qf_obs_data.attrs.get("source_label", qf_data_source_info)
+        else:
+            _source_label = qf_data_source_info or qf_obs_data.attrs.get("source_label", qf_obs_selector.value)
+        _heading = "Test Grid Spectrum Loaded" if _is_test_grid else "Observation Loaded"
+        _ground_truth_md = ""
+        if _is_test_grid:
+            _truth_values = dict(qf_obs_data.attrs.get("ground_truth_params") or {})
+
+            def _format_truth_value(_value):
+                try:
+                    _value = float(_value)
+                except Exception:
+                    return str(_value)
+                if not np.isfinite(_value):
+                    return "N/A"
+                return f"{_value:.4g}"
+
+            def _normalise_truth_label(_label):
+                import re as _re
+                _text = str(_label).strip()
+                if _text.lower().startswith("log10(") and _text.endswith(")"):
+                    _text = _text[6:-1]
+                return _re.sub(r"[^a-z0-9]+", "", _text.lower())
+
+            def _truth_lookup(_display_name):
+                if "inclination" in str(_display_name).lower() and "Inclination" in _truth_values:
+                    return _truth_values["Inclination"]
+                _normalised = {
+                    _normalise_truth_label(_key): _value
+                    for _key, _value in _truth_values.items()
+                }
+                return _normalised.get(_normalise_truth_label(_display_name))
+
+            _truth_parts = []
+            _truth_phys = []
+            if qf_inf_emu_data is not None:
+                _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
+                for _param_name in qf_inf_emu_data.get("param_names", []):
+                    _digits = "".join(_char for _char in str(_param_name) if _char.isdigit())
+                    _idx = int(_digits) if _digits else None
+                    if _idx in _param_map_db:
+                        _base = _param_map_db[_idx][0]
+                        _is_log = len(_param_map_db[_idx]) > 3 and _param_map_db[_idx][3]
+                        _display_name = f"log10({_base})" if _is_log else _base
+                    else:
+                        _display_name = str(_param_name)
+                    _truth_value = _truth_lookup(_display_name)
+                    if _truth_value is not None:
+                        _truth_phys.append(float(_truth_value))
+                        _truth_parts.append(f"`{_display_name}` = {_format_truth_value(_truth_value)}")
+                    else:
+                        _truth_phys.append(None)
+            _truth_parts.extend(["`Av` = 0", "`Distance (pc)` = 100", "`cheb_1` = 0"])
+            if _truth_parts:
+                _ground_truth_lines = "\n".join(
+                    f"              - {_truth_part}"
+                    for _truth_part in _truth_parts
+                )
+                _ground_truth_md = f"\n            - **Ground Truth:**\n{_ground_truth_lines}"
+
         _obs_status = mo.callout(
             mo.md(f"""
-            **Observation Loaded:** `{qf_obs_selector.value}`
-            - **Points:** {len(qf_obs_data)}
+            **{_heading}:** `{_source_label}`
+            - **Points:** {len(qf_obs_data)}{_ground_truth_md}
             """),
             kind="success"
         )
+        if (_is_test_grid and qf_inf_emu_data is not None and _truth_phys
+                and all(_value is not None for _value in _truth_phys)):
+            def _send_ground_truth_to_playground(_):
+                set_qf_playground_target({
+                    "source": "test_grid_ground_truth",
+                    "source_file": qf_inf_emu_data.get("source_file"),
+                    "phys": [float(_value) for _value in _truth_phys],
+                    "Av": 0.0,
+                    "Distance (pc)": 100.0,
+                    "cheb_1": 0.0,
+                })
+                mo.status.toast("Loaded ground truth into the Parameter Playground")
 
+            _obs_status = mo.vstack([
+                _obs_status,
+                mo.ui.button(
+                    label=f"{mo.icon('lucide:sliders-horizontal')} Export ground truth to parameter playground",
+                    on_click=_send_ground_truth_to_playground,
+                    kind="success",
+                ),
+            ])
+
+    _is_test_grid_source = "Test Grid" in qf_data_source_selector.value
     _stage3_controls = []
     if qf_inf_model_picker is not None:
         _stage3_controls.append(qf_inf_model_picker)
+    _stage3_controls.extend([_model_status, mo.md("---"), qf_data_source_selector])
+    if _is_test_grid_source:
+        _stage3_controls.append(
+            mo.hstack([qf_test_run_selector, qf_test_inclination_selector], widths=[3, 1], align="end")
+        )
+    else:
+        _stage3_controls.extend([qf_obs_selector, qf_file_upload_ui])
+
     _stage3_controls.extend([
-        _model_status,
-        mo.md("---"),
-        qf_obs_selector,
-        qf_obs_uploader,
         mo.hstack([qf_inf_wl_slider, qf_obs_scale_selector], widths=[3, 1], align="end"),
         mo.md("---"),
         _obs_status,
@@ -3129,7 +3977,13 @@ def _(np, torch):
             _interp = emu_data.get("norm_factor_interpolator")
             if _interp is not None:
                 try:
-                    return float(np.asarray(_interp(X_raw)).squeeze())
+                    _value = float(np.asarray(_interp(X_raw)).squeeze())
+                    # Undo the log10 transform when the interpolator was built
+                    # in geometric space (linear-scale emulators) so callers
+                    # always receive a multiplicative flux factor.
+                    if emu_data.get("norm_factor_interp_space") == "log10":
+                        _value = float(10.0 ** _value)
+                    return _value
                 except Exception:
                     pass
             _stored = emu_data.get("norm_factors")
@@ -3177,6 +4031,7 @@ def _(np, torch):
 
 @app.cell
 def _(
+    get_qf_playground_target,
     mo,
     np,
     qf_inf_emu_data,
@@ -3203,6 +4058,10 @@ def _(
     _fixed_inclination = qf_inf_emu_data.get("fixed_inclination")
     _n_params = len(_param_names)
     _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
+    qf_distance_prior_ack = mo.ui.checkbox(
+        value=False,
+        label="I have entered the target distance and uncertainty",
+    )
 
     _fixed_toggles = []
     _value_inputs = []
@@ -3229,13 +4088,14 @@ def _(
         _max_inputs.append(mo.ui.number(value=round(_hi, 4), step=0.001, label="Max"))
 
     _model_flux_scale = str(qf_inf_emu_data.get("scale", "linear"))
+    _is_test_grid_data = bool(qf_obs_data is not None and qf_obs_data.attrs.get("is_test_grid", False))
     _fix_distance_for_shape_only = (
         qf_obs_scale_selector.value == "continuum-normalised"
         or _model_flux_scale == "continuum-normalised"
     )
     _nuisance = [
-        ("Av",        0.0,         0.0,               2.0, False),
-        ("Distance (pc)", 100.0, 90.0, 110.0, _fix_distance_for_shape_only),
+        ("Av",        0.0,         0.0,               2.0, _is_test_grid_data),
+        ("Distance (pc)", 100.0, 90.0, 110.0, _is_test_grid_data or _fix_distance_for_shape_only),
         ("cheb_1",    0.0,         -0.5,              0.5, True),
     ]
     for _name, _val, _lo, _hi, _fixed_default in _nuisance:
@@ -3252,7 +4112,26 @@ def _(
         "mins": _min_inputs,
         "maxs": _max_inputs,
         "n_physical": _n_params,
+        "distance_prior_ack": qf_distance_prior_ack,
+        "fixed_inclination": _fixed_inclination,
+        "fix_distance_for_shape_only": _fix_distance_for_shape_only,
     }
+    return (qf_param_config,)
+
+
+@app.cell
+def _(mo, qf_param_config):
+    if qf_param_config is None:
+        mo.stop(True, mo.md(""))
+
+    _labels = qf_param_config["labels"]
+    _fixed_toggles = qf_param_config["fixed"]
+    _value_inputs = qf_param_config["values"]
+    _min_inputs = qf_param_config["mins"]
+    _max_inputs = qf_param_config["maxs"]
+    _distance_prior_ack = qf_param_config["distance_prior_ack"]
+    _fixed_inclination = qf_param_config.get("fixed_inclination")
+    _fix_distance_for_shape_only = qf_param_config.get("fix_distance_for_shape_only", False)
 
     _config_elements = []
     for _i, _name in enumerate(_labels):
@@ -3268,6 +4147,16 @@ def _(
     _config_accordion = mo.accordion({
         f"{mo.icon('lucide:sliders-horizontal')} Parameter Configuration": mo.vstack(_config_elements)
     }, lazy=True)
+
+    # Marimo only allows reactive widget-value reads in downstream cells, so the
+    # distance acknowledgement display logic lives here rather than in the widget
+    # creation cell above.
+    _distance_idx = next((i for i, _label in enumerate(_labels) if _label == "Distance (pc)"), None)
+    if _distance_idx is not None and not _fixed_toggles[_distance_idx].value:
+        _config_accordion = mo.vstack([
+            _config_accordion,
+            _distance_prior_ack,
+        ])
 
     if _fixed_inclination is not None:
         _config_output = mo.vstack([
@@ -3293,7 +4182,7 @@ def _(
         ])
 
     _config_output
-    return (qf_param_config,)
+    return
 
 
 @app.cell
@@ -3320,6 +4209,19 @@ def _(
 
     # Default slider widgets — created unconditionally so downstream cells
     # always receive valid references even before a model is loaded.
+    _pg_target = get_qf_playground_target() or {}
+    if not isinstance(_pg_target, dict):
+        _pg_target = {}
+
+    def _target_value(_key, _default, _lo, _hi):
+        try:
+            _value = float(_pg_target.get(_key, _default))
+        except Exception:
+            _value = float(_default)
+        if not np.isfinite(_value):
+            _value = float(_default)
+        return float(np.clip(_value, _lo, _hi))
+
     qf_pg_av = mo.ui.slider(start=0.0, stop=5.0, value=0.0, step=0.01,
                              label="Av (Extinction)", show_value=True, full_width=True)
     qf_pg_logscale = mo.ui.slider(start=10.0, stop=1000.0, value=100.0, step=1.0,
@@ -3335,12 +4237,25 @@ def _(
     _mid_params = (_min_p + _max_p) / 2.0
     _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
 
-    qf_pg_av = mo.ui.slider(start=0.0, stop=5.0, value=0.0, step=0.01,
+    _source_file = qf_inf_emu_data.get("source_file")
+    if _pg_target.get("source_file") and _pg_target.get("source_file") != _source_file:
+        _pg_target = {}
+
+    _target_phys = _pg_target.get("phys")
+    if _target_phys is not None:
+        try:
+            _target_phys = np.asarray(_target_phys, dtype=float)
+            if _target_phys.shape[0] != len(_min_p):
+                _target_phys = None
+        except Exception:
+            _target_phys = None
+
+    qf_pg_av = mo.ui.slider(start=0.0, stop=5.0, value=_target_value("Av", 0.0, 0.0, 5.0), step=0.01,
                              label="Av (Extinction)", show_value=True, full_width=True)
     qf_pg_logscale = mo.ui.slider(start=10.0, stop=1000.0,
-                                   value=100.0, step=1.0,
+                                   value=_target_value("Distance (pc)", 100.0, 10.0, 1000.0), step=1.0,
                                    label="Distance (pc)", show_value=True, full_width=True)
-    qf_pg_cheb1 = mo.ui.slider(start=-2.0, stop=2.0, value=0.0, step=0.01,
+    qf_pg_cheb1 = mo.ui.slider(start=-2.0, stop=2.0, value=_target_value("cheb_1", 0.0, -2.0, 2.0), step=0.01,
                                 label="cheb_1 (continuum tilt)", show_value=True, full_width=True)
 
     # ── Physical parameter sliders ──
@@ -3384,6 +4299,8 @@ def _(
         _lo = float(_min_p[_pi])
         _hi = float(_max_p[_pi])
         _mid = (_lo + _hi) / 2.0
+        if _target_phys is not None:
+            _mid = float(np.clip(_target_phys[_pi], _lo, _hi))
         _lo_ui = _clean_slider_number(_lo)
         _hi_ui = _clean_slider_number(_hi)
         _mid_ui = _clean_slider_number(_mid)
@@ -3774,6 +4691,22 @@ def _(
     _mins = [m.value for m in qf_param_config["mins"]]
     _maxs = [m.value for m in qf_param_config["maxs"]]
     _n_phys = qf_param_config["n_physical"]
+    _distance_prior_ack = qf_param_config.get("distance_prior_ack")
+
+    if ("Distance (pc)" in _labels
+        and _distance_prior_ack is not None
+        and not _fixed[_labels.index("Distance (pc)")]
+        and not _distance_prior_ack.value):
+        mo.stop(
+            True,
+            mo.callout(
+                mo.md(
+                    "Confirm the Distance (pc) prior in the parameter configuration before running Quick Fit. "
+                    "The center is the target distance and the min/max fields define its uncertainty range."
+                ),
+                kind="warn",
+            ),
+        )
 
     _active_idx = [i for i in range(len(_labels)) if not _fixed[i]]
     _active_labels = [_labels[i] for i in _active_idx]
@@ -3909,6 +4842,22 @@ def _(
 
         _global_best_x = _p0.copy()
         _global_best_nit = 0
+        _restart_summaries = []
+
+        def _capture_restart_result(_restart_number, _solution):
+            _full_params = np.array(_vals, dtype=np.float64)
+            for _ai, _gi in enumerate(_active_idx):
+                if _ai < len(_solution.x):
+                    _full_params[_gi] = float(_solution.x[_ai])
+
+            _restart_summaries.append({
+                "restart": int(_restart_number),
+                "chi2": float(_solution.fun),
+                "values": {
+                    _labels[_i]: float(_full_params[_i])
+                    for _i in range(len(_labels))
+                },
+            })
 
         for _restart_idx, _x0 in enumerate(_start_points):
             _cur_restart[0] = _restart_idx + 1
@@ -3973,6 +4922,8 @@ def _(
                     bounds=_bounds,
                     options=dict(maxiter=int(qf_max_iter.value), ftol=1e-15, gtol=1e-12),
                 )
+
+            _capture_restart_result(_cur_restart[0], _run_soln)
 
             if _run_soln.fun <= _global_best_f[0]:
                 _global_best_f[0] = _run_soln.fun
@@ -4055,6 +5006,43 @@ def _(
     for _ai, _gi in enumerate(_active_idx):
         _best_full[_gi] = _soln.x[_ai]
 
+    _restart_table_rows = None
+    if _restart_summaries:
+        def _format_restart_value(_value):
+            try:
+                _value = float(_value)
+            except Exception:
+                return "-"
+            if not np.isfinite(_value):
+                return "inf"
+            return f"{_value:.6f}"
+
+        def _format_restart_chi2(_value):
+            try:
+                _value = float(_value)
+            except Exception:
+                return "N/A"
+            if not np.isfinite(_value):
+                return "inf"
+            return f"{_value:.2f}"
+
+        _restart_columns = [
+            f"Restart {_summary['restart']}"
+            for _summary in _restart_summaries
+        ]
+        _chi2_row = {"Parameter": "χ²"}
+        for _column, _summary in zip(_restart_columns, _restart_summaries):
+            _chi2_row[_column] = _format_restart_chi2(_summary["chi2"])
+        _restart_table_rows = [_chi2_row]
+
+        for _param_name in _labels:
+            _row = {"Parameter": _param_name}
+            for _column, _summary in zip(_restart_columns, _restart_summaries):
+                _row[_column] = _format_restart_value(
+                    _summary["values"].get(_param_name)
+                )
+            _restart_table_rows.append(_row)
+
     qf_mle_result = {
         "best_params": _best_full,
         "active_idx": _active_idx,
@@ -4069,6 +5057,7 @@ def _(
         "labels": _labels,
         "n_physical": _n_phys,
         "n_restarts": _n_restarts,
+        "restart_table_rows": _restart_table_rows,
     }
     return (qf_mle_result,)
 
@@ -4079,6 +5068,12 @@ def _(mo):
     ## Stage 4: Results & Export
     """)
     return
+
+
+@app.cell
+def _(mo):
+    get_qf_playground_target, set_qf_playground_target = mo.state(None)
+    return get_qf_playground_target, set_qf_playground_target
 
 
 @app.cell
@@ -4100,6 +5095,7 @@ def _(
     qf_obs_scale_selector,
     qf_predict_flux,
     qf_transform_observation_data,
+    set_qf_playground_target,
 ):
     if qf_mle_result is None:
         mo.stop(True, mo.md("*Run Quick Fit to see results.*"))
@@ -4242,12 +5238,29 @@ def _(
         kind="success" if qf_mle_result['success'] else "warn"
     )
 
-    mo.vstack([_status, _overlay_chart, _resid_chart + _zero_line])
+    def _send_mle_to_playground(_):
+        set_qf_playground_target({
+            "source": "quick_fit_mle",
+            "source_file": qf_inf_emu_data.get("source_file"),
+            "phys": [float(_v) for _v in _phys],
+            "Av": float(_av),
+            "Distance (pc)": float(_distance_pc),
+            "cheb_1": float(_cheb1),
+        })
+        mo.status.toast("Loaded MLE best fit into the Parameter Playground")
+
+    _playground_btn = mo.ui.button(
+        label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
+        on_click=_send_mle_to_playground,
+        kind="success",
+    )
+
+    mo.vstack([_status, _playground_btn, _overlay_chart, _resid_chart + _zero_line])
     return
 
 
 @app.cell
-def _(mo, np, pd, qf_mle_result):
+def _(mo, np, pd, qf_mle_result, qf_obs_data):
     if qf_mle_result is None:
         mo.stop(True, mo.md(""))
 
@@ -4255,6 +5268,41 @@ def _(mo, np, pd, qf_mle_result):
     _best = qf_mle_result["best_params"]
     _active_idx = qf_mle_result["active_idx"]
     _e_err = qf_mle_result["ensemble_errors"]
+    _has_ground_truth = bool(qf_obs_data is not None and qf_obs_data.attrs.get("is_test_grid", False))
+    _truth_values = dict(qf_obs_data.attrs.get("ground_truth_params") or {}) if _has_ground_truth else {}
+
+    def _format_summary_value(_value):
+        try:
+            _value = float(_value)
+        except Exception:
+            return str(_value)
+        if not np.isfinite(_value):
+            return "—"
+        return f"{_value:.6f}"
+
+    def _normalise_truth_label(_label):
+        import re as _re
+        _text = str(_label).strip()
+        if _text.lower().startswith("log10(") and _text.endswith(")"):
+            _text = _text[6:-1]
+        return _re.sub(r"[^a-z0-9]+", "", _text.lower())
+
+    def _truth_lookup(_display_name):
+        _name = str(_display_name)
+        _name_lower = _name.lower()
+        if _name == "Av":
+            return 0.0
+        if _name == "Distance (pc)":
+            return 100.0
+        if _name == "cheb_1":
+            return 0.0
+        if "inclination" in _name_lower and "Inclination" in _truth_values:
+            return _truth_values["Inclination"]
+        _normalised = {
+            _normalise_truth_label(_key): _value
+            for _key, _value in _truth_values.items()
+        }
+        return _normalised.get(_normalise_truth_label(_display_name))
 
     _rows = []
     _ai = 0
@@ -4266,14 +5314,51 @@ def _(mo, np, pd, qf_mle_result):
         else:
             _ee = np.nan
 
-        _rows.append({
+        _row = {
             "Parameter": _name,
             "Best Fit": f"{_val:.6f}",
             "±1σ (Ensemble)": f"{_ee:.6f}" if np.isfinite(_ee) else "—",
-        })
+        }
+        if _has_ground_truth:
+            _truth_val = _truth_lookup(_name)
+            if _truth_val is None:
+                _row["Ground Truth"] = "—"
+                _row["Δ"] = "—"
+            else:
+                _delta = float(_val) - float(_truth_val)
+                _row["Ground Truth"] = _format_summary_value(_truth_val)
+                _row["Δ"] = f"{_delta:+.6f}"
+        _rows.append(_row)
 
     _df = pd.DataFrame(_rows)
-    mo.ui.table(_df, label="Parameter Summary", selection=None)
+    _summary_table = mo.ui.table(_df, label="Parameter Summary", selection=None)
+    _outputs = [_summary_table]
+
+    _restart_rows = qf_mle_result.get("restart_table_rows")
+    if _restart_rows:
+        _restart_columns = list(_restart_rows[0].keys()) if _restart_rows else []
+        _restart_align = {
+            _column: "left" if _column == "Parameter" else "right"
+            for _column in _restart_columns
+        }
+        _outputs.append(
+            mo.accordion({
+                f"{mo.icon('lucide:rotate-cw')} MLE Restart Best Fits": mo.ui.table(
+                    _restart_rows,
+                    selection=None,
+                    pagination=False,
+                    show_column_summaries=False,
+                    show_data_types=False,
+                    show_download=False,
+                    freeze_columns_left=["Parameter"],
+                    text_justify_columns=_restart_align,
+                    max_columns=None,
+                    page_size=len(_restart_rows),
+                )
+            })
+        )
+
+    mo.vstack(_outputs)
     return
 
 
@@ -4313,7 +5398,7 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
         _df = pd.DataFrame(_rows)
         _path = os.path.join(_dir, f"quickfit_{_src_file}_params.csv")
         _df.to_csv(_path, index=False)
-        mo.status.toast(f"Saved {_path}", kind="success")
+        mo.status.toast(f"Saved {_path}")
 
     def _export_json(_):
         _dir = "exports"
@@ -4346,7 +5431,7 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
         _path = os.path.join(_dir, f"quickfit_{_src_file}_summary.json")
         with open(_path, 'w') as f:
             json.dump(_out, f, indent=2)
-        mo.status.toast(f"Saved {_path}", kind="success")
+        mo.status.toast(f"Saved {_path}")
 
     def _export_pf(_):
         _dir = "exports"
@@ -4416,7 +5501,7 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
                 header_lines=header,
                 observer_angles=[_observer_angle] if _observer_angle is not None else None,
             )
-            mo.status.toast(f"Exported {_pf_path}", kind="success")
+            mo.status.toast(f"Exported {_pf_path}")
         except Exception as _e:
             mo.status.toast(f".pf export failed: {_e}", kind="danger")
 

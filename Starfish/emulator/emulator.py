@@ -437,9 +437,25 @@ class Emulator:
         self._grid_points_norm = (grid_points - self._param_min) / self._param_range
         
         # Create optimal interpolator (RegularGrid if possible, LinearND fallback)
-        # Uses ORIGINAL-space grid_points for physical-space interpolation
+        # Uses ORIGINAL-space grid_points for physical-space interpolation.
+        #
+        # For linear / continuum-normalised flux scales the factors are
+        # per-spectrum mean fluxes, which vary by orders of magnitude across
+        # the log-spaced grid axes and are strongly convex in parameter space.
+        # Linear interpolation of a convex function overshoots between grid
+        # nodes (the chord lies above the curve), producing a systematic
+        # continuum offset at off-grid parameters.  Interpolating log10(factor)
+        # (geometric interpolation) removes that bias.  Log-scale emulators
+        # store additive mean-log-flux offsets, which are already geometric in
+        # flux and may be negative, so those stay in linear space.
+        if self.flux_scale != "log" and np.all(np.asarray(factors) > 0):
+            self._factor_interp_space = "log10"
+            interp_factors = np.log10(np.asarray(factors, dtype=np.float64))
+        else:
+            self._factor_interp_space = "linear"
+            interp_factors = factors
         self.factor_interpolator = _create_optimal_interpolator(
-            grid_points, factors, logger=self.log
+            grid_points, interp_factors, logger=self.log
         )
 
         self.dv = calculate_dv(wavelength)
@@ -2044,9 +2060,19 @@ class Emulator:
         factor: float
             The interpolated preprocessing factor. For non-log models this is
             multiplicative; for log models it is additive.
+
+        Notes
+        -----
+        Multiplicative (non-log) factors are interpolated in log10 space and
+        exponentiated here, because linearly interpolating mean fluxes that
+        span orders of magnitude systematically overestimates the continuum
+        level between grid nodes.
         """
         _params = np.asarray(params)
-        return self.factor_interpolator(_params)
+        _factor = self.factor_interpolator(_params)
+        if getattr(self, "_factor_interp_space", "linear") == "log10":
+            _factor = 10.0 ** _factor
+        return _factor
 
     def determine_chunk_log(self, wavelength: Sequence[float], buffer: float = 50):
         """
@@ -2815,11 +2841,25 @@ class Emulator:
             print("V11 rebuild complete.", flush=True)
 
         total_elapsed = time.time() - self._training_start_time
+        final_total_loss = None
+        if self._v11 is not None or self._v11_gpu is not None:
+            try:
+                # The per-component optimizer records component-local losses;
+                # the rebuilt V11 gives the total objective for the final model.
+                final_total_loss = -self.log_likelihood()
+            except Exception as exc:
+                self.log.warning(f"Could not evaluate final total NLL: {exc}")
+
+        loss_summary = (
+            f"Final total loss: {final_total_loss:.2f}"
+            if final_total_loss is not None
+            else f"Best component loss: {self._best_loss:.2f}"
+        )
         print(f"\nPer-component training complete")
         print(
             f"Total time: {total_elapsed:.1f}s | "
             f"Total iters: {self._iteration_count} | "
-            f"Best total loss: {self._best_loss:.2f}"
+            f"{loss_summary}"
         )
 
         self._trained = True
@@ -3165,6 +3205,11 @@ class Emulator:
                 for ls in self.lengthscales
             ]
         )
-        output += f"\nLog Likelihood: {self.log_likelihood():.2f}\n" if (self._v11 is not None or self._v11_gpu is not None) else ""
+        if self._v11 is not None or self._v11_gpu is not None:
+            # Training minimizes the negative log-likelihood, so report both
+            # signs here to match the live loss curve and avoid ambiguity.
+            log_likelihood = self.log_likelihood()
+            output += f"\nFinal Log Likelihood: {log_likelihood:.2f}\n"
+            output += f"Final Negative Log Likelihood: {-log_likelihood:.2f}\n"
         output += "\n[V11 not materialized — log likelihood unavailable]\n" if (self._v11 is None and self._v11_gpu is None) else ""
         return output

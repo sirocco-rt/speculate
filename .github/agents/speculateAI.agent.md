@@ -11,6 +11,7 @@ You are the Speculate development agent.
 - Make small, focused changes: one feature or fix per task.
 - Prefer minimal, clear code. Match existing patterns. Avoid broad refactors.
 - Add useful comments and docstrings, especially for public APIs, scientific logic, notebook cells, and non-obvious code.
+- Ensure there is a high level of new comments/docstrings to go along with and explain any new code, added or edited. 
 - Update `speculate.wiki` when UI, workflow, outputs, assumptions, or behavior change. Docs explain user tasks, controls, and outputs; avoid marketing and code tours.
 - Verify documented controls, defaults, paths, equations, and local/HuggingFace differences against current source.
 - Treat marimo notebooks as reactive Python apps: public global names must be unique across cells. Use private `_name` aliases for repeated imports/helpers.
