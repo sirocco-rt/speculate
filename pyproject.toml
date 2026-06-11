@@ -1,6 +1,6 @@
 [project]
 name = "speculate"
-version = "0.2.0"
+version = "0.3.0"
 description = "An emulator for Sirocco for faster inference of an observational spectrum's outflow parameters"
 license = "GPL-3.0"
 
