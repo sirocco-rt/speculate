@@ -4,6 +4,35 @@
 
 ## v0.4.0 (2026-06-11)
 
+### Bug Fixes
+
+- Implement log10 interpolation for linear-scale norm factors to reduce continuum offset
+  ([`2af9991`](https://github.com/sirocco-rt/speculate/commit/2af99910cbe3d6bf9d2e221f0b6d621c6b572ec3))
+
+### Features
+
+- Standardize Gaussian smoothing sigma across modules and update from sigma=10 to sigma=2 and amended
+  bounds limits
+  ([`efc983a`](https://github.com/sirocco-rt/speculate/commit/efc983a57245ae6206f74dda9a58841ecfd347f3))
+
+- Enhance Tier 3 Distance Prior Handling and GP log_amp calculations (in Testing)
+  ([`5cb24c2`](https://github.com/sirocco-rt/speculate/commit/5cb24c22de47cba2106b6802a1aa1b83062a279f))
+
+- Add script to sync release metadata in CITATION.cff
+  ([`bc63fe6`](https://github.com/sirocco-rt/speculate/commit/bc63fe6886300f46ab878443245e916039f3ac43))
+
+- Export fit results to playground sliders
+  ([`d7b3ad4`](https://github.com/sirocco-rt/speculate/commit/d7b3ad44d8552a91e2976fab8b86f98845da5503))
+
+- Grid Maker Agents to assist in implimenting new sirocco grids
+  ([`5a6f72f`](https://github.com/sirocco-rt/speculate/commit/5a6f72f28bb777bd2225b35a5c00748bdc8531ed))
+
+- **quick**: Adding test_grid spectra as an option for inference.
+  ([`4c62601`](https://github.com/sirocco-rt/speculate/commit/4c626018489d225900e2856c3584419e89ba6793))
+
+- **quick**: Table Report of Each MLE best fit parameters
+  ([`a9282fe`](https://github.com/sirocco-rt/speculate/commit/a9282febbe39f07572468ecd59c6752dab264a91))
+
 
 ## v0.3.0 (2026-05-18)
 
