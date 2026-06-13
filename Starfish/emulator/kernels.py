@@ -429,6 +429,53 @@ def _apply_kernel_gpu_inplace(dist, var, kernel_type="rbf"):
     return dist
 
 
+def _apply_kernel_gpu_inplace_batched(
+    dist: torch.Tensor,
+    variances: torch.Tensor,
+    kernel_type: str = "rbf",
+) -> torch.Tensor:
+    """Batched kernel transform — one call for all PCA components.
+
+    Applies the selected kernel function element-wise to a stacked distance
+    tensor of shape ``(n_comp, M, N)``, using per-component variances
+    broadcast as ``(n_comp, 1, 1)``.
+
+    This replaces 30 separate ``_apply_kernel_gpu_inplace`` calls (each
+    launching 6–8 CUDA kernels) with a single batched expression.
+
+    Parameters
+    ----------
+    dist : torch.Tensor, shape (n_comp, M, N)
+        Euclidean distance matrices, one per component.  Modified in-place.
+    variances : torch.Tensor, shape (n_comp,)
+        Kernel amplitudes per component.
+    kernel_type : str
+        One of "rbf", "matern32", "matern52".
+
+    Returns
+    -------
+    torch.Tensor
+        The kernel tensor (same object as dist, modified in-place).
+    """
+    var = variances[:, None, None]  # (n_comp, 1, 1) for broadcasting
+
+    if kernel_type == "rbf":
+        dist.pow_(2).mul_(-0.5).exp_().mul_(var)
+    elif kernel_type == "matern32":
+        scaled = dist * _SQRT3
+        # Keep the batched path algebraically identical to the scalar helper.
+        dist.copy_(var * (1.0 + scaled) * torch.exp(-scaled))
+    elif kernel_type == "matern52":
+        t = dist * _SQRT5
+        # Single compound expression — PyTorch fuses many of the element-wise
+        # ops, reducing the number of CUDA kernel launches vs. the in-place
+        # version.
+        dist.copy_(var * (1.0 + t + t * t / 3.0) * torch.exp(-t))
+    else:
+        raise ValueError(f"Unknown kernel_type: {kernel_type!r}")
+    return dist
+
+
 def batch_kernel_pytorch_gpu_only(X, Z, variances, lengthscales, device='cuda', return_stacked=False, out=None, add_to_out=False, kernel_type="rbf"):
     """
     PyTorch GPU-accelerated batched kernel that returns GPU tensor (NO CPU TRANSFER!)
