@@ -1606,8 +1606,9 @@ def run_tier2(
                 if fname in gt:
                     all_truths[fname].append(gt[fname])
                     spec_result[f"{fname}_truth"] = gt[fname]
+                    _median = float(np.median(samples_i))
                     spec_result[f"{fname}_delta_sigma"] = (
-                        mcmc_result["summary"][fname]["mean"] - gt[fname]
+                        _median - gt[fname]
                     ) / max(mcmc_result["summary"][fname]["std"], 1e-10)
 
         per_spectrum.append(spec_result)

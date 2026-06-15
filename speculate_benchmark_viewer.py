@@ -3661,8 +3661,9 @@ def _(
                                 _all_truths[_fn].append(_gt[_fn])
                                 _spec_res[f"{_fn}_truth"] = _gt[_fn]
                                 _cp_entry[f"{_fn}_truth"] = _gt[_fn]
+                                _median = float(np.median(_samples_i))
                                 _spec_res[f"{_fn}_delta_sigma"] = (
-                                    _mcmc["summary"][_fn]["mean"] - _gt[_fn]
+                                    _median - _gt[_fn]
                                 ) / max(_mcmc["summary"][_fn]["std"], 1e-10)
 
                     # Update the spec_result in the checkpoint entry (it now has _mean/_std keys)

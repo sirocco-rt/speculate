@@ -3877,7 +3877,7 @@ def _(
                     _results_md += f"**Frozen (not sampled):** {', '.join(_frozen_list)}\n\n"
                 _results_md += "| Parameter | Mean | Std | Median | "
                 if ground_truth_params:
-                    _results_md += "Truth | Δσ |\n"
+                    _results_md += "Truth | Δσ (median/std) |\n"
                     _results_md += "|-----------|------|-----|--------|-------|----|\n"
                 else:
                     _results_md += "\n|-----------|------|-----|--------|\n"
@@ -3897,7 +3897,7 @@ def _(
                         _gt_key = _truth_key_for(_display_name, _label)
                         if _gt_key in ground_truth_params:
                             _gt_val = ground_truth_params[_gt_key]
-                            _delta_sigma = (_mean - _gt_val) / _std if _std > 0 else 0
+                            _delta_sigma = (_median - _gt_val) / _std if _std > 0 else 0
                             _results_md += f"{_gt_val:.4f} | {_delta_sigma:+.2f}σ |\n"
                         else:
                             _results_md += "- | - |\n"
