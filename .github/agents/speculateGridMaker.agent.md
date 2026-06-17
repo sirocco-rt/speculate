@@ -1,7 +1,7 @@
 ---
 name: speculateGridMaker
 description: "Use when: implementing new Sirocco/Speculate grids, grid registry entries, GridInterface classes, hosted grid/model support, and grid-specific docs."
-argument-hint: "Provide the grid name, local/HuggingFace dataset state, parameter table, .spec column layout, lookup table, templates, and any desired workflow differences."
+argument-hint: "Provide the grid name, local/HuggingFace dataset state, whether uploaded spectra are lightened/compressed, parameter table, .spec column layout, lookup table, templates, and any desired workflow differences."
 # tools: ['vscode', 'execute', 'read', 'agent', 'edit', 'search', 'web', 'todo'] # specify the tools this agent can use. If not set, all enabled tools are allowed.
 ---
 
@@ -22,6 +22,7 @@ Before implementation, confirm or infer:
 
 - Grid key and test-grid key, e.g. `speculate_<name>_grid_<sirocco_version_number>` and paired validation grid.
 - Raw spectra status: locally under `sirocco_grids/<grid>/`, lightened/compressed, and/or uploaded to HuggingFace Datasets.
+- If the spectra are uploaded to HuggingFace Datasets, whether the uploaded files are lightened/reduced and compressed as `run*.spec.xz`, not native uncompressed Sirocco `.spec` outputs.
 - Required files: `run*.spec`, `grid_run_lookup_table.parquet`, README/metadata, and any auxiliary spectra.
 - `.spec` layout: wavelength column, flux columns, inclination angles, headers/skip rows, units, wavelength range.
 - Parameter table: IDs, labels, descriptions, emulator-space values, log10 axes, axis lengths, default policy, fixed axes.
