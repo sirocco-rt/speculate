@@ -62,6 +62,10 @@ try:
         LOO, set_param_dict) to guarantee train/predict consistency.
         """
         return max(1e-5, 1e-6 * float(variance))
+
+    def _get_cuda_device() -> "torch.device":
+        """Return the active CUDA device with an explicit index."""
+        return torch.device("cuda", torch.cuda.current_device())
             
     def _memory_efficient_log_likelihood_gpu(
         grid_points_gpu, variances_gpu, lengthscales_gpu,
@@ -489,7 +493,7 @@ class Emulator:
         M = self.grid_points.shape[0]
         
         if PYTORCH_AVAILABLE and torch.cuda.is_available():
-            device = torch.device('cuda')
+            device = _get_cuda_device()
             eig_torch = torch.from_numpy(eigenspectra_matrix).to(device, TORCH_FLOAT64)
             
             # Block diagonal optimization: (A ⊗ B)⁻¹ = A⁻¹ ⊗ B⁻¹
@@ -1238,7 +1242,7 @@ class Emulator:
 
         Mathematically identical to _call_gpu — no approximations.
         """
-        device = torch.device('cuda')
+        device = _get_cuda_device()
         
         # Ensure cached GPU tensors exist
         if self._grid_points_gpu is None:
@@ -1427,7 +1431,7 @@ class Emulator:
         
         Uses cached GPU tensors (grid_points, w_hat, v11) to minimize transfers.
         """
-        device = torch.device('cuda')
+        device = _get_cuda_device()
         
         # Ensure cached GPU tensors exist
         if self._grid_points_gpu is None:
@@ -1918,7 +1922,7 @@ class Emulator:
         -------
         loo_mu, loo_var : ndarray (ncomps, M) each
         """
-        device = torch.device('cuda')
+        device = _get_cuda_device()
         dtype = TORCH_FLOAT64
 
         # Free the inference L cache to make room — LOO needs ~2×M²×8 VRAM per block.
@@ -2539,7 +2543,7 @@ class Emulator:
         # Prepare GPU tensors once
         use_gpu = PYTORCH_AVAILABLE and torch.cuda.is_available()
         if use_gpu:
-            device = torch.device("cuda")
+            device = _get_cuda_device()
             grid_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)
             w_hat_reshaped = torch.from_numpy(
                 self.w_hat.reshape(self.ncomps, M)
@@ -2969,7 +2973,7 @@ class Emulator:
                 self.hyperparams[key] = val
 
         if self._gpu_training_mode and PYTORCH_AVAILABLE and torch.cuda.is_available():
-            device = torch.device('cuda')
+            device = _get_cuda_device()
             
             if self._grid_points_gpu is None:
                 self._grid_points_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)

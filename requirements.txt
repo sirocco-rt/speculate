@@ -39,7 +39,7 @@ scikit-learn
 pyinstrument
 
 # Arviz for MCMC diagnostics (last to avoid potential conflicts with other dependencies)
-arviz<1.0
+arviz>=0.22,<1.0
 tabulate
 
 # Versioning
