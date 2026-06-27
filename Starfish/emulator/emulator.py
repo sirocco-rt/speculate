@@ -62,6 +62,10 @@ try:
         LOO, set_param_dict) to guarantee train/predict consistency.
         """
         return max(1e-5, 1e-6 * float(variance))
+
+    def _get_cuda_device() -> "torch.device":
+        """Return the active CUDA device with an explicit index."""
+        return torch.device("cuda", torch.cuda.current_device())
             
     def _memory_efficient_log_likelihood_gpu(
         grid_points_gpu, variances_gpu, lengthscales_gpu,
@@ -208,7 +212,7 @@ except ImportError:
 from Starfish.grid_tools import NPZInterface
 from Starfish.grid_tools.utils import determine_chunk_log
 from Starfish.utils import calculate_dv
-from .kernels import batch_kernel, batch_kernel_cached, batch_kernel_auto, batch_kernel_pytorch_gpu_only, clear_kernel_cache, get_cache_size, rbf_kernel, get_cpu_kernel_func, _apply_kernel_gpu_inplace
+from .kernels import batch_kernel, batch_kernel_cached, batch_kernel_auto, batch_kernel_pytorch_gpu_only, clear_kernel_cache, get_cache_size, rbf_kernel, get_cpu_kernel_func, _apply_kernel_gpu_inplace, _apply_kernel_gpu_inplace_batched
 from ._utils import get_phi_squared_optimized, get_phi_squared_pytorch, get_w_hat, PYTORCH_AVAILABLE as UTILS_PYTORCH_AVAILABLE
 log = logging.getLogger(__name__)
 
@@ -489,7 +493,7 @@ class Emulator:
         M = self.grid_points.shape[0]
         
         if PYTORCH_AVAILABLE and torch.cuda.is_available():
-            device = torch.device('cuda')
+            device = _get_cuda_device()
             eig_torch = torch.from_numpy(eigenspectra_matrix).to(device, TORCH_FLOAT64)
             
             # Block diagonal optimization: (A ⊗ B)⁻¹ = A⁻¹ ⊗ B⁻¹
@@ -1238,7 +1242,7 @@ class Emulator:
 
         Mathematically identical to _call_gpu — no approximations.
         """
-        device = torch.device('cuda')
+        device = _get_cuda_device()
         
         # Ensure cached GPU tensors exist
         if self._grid_points_gpu is None:
@@ -1258,16 +1262,21 @@ class Emulator:
         w_hat_reshaped = self._w_hat_gpu.view(n_comp, M).unsqueeze(-1)  # (n_comp, M, 1)
         params_gpu = torch.from_numpy(params).to(device, TORCH_FLOAT64)
 
+        # Pre-compute per-component jitter on GPU (no .item() sync).
+        # _get_v11_jitter(v) = max(1e-5, 1e-6*v); done vectorised here.
+        self._jitter_gpu = torch.clamp(self._variances_gpu * 1e-6, min=1e-5)
+
         def _build_v11_cholesky_for_component(i):
             X_scaled = self._grid_points_gpu / self._lengthscales_gpu[i]
             dist = torch.cdist(X_scaled, X_scaled, p=2.0)
             _apply_kernel_gpu_inplace(dist, self._variances_gpu[i], self.kernel)
 
-            jitter = _get_v11_jitter(self._variances_gpu[i].item())
+            jitter = self._jitter_gpu[i]
             if self.strict_weight_fit:
                 dist.diagonal().add_(jitter)
             else:
-                dist.diagonal().add_(self._dots_inv_diag_gpu[i].item() / self.lambda_xi + jitter)
+                # dots_inv_diag_gpu[i] is already a GPU scalar — no .item() needed
+                dist.diagonal().add_(self._dots_inv_diag_gpu[i] / self.lambda_xi + jitter)
 
             L_i = torch.linalg.cholesky(dist)
             del dist, X_scaled
@@ -1320,10 +1329,30 @@ class Emulator:
         mu_list = []
         cov_list = []
 
-        for i in range(n_comp):
-            X_scaled = self._grid_points_gpu / self._lengthscales_gpu[i]
-            params_scaled = params_gpu / self._lengthscales_gpu[i]
+        n_query = params.shape[0]
+        # Batched query kernels replace 30 tiny per-component cdist launches
+        # with one batched launch.  Keep the stacked v12 workspace no larger
+        # than one MxM block so this path remains genuinely memory-efficient.
+        use_batched_query_kernel = n_query <= max(1, M // max(1, n_comp))
+        if use_batched_query_kernel:
+            ls = self._lengthscales_gpu.unsqueeze(1)                  # (n_comp, 1, D)
+            X_batch = self._grid_points_gpu.unsqueeze(0) / ls         # (n_comp, M, D)
+            Z_batch = params_gpu.unsqueeze(0) / ls                    # (n_comp, n_query, D)
 
+            v12_stacked = torch.cdist(X_batch, Z_batch, p=2.0)        # (n_comp, M, n_query)
+            _apply_kernel_gpu_inplace_batched(v12_stacked, self._variances_gpu, self.kernel)
+
+            if n_query == 1:
+                # k(z, z) is exactly the component variance for all supported
+                # stationary kernels, so avoid a second cdist launch entirely.
+                v22_stacked = self._variances_gpu.view(n_comp, 1, 1)
+            else:
+                v22_stacked = torch.cdist(Z_batch, Z_batch, p=2.0)
+                _apply_kernel_gpu_inplace_batched(v22_stacked, self._variances_gpu, self.kernel)
+
+            del X_batch, Z_batch, ls
+
+        for i in range(n_comp):
             if cache_ready:
                 L_i = self._mem_eff_L_blocks[i]
                 alpha_i = self._mem_eff_alpha_blocks[i]
@@ -1331,12 +1360,22 @@ class Emulator:
                 # Build V11 for this component only, matching the training path.
                 L_i, alpha_i = _build_v11_cholesky_for_component(i)
 
-            v12_i = torch.cdist(X_scaled, params_scaled, p=2.0)
-            _apply_kernel_gpu_inplace(v12_i, self._variances_gpu[i], self.kernel)
-            v21_i = v12_i.transpose(-2, -1)
+            if use_batched_query_kernel:
+                v12_i = v12_stacked[i]
+                v22_i = v22_stacked[i]
+            else:
+                X_scaled = self._grid_points_gpu / self._lengthscales_gpu[i]
+                params_scaled = params_gpu / self._lengthscales_gpu[i]
+                v12_i = torch.cdist(X_scaled, params_scaled, p=2.0)
+                _apply_kernel_gpu_inplace(v12_i, self._variances_gpu[i], self.kernel)
+                if n_query == 1:
+                    v22_i = self._variances_gpu[i].view(1, 1)
+                else:
+                    v22_i = torch.cdist(params_scaled, params_scaled, p=2.0)
+                    _apply_kernel_gpu_inplace(v22_i, self._variances_gpu[i], self.kernel)
+                del X_scaled, params_scaled
 
-            v22_i = torch.cdist(params_scaled, params_scaled, p=2.0)
-            _apply_kernel_gpu_inplace(v22_i, self._variances_gpu[i], self.kernel)
+            v21_i = v12_i.transpose(-2, -1)
 
             mu_i = torch.matmul(v21_i, alpha_i).squeeze(-1)
             v11_inv_v12_i = torch.cholesky_solve(v12_i, L_i)
@@ -1349,10 +1388,13 @@ class Emulator:
                 mu_list.append(mu_i.detach().cpu())
                 cov_list.append((cov_i if full_cov else cov_i.diagonal()).detach().cpu())
 
-            del X_scaled, params_scaled, v12_i, v21_i, v22_i, v11_inv_v12_i, cov_i, mu_i
+            del v12_i, v21_i, v22_i, v11_inv_v12_i, cov_i, mu_i
             if not cache_ready:
                 del L_i, alpha_i
                 torch.cuda.empty_cache()
+
+        if use_batched_query_kernel:
+            del v12_stacked, v22_stacked
 
         if return_tensors:
             mu_gpu = torch.cat(mu_list)  # (n_comp * n_query,)
@@ -1389,7 +1431,7 @@ class Emulator:
         
         Uses cached GPU tensors (grid_points, w_hat, v11) to minimize transfers.
         """
-        device = torch.device('cuda')
+        device = _get_cuda_device()
         
         # Ensure cached GPU tensors exist
         if self._grid_points_gpu is None:
@@ -1413,38 +1455,33 @@ class Emulator:
             M = self.grid_points.shape[0]
             n_query = params.shape[0]
             
-            # Compute kernels in stacked mode
-            v12_gpu = batch_kernel_pytorch_gpu_only(
-                self._grid_points_gpu, 
-                params_gpu, 
-                self._variances_gpu, 
-                self._lengthscales_gpu,
-                device='cuda',
-                return_stacked=True,
-                kernel_type=self.kernel
-            ) # (n_comp, M, n_query)
+            # ── Batched kernel computation ──────────────────────────────
+            # Instead of looping 30× through batch_kernel_pytorch_gpu_only,
+            # do one batched cdist per kernel direction.  v12 is at most
+            # (n_comp, M, n_query) — for single-query inference (n_query=1)
+            # this is only (30, 4374, 1) = 1 MB, completely memory-safe.
+            #
+            # Each component uses a different lengthscale vector, so we
+            # broadcast:  grid_points (M,D) / ls (n_comp,1,D) → (n_comp,M,D).
+            ls = self._lengthscales_gpu.unsqueeze(1)                  # (n_comp, 1, D)
+            X_batch = self._grid_points_gpu.unsqueeze(0) / ls         # (n_comp, M, D)
+            Z_batch = params_gpu.unsqueeze(0) / ls                     # (n_comp, n_query, D)
+
+            # v12: kernel between all grid points and query points
+            v12_gpu = torch.cdist(X_batch, Z_batch, p=2.0)            # (n_comp, M, n_query)
+            _apply_kernel_gpu_inplace_batched(v12_gpu, self._variances_gpu, self.kernel)
+
+            # v22: kernel among query points (trivial for n_query=1)
+            v22_gpu = torch.cdist(Z_batch, Z_batch, p=2.0)            # (n_comp, n_query, n_query)
+            _apply_kernel_gpu_inplace_batched(v22_gpu, self._variances_gpu, self.kernel)
+
+            v21_gpu = v12_gpu.transpose(-2, -1)                       # (n_comp, n_query, M)
+            del X_batch, Z_batch
+
+            # ── Reshape w_hat ──────────────────────────────────────────
+            w_hat_reshaped = self._w_hat_gpu.view(n_comp, M).unsqueeze(-1)  # (n_comp, M, 1)
             
-            v22_gpu = batch_kernel_pytorch_gpu_only(
-                params_gpu, 
-                params_gpu, 
-                self._variances_gpu, 
-                self._lengthscales_gpu,
-                device='cuda',
-                return_stacked=True,
-                kernel_type=self.kernel
-            ) # (n_comp, n_query, n_query)
-            
-            v21_gpu = v12_gpu.transpose(-2, -1) # (n_comp, n_query, M)
-            
-            # Reshape w_hat for batch solve
-            w_hat_reshaped = self._w_hat_gpu.view(n_comp, M).unsqueeze(-1) # (n_comp, M, 1)
-            
-            # --- Optimization: Cached Cholesky Decomposition & Precomputed Alpha ---
-            # Using Cholesky (O(N^3) once) + Substitution (O(N^2)) is much faster than Solve (O(N^3))
-            # avoiding MAGMA batched warnings by looping explicitly during heavy ops.
-            
-            # Check if we have a valid cached Cholesky factor L
-            # We track the 'source' v11 tensor object to invalidate cache if v11 changes (e.g. re-training)
+            # ── Cached Cholesky Decomposition (one-time O(N³) cost) ────
             current_v11_id = id(self._v11_gpu)
             cached_v11_id = getattr(self, '_L_gpu_source_id', None)
             
@@ -1452,14 +1489,10 @@ class Emulator:
                 # Cache invalid or missing, recompute L and alpha
                 L_list = []
                 for i in range(n_comp):
-                    # Compute Cholesky decomposition: v11 = L @ L.T
-                    # Loop avoids "batched routines" warning for large matrices
                     L_list.append(torch.linalg.cholesky(self._v11_gpu[i]))
                 self._L_gpu = torch.stack(L_list)
                 self._L_gpu_source_id = current_v11_id
                 
-                # Compute alpha = v11^-1 @ w_hat using Cholesky
-                # alpha = cholesky_solve(w_hat, L)
                 alpha_list = []
                 for i in range(n_comp):
                     alpha_list.append(torch.cholesky_solve(w_hat_reshaped[i], self._L_gpu[i]))
@@ -1468,33 +1501,29 @@ class Emulator:
             # Retrieve cached alpha
             alpha = self._alpha_gpu
 
+            # ── GP prediction (R&W eqns 2.18, 2.19) ────────────────────
             # mu = v21 @ alpha
-            mu_stacked = torch.matmul(v21_gpu, alpha) # (n_comp, n_query, 1)
+            mu_stacked = torch.matmul(v21_gpu, alpha)                  # (n_comp, n_query, 1)
+
+            # Batched cholesky_solve: solves v11⁻¹ @ v12 for all components
+            # in a single call.  torch.cholesky_solve natively supports
+            # batched (B, N, RHS) inputs — no Python loop needed.
+            v11_inv_v12 = torch.cholesky_solve(v12_gpu, self._L_gpu)   # (n_comp, M, n_query)
             
-            # Solve v11 @ X = v12
-            # v11_inv_v12 = v11^-1 @ v12 => cholesky_solve(v12, L)
-            # Manual batching with Cholesky solve (O(N^2)) is very fast even in Python loop
-            v11_inv_v12_list = []
-            for i in range(n_comp):
-                v11_inv_v12_list.append(torch.cholesky_solve(v12_gpu[i], self._L_gpu[i]))
-            v11_inv_v12 = torch.stack(v11_inv_v12_list)
-            
-            # cov = v22 - v21 @ v11^{-1} @ v12
-            cov_term = torch.matmul(v21_gpu, v11_inv_v12) # (n_comp, n_query, n_query)
-            cov_stacked = v22_gpu - cov_term # (n_comp, n_query, n_query)
+            # cov = v22 - v21 @ v11⁻¹ @ v12
+            cov_term = torch.matmul(v21_gpu, v11_inv_v12)              # (n_comp, n_query, n_query)
+            cov_stacked = v22_gpu - cov_term
             
             # Reshape results to match expected output format
-            mu_gpu = mu_stacked.squeeze(-1).flatten() # (n_comp * n_query)
+            mu_gpu = mu_stacked.squeeze(-1).flatten()                  # (n_comp * n_query)
             
             if not full_cov:
-                # Just return variances (diagonal of cov)
-                cov_diag = cov_stacked.diagonal(dim1=-2, dim2=-1) # (n_comp, n_query)
+                cov_diag = cov_stacked.diagonal(dim1=-2, dim2=-1)      # (n_comp, n_query)
                 if return_tensors:
                     return mu_gpu, cov_diag.flatten()
                 cov = cov_diag.flatten().cpu().numpy()
                 mu = mu_gpu.cpu().numpy()
             else:
-                # Construct full block diagonal matrix
                 blocks = [cov_stacked[i] for i in range(n_comp)]
                 cov_gpu = torch.block_diag(*blocks)
                 
@@ -1893,7 +1922,7 @@ class Emulator:
         -------
         loo_mu, loo_var : ndarray (ncomps, M) each
         """
-        device = torch.device('cuda')
+        device = _get_cuda_device()
         dtype = TORCH_FLOAT64
 
         # Free the inference L cache to make room — LOO needs ~2×M²×8 VRAM per block.
@@ -2514,7 +2543,7 @@ class Emulator:
         # Prepare GPU tensors once
         use_gpu = PYTORCH_AVAILABLE and torch.cuda.is_available()
         if use_gpu:
-            device = torch.device("cuda")
+            device = _get_cuda_device()
             grid_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)
             w_hat_reshaped = torch.from_numpy(
                 self.w_hat.reshape(self.ncomps, M)
@@ -2944,7 +2973,7 @@ class Emulator:
                 self.hyperparams[key] = val
 
         if self._gpu_training_mode and PYTORCH_AVAILABLE and torch.cuda.is_available():
-            device = torch.device('cuda')
+            device = _get_cuda_device()
             
             if self._grid_points_gpu is None:
                 self._grid_points_gpu = torch.from_numpy(self._grid_points_norm).to(device, TORCH_FLOAT64)
