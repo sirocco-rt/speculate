@@ -2136,25 +2136,32 @@ def _transform_flux_for_scale(
     flux: np.ndarray,
     flux_scale: str,
 ) -> np.ndarray:
-    """Transform a native linear-flux spectrum onto the emulator fit scale."""
+    """Convert a native linear-flux Sirocco spectrum onto the emulator fit space.
+
+    Only the flux *space* is changed; the absolute normalisation is preserved.
+    The Tier 3 model is built with ``norm=True``, so the fit operates in
+    absolute-flux units (linear) or absolute log10-flux units (log), and the
+    Sirocco spectrum is itself absolute physical flux at its native 100 pc
+    reference distance. Preserving that calibration here is what lets the
+    subsequent ``log_scale`` (distance) transform in
+    :func:`_apply_spectrum_nuisance_transforms` rescale the Sirocco spectrum from
+    100 pc to the source distance correctly. Dividing out the mean (as an earlier
+    revision did) destroyed the 100 pc zero-point and left the Sirocco overlay
+    ~1e8-1e9x offset from the absolute observation.
+
+    Continuum-normalised fits divide out the fitted power-law continuum to match
+    the observation's own normalisation; ``log_scale`` is fixed at 0 (distance is
+    shape-only) in that mode, so no absolute scale needs to be retained.
+    """
     wl = np.asarray(wl, dtype=np.float64)
     flux = np.asarray(flux, dtype=np.float64)
     if flux_scale == "log":
-        flux = np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
-        finite = np.isfinite(flux)
-        offset = float(np.mean(flux[finite])) if np.any(finite) else 0.0
-        return flux - offset
+        return np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
     if flux_scale == "continuum-normalised":
         from Speculate_addons.Spec_functions import fit_power_law_continuum
 
         continuum, _ = fit_power_law_continuum(wl, flux)
-        flux = flux / np.where(continuum > 0, continuum, 1.0)
-
-    finite = np.isfinite(flux)
-    factor = float(np.mean(flux[finite])) if np.any(finite) else 1.0
-    if not np.isfinite(factor) or abs(factor) == 0.0:
-        factor = 1.0
-    flux = flux / factor
+        return flux / np.where(continuum > 0, continuum, 1.0)
     return flux
 
 
@@ -2419,6 +2426,14 @@ def run_tier3_single(
         iteration_callback=mle_iteration_callback,
         prior_overrides=prior_overrides,
         initial_params=initial_params,
+        # Build the model with the emulator's absolute-flux calibration applied,
+        # exactly like Tier 2 (line ~1531) and the inference/quick-fit tools.
+        # The distance prior maps parsecs to log_scale via 2*ln(100/d), which is
+        # only valid when norm=True so that log_scale=0 corresponds to the 100 pc
+        # reference. Without it the emulator flux carries an arbitrary zero-point
+        # (~1e-11), so the distance-derived log_scale (~-1.2) leaves the model
+        # ~1e8-1e9x too bright and the GP log_amp inflates to absorb the mismatch.
+        use_emulator_norm=True,
     )
     model = mle["model"]
     priors = mle["priors"]

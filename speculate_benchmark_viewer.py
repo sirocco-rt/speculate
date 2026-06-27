@@ -1951,6 +1951,21 @@ def _(get_tier3_posteriors, mo, np, os, render_fixed_matplotlib, t3_observation_
         mo.md("*Tier 3 posterior artifact has no samples to plot.*"),
     )
 
+    # The backend samples distance as ``log_scale`` (natural-log flux scale), but
+    # it is presented to users as Distance (pc) — matching Tier 2 and the
+    # inference / quick-fit tools. Convert the sampled column (the mapping is
+    # non-linear, so the marginal must be built from the converted draws) and
+    # relabel before plotting and tabulating.
+    if "log_scale" in _labels:
+        from Speculate_addons.distance_scale import (
+            log_scale_to_distance_pc as _ls_to_distance_pc,
+        )
+
+        _ls_idx = _labels.index("log_scale")
+        _samples = _samples.copy()
+        _samples[:, _ls_idx] = _ls_to_distance_pc(_samples[:, _ls_idx])
+        _labels[_ls_idx] = "Distance (pc)"
+
     def _corner_fig(_data, _lbls):
         return _corner.corner(
             _data,
