@@ -120,7 +120,8 @@ def _(mo, os, usage_bars):
         }, orientation="vertical"),
     ])
     _items.extend([mo.md("---"), usage_bars])
-    mo.sidebar(mo.vstack(_items))
+
+    mo.sidebar(mo.vstack(_items, gap=0.5), width="20rem")
     return
 
 @app.cell(hide_code=True)

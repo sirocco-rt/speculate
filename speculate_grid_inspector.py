@@ -26,7 +26,6 @@ __generated_with = "0.23.1"
 app = marimo.App(
     width="full",
     app_title="Speculate Grid Inspector",
-    layout_file="layouts/speculate_grid_inspector.grid.json",
 )
 
 
@@ -43,6 +42,42 @@ def _():
     import marimo as mo
 
     return (mo,)
+
+
+@app.cell
+def _(mo):
+    # ── State initialisation ──
+    # pinned_spectra  – list of (run_index, inclination) tuples shown as
+    #                   fixed background traces in the plot
+    # run_index       – shared slider ↔ parameter-dropdown position
+    # inclination     – currently selected viewing angle
+    # flux_scale      – active y-axis transform mode
+    # wavelength_range – current wavelength crop used by the plot
+    # cache_tracker   – set of file paths downloaded from HuggingFace so
+    #                   the grid-switch cell can clean up stale archives
+    get_pinned_spectra, set_pinned_spectra = mo.state([])
+
+    # Initialize state for current run index (synced between slider and parameters)
+    get_run_index, set_run_index = mo.state(0)
+    get_selected_inclination, set_selected_inclination = mo.state(None)
+    get_flux_scale_mode, set_flux_scale_mode = mo.state("linear")
+    get_wavelength_window, set_wavelength_window = mo.state(None)
+
+    # Initialize cache tracker for HuggingFace downloads
+    cache_tracker_state = mo.state(set())
+    return (
+        cache_tracker_state,
+        get_flux_scale_mode,
+        get_pinned_spectra,
+        get_run_index,
+        get_selected_inclination,
+        get_wavelength_window,
+        set_flux_scale_mode,
+        set_pinned_spectra,
+        set_run_index,
+        set_selected_inclination,
+        set_wavelength_window,
+    )
 
 
 @app.cell
@@ -159,7 +194,8 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
         _items.extend([hf_mode_switch])
 
     _items.extend([mo.md("---"), usage_bars])
-    mo.sidebar(mo.vstack(_items))
+
+    mo.sidebar(mo.vstack(_items, gap=0.5), width="20rem")
     return (IS_HUGGINGFACE_SPACE,)
 
 
@@ -178,7 +214,9 @@ def _():
     spec_functions.enable_speculate_altair_theme(alt)
     fit_power_law_continuum = spec_functions.fit_power_law_continuum
 
-    alt.data_transformers.enable("vegafusion")
+    # Assign to throwaway so marimo does not render the registry repr as the
+    # cell's visual output ("DataTransformerRegistry.enable('vegafusion')").
+    _ = alt.data_transformers.enable("vegafusion")
     return Path, alt, fit_power_law_continuum, np, os, pd
 
 
@@ -444,8 +482,10 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
         num_wavelengths = len(wavelengths)
         num_inclinations = len(inclination_angles)
 
-    mo.md(f"""
-    {mo.icon('lucide:check-circle')} **Grid loaded successfully**
+    # Collapse the grid metadata into an accordion so the confirmation is
+    # available on demand without dominating the page.
+    mo.accordion({
+        f"{mo.icon('lucide:check-circle')} Grid loaded: `{selected_grid}`": mo.md(f"""
     - **Grid**: `{selected_grid}`
     - **Mode**: `{grid_mode}`
     - **Run Files**: {num_runs:,}
@@ -454,6 +494,7 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
     - **Wavelength Range**: {wavelengths.min():.1f} - {wavelengths.max():.1f} Å
     - **Parameters**: {len(param_cols)} ({', '.join(param_cols)})
     """)
+    })
     return (
         grid_mode,
         grid_path,
@@ -472,10 +513,157 @@ def _(IS_HUGGINGFACE_SPACE, Path, grid_selector, mo, np, pd):
 
 @app.cell
 def _(mo):
+    get_obs_refresh, set_obs_refresh = mo.state(0)
+    return get_obs_refresh, set_obs_refresh
+
+
+@app.cell
+def _(mo):
+    # File upload for observational spectra
+    obs_file_uploader = mo.ui.file(
+        kind="area",
+        label="**Drag and drop a new observational spectra (CSV)**",
+        multiple=False
+    )
+
+    file_upload_ui = mo.vstack([
+         obs_file_uploader,
+         mo.md("<center><small>Format: CSV with headers `WAVELENGTH`, `FLUX`, and optionally `ERROR`</small></center>")
+    ])
+    return file_upload_ui, obs_file_uploader
+
+
+@app.cell
+def _(mo, obs_file_uploader, os, set_obs_refresh):
+    # Handle file upload
+    if obs_file_uploader.value:
+        save_dir = "observation_files"
+        os.makedirs(save_dir, exist_ok=True)
+
+        files = obs_file_uploader.value
+        # Check if it's a single file (has 'name' attribute) or a list/tuple
+        if hasattr(files, "name"):
+            files = [files]
+
+        for file in files:
+            save_path = os.path.join(save_dir, file.name)
+            with open(save_path, "wb") as file_handle:
+                file_handle.write(file.contents)
+            mo.md(f"{mo.icon('lucide:check-circle')} Uploaded `{file.name}` to `{save_dir}`")
+
+        # Trigger refresh of the file list
+        set_obs_refresh(lambda v: v + 1)
+    return
+
+
+@app.cell
+def _(get_obs_refresh, obs_file_uploader, os):
+    # Select observational spectrum - File List Calculation
+    import glob
+
+    # Trigger refresh on upload or delete
+    _ = obs_file_uploader.value
+    _ = get_obs_refresh()
+
+    obs_dir = "observation_files"
+    if os.path.exists(obs_dir):
+        obs_files = sorted([os.path.basename(f) for f in glob.glob(os.path.join(obs_dir, "*.csv"))])
+    else:
+        obs_files = []
+    return (obs_files,)
+
+
+@app.cell
+def _(mo, obs_files):
+    # Select observational spectrum - Dropdown Creation
+    obs_file_selector = mo.ui.dropdown(
+        options=obs_files,
+        value=obs_files[0] if obs_files else None,
+        label="Select Observational Spectrum:"
+    )
+    return (obs_file_selector,)
+
+
+@app.cell
+def _(mo, obs_file_selector, os, set_obs_refresh):
+    # Select observational spectrum - Delete Action
+    def delete_selected_file():
+        protected_files = [
+            "CV:ixvel_all.csv", 
+            "CV:rwsex_all.csv", 
+            "CV:rwtri_dered.csv", 
+            "CV:uxuma_all.csv", 
+            "CV:v3885sgr_all.csv"
+        ]
+
+        if obs_file_selector.value:
+            if obs_file_selector.value in protected_files:
+                return
+
+            save_dir = "observation_files"
+            file_path = os.path.join(save_dir, obs_file_selector.value)
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    set_obs_refresh(lambda v: v + 1)
+                except Exception:
+                    pass
+
+    delete_obs_btn = mo.ui.button(
+        label=f"{mo.icon('lucide:trash-2')} Delete Selected",
+        kind="danger",
+        on_click=lambda _: delete_selected_file()
+    )
+    return (delete_obs_btn,)
+
+
+@app.cell
+def _(delete_obs_btn, file_upload_ui, mo, obs_file_selector):
+    # Select observational spectrum - Layout
+    mo.vstack([
+        mo.md("## Observational Data:"),
+        mo.hstack([obs_file_selector, delete_obs_btn], align="end"),
+        file_upload_ui,
+    ])
+    return
+
+
+@app.cell
+def _(mo):
     mo.md("""
     ## Interactive Controls:
     """)
     return
+
+
+@app.cell
+def _(mo):
+    # Visibility and display options
+    # Smoothing sigma comes from the shared constant so the label matches the
+    # kernel applied in the plotting cell below (and in Training/Quick Fit).
+    from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _smooth_sigma
+
+    show_current = mo.ui.checkbox(value=True, label="Show Current Spectrum")
+    show_fixed = mo.ui.checkbox(value=True, label="Show Fixed Spectra")
+    show_obs = mo.ui.checkbox(value=False, label="Show Observational Spectra")
+    use_dimensionless = mo.ui.checkbox(value=False, label="Dimensionless Data")
+    use_smoothing = mo.ui.checkbox(value=True, label=f"Smooth Data (Gaussian σ={_smooth_sigma:g})")
+    show_grid = mo.ui.checkbox(value=True, label="Show Grid")
+
+    # Split the six toggles across two narrower rows so they don't span the full
+    # window width and wrap cleanly on smaller screens.
+    mo.vstack([
+        mo.hstack([show_current, show_fixed, show_obs], justify="space-between"),
+        mo.hstack([use_dimensionless, use_smoothing, show_grid], justify="space-between"),
+    ])
+    return (
+        show_current,
+        show_fixed,
+        show_grid,
+        show_obs,
+        use_dimensionless,
+        use_smoothing,
+    )
 
 
 @app.cell
@@ -509,6 +697,7 @@ def _(
         label="Run File Index:",
         show_value=True,
         include_input=True,
+        full_width=True,
         on_change=set_run_index
     )
 
@@ -524,6 +713,7 @@ def _(
         options={f"{angle}°": angle for angle in inclination_angles},
         value=f"{_selected_inclination}°" if _selected_inclination is not None else None,
         label="Inclination Angle:",
+        full_width=True,
         on_change=set_selected_inclination,
     )
 
@@ -543,6 +733,7 @@ def _(
         step=1.0,
         label="Wavelength Range (Å):",
         show_value=True,
+        full_width=True,
         on_change=set_wavelength_window,
     )
 
@@ -551,15 +742,18 @@ def _(
         options=["linear", "log", "continuum-normalised"],
         value=get_flux_scale_mode(),
         label="Flux Scale:",
+        full_width=True,
         on_change=set_flux_scale_mode,
     )
 
-    mo.hstack([
-        run_slider,
-        wavelength_range,
-        inclination_selector, 
-        flux_scale_selector
-    ], justify='space-between')
+    # Split the four controls across two rows of two. `widths="equal"` gives
+    # each control half the row, and `full_width=True` on the widgets makes them
+    # fill that half so the sliders span the available width instead of leaving a
+    # gap.
+    mo.vstack([
+        mo.hstack([run_slider, wavelength_range], widths="equal", gap=2),
+        mo.hstack([inclination_selector, flux_scale_selector], widths="equal", gap=2),
+    ])
     return flux_scale_selector, inclination_selector, wavelength_range
 
 
@@ -569,119 +763,6 @@ def _(get_run_index):
     # sequential slider and the parameter-dropdown navigation.
     current_run_index = get_run_index()
     return (current_run_index,)
-
-
-@app.cell
-def _(mo):
-    # Visibility and display options
-    # Smoothing sigma comes from the shared constant so the label matches the
-    # kernel applied in the plotting cell below (and in Training/Quick Fit).
-    from Speculate_addons.Spec_gridinterfaces import GAUSSIAN_SMOOTHING_SIGMA as _smooth_sigma
-
-    show_current = mo.ui.checkbox(value=True, label="Show Current Spectrum")
-    show_fixed = mo.ui.checkbox(value=True, label="Show Fixed Spectra")
-    show_obs = mo.ui.checkbox(value=False, label="Show Observational Spectra")
-    use_dimensionless = mo.ui.checkbox(value=False, label="Dimensionless Data")
-    use_smoothing = mo.ui.checkbox(value=True, label=f"Smooth Data (Gaussian σ={_smooth_sigma:g})")
-    show_grid = mo.ui.checkbox(value=True, label="Show Grid")
-
-    mo.hstack([show_current, show_fixed, show_obs, use_dimensionless, use_smoothing, show_grid], justify="space-between")
-    return (
-        show_current,
-        show_fixed,
-        show_grid,
-        show_obs,
-        use_dimensionless,
-        use_smoothing,
-    )
-
-
-@app.cell
-def _(mo):
-    # ── State initialisation ──
-    # pinned_spectra  – list of (run_index, inclination) tuples shown as
-    #                   fixed background traces in the plot
-    # run_index       – shared slider ↔ parameter-dropdown position
-    # inclination     – currently selected viewing angle
-    # flux_scale      – active y-axis transform mode
-    # wavelength_range – current wavelength crop used by the plot
-    # cache_tracker   – set of file paths downloaded from HuggingFace so
-    #                   the grid-switch cell can clean up stale archives
-    get_pinned_spectra, set_pinned_spectra = mo.state([])
-
-    # Initialize state for current run index (synced between slider and parameters)
-    get_run_index, set_run_index = mo.state(0)
-    get_selected_inclination, set_selected_inclination = mo.state(None)
-    get_flux_scale_mode, set_flux_scale_mode = mo.state("linear")
-    get_wavelength_window, set_wavelength_window = mo.state(None)
-
-    # Initialize cache tracker for HuggingFace downloads
-    cache_tracker_state = mo.state(set())
-    return (
-        cache_tracker_state,
-        get_flux_scale_mode,
-        get_pinned_spectra,
-        get_run_index,
-        get_selected_inclination,
-        get_wavelength_window,
-        set_flux_scale_mode,
-        set_pinned_spectra,
-        set_run_index,
-        set_selected_inclination,
-        set_wavelength_window,
-    )
-
-
-@app.cell
-def _(
-    current_run_index,
-    get_pinned_spectra,
-    inclination_selector,
-    mo,
-    set_pinned_spectra,
-):
-    # Define button callbacks
-    def add_current_spectrum():
-        current_combo = (current_run_index, inclination_selector.value)
-        current_list = list(get_pinned_spectra())
-        if current_combo not in current_list:
-            current_list.append(current_combo)
-            set_pinned_spectra(current_list)
-
-    def clear_all_spectra():
-        set_pinned_spectra([])
-
-    # Create buttons with on_click callbacks
-    add_spectrum_btn = mo.ui.button(
-        label=f"{mo.icon('lucide:plus-circle')} Pin Grid Spectrum", 
-        kind="success",
-        on_click=lambda _: add_current_spectrum()
-    )
-    clear_spectra_btn = mo.ui.button(
-        label=f"{mo.icon('lucide:trash-2')} Clear All", 
-        kind="danger",
-        on_click=lambda _: clear_all_spectra()
-    )
-
-    mo.hstack([add_spectrum_btn, clear_spectra_btn], justify="start", gap=1)
-    return
-
-
-@app.cell
-def _(get_pinned_spectra, mo):
-    # Display pinned spectra status
-    pinned_spectra_indices = list(get_pinned_spectra())
-    num_pinned = len(pinned_spectra_indices)
-
-    # Display status message
-    if num_pinned > 0:
-        pinned_labels = [f"run{run}@{inc}°" for run, inc in pinned_spectra_indices]
-        status_msg = mo.md(f"{mo.icon('lucide:pin')} **Pinned Spectra**: {num_pinned} ({', '.join(pinned_labels)})")
-    else:
-        status_msg = mo.md("_No pinned spectra_")
-
-    status_msg
-    return (pinned_spectra_indices,)
 
 
 @app.cell
@@ -1001,7 +1082,7 @@ def _(
                 {"test": alt.datum.Type == 'Observational', "value": 1.0}
             ])
         ).properties(
-            width=850,
+            width="container",
             height=500,
             title=f'Spectral Data Exploration - {selected_grid}',
             background='white'
@@ -1024,13 +1105,65 @@ def _(
             x='x:Q',
             y='y:Q'
         ).properties(
-            width=850,
+            width="container",
             height=500,
             title='No spectra to display'
         )
 
     spectrum_chart
     return
+
+
+@app.cell
+def _(
+    current_run_index,
+    get_pinned_spectra,
+    inclination_selector,
+    mo,
+    set_pinned_spectra,
+):
+    # Define button callbacks
+    def add_current_spectrum():
+        current_combo = (current_run_index, inclination_selector.value)
+        current_list = list(get_pinned_spectra())
+        if current_combo not in current_list:
+            current_list.append(current_combo)
+            set_pinned_spectra(current_list)
+
+    def clear_all_spectra():
+        set_pinned_spectra([])
+
+    # Create buttons with on_click callbacks
+    add_spectrum_btn = mo.ui.button(
+        label=f"{mo.icon('lucide:plus-circle')} Pin Grid Spectrum", 
+        kind="success",
+        on_click=lambda _: add_current_spectrum()
+    )
+    clear_spectra_btn = mo.ui.button(
+        label=f"{mo.icon('lucide:trash-2')} Clear All", 
+        kind="danger",
+        on_click=lambda _: clear_all_spectra()
+    )
+
+    mo.hstack([add_spectrum_btn, clear_spectra_btn], justify="start", gap=1)
+    return
+
+
+@app.cell
+def _(get_pinned_spectra, mo):
+    # Display pinned spectra status
+    pinned_spectra_indices = list(get_pinned_spectra())
+    num_pinned = len(pinned_spectra_indices)
+
+    # Display status message
+    if num_pinned > 0:
+        pinned_labels = [f"run{run}@{inc}°" for run, inc in pinned_spectra_indices]
+        status_msg = mo.md(f"{mo.icon('lucide:pin')} **Pinned Spectra**: {num_pinned} ({', '.join(pinned_labels)})")
+    else:
+        status_msg = mo.md("_No pinned spectra_")
+
+    status_msg
+    return (pinned_spectra_indices,)
 
 
 @app.cell
@@ -1137,150 +1270,47 @@ def _(
 
 @app.cell
 def _(mo):
-    mo.md("""
-    ---
-    ## Usage Guide
+    mo.accordion({
+        f"{mo.icon('lucide:book-open')} Usage Guide": mo.md("""
+    ### Grid & Data Selection
+    - **Select Grid Dataset**: Choose which Sirocco spectral grid to browse.
+    - **Select Observational Spectrum**: Pick an observation CSV to overlay on the plot.
+    - **Delete Selected**: Remove the selected uploaded observation file (built-in CV examples are protected).
+    - **Drag and drop a new observational spectra (CSV)**: Upload your own observation (headers `WAVELENGTH`, `FLUX`, optional `ERROR`).
 
-    ### Navigation
-    - **Slider**: Drag to browse through spectra sequentially
-    - **Index Input**: Jump directly to a specific spectrum by index
-    - **Pin Spectrum**: Pin the current spectrum for comparison
-    - **Clear All**: Remove all pinned spectra
+    ### Display Toggles
+    - **Show Current Spectrum**: Toggle visibility of the spectrum at the current run/inclination.
+    - **Show Fixed Spectra**: Toggle visibility of all pinned spectra.
+    - **Show Observational Spectra**: Overlay the selected observation file (red trace).
+    - **Dimensionless Data**: Normalise (mean-centred) so spectra are compared by shape, not absolute flux.
+    - **Smooth Data (Gaussian σ)**: Apply the same Gaussian smoothing used by Training/Quick Fit.
+    - **Show Grid**: Toggle the plot's gridlines.
 
-    ### Display Options
-    - **Show Current Spectrum**: Toggle visibility of the active spectrum
-    - **Show Fixed Spectra**: Toggle visibility of all pinned spectra
-    - **Dimensionless Data**: Normalize spectra (mean-centered) for comparison
+    ### Interactive Controls
+    - **Run File Index** (slider + input): Drag to browse runs sequentially, or type an index to jump directly.
+    - **Wavelength Range (Å)**: Crop the plotted wavelength window (edges trimmed by 10 Å to avoid Sirocco artifacts).
+    - **Inclination Angle**: Choose the observer viewing angle (flux column) to display.
+    - **Flux Scale**: Switch between `linear`, `log`, and `continuum-normalised` y-axis.
+
+    ### Pinning & Parameter Navigation
+    - **Pin Grid Spectrum**: Pin the current run/inclination as a fixed background trace for comparison.
+    - **Clear All**: Remove every pinned spectrum.
+    - **Parameter dropdowns**: Jump to the nearest valid run for a chosen parameter value (hierarchical match — earlier parameters take priority). Not every combination exists in the grid.
 
     ### Performance Notes
-    - Spectra are cached within a grid session for fast browsing
-    - Each spectrum is ~2.5MB, first load from cloud, then cached
-    - Cache automatically cleared when switching grids
-    - HuggingFace Space: ~1-2s first load, <0.5s cached loads
+    - Spectra are cached within a grid session for fast browsing.
+    - Each spectrum is ~2.5 MB: first load streams from the cloud, then is cached.
+    - The cache is automatically cleared when switching grids.
+    - HuggingFace Space: ~1–2 s first load, <0.5 s for cached loads.
 
     ### Tips
-    - Pin interesting spectra before changing parameters
-    - Use dimensionless mode to compare spectral shapes
-    - The interactive plot supports zoom, pan, and save
+    - Pin interesting spectra before changing parameters.
+    - Use dimensionless mode to compare spectral shapes regardless of flux level.
+    - The interactive plot supports zoom, pan, and save.
     """)
+    })
     return
 
-
-@app.cell
-def _(mo):
-    get_obs_refresh, set_obs_refresh = mo.state(0)
-    return get_obs_refresh, set_obs_refresh
-
-
-@app.cell
-def _(mo):
-    # File upload for observational spectra
-    obs_file_uploader = mo.ui.file(
-        kind="area",
-        label="**Drag and drop a new observational spectra (CSV)**",
-        multiple=False
-    )
-
-    file_upload_ui = mo.vstack([
-         obs_file_uploader,
-         mo.md("<center><small>Format: CSV with headers `WAVELENGTH`, `FLUX`, and optionally `ERROR`</small></center>")
-    ])
-    return file_upload_ui, obs_file_uploader
-
-
-@app.cell
-def _(mo, obs_file_uploader, os, set_obs_refresh):
-    # Handle file upload
-    if obs_file_uploader.value:
-        save_dir = "observation_files"
-        os.makedirs(save_dir, exist_ok=True)
-
-        files = obs_file_uploader.value
-        # Check if it's a single file (has 'name' attribute) or a list/tuple
-        if hasattr(files, "name"):
-            files = [files]
-
-        for file in files:
-            save_path = os.path.join(save_dir, file.name)
-            with open(save_path, "wb") as file_handle:
-                file_handle.write(file.contents)
-            mo.md(f"{mo.icon('lucide:check-circle')} Uploaded `{file.name}` to `{save_dir}`")
-
-        # Trigger refresh of the file list
-        set_obs_refresh(lambda v: v + 1)
-    return
-
-
-@app.cell
-def _(get_obs_refresh, obs_file_uploader, os):
-    # Select observational spectrum - File List Calculation
-    import glob
-
-    # Trigger refresh on upload or delete
-    _ = obs_file_uploader.value
-    _ = get_obs_refresh()
-
-    obs_dir = "observation_files"
-    if os.path.exists(obs_dir):
-        obs_files = sorted([os.path.basename(f) for f in glob.glob(os.path.join(obs_dir, "*.csv"))])
-    else:
-        obs_files = []
-    return (obs_files,)
-
-
-@app.cell
-def _(mo, obs_files):
-    # Select observational spectrum - Dropdown Creation
-    obs_file_selector = mo.ui.dropdown(
-        options=obs_files,
-        value=obs_files[0] if obs_files else None,
-        label="Select Observational Spectrum:"
-    )
-    return (obs_file_selector,)
-
-
-@app.cell
-def _(mo, obs_file_selector, os, set_obs_refresh):
-    # Select observational spectrum - Delete Action
-    def delete_selected_file():
-        protected_files = [
-            "CV:ixvel_all.csv", 
-            "CV:rwsex_all.csv", 
-            "CV:rwtri_dered.csv", 
-            "CV:uxuma_all.csv", 
-            "CV:v3885sgr_all.csv"
-        ]
-
-        if obs_file_selector.value:
-            if obs_file_selector.value in protected_files:
-                return
-
-            save_dir = "observation_files"
-            file_path = os.path.join(save_dir, obs_file_selector.value)
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                    set_obs_refresh(lambda v: v + 1)
-                except Exception:
-                    pass
-
-    delete_obs_btn = mo.ui.button(
-        label=f"{mo.icon('lucide:trash-2')} Delete Selected",
-        kind="danger",
-        on_click=lambda _: delete_selected_file()
-    )
-    return (delete_obs_btn,)
-
-
-@app.cell
-def _(delete_obs_btn, file_upload_ui, mo, obs_file_selector):
-    # Select observational spectrum - Layout
-    mo.vstack([
-        mo.md("## Observational Data:"),
-        mo.hstack([obs_file_selector, delete_obs_btn], align="end"),
-        file_upload_ui,
-    ])
-    return
 
 
 if __name__ == "__main__":
