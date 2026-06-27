@@ -17,7 +17,7 @@ pandas==2.3.3
 numpy==2.2.6
 pyarrow==22.0.0
 scipy==1.16.3
-flatdict==4.0.1
+flatdict==4.1.0
 toml==0.10.2
 
 # Visualization
