@@ -252,7 +252,8 @@ def _(hf_mode_switch, is_hf_space_nav, mo, usage_bars):
         _items.extend([hf_mode_switch])
 
     _items.extend([mo.md("---"), usage_bars])
-    mo.sidebar(mo.vstack(_items))
+
+    mo.sidebar(mo.vstack(_items, gap=0.5), width="20rem")
     return
 
 

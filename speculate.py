@@ -179,7 +179,7 @@ def _(hf_mode_switch, is_hf_space, mo, usage_bars):
 
     sidebar_items.extend([mo.md("---"), usage_bars])
 
-    mo.sidebar(mo.vstack(sidebar_items))
+    mo.sidebar(mo.vstack(sidebar_items, gap=0.5), width="20rem")
     return (current_mode,)
 
 
