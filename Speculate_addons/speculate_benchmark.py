@@ -114,15 +114,23 @@ def build_tier2_freeze_defaults(param_names: Sequence[str], grid_name: Optional[
 
     Grid parameter labels depend on the active registry entry, while nuisance
     labels stay shared across grids.
+
+    Tier 2 fits synthetic test-grid spectra, which carry no extinction and share
+    the reference distance, so Av and Distance (``log_scale``) default to FIXED
+    while the Chebyshev tilt and GP covariance terms (``cheb:1``,
+    ``global_cov:log_amp``, ``global_cov:log_ls``) default to FREE — for both the
+    MLE and MCMC stages.
     """
     label_map = build_tier2_label_map(param_names, grid_name)
+    _default_frozen = ("Av", "log_scale")
+
     mle = {label: False for label in label_map}
-    for mle_label in ("Av", "log_scale", "cheb:1"):
-        if mle_label in mle:
-            mle[mle_label] = True
+    for label in _default_frozen:
+        if label in mle:
+            mle[label] = True
 
     mcmc = {label: False for label in label_map}
-    for label in ("Av", "log_scale", "cheb:1", "global_cov:log_amp", "global_cov:log_ls"):
+    for label in _default_frozen:
         if label in mcmc:
             mcmc[label] = True
 
@@ -2418,10 +2426,15 @@ def run_tier3_single(
     # MCMC
     if mcmc_iteration_callback is not None:
         mcmc_iteration_callback(0, mcmc_steps, 0.0)
+    # Tier 3 fits real observational spectra, where every nuisance parameter
+    # carries physical information (extinction, distance, continuum tilt, and GP
+    # covariance).  Following the migration to including nuisance parameters in
+    # inference, the MCMC samples them all rather than freezing them at their MLE
+    # values.
     mcmc = run_mcmc_single(
         model, priors,
         nwalkers=mcmc_walkers, nsteps=mcmc_steps, burnin=mcmc_burnin,
-        freeze_nuisance=True,
+        freeze_nuisance=False,
         iteration_callback=mcmc_iteration_callback,
         grid_name=grid_name,
     )

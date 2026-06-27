@@ -2069,7 +2069,7 @@ def _(
 
 
 @app.cell
-def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_sirocco_sigma, emu, estimate_log_amp_centre_from_sigma, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
+def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_sirocco_sigma, data_source_selector, emu, estimate_log_amp_centre_from_sigma, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
     # ── Stage 2: Prior & Parameter Setup ──
     # Build per-parameter UI widgets (fixed/free toggle, value, min, max) that
     # drive the prior construction in Stage 3.  Parameters fall into two groups:
@@ -2237,10 +2237,23 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
         label="I have entered the target distance and uncertainty",
     )
 
+    # Default fix/free tickboxes reflect the migration to including the nuisance
+    # parameters in inference:
+    #   • Test-grid (synthetic validation) spectra: Av and Distance (log_scale)
+    #     default to FIXED — the synthetic spectra carry no extinction and share
+    #     the 100 pc reference distance — while the Chebyshev tilt and GP
+    #     covariance terms (cheb_1, log_amp, log_ls) default to FREE.
+    #   • Observational spectra: every nuisance parameter defaults to FREE.
+    # Grid (physical) parameters always default to FREE.  Continuum-normalised
+    # fits still pin Distance because the overall flux scale is degenerate there.
+    _is_test_grid = "Test Grid" in (data_source_selector.value or "")
     _fix_distance_for_shape_only = obs_flux_scale.value == "continuum-normalised"
+    _default_fixed = {"Av", "log_scale"} if _is_test_grid else set()
+    if _fix_distance_for_shape_only:
+        _default_fixed.add("log_scale")
     for _name in param_names:
         _fix_dict[_name] = mo.ui.checkbox(
-            value=(_name == 'log_scale' and _fix_distance_for_shape_only)
+            value=(_name in _default_fixed)
         )
 
         mn, mx = bounds.get(_name, [0.0, 1.0])
@@ -3737,19 +3750,27 @@ def _(
                     if not _has_any:
                         _truths = None
 
-                _fig_corner = _corner.corner(
-                    _burn_samples_display,
-                    labels=_friendly_labels,
-                    show_titles=True,
-                    quantiles=_corner_quantiles,
-                    levels=_corner_levels,
-                    title_fmt=".4f",
-                    truths=_truths,
-                    truth_color="#ff4444",
-                    truth_kwargs={"linewidth": 2},
-                )
-                for _ax in _fig_corner.axes:
-                    _ax.grid(False)
+                # Shared corner-plot builder so every variant (auto-range,
+                # full-prior, and their marginalised versions) looks identical.
+                def _corner_fig(_data, _lbls, _tr, _rng=None):
+                    _kw = dict(
+                        labels=_lbls,
+                        show_titles=True,
+                        quantiles=_corner_quantiles,
+                        levels=_corner_levels,
+                        title_fmt=".4f",
+                        truths=_tr,
+                        truth_color="#ff4444",
+                        truth_kwargs={"linewidth": 2},
+                    )
+                    if _rng is not None:
+                        _kw["range"] = _rng
+                    _f = _corner.corner(_data, **_kw)
+                    for _axis in _f.axes:
+                        _axis.grid(False)
+                    return _f
+
+                _fig_corner = _corner_fig(_burn_samples_display, _friendly_labels, _truths)
 
                 # Prior-range corner plot: axes span the full prior support so
                 # the user can judge posterior breadth relative to the prior.
@@ -3770,30 +3791,57 @@ def _(
                             _prior_ranges.append((_lo, _hi))
                     else:
                         _prior_ranges.append(None)
-                # Only build the second plot if we resolved at least one range
-                if any(_r is not None for _r in _prior_ranges):
+
+                # Marginalised variants drop only the GP covariance and Chebyshev
+                # nuisance terms — physical grid parameters plus Av and Distance
+                # are kept.  Columns follow _model.labels / _friendly_labels order,
+                # so we pick the surviving columns by index.
+                _marginalise_hide = {
+                    "cheb:1", "cheb_1",
+                    "global_cov:log_amp", "GP log_amp",
+                    "global_cov:log_ls", "GP log_ls",
+                }
+                _keep_cols = [
+                    _ci for _ci in range(len(_friendly_labels))
+                    if str(_model.labels[_ci]) not in _marginalise_hide
+                    and str(_friendly_labels[_ci]) not in _marginalise_hide
+                ]
+                _has_nuisance = 0 < len(_keep_cols) < len(_friendly_labels)
+                _has_prior = any(_r is not None for _r in _prior_ranges)
+
+                # Assemble the available corner-plot tabs.  Marginalised tabs only
+                # appear when there is a nuisance term to drop.
+                _corner_tabs = {"Posterior (Auto Range)": _fig_corner}
+                _corner_variants = ["posterior_auto_range"]
+
+                if _has_prior:
                     # Replace None entries with auto-range sentinel (corner uses 0.999 quantile)
                     _safe_ranges = [_r if _r is not None else (1.0,) for _r in _prior_ranges]
-                    _fig_corner_prior = _corner.corner(
-                        _burn_samples_display,
-                        labels=_friendly_labels,
-                        show_titles=True,
-                        quantiles=_corner_quantiles,
-                        levels=_corner_levels,
-                        title_fmt=".4f",
-                        truths=_truths,
-                        truth_color="#ff4444",
-                        truth_kwargs={"linewidth": 2},
-                        range=_safe_ranges,
+                    _corner_tabs["Full Prior Range"] = _corner_fig(
+                        _burn_samples_display, _friendly_labels, _truths, _safe_ranges
                     )
-                    for _ax in _fig_corner_prior.axes:
-                        _ax.grid(False)
-                    _corner_display = mo.ui.tabs({
-                        "Posterior (Auto Range)": _fig_corner,
-                        "Full Prior Range": _fig_corner_prior,
-                    })
-                else:
-                    _corner_display = _fig_corner
+                    _corner_variants.append("full_prior_range")
+
+                if _has_nuisance:
+                    _marg_samples = _burn_samples_display[:, _keep_cols]
+                    _marg_labels = [_friendly_labels[_ci] for _ci in _keep_cols]
+                    _marg_truths = (
+                        [_truths[_ci] for _ci in _keep_cols] if _truths is not None else None
+                    )
+                    _corner_tabs["Marginalised (Auto Range)"] = _corner_fig(
+                        _marg_samples, _marg_labels, _marg_truths
+                    )
+                    _corner_variants.append("marginalised_auto_range")
+                    if _has_prior:
+                        _marg_ranges = [_safe_ranges[_ci] for _ci in _keep_cols]
+                        _corner_tabs["Marginalised (Full Prior Range)"] = _corner_fig(
+                            _marg_samples, _marg_labels, _marg_truths, _marg_ranges
+                        )
+                        _corner_variants.append("marginalised_full_prior_range")
+
+                _corner_display = (
+                    mo.ui.tabs(_corner_tabs) if len(_corner_tabs) > 1 else _fig_corner
+                )
 
                 set_mcmc_corner_meta({
                     "source": "inference",
@@ -3805,12 +3853,7 @@ def _(
                         list(_r) if _r is not None else None
                         for _r in _prior_ranges
                     ],
-                    "plot_variants": [
-                        "posterior_auto_range",
-                        "full_prior_range",
-                    ] if any(_r is not None for _r in _prior_ranges) else [
-                        "posterior_auto_range"
-                    ],
+                    "plot_variants": list(_corner_variants),
                     "corner_settings": {
                         "show_titles": True,
                         "quantiles": list(_corner_quantiles),

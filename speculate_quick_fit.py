@@ -2058,6 +2058,20 @@ def _(
         _pidx = int(_m.group(1)) if _m else 0
         return _param_map_db[_pidx][0] if _pidx in _param_map_db else str(_pn)
 
+    # Parameters stored on a log10 grid get a log₁₀(...) wrapper on their plot
+    # axis label so the weight-diagnostic x-axis reads correctly, matching the
+    # GP weight diagnostics in speculate_training.py.  The plain label (no
+    # wrapper) is kept for tooltips and parameter selectors.
+    from Speculate_addons.grid_registry import log_param_ids as _log_param_ids
+    _logged_param_ids = _log_param_ids(qf_pca_data.get("grid_name"))
+
+    def _get_param_axis_label(p_idx):
+        _pn = _param_names[p_idx] if p_idx < len(_param_names) else f"param_{p_idx}"
+        _m = re.search(r"(\d+)", str(_pn))
+        _pidx = int(_m.group(1)) if _m else 0
+        _label = _get_param_label(p_idx)
+        return f"log₁₀({_label})" if _pidx in _logged_param_ids else _label
+
     _unique_per_dim = [np.sort(np.unique(_X_grid[:, d])) for d in range(_n_params)]
 
     _type_label = ("Grid Interpolation (Linear)" if _source == "grid_interp"
@@ -2614,6 +2628,7 @@ def _(
 
     # Store shared diagnostics data for the reactive chart cells below.
     _param_labels = [_get_param_label(i) for i in range(_n_params)]
+    _param_axis_labels = [_get_param_axis_label(i) for i in range(_n_params)]
     qf_diag_data = {
         "source": _source,
         "X_grid": _X_grid,
@@ -2622,6 +2637,7 @@ def _(
         "n_params": _n_params,
         "N": _N,
         "param_labels": _param_labels,
+        "param_axis_labels": _param_axis_labels,
         "unique_per_dim": _unique_per_dim,
     }
 
@@ -2727,6 +2743,7 @@ def _(
     _n_params = qf_diag_data["n_params"]
     _N = qf_diag_data["N"]
     _param_labels = qf_diag_data["param_labels"]
+    _param_axis_labels = qf_diag_data["param_axis_labels"]
     _unique_per_dim = qf_diag_data["unique_per_dim"]
 
     # Read UI control values
@@ -2737,7 +2754,10 @@ def _(
     if _comp_end < _comp_start:
         _comp_end = _comp_start
 
+    # Plain label for tooltips; log₁₀(...)-wrapped label for the x-axis title
+    # when the varying parameter is stored on a log10 grid.
     _xlabel = _param_labels[_not_fixed_col]
+    _xlabel_axis = _param_axis_labels[_not_fixed_col]
 
     # Build fixed parameter values: for each dimension, map the slider position
     # proportionally into that dimension's unique values.  This ensures that
@@ -2818,7 +2838,7 @@ def _(
         _scatter = alt.Chart(_scatter_df).mark_circle(
             size=60, color='#3b82f6', opacity=0.8,
         ).encode(
-            x=alt.X('x:Q', title=_xlabel, scale=alt.Scale(zero=False)),
+            x=alt.X('x:Q', title=_xlabel_axis, scale=alt.Scale(zero=False)),
             y=alt.Y('weight:Q', title=f'Weight {_comp}', scale=alt.Scale(zero=False)),
             tooltip=[alt.Tooltip('x:Q', title=_xlabel, format='.4f'),
                      alt.Tooltip('weight:Q', title='Weight', format='.4e')],
@@ -4093,10 +4113,18 @@ def _(
         qf_obs_scale_selector.value == "continuum-normalised"
         or _model_flux_scale == "continuum-normalised"
     )
+    # Default fix/free tickboxes follow the migration to including nuisance
+    # parameters in inference:
+    #   • Test-grid spectra: Av and Distance default to FIXED (synthetic spectra
+    #     carry no extinction and share the 100 pc reference distance), while the
+    #     Chebyshev continuum tilt defaults to FREE.
+    #   • Observational spectra: every nuisance parameter defaults to FREE.
+    # Continuum-normalised fits still pin Distance because the flux scale is
+    # degenerate there.  (Quick Fit has no GP covariance nuisance parameters.)
     _nuisance = [
         ("Av",        0.0,         0.0,               2.0, _is_test_grid_data),
         ("Distance (pc)", 100.0, 90.0, 110.0, _is_test_grid_data or _fix_distance_for_shape_only),
-        ("cheb_1",    0.0,         -0.5,              0.5, True),
+        ("cheb_1",    0.0,         -0.5,              0.5, False),
     ]
     for _name, _val, _lo, _hi, _fixed_default in _nuisance:
         _labels.append(_name)

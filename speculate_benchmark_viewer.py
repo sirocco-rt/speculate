@@ -1512,21 +1512,43 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
         else:
             _truths.append(None)
 
-    _fig = _corner.corner(
-        _samples,
-        labels=_labels,
-        show_titles=True,
-        quantiles=[0.16, 0.5, 0.84],
-        levels=[0.6827, 0.9545, 0.9973],
-        title_fmt=".4f",
-        truths=_truths if _has_any_truth else None,
-        truth_color="#ff4444",
-        truth_kwargs={"linewidth": 2},
-    )
+    # Shared corner-plot builder so every variant looks identical.
+    def _corner_fig(_data, _lbls, _tr, _rng=None):
+        _kw = dict(
+            labels=_lbls,
+            show_titles=True,
+            quantiles=[0.16, 0.5, 0.84],
+            levels=[0.6827, 0.9545, 0.9973],
+            title_fmt=".4f",
+            truths=_tr,
+            truth_color="#ff4444",
+            truth_kwargs={"linewidth": 2},
+        )
+        if _rng is not None:
+            _kw["range"] = _rng
+        return _corner.corner(_data, **_kw)
+
+    _plot_truths = _truths if _has_any_truth else None
+    _fig = _corner_fig(_samples, _labels, _plot_truths)
+
+    # Marginalised variants drop only the GP covariance and Chebyshev nuisance
+    # terms; physical grid parameters plus Av and Distance are kept.  Labels are
+    # already the friendly forms, so match against the friendly nuisance names.
+    _marginalise_hide = {
+        "cheb:1", "cheb_1",
+        "global_cov:log_amp", "GP log_amp",
+        "global_cov:log_ls", "GP log_ls",
+    }
+    _keep_cols = [
+        _ci for _ci in range(len(_labels))
+        if str(_labels[_ci]) not in _marginalise_hide
+    ]
+    _has_nuisance = 0 < len(_keep_cols) < len(_labels)
 
     # Prior-range corner plot: axes span the full emulator grid bounds so
     # the user can judge posterior breadth relative to the full prior.
     _pr_dict = _post.get("prior_ranges", {})
+    _pr_list = None
     if _pr_dict:
         _pr_list = []
         for _lbl in _labels:
@@ -1542,24 +1564,38 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
                     _pr_list.append((_lo, _hi))
                     continue
             _pr_list.append(1.0)
-        _fig_prior = _corner.corner(
-            _samples,
-            labels=_labels,
-            show_titles=True,
-            quantiles=[0.16, 0.5, 0.84],
-            levels=[0.6827, 0.9545, 0.9973],
-            title_fmt=".4f",
-            truths=_truths if _has_any_truth else None,
-            truth_color="#ff4444",
-            truth_kwargs={"linewidth": 2},
-            range=_pr_list,
+
+    _has_prior = _pr_list is not None
+
+    # Assemble the available corner-plot tabs.  Marginalised tabs only appear
+    # when there is actually a nuisance term to drop.
+    _corner_tabs = {
+        "Posterior (Auto Range)": render_fixed_matplotlib(mo, _fig, width_px=920),
+    }
+    if _has_prior:
+        _fig_prior = _corner_fig(_samples, _labels, _plot_truths, _pr_list)
+        _corner_tabs["Full Prior Range"] = render_fixed_matplotlib(mo, _fig_prior, width_px=920)
+
+    if _has_nuisance:
+        _marg_samples = np.asarray(_samples)[:, _keep_cols]
+        _marg_labels = [_labels[_ci] for _ci in _keep_cols]
+        _marg_truths = (
+            [_plot_truths[_ci] for _ci in _keep_cols] if _plot_truths is not None else None
         )
-        _corner_display = mo.ui.tabs({
-            "Posterior (Auto Range)": render_fixed_matplotlib(mo, _fig, width_px=920),
-            "Full Prior Range": render_fixed_matplotlib(mo, _fig_prior, width_px=920),
-        })
-    else:
-        _corner_display = render_fixed_matplotlib(mo, _fig, width_px=920)
+        _corner_tabs["Marginalised (Auto Range)"] = render_fixed_matplotlib(
+            mo, _corner_fig(_marg_samples, _marg_labels, _marg_truths), width_px=920
+        )
+        if _has_prior:
+            _marg_ranges = [_pr_list[_ci] for _ci in _keep_cols]
+            _corner_tabs["Marginalised (Full Prior Range)"] = render_fixed_matplotlib(
+                mo, _corner_fig(_marg_samples, _marg_labels, _marg_truths, _marg_ranges),
+                width_px=920,
+            )
+
+    _corner_display = (
+        mo.ui.tabs(_corner_tabs) if len(_corner_tabs) > 1
+        else render_fixed_matplotlib(mo, _fig, width_px=920)
+    )
 
     _conv_tag = "converged" if _converged else "**not converged**"
     _summary_rows = []
@@ -1914,14 +1950,39 @@ def _(get_tier3_posteriors, mo, np, os, render_fixed_matplotlib, t3_observation_
         mo.md("*Tier 3 posterior artifact has no samples to plot.*"),
     )
 
-    _fig = _corner.corner(
-        _samples,
-        labels=_labels,
-        show_titles=True,
-        quantiles=[0.16, 0.5, 0.84],
-        levels=[0.6827, 0.9545, 0.9973],
-        title_fmt=".4f",
-    )
+    def _corner_fig(_data, _lbls):
+        return _corner.corner(
+            _data,
+            labels=_lbls,
+            show_titles=True,
+            quantiles=[0.16, 0.5, 0.84],
+            levels=[0.6827, 0.9545, 0.9973],
+            title_fmt=".4f",
+        )
+
+    _fig = _corner_fig(_samples, _labels)
+
+    # Marginalised view drops only the GP covariance and Chebyshev nuisance
+    # terms; physical grid parameters plus Av and Distance are kept.  Tier 3 has
+    # no prior-range view, so only the auto-range variants are offered.
+    _marginalise_hide = {
+        "cheb:1", "cheb_1",
+        "global_cov:log_amp", "GP log_amp",
+        "global_cov:log_ls", "GP log_ls",
+    }
+    _keep_cols = [
+        _ci for _ci in range(len(_labels))
+        if str(_labels[_ci]) not in _marginalise_hide
+    ]
+    if 0 < len(_keep_cols) < len(_labels):
+        _marg_fig = _corner_fig(np.asarray(_samples)[:, _keep_cols],
+                                [_labels[_ci] for _ci in _keep_cols])
+        _corner_display = mo.ui.tabs({
+            "Posterior (Auto Range)": render_fixed_matplotlib(mo, _fig, width_px=920),
+            "Marginalised (Auto Range)": render_fixed_matplotlib(mo, _marg_fig, width_px=920),
+        })
+    else:
+        _corner_display = render_fixed_matplotlib(mo, _fig, width_px=920)
 
     def _fmt_metric(_value, _fmt):
         try:
@@ -1966,7 +2027,7 @@ def _(get_tier3_posteriors, mo, np, os, render_fixed_matplotlib, t3_observation_
         mo.md(f"### {_post.get('obs_file', '?')} @ {_inc_display} deg"),
         mo.ui.table(_metrics, label="Fit Metrics", selection=None),
         mo.ui.table(_rows, label="Posterior Summary", selection=None),
-        render_fixed_matplotlib(mo, _fig, width_px=920),
+        _corner_display,
     ])
     return
 
@@ -2831,7 +2892,7 @@ def _(glob, mo, os):
 
 
 @app.cell(hide_code=True)
-def _(emu_picker, glob, mo, os, re):
+def _(emu_picker, glob, mo, np, os, re):
     """Auto-populate grid and test-grid paths from the emulator selection."""
     _emu_val = emu_picker.value or ""
     _emu_base = os.path.basename(_emu_val)
@@ -2852,6 +2913,36 @@ def _(emu_picker, glob, mo, os, re):
         options=["linear", "log", "continuum-normalised"],
         value=_detected_scale,
         label="Flux Transform",
+    )
+
+    # --- Tier 3 fitting wavelength-range slider ---
+    # Tier 3 fits each observation over the selected emulator's wavelength
+    # coverage by default, but the user can shrink this window so the
+    # observation, MLE/MCMC fit, and Sirocco simulation are all restricted to a
+    # narrower band.  Read just the stored wavelength array from the NPZ (cheap,
+    # lazy load) to set accurate slider bounds rather than loading the whole
+    # emulator, which only happens once the run actually starts.  Bounds come
+    # from the real wavelength grid (not the rounded filename tag) so the default
+    # full-range selection stays inside the emulator's coverage.
+    _wl_lo_default, _wl_hi_default = 800.0, 8000.0
+    if _emu_val and os.path.isfile(_emu_val):
+        try:
+            with np.load(_emu_val, allow_pickle=True) as _emu_npz:
+                _emu_wl = _emu_npz["wavelength"]
+            _wl_lo_default = float(np.nanmin(_emu_wl))
+            _wl_hi_default = float(np.nanmax(_emu_wl))
+        except Exception:
+            # Fall back to generic bounds if the NPZ lacks a wavelength array.
+            pass
+
+    tier3_wl_range_slider = mo.ui.range_slider(
+        start=_wl_lo_default,
+        stop=_wl_hi_default,
+        value=[_wl_lo_default, _wl_hi_default],
+        step=1.0,
+        label="Tier 3 Fitting Wavelength Range (Å):",
+        show_value=True,
+        full_width=True,
     )
 
     matched_grid_path = ""
@@ -2915,7 +3006,14 @@ def _(emu_picker, glob, mo, os, re):
                    "Expected pattern: `{stem}_emu_{params}_{inc}inc_{wl}_{PCA}PCA.npz`"),
             kind="warn",
         )
-    return emu_grid_info, flux_scale_picker, matched_grid_name, matched_grid_path, matched_testgrid_path
+    return (
+        emu_grid_info,
+        flux_scale_picker,
+        matched_grid_name,
+        matched_grid_path,
+        matched_testgrid_path,
+        tier3_wl_range_slider,
+    )
 
 
 @app.cell(hide_code=True)
@@ -2986,6 +3084,7 @@ def _(
     obs_picker,
     sirocco_cpu_slider,
     tier3_distance_prior_controls,
+    tier3_wl_range_slider,
     tier_picker,
 ):
     mo.vstack([
@@ -2995,6 +3094,7 @@ def _(
         mo.hstack([obs_picker], gap=1),
         tier3_distance_prior_controls,
         mo.vstack([inclination_picker, max_spectra_slider, mle_restarts_slider, mcmc_steps_slider], gap=1),
+        tier3_wl_range_slider,
         sirocco_cpu_slider,
     ])
     return
@@ -3171,6 +3271,7 @@ def _(
     tier2_mcmc_freeze,
     tier2_mle_freeze,
     tier3_distance_prior_widgets,
+    tier3_wl_range_slider,
     tier_picker,
     time,
 ):
@@ -3259,7 +3360,21 @@ def _(
         # use the same setting even if only one tier is selected.
         _flux_scale = flux_scale_picker.value
         _grid_name = matched_grid_name or None
-        _tier3_wl_range = (float(_np.nanmin(_emu.wl)), float(_np.nanmax(_emu.wl)))
+        # Tier 3 fitting window: default to the full emulator coverage, but
+        # honour the wavelength-range slider so the observation, MLE/MCMC fit,
+        # and Sirocco simulation are all restricted to the selected sub-range.
+        # Clamp the slider values to the loaded emulator's true bounds so float
+        # rounding from the slider step never pushes the request outside coverage
+        # (which run_tier3_single rejects to avoid spline extrapolation).
+        _emu_wl_min = float(_np.nanmin(_emu.wl))
+        _emu_wl_max = float(_np.nanmax(_emu.wl))
+        _slider_wl = tier3_wl_range_slider.value
+        if _slider_wl is not None:
+            _wl_lo = max(_emu_wl_min, float(_slider_wl[0]))
+            _wl_hi = min(_emu_wl_max, float(_slider_wl[1]))
+            _tier3_wl_range = (_wl_lo, _wl_hi)
+        else:
+            _tier3_wl_range = (_emu_wl_min, _emu_wl_max)
         _tier2_defaults = _build_tier2_freeze_defaults(_emu.param_names, _grid_name)
         _tier2_mle_freeze_settings = dict(tier2_mle_freeze.value or _tier2_defaults["mle"])
         _tier2_mcmc_freeze_settings = dict(tier2_mcmc_freeze.value or _tier2_defaults["mcmc"])
