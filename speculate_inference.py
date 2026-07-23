@@ -1244,12 +1244,17 @@ def _(
                 })
                 mo.status.toast("Loaded ground truth into the Parameter Playground")
 
-            _gt_export_btn = mo.ui.button(
+            # Keep callback widgets publicly bound so Marimo registers their
+            # on_click handlers with the reactive runtime.
+            inf_ground_truth_playground_export_button = mo.ui.button(
                 label=f"{mo.icon('lucide:sliders-horizontal')} Export ground truth to parameter playground",
                 on_click=_send_ground_truth_to_playground,
                 kind="success",
             )
-            gt_display = mo.vstack([_gt_body, _gt_export_btn])
+            gt_display = mo.vstack([
+                _gt_body,
+                inf_ground_truth_playground_export_button,
+            ])
         elif emu is None:
             gt_display = mo.vstack([
                 _gt_body,
@@ -2070,7 +2075,7 @@ def _(
 
 
 @app.cell
-def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_sirocco_sigma, data_source_selector, emu, estimate_log_amp_centre_from_sigma, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
+def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_sirocco_sigma, data_source_selector, emu, estimate_log_amp_centre_from_sigma, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_file_selector, obs_flux_scale, re, wl_range_slider):
     # ── Stage 2: Prior & Parameter Setup ──
     # Build per-parameter UI widgets (fixed/free toggle, value, min, max) that
     # drive the prior construction in Stage 3.  Parameters fall into two groups:
@@ -2091,6 +2096,23 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
     defaults = {}
     bounds = {}
     log10_params = set()  # names of params whose values are log10-scaled
+    # ``bounds`` serves two UI meanings: hard lower/upper support for Uniform
+    # rows and finite -2σ/+2σ controls for Normal rows. Keep the kind alongside
+    # every parameter so Stage 3 never has to infer scientific semantics from
+    # the shape of three numbers.
+    prior_kinds = {}
+
+    from Speculate_addons.observation_priors import OBSERVATION_PRIORS as _OBSERVATION_PRIORS
+
+    _is_test_grid = "Test Grid" in (data_source_selector.value or "")
+    # Only real observation filenames participate in the published catalogue.
+    # Synthetic validation spectra retain their known 100 pc/fixed-data setup
+    # and the emulator-wide physical parameter priors.
+    _observation_prior = (
+        _OBSERVATION_PRIORS.get(str(obs_file_selector.value).lower())
+        if not _is_test_grid and obs_file_selector.value
+        else None
+    )
 
     # Parameter Mapping Dictionary
     if emu is not None:
@@ -2135,10 +2157,40 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
                 mx = float(emu.max_params[_i])
                 bounds[_name] = [mn, mx]
                 defaults[_name] = (mn + mx) / 2.0
+                prior_kinds[_name] = "uniform"
         else:
              for _name in current_names:
                 bounds[_name] = [0.0, 1.0]
                 defaults[_name] = 0.5
+                prior_kinds[_name] = "uniform"
+
+        # A recognised observation overrides the generic inclination controls:
+        # quoted uncertainties are Normal; cited ranges are Uniform.
+        _inclination_name = next(
+            (_name for _name in current_names if "inclination" in _name.lower()),
+            None,
+        )
+        if _observation_prior is not None and _inclination_name is not None:
+            _inclination_index = current_names.index(_inclination_name)
+            _inclination_prior = _observation_prior["inclination_deg"]
+            _inclination_kind = _inclination_prior["kind"]
+            _emu_inc_min = float(emu.min_params[_inclination_index])
+            _emu_inc_max = float(emu.max_params[_inclination_index])
+            if _inclination_kind == "normal":
+                _inc_mean = float(_inclination_prior["mean"])
+                _inc_sigma = float(_inclination_prior["sigma"])
+                defaults[_inclination_name] = _inc_mean
+                bounds[_inclination_name] = [
+                    _inc_mean - 2.0 * _inc_sigma,
+                    _inc_mean + 2.0 * _inc_sigma,
+                ]
+            else:
+                # RW Sex starts at 28°, below this grid's 30° lower edge.
+                _applied_min = max(float(_inclination_prior["min"]), _emu_inc_min)
+                _applied_max = min(float(_inclination_prior["max"]), _emu_inc_max)
+                bounds[_inclination_name] = [_applied_min, _applied_max]
+                defaults[_inclination_name] = 0.5 * (_applied_min + _applied_max)
+            prior_kinds[_inclination_name] = _inclination_kind
 
     # Add Inference Parameters (Global / Nuisance)
     # These are not part of the emulator grid but are optimised alongside
@@ -2162,11 +2214,20 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
         # Defaults for Global Params
         bounds['Av'] = [0.0, 2.0]
         defaults['Av'] = 0.0
+        prior_kinds['Av'] = "uniform"
 
         # log_scale is exposed as a distance prior. With SpectrumModel(norm=True),
         # the emulator's stored normalisation is the 100 pc reference and
         # backend log_scale=0 means Distance=100 pc.
-        _distance_default = 100.0
+        _distance_prior = (
+            _observation_prior["distance_pc"]
+            if _observation_prior is not None
+            else {"kind": "normal", "mean": 100.0, "sigma": 5.0}
+        )
+        # The catalogue stores native (mean, 1σ) values. Stage 2 continues to
+        # use the established Inference UI convention of centre/-2σ/+2σ; the
+        # backend recovers one sigma from that displayed four-sigma span.
+        _distance_default = float(_distance_prior["mean"])
         _la_default = -60.0 if obs_flux_scale.value == "linear" else -5.0
         if obs_data is not None:
             try:
@@ -2206,14 +2267,20 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
                 pass
         _la_default = round(_la_default, 1)
 
-        bounds['log_scale'] = [90.0, 110.0]
+        _distance_sigma = float(_distance_prior["sigma"])
+        bounds['log_scale'] = [
+            _distance_default - 2.0 * _distance_sigma,
+            _distance_default + 2.0 * _distance_sigma,
+        ]
         defaults['log_scale'] = _distance_default
+        prior_kinds['log_scale'] = "normal"
 
         # cheb_1: Chebyshev c1 coefficient – linear continuum tilt
         # Multiplies the model by a Chebyshev polynomial; c0 is fixed to 1.
         # Small values nudge the continuum gradient without changing lines.
         bounds['cheb_1'] = [-0.5, 0.5]
         defaults['cheb_1'] = 0.0
+        prior_kinds['cheb_1'] = "uniform"
 
         # log_amp: GP global covariance amplitude (natural log)
         # Normal prior: center is tied to observational uncertainty, while the
@@ -2222,10 +2289,12 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
         _log_amp_half_width = 2.0 * GP_LOG_AMP_PRIOR_SIGMA
         bounds['log_amp'] = [_la_default - _log_amp_half_width, _la_default + _log_amp_half_width]
         defaults['log_amp'] = _la_default
+        prior_kinds['log_amp'] = "normal"
 
         # log_ls: GP global covariance length scale (natural log)
         bounds['log_ls'] = [1.0, 8.0]
         defaults['log_ls'] = 4.5
+        prior_kinds['log_ls'] = "uniform"
 
     # Build one widget bundle per parameter: a fixed/free toggle, a point value,
     # and lower/upper controls for the prior bounds shown in Stage 2.
@@ -2247,7 +2316,6 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
     #   • Observational spectra: every nuisance parameter defaults to FREE.
     # Grid (physical) parameters always default to FREE.  Continuum-normalised
     # fits still pin Distance because the overall flux scale is degenerate there.
-    _is_test_grid = "Test Grid" in (data_source_selector.value or "")
     _fix_distance_for_shape_only = obs_flux_scale.value == "continuum-normalised"
     _default_fixed = {"Av", "log_scale"} if _is_test_grid else set()
     if _fix_distance_for_shape_only:
@@ -2267,18 +2335,15 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
     # Wrap in mo.ui.dictionary for Marimo reactivity
     w_fix = mo.ui.dictionary(_fix_dict) if _fix_dict else mo.ui.dictionary({})
     w_val = mo.ui.dictionary(_val_dict) if _val_dict else mo.ui.dictionary({})
-    return bounds, distance_prior_ack, log10_params, param_names, w_fix, w_max, w_min, w_val
+    return bounds, distance_prior_ack, log10_params, param_names, prior_kinds, w_fix, w_max, w_min, w_val
 
 
 @app.cell(hide_code=True)
-def _(bounds, distance_prior_ack, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
+def _(bounds, distance_prior_ack, log10_params, mo, param_names, prior_kinds, w_fix, w_max, w_min, w_val):
     # Render Parameter UI
     if not param_names:
          param_settings = mo.md("*Load an emulator to see parameters.*")
     else:
-        # Parameters that use a normal prior instead of uniform
-        _normal_prior_params = {'log_amp', 'log_scale'}
-
         # Friendly display names
         _label_map = {
             'log_scale': 'Distance (pc)',
@@ -2316,7 +2381,7 @@ def _(bounds, distance_prior_ack, log10_params, mo, param_names, w_fix, w_max, w
                 ], widths=[3, 2], align="center")
             else:
                 # FREE: show prior distribution controls
-                if _name in _normal_prior_params:
+                if prior_kinds.get(_name) == "normal":
                     # Normal prior: Value = center, Min/Max define ±2σ range
                     _prior_col = mo.hstack([
                         mo.vstack([mo.md("<small>Center</small>"), _val_elements[_name]], gap=0),
@@ -2361,8 +2426,9 @@ def _(bounds, distance_prior_ack, log10_params, mo, param_names, w_fix, w_max, w
         mo.callout(mo.md(
             "Set prior distributions for each parameter. "
             "**Fix** a parameter to lock it at a specific value (tight δ-prior). "
-            "Free parameters use **Uniform** priors (lower–upper) except "
-            "Distance and GP Log Amp, which use **Normal** priors (center ± 2σ)."
+            "Free parameters show either **Uniform** lower–upper bounds or "
+            "**Normal** center ±2σ controls. Recognised observation files "
+            "automatically load their published distance and inclination prior types."
         ), kind="neutral"),
         param_settings
     ])
@@ -2475,6 +2541,7 @@ def _(
     np,
     obs_data,
     param_names,
+    prior_kinds,
     run_mle_btn,
     set_mle_model,
     set_mle_priors,
@@ -2649,7 +2716,26 @@ def _(
                         _mn = w_min[_ui].value
                         _mx = w_max[_ui].value
                         if _mx > _mn:
-                            _priors[_internal] = stats.uniform(loc=_mn, scale=_mx - _mn)
+                            if prior_kinds.get(_ui) == "normal":
+                                # Inclination uses the same Center/±2σ
+                                # convention as the existing Normal priors.
+                                _center = float(w_val.value[_ui])
+                                _prior_sigma = (_mx - _mn) / 4.0
+                                if _prior_sigma <= 0:
+                                    raise ValueError(
+                                        f"Normal prior for {_ui} needs a positive ±2σ range."
+                                    )
+                                _priors[_internal] = stats.norm(
+                                    loc=_center,
+                                    scale=_prior_sigma,
+                                )
+                            else:
+                                # Generic grid axes and cited inclination
+                                # ranges remain flat inside their UI bounds.
+                                _priors[_internal] = stats.uniform(
+                                    loc=_mn,
+                                    scale=_mx - _mn,
+                                )
 
                 # B. Global Parameter Priors
                 if 'Av' in param_names:
@@ -3293,7 +3379,10 @@ def _(
             set_inf_playground_target(_result["playground_payload"])
             mo.status.toast("Loaded MLE best fit into the Parameter Playground")
 
-        _playground_button = mo.ui.button(
+        # Marimo only registers UI callbacks for elements bound to public
+        # cell names; an underscore-prefixed button can render while its
+        # on_click handler is skipped.
+        mle_playground_export_button = mo.ui.button(
             label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
             on_click=_send_mle_to_playground,
             kind="success",
@@ -3301,7 +3390,7 @@ def _(
 
         _result_elements = [
             _result["fit_status"],
-            _playground_button,
+            mle_playground_export_button,
             mo.hstack([
                 mo.md(_result["results_md"]),
                 mo.md(_result["global_md"]),
@@ -3965,7 +4054,9 @@ def _(
                     set_inf_playground_target(_mcmc_playground_payload)
                     mo.status.toast("Loaded MCMC posterior mean into the Parameter Playground")
 
-                _playground_button = mo.ui.button(
+                # This button must have a public cell name for Marimo to keep
+                # the state-updating callback registered after MCMC completes.
+                mcmc_playground_export_button = mo.ui.button(
                     label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
                     on_click=_send_mcmc_to_playground,
                     kind="success",
@@ -3990,7 +4081,7 @@ def _(
 
                 mcmc_results = mo.vstack([
                     _status_callout,
-                    _playground_button,
+                    mcmc_playground_export_button,
                     mo.md(_results_md),
                     _chain_accordion,
                     mo.md("### Corner Plot"),

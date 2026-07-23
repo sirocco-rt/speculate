@@ -3868,13 +3868,16 @@ def _(
                 })
                 mo.status.toast("Loaded ground truth into the Parameter Playground")
 
+            # A direct, anonymous button does not retain its on_click handler
+            # in Marimo; bind it to a unique public cell name first.
+            qf_ground_truth_playground_export_button = mo.ui.button(
+                label=f"{mo.icon('lucide:sliders-horizontal')} Export ground truth to parameter playground",
+                on_click=_send_ground_truth_to_playground,
+                kind="success",
+            )
             _obs_status = mo.vstack([
                 _obs_status,
-                mo.ui.button(
-                    label=f"{mo.icon('lucide:sliders-horizontal')} Export ground truth to parameter playground",
-                    on_click=_send_ground_truth_to_playground,
-                    kind="success",
-                ),
+                qf_ground_truth_playground_export_button,
             ])
 
     _is_test_grid_source = "Test Grid" in qf_data_source_selector.value
@@ -4079,6 +4082,21 @@ def _(
     _fixed_inclination = qf_inf_emu_data.get("fixed_inclination")
     _n_params = len(_param_names)
     _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
+    from Speculate_addons.observation_priors import OBSERVATION_PRIORS as _OBSERVATION_PRIORS
+
+    _is_test_grid_data = bool(
+        qf_obs_data is not None and qf_obs_data.attrs.get("is_test_grid", False)
+    )
+    # Observation loaders preserve the selected filename in dataframe attrs.
+    # The five shipped names match the catalogue exactly; other uploads keep
+    # the existing generic controls.
+    _observation_prior = (
+        _OBSERVATION_PRIORS.get(
+            str(qf_obs_data.attrs.get("source_label", "")).lower()
+        )
+        if qf_obs_data is not None and not _is_test_grid_data
+        else None
+    )
     qf_distance_prior_ack = mo.ui.checkbox(
         value=False,
         label="I have entered the target distance and uncertainty",
@@ -4089,6 +4107,9 @@ def _(
     _min_inputs = []
     _max_inputs = []
     _labels = []
+    # The distribution kind only changes the row labels and catalogue defaults:
+    # Quick Fit continues to minimise spectral chi-squared within these bounds.
+    _prior_kinds = []
 
     for _i in range(_n_params):
         _name = _param_names[_i]
@@ -4101,15 +4122,43 @@ def _(
         _lo = float(_min_p[_i])
         _hi = float(_max_p[_i])
         _mid = (_lo + _hi) / 2.0
+        _kind = "uniform"
+        _ui_lo = _lo
+        _ui_hi = _hi
+        _value = _mid
+
+        if "inclination" in _display.lower() and _observation_prior is not None:
+            _inclination_prior = _observation_prior["inclination_deg"]
+            _kind = _inclination_prior["kind"]
+            if _kind == "normal":
+                # Quoted inclinations use their cited mean and ±2σ interval.
+                _value = float(_inclination_prior["mean"])
+                _inc_sigma = float(_inclination_prior["sigma"])
+                _ui_lo = _value - 2.0 * _inc_sigma
+                _ui_hi = _value + 2.0 * _inc_sigma
+            else:
+                # Dash-separated ranges are Uniform and stay inside the model grid.
+                _ui_lo = max(_lo, float(_inclination_prior["min"]))
+                _ui_hi = min(_hi, float(_inclination_prior["max"]))
+                _value = 0.5 * (_ui_lo + _ui_hi)
         _labels.append(_display)
+        _prior_kinds.append(_kind)
 
         _fixed_toggles.append(mo.ui.checkbox(label="Fix", value=False))
-        _value_inputs.append(mo.ui.number(value=round(_mid, 4), step=0.001, label="Value"))
-        _min_inputs.append(mo.ui.number(value=round(_lo, 4), step=0.001, label="Min"))
-        _max_inputs.append(mo.ui.number(value=round(_hi, 4), step=0.001, label="Max"))
+        _value_inputs.append(mo.ui.number(
+            value=round(_value, 4), step=0.001,
+            label="Center" if _kind == "normal" else "Value", full_width=True,
+        ))
+        _min_inputs.append(mo.ui.number(
+            value=round(_ui_lo, 4), step=0.001,
+            label="-2σ" if _kind == "normal" else "Min", full_width=True,
+        ))
+        _max_inputs.append(mo.ui.number(
+            value=round(_ui_hi, 4), step=0.001,
+            label="+2σ" if _kind == "normal" else "Max", full_width=True,
+        ))
 
     _model_flux_scale = str(qf_inf_emu_data.get("scale", "linear"))
-    _is_test_grid_data = bool(qf_obs_data is not None and qf_obs_data.attrs.get("is_test_grid", False))
     _fix_distance_for_shape_only = (
         qf_obs_scale_selector.value == "continuum-normalised"
         or _model_flux_scale == "continuum-normalised"
@@ -4122,17 +4171,46 @@ def _(
     #   • Observational spectra: every nuisance parameter defaults to FREE.
     # Continuum-normalised fits still pin Distance because the flux scale is
     # degenerate there.  (Quick Fit has no GP covariance nuisance parameters.)
+    _distance_prior = (
+        _observation_prior["distance_pc"]
+        if _observation_prior is not None
+        else {"kind": "normal", "mean": 100.0, "sigma": 5.0}
+    )
+    _distance_value = float(_distance_prior["mean"])
+    # All current Table A1 distances are quoted measurements, so they are
+    # Normal. Unknown files keep the historical 100 pc centre and 90/110 pc
+    # -2σ/+2σ display, equivalent to sigma=5 pc.
+    _distance_sigma = float(_distance_prior["sigma"])
+    _distance_lo = _distance_value - 2.0 * _distance_sigma
+    _distance_hi = _distance_value + 2.0 * _distance_sigma
     _nuisance = [
-        ("Av",        0.0,         0.0,               2.0, _is_test_grid_data),
-        ("Distance (pc)", 100.0, 90.0, 110.0, _is_test_grid_data or _fix_distance_for_shape_only),
-        ("cheb_1",    0.0,         -0.5,              0.5, False),
+        ("Av", 0.0, 0.0, 2.0, _is_test_grid_data, "uniform"),
+        (
+            "Distance (pc)",
+            _distance_value,
+            _distance_lo,
+            _distance_hi,
+            _is_test_grid_data or _fix_distance_for_shape_only,
+            "normal",
+        ),
+        ("cheb_1", 0.0, -0.5, 0.5, False, "uniform"),
     ]
-    for _name, _val, _lo, _hi, _fixed_default in _nuisance:
+    for _name, _val, _lo, _hi, _fixed_default, _kind in _nuisance:
         _labels.append(_name)
+        _prior_kinds.append(_kind)
         _fixed_toggles.append(mo.ui.checkbox(label="Fix", value=_fixed_default))
-        _value_inputs.append(mo.ui.number(value=round(_val, 4), step=0.01, label="Value"))
-        _min_inputs.append(mo.ui.number(value=round(_lo, 4), step=0.01, label="Min"))
-        _max_inputs.append(mo.ui.number(value=round(_hi, 4), step=0.01, label="Max"))
+        _value_inputs.append(mo.ui.number(
+            value=round(_val, 4), step=0.01,
+            label="Center" if _kind == "normal" else "Value", full_width=True,
+        ))
+        _min_inputs.append(mo.ui.number(
+            value=round(_lo, 4), step=0.01,
+            label="-2σ" if _kind == "normal" else "Min", full_width=True,
+        ))
+        _max_inputs.append(mo.ui.number(
+            value=round(_hi, 4), step=0.01,
+            label="+2σ" if _kind == "normal" else "Max", full_width=True,
+        ))
 
     qf_param_config = {
         "labels": _labels,
@@ -4140,6 +4218,7 @@ def _(
         "values": _value_inputs,
         "mins": _min_inputs,
         "maxs": _max_inputs,
+        "prior_kinds": _prior_kinds,
         "n_physical": _n_params,
         "distance_prior_ack": qf_distance_prior_ack,
         "fixed_inclination": _fixed_inclination,
@@ -4158,6 +4237,7 @@ def _(mo, qf_param_config):
     _value_inputs = qf_param_config["values"]
     _min_inputs = qf_param_config["mins"]
     _max_inputs = qf_param_config["maxs"]
+    _prior_kinds = qf_param_config["prior_kinds"]
     _distance_prior_ack = qf_param_config["distance_prior_ack"]
     _fixed_inclination = qf_param_config.get("fixed_inclination")
     _fix_distance_for_shape_only = qf_param_config.get("fix_distance_for_shape_only", False)
@@ -4166,15 +4246,19 @@ def _(mo, qf_param_config):
     for _i, _name in enumerate(_labels):
         _row = mo.hstack([
             mo.md(f"**{_name}**"),
+            mo.md(f"`{'Normal' if _prior_kinds[_i] == 'normal' else 'Uniform'}`"),
             _fixed_toggles[_i],
             _value_inputs[_i],
             _min_inputs[_i],
             _max_inputs[_i],
-        ], justify="start", gap="0.5rem")
+        ], widths=[3, 1, 1, 2, 2, 2], align="end", gap="0.75rem")
         _config_elements.append(_row)
 
     _config_accordion = mo.accordion({
-        f"{mo.icon('lucide:sliders-horizontal')} Parameter Configuration": mo.vstack(_config_elements)
+        f"{mo.icon('lucide:sliders-horizontal')} Parameter Configuration": mo.vstack(
+            _config_elements,
+            gap="0.75rem",
+        )
     }, lazy=True)
 
     # Marimo only allows reactive widget-value reads in downstream cells, so the
@@ -4731,7 +4815,8 @@ def _(
             mo.callout(
                 mo.md(
                     "Confirm the Distance (pc) prior in the parameter configuration before running Quick Fit. "
-                    "The center is the target distance and the min/max fields define its uncertainty range."
+                    "The center is the target distance and the −2σ/+2σ fields "
+                    "define its Normal uncertainty."
                 ),
                 kind="warn",
             ),
@@ -4777,6 +4862,7 @@ def _(
         mo.stop(True, mo.callout(mo.md("No emulator wavelengths fall within the selected wavelength range."), kind="warn"))
 
     from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
+    _fit_dof = max(1, len(_obs_wl) - len(_active_idx))
 
     def _chi2(active_params):
         # ── Enforce prior bounds ─────────────────────────────────────────
@@ -4844,6 +4930,7 @@ def _(
         _t0 = time_mod.time()
 
         _global_best_f = [float("inf")]  # mutable for callback access
+        _best_reduced_chi2 = [float("inf")]
         _cur_restart = [0]
 
         def _chi2_cb(P):
@@ -4852,12 +4939,14 @@ def _(
             except (ValueError, np.linalg.LinAlgError):
                 val = 1e30
             _nll_history.append(val)
+            if np.isfinite(val):
+                _best_reduced_chi2[0] = min(_best_reduced_chi2[0], val / _fit_dof)
             _iter_count[0] += 1
             if _iter_count[0] % 50 == 0:
                 _spinner.update(
                     f"{qf_opt_method.value} | Restart {_cur_restart[0]}/{_n_restarts} | "
                     f"Eval {_iter_count[0]} | "
-                    f"Best χ² = {_global_best_f[0]:.4f} | "
+                    f"Best reduced χ² = {_best_reduced_chi2[0]:.4f} | "
                     f"{time_mod.time() - _t0:.1f}s"
                 )
             return val
@@ -5278,13 +5367,19 @@ def _(
         })
         mo.status.toast("Loaded MLE best fit into the Parameter Playground")
 
-    _playground_btn = mo.ui.button(
+    # Keep the callback widget public so clicking it updates playground state.
+    qf_mle_playground_export_button = mo.ui.button(
         label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
         on_click=_send_mle_to_playground,
         kind="success",
     )
 
-    mo.vstack([_status, _playground_btn, _overlay_chart, _resid_chart + _zero_line])
+    mo.vstack([
+        _status,
+        qf_mle_playground_export_button,
+        _overlay_chart,
+        _resid_chart + _zero_line,
+    ])
     return
 
 

@@ -1420,15 +1420,24 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                     alt.Tooltip("PPC Coverage:Q", title="PPC Coverage", format=".3f"),
                 ],
             )
+            # Enable pan/zoom per panel with explicitly named interval
+            # selections.  Calling .interactive() on the combined hconcat would
+            # add an identically-configured (and identically auto-named)
+            # selection to both panels, which Altair then silently deduplicates
+            # with a UserWarning; under the vegafusion data transformer that
+            # warning is raised while building the spec and the chart fails to
+            # render.  Naming the two selections differently avoids the clash.
             _fig4 = ((_fig4_chi2_rule + _fig4_chi2_bars).properties(
                 width=_obs_chart_width,
                 height=320,
                 title="Reduced chi2",
-            ) | (_fig4_ppc_rule + _fig4_ppc_bars).properties(
+            ).interactive(name="tier3_obs_chi2_zoom") | (
+                _fig4_ppc_rule + _fig4_ppc_bars
+            ).properties(
                 width=_obs_chart_width,
                 height=320,
                 title="Posterior Predictive Coverage",
-            )).resolve_scale(y="independent").interactive()
+            ).interactive(name="tier3_obs_ppc_zoom")).resolve_scale(y="independent")
             _t3_items.append(_fig4)
         except Exception:
             pass
@@ -3034,57 +3043,129 @@ def _(emu_picker, glob, mo, np, os, re):
 
 @app.cell(hide_code=True)
 def _(mo, obs_picker, os, tier_picker):
-    # Tier 3 needs per-observation distance priors because observational
-    # spectra do not share the synthetic 100 pc reference scale used by test
-    # grids.  The widgets stay keyed by observation path so the run cell can
-    # pass the correct pc prior to each independent Tier 3 fit.
-    _known_distance_priors_pc = {
-        "ixvel": (88.8, 85.6, 92.0),
-        "rwsex": (150.0, 113.0, 187.0),
-        "rwtri": (306.0, 296.0, 316.0),
-        "uxuma": (263.5, 233.1, 293.9),
-        "v3885sgr": (135.9, 127.6, 144.2),
-    }
-
-    def _distance_defaults_for_observation(_obs_path):
-        """Return known pc prior defaults from the observation filename."""
-        _stem = os.path.splitext(os.path.basename(_obs_path))[0].lower()
-        _normalised = "".join(_ch for _ch in _stem if _ch.isalnum())
-        for _key, _defaults in _known_distance_priors_pc.items():
-            if _key in _normalised:
-                return _defaults
-        return (100.0, 90.0, 110.0)
+    # Exact filenames are shared by all three notebooks; unknown uploads retain
+    # the existing generic distance controls and no inclination override.
+    from Speculate_addons.observation_priors import OBSERVATION_PRIORS as _OBSERVATION_PRIORS
 
     tier3_distance_prior_widgets = {}
     tier3_distance_prior_controls = mo.md("")
+    tier3_inclination_prior_widgets = {}
+    tier3_inclination_prior_controls = mo.md("")
 
     _selected_tiers = set(tier_picker.value or [])
     _tier3_selected = 3 in _selected_tiers or "Tier 3" in _selected_tiers
     _obs_paths = list(obs_picker.value or [])
     if _tier3_selected and _obs_paths:
-        _rows = []
+        _distance_rows = []
+        _inclination_rows = []
         for _obs_path in _obs_paths:
-            _mean_pc, _min_pc, _max_pc = _distance_defaults_for_observation(_obs_path)
+            _filename = os.path.basename(_obs_path)
+            _known = _OBSERVATION_PRIORS.get(_filename.lower())
+            _distance_prior = (
+                _known["distance_pc"]
+                if _known is not None
+                else {"mean": 100.0, "sigma": 5.0}
+            )
+            # Table A1 quotes every distance as mean ± 1σ.
             _widgets = {
-                "mean_pc": mo.ui.number(value=_mean_pc, step=0.1, label="Mean (pc)"),
-                "min_pc": mo.ui.number(value=_min_pc, step=0.1, label="Min (pc)"),
-                "max_pc": mo.ui.number(value=_max_pc, step=0.1, label="Max (pc)"),
+                "mean_pc": mo.ui.number(
+                    value=float(_distance_prior["mean"]),
+                    step=0.01,
+                    label="Mean (pc)",
+                ),
+                "sigma_pc": mo.ui.number(
+                    value=float(_distance_prior["sigma"]),
+                    step=0.01,
+                    label="σ (pc)",
+                ),
             }
             tier3_distance_prior_widgets[_obs_path] = _widgets
-            _rows.append(
+            _distance_rows.append(
                 mo.hstack([
-                    mo.md(f"**{os.path.basename(_obs_path)}**"),
+                    mo.md(f"**{_filename}**"),
+                    mo.md("`Normal`"),
                     _widgets["mean_pc"],
-                    _widgets["min_pc"],
-                    _widgets["max_pc"],
+                    _widgets["sigma_pc"],
                 ], justify="start", gap="0.5rem")
             )
 
-        tier3_distance_prior_controls = mo.accordion({
-            f"{mo.icon('lucide:sliders-horizontal')} Tier 3 Distance Priors": mo.vstack(_rows)
-        }, lazy=False)
+            if _known is not None:
+                _inclination_prior = _known["inclination_deg"]
+                _inclination_kind = _inclination_prior["kind"]
+                if _inclination_kind == "normal":
+                    _widgets = {
+                        "kind": "normal",
+                        "mean_deg": mo.ui.number(
+                            value=float(_inclination_prior["mean"]),
+                            step=0.05,
+                            label="Mean (deg)",
+                        ),
+                        "sigma_deg": mo.ui.number(
+                            value=float(_inclination_prior["sigma"]),
+                            step=0.05,
+                            label="σ (deg)",
+                        ),
+                    }
+                    _row_controls = [
+                        _widgets["mean_deg"],
+                        _widgets["sigma_deg"],
+                    ]
+                    _kind_label = "Normal"
+                else:
+                    # A dash-separated citation is a hard Uniform range; its
+                    # midpoint is only the optimiser's starting value.
+                    _widgets = {
+                        "kind": "uniform",
+                        "mean_deg": mo.ui.number(
+                            value=0.5 * (
+                                float(_inclination_prior["min"])
+                                + float(_inclination_prior["max"])
+                            ),
+                            step=0.05,
+                            label="Start (deg)",
+                        ),
+                        "min_deg": mo.ui.number(
+                            value=float(_inclination_prior["min"]),
+                            step=0.05,
+                            label="Min (deg)",
+                        ),
+                        "max_deg": mo.ui.number(
+                            value=float(_inclination_prior["max"]),
+                            step=0.05,
+                            label="Max (deg)",
+                        ),
+                    }
+                    _row_controls = [
+                        _widgets["mean_deg"],
+                        _widgets["min_deg"],
+                        _widgets["max_deg"],
+                    ]
+                    _kind_label = "Uniform"
+                tier3_inclination_prior_widgets[_obs_path] = _widgets
+                _inclination_rows.append(
+                    mo.hstack([
+                        mo.md(f"**{_filename}**"),
+                        mo.md(f"`{_kind_label}`"),
+                        *_row_controls,
+                    ], justify="start", gap="0.5rem")
+                )
 
-    return tier3_distance_prior_controls, tier3_distance_prior_widgets
+        tier3_distance_prior_controls = mo.accordion({
+            f"{mo.icon('lucide:sliders-horizontal')} Tier 3 Distance Priors":
+                mo.vstack(_distance_rows)
+        }, lazy=False)
+        if _inclination_rows:
+            tier3_inclination_prior_controls = mo.accordion({
+                f"{mo.icon('lucide:scan')} Tier 3 Inclination Priors":
+                    mo.vstack(_inclination_rows)
+            }, lazy=False)
+
+    return (
+        tier3_distance_prior_controls,
+        tier3_distance_prior_widgets,
+        tier3_inclination_prior_controls,
+        tier3_inclination_prior_widgets,
+    )
 
 
 @app.cell(hide_code=True)
@@ -3100,6 +3181,7 @@ def _(
     obs_picker,
     sirocco_cpu_slider,
     tier3_distance_prior_controls,
+    tier3_inclination_prior_controls,
     tier3_wl_range_slider,
     tier_picker,
 ):
@@ -3109,6 +3191,7 @@ def _(
         emu_grid_info,
         mo.hstack([obs_picker], gap=1),
         tier3_distance_prior_controls,
+        tier3_inclination_prior_controls,
         mo.vstack([inclination_picker, max_spectra_slider, mle_restarts_slider, mcmc_steps_slider], gap=1),
         tier3_wl_range_slider,
         sirocco_cpu_slider,
@@ -3150,18 +3233,27 @@ def _(mo, sirocco_cpu_slider, tier_picker):
 
 
 @app.cell(hide_code=True)
-def _(emu_picker, mo, np, os):
+def _(emu_picker, matched_grid_name, mo, np, os):
     tier2_mle_freeze = mo.ui.dictionary({})
     tier2_mcmc_freeze = mo.ui.dictionary({})
     tier2_freeze_controls = mo.callout(
         mo.md("Select an emulator to configure Tier 2 MLE/MCMC freeze settings."),
         kind="neutral",
     )
+    tier3_mle_freeze = mo.ui.dictionary({})
+    tier3_mcmc_freeze = mo.ui.dictionary({})
+    tier3_freeze_controls = mo.callout(
+        mo.md("Select an emulator to configure Tier 3 MLE/MCMC freeze settings."),
+        kind="neutral",
+    )
 
     _emu_val = emu_picker.value or ""
     if _emu_val and os.path.isfile(_emu_val):
         try:
-            from Speculate_addons.speculate_benchmark import build_tier2_freeze_defaults
+            from Speculate_addons.speculate_benchmark import (
+                build_tier2_freeze_defaults,
+                build_tier3_freeze_defaults,
+            )
 
             with np.load(_emu_val, allow_pickle=True) as _npz:
                 _raw_param_names = _npz["param_names"].tolist()
@@ -3170,22 +3262,23 @@ def _(emu_picker, mo, np, os):
                 _name.decode() if isinstance(_name, bytes) else str(_name)
                 for _name in _raw_param_names
             ]
-            _defaults = build_tier2_freeze_defaults(_param_names)
+            _tier2_defaults = build_tier2_freeze_defaults(_param_names, matched_grid_name)
+            _tier3_defaults = build_tier3_freeze_defaults(_param_names, matched_grid_name)
 
-            _mle_widgets = {}
-            _mcmc_widgets = {}
-            for _label, _friendly in _defaults["labels"].items():
-                _mle_widgets[_label] = mo.ui.checkbox(
-                    value=bool(_defaults["mle"].get(_label, False)),
+            _tier2_mle_widgets = {}
+            _tier2_mcmc_widgets = {}
+            for _label, _friendly in _tier2_defaults["labels"].items():
+                _tier2_mle_widgets[_label] = mo.ui.checkbox(
+                    value=bool(_tier2_defaults["mle"].get(_label, False)),
                     label=_friendly,
                 )
-                _mcmc_widgets[_label] = mo.ui.checkbox(
-                    value=bool(_defaults["mcmc"].get(_label, False)),
+                _tier2_mcmc_widgets[_label] = mo.ui.checkbox(
+                    value=bool(_tier2_defaults["mcmc"].get(_label, False)),
                     label=_friendly,
                 )
 
-            tier2_mle_freeze = mo.ui.dictionary(_mle_widgets)
-            tier2_mcmc_freeze = mo.ui.dictionary(_mcmc_widgets)
+            tier2_mle_freeze = mo.ui.dictionary(_tier2_mle_widgets)
+            tier2_mcmc_freeze = mo.ui.dictionary(_tier2_mcmc_widgets)
             tier2_freeze_controls = mo.vstack([
                 mo.md("### Tier 2 Freeze Controls"),
                 mo.callout(
@@ -3207,13 +3300,60 @@ def _(emu_picker, mo, np, os):
                     ]),
                 ], widths=[1, 1], align="start", gap=2),
             ])
+
+            _tier3_mle_widgets = {}
+            _tier3_mcmc_widgets = {}
+            for _label, _friendly in _tier3_defaults["labels"].items():
+                _tier3_mle_widgets[_label] = mo.ui.checkbox(
+                    value=bool(_tier3_defaults["mle"].get(_label, False)),
+                    label=_friendly,
+                )
+                _tier3_mcmc_widgets[_label] = mo.ui.checkbox(
+                    value=bool(_tier3_defaults["mcmc"].get(_label, False)),
+                    label=_friendly,
+                )
+
+            tier3_mle_freeze = mo.ui.dictionary(_tier3_mle_widgets)
+            tier3_mcmc_freeze = mo.ui.dictionary(_tier3_mcmc_widgets)
+            tier3_freeze_controls = mo.vstack([
+                mo.md("### Tier 3 Freeze Controls"),
+                mo.callout(
+                    mo.md(
+                        "MLE freezes hold parameters at the benchmark starting values, including each "
+                        "observation's selected distance-prior mean. MCMC freezes hold parameters at "
+                        "their post-MLE values. All Tier 3 parameters are free by default."
+                    ),
+                    kind="neutral",
+                ),
+                mo.hstack([
+                    mo.vstack([
+                        mo.md("#### MLE"),
+                        tier3_mle_freeze,
+                    ]),
+                    mo.vstack([
+                        mo.md("#### MCMC"),
+                        tier3_mcmc_freeze,
+                    ]),
+                ], widths=[1, 1], align="start", gap=2),
+            ])
         except Exception as _exc:
             tier2_freeze_controls = mo.callout(
                 mo.md(f"Could not load Tier 2 freeze controls from emulator metadata: {_exc}"),
                 kind="warn",
             )
+            tier3_freeze_controls = mo.callout(
+                mo.md(f"Could not load Tier 3 freeze controls from emulator metadata: {_exc}"),
+                kind="warn",
+            )
 
-    return tier2_freeze_controls, tier2_mcmc_freeze, tier2_mle_freeze
+    return (
+        tier2_freeze_controls,
+        tier2_mcmc_freeze,
+        tier2_mle_freeze,
+        tier3_freeze_controls,
+        tier3_mcmc_freeze,
+        tier3_mle_freeze,
+    )
 
 
 @app.cell(hide_code=True)
@@ -3223,11 +3363,22 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(emu_picker, matched_grid_path, matched_testgrid_path, mo, run_btn, tier2_freeze_controls, tier_picker):
+def _(
+    emu_picker,
+    matched_grid_path,
+    matched_testgrid_path,
+    mo,
+    run_btn,
+    tier2_freeze_controls,
+    tier3_freeze_controls,
+    tier_picker,
+):
     _selected_tiers = set(tier_picker.value or [])
     _items = []
     if 2 in _selected_tiers or "Tier 2" in _selected_tiers:
         _items.append(tier2_freeze_controls)
+    if 3 in _selected_tiers or "Tier 3" in _selected_tiers:
+        _items.append(tier3_freeze_controls)
 
     # Pre-trained emulators can be downloaded before the matching processed
     # Tier 1 grid or decompressed Tier 2 test grid exists locally.  Surface any
@@ -3287,6 +3438,9 @@ def _(
     tier2_mcmc_freeze,
     tier2_mle_freeze,
     tier3_distance_prior_widgets,
+    tier3_inclination_prior_widgets,
+    tier3_mcmc_freeze,
+    tier3_mle_freeze,
     tier3_wl_range_slider,
     tier_picker,
     time,
@@ -3310,6 +3464,7 @@ def _(
             check_sirocco_runtime as _check_sirocco_runtime,
             build_report_card as _build_report_card,
             build_tier2_freeze_defaults as _build_tier2_freeze_defaults,
+            build_tier3_freeze_defaults as _build_tier3_freeze_defaults,
             save_report as _save_report,
             # Tier 2 helpers — viewer drives the loop for nested progress
             load_test_grid_spectrum as _load_spec,
@@ -3398,6 +3553,9 @@ def _(
             _tier2_mle_freeze_settings["log_scale"] = True
         if "log_scale" in _tier2_mcmc_freeze_settings:
             _tier2_mcmc_freeze_settings["log_scale"] = True
+        _tier3_defaults = _build_tier3_freeze_defaults(_emu.param_names, _grid_name)
+        _tier3_mle_freeze_settings = dict(tier3_mle_freeze.value or _tier3_defaults["mle"])
+        _tier3_mcmc_freeze_settings = dict(tier3_mcmc_freeze.value or _tier3_defaults["mcmc"])
         _mcmc_steps_val = mcmc_steps_slider.value
         _mcmc_walkers_val = 64
         _mcmc_burnin_val = 500
@@ -3405,6 +3563,7 @@ def _(
         _tier2_result = None
         _tier3_results = None
         _tier3_distance_priors_pc = None
+        _tier3_inclination_priors_deg = None
         _tier3_checkpoint_path_to_remove = None
 
         # ---- Tier 1 (spinner — single LOO cross-validation pass) ----
@@ -3886,25 +4045,73 @@ def _(
             def _read_tier3_distance_prior(_obs_path):
                 """Read and validate the pc distance prior widgets for one observation."""
                 _widgets = tier3_distance_prior_widgets.get(_obs_path) or {}
-                _prior = {
-                    "mean_pc": float(_widgets.get("mean_pc").value) if _widgets.get("mean_pc") else 100.0,
-                    "min_pc": float(_widgets.get("min_pc").value) if _widgets.get("min_pc") else 90.0,
-                    "max_pc": float(_widgets.get("max_pc").value) if _widgets.get("max_pc") else 110.0,
+                _mean_pc = (
+                    float(_widgets["mean_pc"].value)
+                    if _widgets.get("mean_pc")
+                    else 100.0
+                )
+                if not (_np.isfinite(_mean_pc) and _mean_pc > 0):
+                    raise ValueError(
+                        f"Tier 3 distance-prior mean for {os.path.basename(_obs_path)} "
+                        "must be finite and positive."
+                    )
+                # The five source distances and the fallback are all Normal.
+                _sigma_pc = float(_widgets["sigma_pc"].value)
+                if not (_np.isfinite(_sigma_pc) and _sigma_pc > 0):
+                    raise ValueError(
+                        f"Tier 3 distance-prior σ for {os.path.basename(_obs_path)} "
+                        "must be finite and positive."
+                    )
+                return {
+                    "kind": "normal",
+                    "mean_pc": _mean_pc,
+                    "sigma_pc": _sigma_pc,
                 }
-                _vals = [_prior["mean_pc"], _prior["min_pc"], _prior["max_pc"]]
-                if not all(_np.isfinite(_v) and _v > 0 for _v in _vals):
+
+            def _read_tier3_inclination_prior(_obs_path):
+                """Read and validate the inclination prior widgets for one observation."""
+                _widgets = tier3_inclination_prior_widgets.get(_obs_path) or {}
+                if not _widgets:
+                    return None
+                _kind = str(_widgets.get("kind", "uniform")).lower()
+                _mean_deg = float(_widgets["mean_deg"].value)
+                if not _np.isfinite(_mean_deg):
                     raise ValueError(
-                        f"Tier 3 distance prior for {os.path.basename(_obs_path)} must be finite and positive."
+                        f"Tier 3 inclination-prior centre for {os.path.basename(_obs_path)} "
+                        "must be finite."
                     )
-                if _prior["min_pc"] >= _prior["max_pc"]:
+                if _kind == "normal":
+                    # The quoted uncertainty is 1σ; the backend constructs the
+                    # corresponding Normal prior on the inclination parameter.
+                    _sigma_deg = float(_widgets["sigma_deg"].value)
+                    if not (_np.isfinite(_sigma_deg) and _sigma_deg > 0):
+                        raise ValueError(
+                            f"Tier 3 inclination-prior σ for {os.path.basename(_obs_path)} "
+                            "must be finite and positive."
+                        )
+                    return {
+                        "kind": "normal",
+                        "mean_deg": _mean_deg,
+                        "sigma_deg": _sigma_deg,
+                    }
+
+                _min_deg = float(_widgets["min_deg"].value)
+                _max_deg = float(_widgets["max_deg"].value)
+                if not (0.0 <= _min_deg < _max_deg <= 90.0):
                     raise ValueError(
-                        f"Tier 3 distance prior for {os.path.basename(_obs_path)} needs Min < Max."
+                        f"Tier 3 inclination prior for {os.path.basename(_obs_path)} needs "
+                        "0 <= Min < Max <= 90 deg."
                     )
-                if not (_prior["min_pc"] <= _prior["mean_pc"] <= _prior["max_pc"]):
+                if not (_min_deg <= _mean_deg <= _max_deg):
                     raise ValueError(
-                        f"Tier 3 distance prior mean for {os.path.basename(_obs_path)} must lie within Min/Max."
+                        f"Tier 3 inclination start for {os.path.basename(_obs_path)} must lie within Min/Max."
                     )
-                return _prior
+                return {
+                    "kind": "uniform",
+                    "mean_deg": _mean_deg,
+                    "min_deg": _min_deg,
+                    "max_deg": _max_deg,
+                }
 
             # ---- Checkpoint / Resume ----
             # Tier 3 observations are independent but expensive: each completed
@@ -3914,6 +4121,10 @@ def _(
             _obs_keys = [str(_Path(_obs).expanduser().resolve()) for _obs in _obs_list]
             _tier3_distance_priors_pc = {
                 str(_Path(_obs).expanduser().resolve()): _read_tier3_distance_prior(_obs)
+                for _obs in _obs_list
+            }
+            _tier3_inclination_priors_deg = {
+                str(_Path(_obs).expanduser().resolve()): _read_tier3_inclination_prior(_obs)
                 for _obs in _obs_list
             }
             _tier3_checkpoint_config = {
@@ -3929,6 +4140,9 @@ def _(
                 "sirocco_cpus": int(sirocco_cpu_slider.value),
                 "observations": sorted(_obs_keys),
                 "distance_priors_pc": _tier3_distance_priors_pc,
+                "inclination_priors_deg": _tier3_inclination_priors_deg,
+                "mle_freeze": dict(_tier3_mle_freeze_settings),
+                "mcmc_freeze": dict(_tier3_mcmc_freeze_settings),
             }
             _tier3_checkpoint_hash = _hashlib.sha256(
                 _json.dumps(_tier3_checkpoint_config, sort_keys=True).encode("utf-8")
@@ -3998,6 +4212,7 @@ def _(
                     _obs_name = os.path.basename(_obs_path)
                     _obs_key = str(_Path(_obs_path).expanduser().resolve())
                     _distance_prior_pc = _tier3_distance_priors_pc.get(_obs_key)
+                    _inclination_prior_deg = _tier3_inclination_priors_deg.get(_obs_key)
                     if _obs_key in _resumed_tier3_results:
                         _tier3_results.append(_resumed_tier3_results[_obs_key])
                         continue
@@ -4056,6 +4271,9 @@ def _(
                         flux_scale=_flux_scale,
                         wl_range=_tier3_wl_range,
                         distance_prior_pc=_distance_prior_pc,
+                        inclination_prior_deg=_inclination_prior_deg,
+                        mle_freeze_params=_tier3_mle_freeze_settings,
+                        mcmc_freeze_params=_tier3_mcmc_freeze_settings,
                         mle_restarts=mle_restarts_slider.value,
                         mcmc_walkers=_mcmc_walkers_val,
                         mcmc_steps=_mcmc_steps_val,
@@ -4113,6 +4331,9 @@ def _(
             "tier3_export_dir": _tier3_export_dir if 3 in _tiers else None,
             "tier3_wl_range": list(_tier3_wl_range) if 3 in _tiers else None,
             "tier3_distance_priors_pc": _tier3_distance_priors_pc if 3 in _tiers else None,
+            "tier3_inclination_priors_deg": _tier3_inclination_priors_deg if 3 in _tiers else None,
+            "tier3_mle_freeze": dict(_tier3_mle_freeze_settings),
+            "tier3_mcmc_freeze": dict(_tier3_mcmc_freeze_settings),
             "tier2_mle_freeze": dict(_tier2_mle_freeze_settings),
             "tier2_mcmc_freeze": dict(_tier2_mcmc_freeze_settings),
         }

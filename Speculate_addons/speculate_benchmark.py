@@ -141,6 +141,21 @@ def build_tier2_freeze_defaults(param_names: Sequence[str], grid_name: Optional[
     }
 
 
+def build_tier3_freeze_defaults(param_names: Sequence[str], grid_name: Optional[str] = None) -> dict:
+    """Return editable Tier 3 MLE/MCMC freeze dictionaries.
+
+    Observational fits keep every grid and nuisance parameter free by default.
+    The viewer can selectively freeze MLE parameters at their initial values or
+    MCMC parameters at the post-MLE values without changing that default policy.
+    """
+    label_map = build_tier2_label_map(param_names, grid_name)
+    return {
+        "labels": label_map,
+        "mle": {label: False for label in label_map},
+        "mcmc": {label: False for label in label_map},
+    }
+
+
 def _serialise_freeze_settings(freeze_params: Optional[dict]) -> Dict[str, bool]:
     """Coerce a freeze settings mapping to JSON-safe bools."""
     return {
@@ -532,43 +547,120 @@ def _resolve_tier3_wl_range(
 
 
 def _tier3_distance_prior_to_log_scale(distance_prior_pc: Optional[dict]):
-    """Convert a user-facing Tier 3 distance prior to backend log-scale inputs."""
+    """Convert a Normal distance prior from parsecs to backend log-scale."""
     if not distance_prior_pc:
         return None, {}, {}
 
-    from Speculate_addons.distance_scale import distance_to_log_scale
-
+    from Speculate_addons.distance_scale import (
+        distance_prior_to_log_scale_prior,
+        log_scale_to_distance_pc,
+    )
     mean_pc = float(distance_prior_pc["mean_pc"])
-    min_pc = float(distance_prior_pc["min_pc"])
-    max_pc = float(distance_prior_pc["max_pc"])
-    if not all(np.isfinite(v) and v > 0 for v in (mean_pc, min_pc, max_pc)):
-        raise ValueError("Tier 3 distance prior values must be finite positive parsecs.")
-    if min_pc >= max_pc:
-        raise ValueError("Tier 3 distance prior min_pc must be smaller than max_pc.")
-    if not (min_pc <= mean_pc <= max_pc):
-        raise ValueError("Tier 3 distance prior mean_pc must lie within [min_pc, max_pc].")
+    sigma_pc = float(distance_prior_pc["sigma_pc"])
+    if not all(np.isfinite(value) and value > 0 for value in (mean_pc, sigma_pc)):
+        raise ValueError("Tier 3 distance mean and sigma must be finite and positive.")
 
-    log_scale_mean = float(distance_to_log_scale(mean_pc))
-    log_scale_at_min_distance = float(distance_to_log_scale(min_pc))
-    log_scale_at_max_distance = float(distance_to_log_scale(max_pc))
-    log_scale_min = min(log_scale_at_min_distance, log_scale_at_max_distance)
-    log_scale_max = max(log_scale_at_min_distance, log_scale_at_max_distance)
-    if log_scale_min == log_scale_max:
-        raise ValueError("Tier 3 distance prior maps to a zero-width log_scale prior.")
-
+    # Match the Inference Tool's first-order propagation through
+    # log_scale = 2 ln(100 pc / distance). Table A1 uncertainties are all <1%.
+    log_scale_mean, log_scale_sigma = distance_prior_to_log_scale_prior(
+        mean_pc,
+        sigma_pc,
+    )
+    plot_distances = log_scale_to_distance_pc(
+        [log_scale_mean - 4.0 * log_scale_sigma,
+         log_scale_mean + 4.0 * log_scale_sigma]
+    )
     metadata = {
+        "kind": "normal",
         "mean_pc": mean_pc,
-        "min_pc": min_pc,
-        "max_pc": max_pc,
-        "log_scale_mean": log_scale_mean,
-        "log_scale_min": log_scale_min,
-        "log_scale_max": log_scale_max,
+        "sigma_pc": sigma_pc,
+        "min_pc": mean_pc - 2.0 * sigma_pc,
+        "max_pc": mean_pc + 2.0 * sigma_pc,
+        "plot_min_pc": float(np.min(plot_distances)),
+        "plot_max_pc": float(np.max(plot_distances)),
+        "log_scale_mean": float(log_scale_mean),
+        "log_scale_sigma": float(log_scale_sigma),
     }
-    prior_overrides = {
-        "log_scale": stats.uniform(loc=log_scale_min, scale=log_scale_max - log_scale_min),
-    }
-    initial_params = {"log_scale": log_scale_mean}
-    return metadata, prior_overrides, initial_params
+    return (
+        metadata,
+        {"log_scale": stats.norm(loc=log_scale_mean, scale=log_scale_sigma)},
+        {"log_scale": float(log_scale_mean)},
+    )
+
+
+def _tier3_inclination_prior_to_parameter(
+    emu,
+    inclination_prior_deg: Optional[dict],
+    grid_name: Optional[str] = None,
+):
+    """Map the published inclination prior onto the emulator inclination axis."""
+    if not inclination_prior_deg:
+        return None, {}, {}
+
+    param_names = [str(name) for name in emu.param_names]
+    friendly_names = internal_to_friendly(param_names, grid_name)
+    if "Inclination" not in friendly_names:
+        return None, {}, {}
+    inclination_index = friendly_names.index("Inclination")
+    inclination_param = param_names[inclination_index]
+    emulator_min_deg = float(emu.min_params[inclination_index])
+    emulator_max_deg = float(emu.max_params[inclination_index])
+    kind = str(inclination_prior_deg["kind"]).lower()
+
+    if kind == "normal":
+        mean_deg = float(inclination_prior_deg["mean_deg"])
+        sigma_deg = float(inclination_prior_deg["sigma_deg"])
+        if sigma_deg <= 0 or not (emulator_min_deg <= mean_deg <= emulator_max_deg):
+            raise ValueError(
+                "Tier 3 Normal inclination needs positive sigma and a mean "
+                "inside the emulator range."
+            )
+        # The UI reports ±2σ, while the existing optimiser bounds for a Normal
+        # prior extend to ±4σ. All three fixed Table A1 measurements remain
+        # within the bundled emulator's inclination range at ±4σ.
+        metadata = {
+            "kind": "normal",
+            "mean_deg": mean_deg,
+            "sigma_deg": sigma_deg,
+            "min_deg": mean_deg - 2.0 * sigma_deg,
+            "max_deg": mean_deg + 2.0 * sigma_deg,
+            "applied_min_deg": mean_deg - 4.0 * sigma_deg,
+            "applied_max_deg": mean_deg + 4.0 * sigma_deg,
+            "parameter": inclination_param,
+        }
+        prior = stats.norm(loc=mean_deg, scale=sigma_deg)
+        start_deg = mean_deg
+    else:
+        min_deg = float(inclination_prior_deg["min_deg"])
+        max_deg = float(inclination_prior_deg["max_deg"])
+        applied_min_deg = max(min_deg, emulator_min_deg)
+        applied_max_deg = min(max_deg, emulator_max_deg)
+        if not applied_min_deg < applied_max_deg:
+            raise ValueError(
+                "Tier 3 Uniform inclination does not overlap the emulator range."
+            )
+        # A dashed literature range is hard Uniform support. RW Sex begins at
+        # 28°, so its applied lower edge becomes the emulator minimum of 30°.
+        start_deg = float(np.clip(
+            inclination_prior_deg["mean_deg"],
+            applied_min_deg,
+            applied_max_deg,
+        ))
+        metadata = {
+            "kind": "uniform",
+            "mean_deg": start_deg,
+            "min_deg": min_deg,
+            "max_deg": max_deg,
+            "applied_min_deg": applied_min_deg,
+            "applied_max_deg": applied_max_deg,
+            "parameter": inclination_param,
+        }
+        prior = stats.uniform(
+            loc=applied_min_deg,
+            scale=applied_max_deg - applied_min_deg,
+        )
+
+    return metadata, {inclination_param: prior}, {inclination_param: start_deg}
 
 
 def run_mle_single(
@@ -732,7 +824,7 @@ def run_mle_single(
                 loc=_bootstrapped_ls - 5.0, scale=10.0
             )
         # Chebyshev c1 continuum tilt — small correction for gradient mismatch
-        priors["cheb:1"] = stats.uniform(loc=-0.5, scale=1.0)
+        priors["cheb:1"] = stats.uniform(loc=-1.0, scale=2.0)
         # GP log_amp is a covariance variance scale. Centre it on the
         # propagated observational uncertainty rather than residuals against a
         # midpoint model, otherwise a poor starting spectrum can teach the GP to
@@ -1397,7 +1489,7 @@ def run_tier2(
     mcmc_walkers: int = 64,
     mcmc_steps: int = 2500,
     mcmc_burnin: int = 500,
-    max_mle_iter: int = 5000,
+    max_mle_iter: int = 10000,
     mle_restarts: int = 1,
     max_spectra: Optional[int] = None,
     mle_freeze_params: Optional[Dict[str, bool]] = None,
@@ -2259,15 +2351,24 @@ def _extract_posterior_mean_inclination(
     samples: np.ndarray,
     friendly_labels: Sequence[str],
     grid_name: Optional[str] = None,
+    frozen_param_values: Optional[Dict[str, float]] = None,
 ) -> float:
-    """Return the posterior-mean inclination used for the Sirocco observer."""
+    """Return the sampled or post-MLE frozen inclination for Sirocco."""
     friendly_grid = internal_to_friendly(emu.param_names, grid_name)
     if "Inclination" not in friendly_grid:
         return _fixed_inclination_from_emulator(emu, grid_name)
-    if "Inclination" not in friendly_labels:
-        raise ValueError("MCMC samples do not contain an Inclination column.")
-    col = list(friendly_labels).index("Inclination")
-    inclination = float(np.mean(samples[:, col]))
+    if "Inclination" in friendly_labels:
+        col = list(friendly_labels).index("Inclination")
+        inclination = float(np.mean(samples[:, col]))
+    else:
+        inclination_index = friendly_grid.index("Inclination")
+        inclination_label = emu.param_names[inclination_index]
+        frozen_param_values = frozen_param_values or {}
+        if inclination_label not in frozen_param_values:
+            raise ValueError(
+                "MCMC samples and frozen parameter values do not contain Inclination."
+            )
+        inclination = float(frozen_param_values[inclination_label])
     return float(np.clip(inclination, 0.0, 90.0))
 
 
@@ -2326,7 +2427,7 @@ def run_tier3_single(
     flux_scale: str = "linear",
     wl_range: Optional[Tuple[float, float]] = None,
     distance_prior_pc: Optional[dict] = None,
-    max_mle_iter: int = 5000,
+    max_mle_iter: int = 10000,
     mle_restarts: int = 5,
     n_ppc_draws: int = 100,
     mcmc_walkers: int = 64,
@@ -2340,6 +2441,9 @@ def run_tier3_single(
     mle_iteration_callback=None,
     mcmc_iteration_callback=None,
     sirocco_progress_callback=None,
+    mle_freeze_params: Optional[Dict[str, bool]] = None,
+    mcmc_freeze_params: Optional[Dict[str, bool]] = None,
+    inclination_prior_deg: Optional[dict] = None,
 ) -> dict:
     """
     Tier 3 benchmark: goodness-of-fit for a single observational spectrum.
@@ -2357,9 +2461,15 @@ def run_tier3_single(
         the selected emulator's wavelength coverage.  Explicit ranges must sit
         inside that coverage to avoid spline extrapolation.
     distance_prior_pc : dict or None
-        User-facing distance prior for this observation with ``mean_pc``,
-        ``min_pc``, and ``max_pc``.  Tier 3 converts these parsec values to the
-        backend ``log_scale`` initial value and uniform prior bounds before MLE.
+        Normal distance prior with ``mean_pc`` and 1σ ``sigma_pc``. Tier 3
+        converts it to the backend ``log_scale`` parameter.
+    inclination_prior_deg : dict or None
+        Normal payloads provide ``mean_deg`` and 1σ ``sigma_deg``. Uniform
+        payloads provide ``mean_deg``, ``min_deg``, and ``max_deg``.
+    mle_freeze_params, mcmc_freeze_params : dict or None
+        Optional freeze settings keyed by internal parameter name. MLE freezes
+        hold parameters at their initial values; MCMC freezes hold parameters
+        at their post-MLE values. Every parameter remains free by default.
     sirocco_cpus : int
         Number of CPUs to use when launching Sirocco.  Values above 1 use
         ``mpirun -np N sirocco <pf>``.
@@ -2384,6 +2494,11 @@ def run_tier3_single(
     distance_prior_meta, prior_overrides, initial_params = _tier3_distance_prior_to_log_scale(
         distance_prior_pc
     )
+    inclination_prior_meta, inclination_priors, inclination_initial = (
+        _tier3_inclination_prior_to_parameter(emu, inclination_prior_deg, grid_name)
+    )
+    prior_overrides.update(inclination_priors)
+    initial_params.update(inclination_initial)
 
     if grid_name is None and (require_sirocco or run_sirocco):
         raise ValueError("Tier 3 Sirocco workflow requires a grid_name for .pf export.")
@@ -2426,6 +2541,7 @@ def run_tier3_single(
         iteration_callback=mle_iteration_callback,
         prior_overrides=prior_overrides,
         initial_params=initial_params,
+        freeze_params=mle_freeze_params,
         # Build the model with the emulator's absolute-flux calibration applied,
         # exactly like Tier 2 (line ~1531) and the inference/quick-fit tools.
         # The distance prior maps parsecs to log_scale via 2*ln(100/d), which is
@@ -2441,20 +2557,20 @@ def run_tier3_single(
     # MCMC
     if mcmc_iteration_callback is not None:
         mcmc_iteration_callback(0, mcmc_steps, 0.0)
-    # Tier 3 fits real observational spectra, where every nuisance parameter
-    # carries physical information (extinction, distance, continuum tilt, and GP
-    # covariance).  Following the migration to including nuisance parameters in
-    # inference, the MCMC samples them all rather than freezing them at their MLE
-    # values.
+    # Tier 3 keeps all physical and nuisance parameters free by default. Explicit
+    # viewer selections can instead hold chosen parameters at their post-MLE
+    # values for this MCMC pass.
     mcmc = run_mcmc_single(
         model, priors,
         nwalkers=mcmc_walkers, nsteps=mcmc_steps, burnin=mcmc_burnin,
         freeze_nuisance=False,
+        freeze_params=mcmc_freeze_params,
         iteration_callback=mcmc_iteration_callback,
         grid_name=grid_name,
     )
     friendly_labels = mcmc.get("labels", [])
     internal_labels = mcmc.get("internal_labels", friendly_labels)
+    frozen_param_values = mcmc.get("frozen_param_values", {})
 
     # Posterior Predictive Check (PPC)
     # Draw random posterior samples, evaluate the model flux at each one, and
@@ -2524,7 +2640,11 @@ def run_tier3_single(
         reduced_chi2 = np.nan
 
     exact_inclination = _extract_posterior_mean_inclination(
-        emu, mcmc["samples"], friendly_labels, grid_name
+        emu,
+        mcmc["samples"],
+        friendly_labels,
+        grid_name,
+        frozen_param_values=frozen_param_values,
     )
 
     result = {
@@ -2537,20 +2657,32 @@ def run_tier3_single(
         "mcmc_converged": mcmc["converged"],
         "n_effective": mcmc.get("n_effective"),
         "labels": friendly_labels,
+        "mle_freeze_settings": mle.get("freeze_params", {}),
+        "mle_frozen_params": mle.get("frozen_params", []),
+        "mcmc_freeze_settings": mcmc.get("freeze_params", {}),
+        "mcmc_frozen_params": mcmc.get("frozen_params", []),
+        "mcmc_frozen_param_values": mcmc.get("frozen_param_values", {}),
         "exact_inclination": exact_inclination,
         "export_dir": str(artifact_dir),
         "wl_range": [float(wl_range[0]), float(wl_range[1])],
         "emulator_wl_range": list(_emulator_wavelength_bounds(emu)),
         "tier3_time_s": None,
     }
+    prior_ranges = {}
     if distance_prior_meta is not None:
         result["distance_prior_pc"] = distance_prior_meta
-        result["prior_ranges"] = {
-            "Distance (pc)": [
-                distance_prior_meta["min_pc"],
-                distance_prior_meta["max_pc"],
-            ]
-        }
+        prior_ranges["Distance (pc)"] = [
+            distance_prior_meta["plot_min_pc"],
+            distance_prior_meta["plot_max_pc"],
+        ]
+    if inclination_prior_meta is not None:
+        result["inclination_prior_deg"] = inclination_prior_meta
+        prior_ranges["Inclination"] = [
+            inclination_prior_meta["applied_min_deg"],
+            inclination_prior_meta["applied_max_deg"],
+        ]
+    if prior_ranges:
+        result["prior_ranges"] = prior_ranges
 
     # Export a Sirocco .pf file from the posterior-mean parameters
     if grid_name is not None:
@@ -2560,18 +2692,29 @@ def run_tier3_single(
         _uncertainties = {}
         _friendly_grid = internal_to_friendly(emu.param_names, grid_name)
         for _pn, _friendly in zip(emu.param_names, _friendly_grid):
-            if _pn not in internal_labels:
-                raise ValueError(f"MCMC samples do not contain required grid parameter {_pn}")
-            _col = list(internal_labels).index(_pn)
-            _grid_means.append(float(np.mean(mcmc["samples"][:, _col])))
-            _lo = float(np.percentile(mcmc["samples"][:, _col], 16))
-            _hi = float(np.percentile(mcmc["samples"][:, _col], 84))
+            if _pn in internal_labels:
+                _col = list(internal_labels).index(_pn)
+                _grid_value = float(np.mean(mcmc["samples"][:, _col]))
+                _lo = float(np.percentile(mcmc["samples"][:, _col], 16))
+                _hi = float(np.percentile(mcmc["samples"][:, _col], 84))
+            elif _pn in frozen_param_values:
+                _grid_value = float(frozen_param_values[_pn])
+                _lo = _grid_value
+                _hi = _grid_value
+            else:
+                raise ValueError(
+                    f"MCMC samples and frozen parameter values do not contain required grid parameter {_pn}"
+                )
+            _grid_means.append(_grid_value)
             _uncertainties[_friendly] = (_lo, _hi)
 
         _global = {}
         for _i, _label in enumerate(internal_labels):
             if not str(_label).startswith("param"):
                 _global[str(_label)] = float(np.mean(mcmc["samples"][:, _i]))
+        for _label, _value in frozen_param_values.items():
+            if not str(_label).startswith("param"):
+                _global[str(_label)] = float(_value)
 
         export_pf_template(
             emu, np.asarray(_grid_means), str(_pf_path),
@@ -2704,13 +2847,19 @@ def run_tier3_single(
         "mcmc_summary": mcmc["summary"],
         "mle_params": result["mle_params"],
         "mle_all_params": result.get("mle_all_params", {}),
+        "mle_freeze_settings": result["mle_freeze_settings"],
+        "mle_frozen_params": result["mle_frozen_params"],
         "mcmc_converged": result["mcmc_converged"],
+        "mcmc_freeze_settings": result["mcmc_freeze_settings"],
+        "mcmc_frozen_params": result["mcmc_frozen_params"],
+        "mcmc_frozen_param_values": result["mcmc_frozen_param_values"],
         "exact_inclination": exact_inclination,
         "wl_range": result["wl_range"],
         "emulator_wl_range": result["emulator_wl_range"],
         "sirocco_transform_params": sirocco_transforms,
         "sirocco_transform_label": sirocco_transform_label,
         "distance_prior_pc": distance_prior_meta,
+        "inclination_prior_deg": inclination_prior_meta,
         "metrics": {
             "reduced_chi2": reduced_chi2,
             "ppc_coverage": ppc_in,
@@ -3127,9 +3276,15 @@ def build_report_card(
                 "exact_inclination",
                 "mle_params",
                 "mle_all_params",
+                "mle_freeze_settings",
+                "mle_frozen_params",
                 "mcmc_summary",
+                "mcmc_freeze_settings",
+                "mcmc_frozen_params",
+                "mcmc_frozen_param_values",
                 "labels",
                 "distance_prior_pc",
+                "inclination_prior_deg",
                 "prior_ranges",
                 "wl_range",
                 "emulator_wl_range",
