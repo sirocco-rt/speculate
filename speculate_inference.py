@@ -41,6 +41,7 @@ def _():
     import importlib
     from Starfish.emulator import Emulator
     from Starfish.spectrum import Spectrum
+    from Starfish.models.utils import find_residual_peaks, optimize_residual_peaks
     import Starfish.models.spectrum_model as _spectrum_model_module
     _spectrum_model_module = importlib.reload(_spectrum_model_module)
     SpectrumModel = _spectrum_model_module.SpectrumModel
@@ -50,6 +51,7 @@ def _():
     from Speculate_addons.gp_covariance import (
         GP_LOG_AMP_PRIOR_SIGMA,
         bounds_for_frozen_prior,
+        covariance_diagonal_components,
         estimate_log_amp_centre_from_sigma,
         get_frozen_dist_loc_scale,
         global_covariance_diagnostics,
@@ -102,7 +104,9 @@ def _():
         build_bestfit_spectrum_altair,
         build_default_observation_sigma,
         build_synthetic_sirocco_sigma,
+        covariance_diagonal_components,
         estimate_log_amp_centre_from_sigma,
+        find_residual_peaks,
         fit_power_law_continuum,
         get_frozen_dist_loc_scale,
         global_covariance_diagnostics,
@@ -111,6 +115,7 @@ def _():
         os,
         pd,
         re,
+        optimize_residual_peaks,
         stats,
     )
 
@@ -2306,6 +2311,10 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
         value=False,
         label="I have entered the target distance and uncertainty",
     )
+    enable_local_cov = mo.ui.checkbox(
+        value=False,
+        label="Enable fixed local covariance kernels (adds 1 MLE pre-fit)",
+    )
 
     # Default fix/free tickboxes reflect the migration to including the nuisance
     # parameters in inference:
@@ -2335,15 +2344,16 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
     # Wrap in mo.ui.dictionary for Marimo reactivity
     w_fix = mo.ui.dictionary(_fix_dict) if _fix_dict else mo.ui.dictionary({})
     w_val = mo.ui.dictionary(_val_dict) if _val_dict else mo.ui.dictionary({})
-    return bounds, distance_prior_ack, log10_params, param_names, prior_kinds, w_fix, w_max, w_min, w_val
+    return bounds, distance_prior_ack, enable_local_cov, log10_params, param_names, prior_kinds, w_fix, w_max, w_min, w_val
 
 
 @app.cell(hide_code=True)
-def _(bounds, distance_prior_ack, log10_params, mo, param_names, prior_kinds, w_fix, w_max, w_min, w_val):
+def _(bounds, data_source_selector, distance_prior_ack, enable_local_cov, log10_params, mo, param_names, prior_kinds, w_fix, w_max, w_min, w_val):
     # Render Parameter UI
     if not param_names:
          param_settings = mo.md("*Load an emulator to see parameters.*")
     else:
+        _is_test_grid = "Test Grid" in data_source_selector.value
         # Friendly display names
         _label_map = {
             'log_scale': 'Distance (pc)',
@@ -2416,6 +2426,8 @@ def _(bounds, distance_prior_ack, log10_params, mo, param_names, prior_kinds, w_
             _sections.append(mo.md("---"))
             _sections.append(mo.md("#### Inference / Nuisance Parameters"))
             _sections.extend(_global_rows)
+            if not _is_test_grid:
+                _sections.append(enable_local_cov)
             if 'log_scale' in param_names and not _fix_values.get('log_scale', False):
                 _sections.append(distance_prior_ack)
 
@@ -2523,11 +2535,15 @@ def _(mo):
 def _(
     build_default_observation_sigma,
     distance_prior_ack,
+    enable_local_cov,
     Spectrum,
     SpectrumModel,
     bounds_for_frozen_prior,
     build_synthetic_sirocco_sigma,
+    covariance_diagonal_components,
+    data_source_selector,
     emu,
+    find_residual_peaks,
     fit_power_law_continuum,
     get_frozen_dist_loc_scale,
     global_covariance_diagnostics,
@@ -2540,6 +2556,7 @@ def _(
     mo,
     np,
     obs_data,
+    optimize_residual_peaks,
     param_names,
     prior_kinds,
     run_mle_btn,
@@ -2798,149 +2815,126 @@ def _(
                         _mx = w_max['cheb_1'].value
                         _priors['cheb:1'] = stats.uniform(loc=_mn, scale=_mx - _mn)
 
-                # 4. Build Initial Simplex / Bounds
-                _spinner.update("Preparing optimizer...")
-                _opt_method = mle_method.value
+                def _copy_local_cov_params(_src_model):
+                    """Return plain-Python local-kernel dictionaries for reuse.
 
-                _active_labels = list(_model.labels)
-                _N = len(_active_labels)
-
-                # Derive per-parameter bounds from the priors (used by all methods).
-                _lo_bounds = []
-                _hi_bounds = []
-                for _label in _active_labels:
-                    if _label in _priors:
-                        _dist = _priors[_label]
-                        _prior_bounds = bounds_for_frozen_prior(_label, _dist)
-                        if _prior_bounds is not None:
-                            _lo, _hi = _prior_bounds
-                            _lo_bounds.append(_lo)
-                            _hi_bounds.append(_hi)
-                        else:
-                            _cv = _model.get_param_vector()[_active_labels.index(_label)]
-                            _lo_bounds.append(_cv - abs(_cv) * 0.5)
-                            _hi_bounds.append(_cv + abs(_cv) * 0.5)
+                    Starfish stores grouped parameters in a FlatterDict.  The
+                    truth-overlay model is constructed from scratch, so it needs
+                    normal dictionaries rather than references into the fitted
+                    model's mutable parameter container.
+                    """
+                    if 'local_cov' not in _src_model.params:
+                        return []
+                    try:
+                        _raw = _src_model.params.as_dict().get('local_cov', [])
+                    except Exception:
+                        return []
+                    if isinstance(_raw, dict):
+                        def _sort_key(_key):
+                            _text = str(_key)
+                            return (0, int(_text)) if _text.isdigit() else (1, _text)
+                        _items = [_raw[_key] for _key in sorted(_raw.keys(), key=_sort_key)]
                     else:
-                        _cv = _model.get_param_vector()[_active_labels.index(_label)]
-                        _lo_bounds.append(_cv - abs(_cv) * 0.5 - 1e-6)
-                        _hi_bounds.append(_cv + abs(_cv) * 0.5 + 1e-6)
-
-                # Shared (min, max) pairs for every bounded optimizer. All three
-                # methods must respect the same box — in particular the asymmetric
-                # log_amp ceiling — so the GP amplitude cannot blow up to absorb
-                # model-data mismatch under any optimizer choice.
-                _bounds_list = list(zip(_lo_bounds, _hi_bounds))
-
-                _simplex = None
-                if _opt_method == "Nelder-Mead":
-                    # Build an initial simplex spanning the prior volume.
-                    def _simplex_column_uniform(loc, scale, N):
-                        mn = loc
-                        mx = loc + scale
-                        rng = mx - mn
-                        margin = rng / 20
-                        t_mn, t_mx = mn + margin, mx - margin
-                        interval = (t_mx - t_mn) / N
-                        return [t_mn + interval * k for k in range(N + 1)]
-
-                    def _simplex_column_norm(mean, std, N):
-                        mn = mean - 2 * std
-                        mx = mean + 2 * std
-                        interval = (mx - mn) / N
-                        return [mn + interval * k for k in range(N + 1)]
-
-                    _simplex = np.zeros((_N + 1, _N))
-                    _simplex_info = []
-
-                    for _col_idx, _label in enumerate(_active_labels):
-                        if _label in _priors:
-                            _dist = _priors[_label]
-                            _loc, _sc = get_frozen_dist_loc_scale(_dist)
-                            if _dist.dist.name == 'uniform':
-                                _col = _simplex_column_uniform(_loc, _sc, _N)
-                            elif _dist.dist.name == 'norm':
-                                _col = _simplex_column_norm(_loc, _sc, _N)
-                            else:
-                                _cv = _model.get_param_vector()[_col_idx]
-                                _col = [_cv + (_cv * 0.01 * k) for k in range(_N + 1)]
-                        else:
-                            _cv = _model.get_param_vector()[_col_idx]
-                            _col = [_cv] * (_N + 1)
-
-                        _simplex[:, _col_idx] = _col
-                        _simplex_info.append(
-                            f"  {_label}: [{min(_col):.4f} .. {max(_col):.4f}]")
-                        _simplex[:, _col_idx] = np.roll(
-                            _simplex[:, _col_idx], _col_idx)
-
-                    _centroid = _simplex.mean(axis=0)
-                    _model.set_param_vector(_centroid)
-
-                # 5. Run MLE Optimization
-                # Warm up emulator caches (Cholesky factorisation etc.)
-                # before starting the optimizer timer, so the first eval
-                # isn't artificially slow.
-                _spinner.update("Building emulator cache (one-time)...")
-                try:
-                    _ = _model()
-                except Exception:
-                    pass
-
-                _spinner.update(f"Running {_opt_method} optimisation...")
-
-                _nll_history = []
-                _iter_count = [0]
-                _start_time = _time.time()
-                _max_iter = int(mle_max_iter.value)
-                _n_restarts = max(1, int(mle_restarts.value))
-
-                _global_best_f = [float("inf")]  # mutable for callback
-                _cur_restart = [0]
-
-                def _nll_with_callback(P):
-                    _model.set_param_vector(P)
-                    # Fast bounds check — skip expensive GPU eval for out-of-range proposals
-                    _gp = np.array(_model.grid_params)
-                    if (np.any(_gp < _model.emulator.min_params) or
-                            np.any(_gp > _model.emulator.max_params)):
-                        nll = 1e30
-                    else:
+                        _items = list(_raw)
+                    _params = []
+                    for _kernel in _items:
                         try:
-                            nll = -_model.log_likelihood(_priors)
-                        except (ValueError, np.linalg.LinAlgError):
-                            nll = 1e30
-                    _nll_history.append(nll)
-                    _iter_count[0] += 1
-                    if _iter_count[0] % 50 == 0:
-                        _elapsed = _time.time() - _start_time
-                        _spinner.update(
-                            f"{_opt_method} Restart {_cur_restart[0]}/{_n_restarts} | "
-                            f"Eval {_iter_count[0]} | "
-                            f"Best NLL: {_global_best_f[0]:.10f} | "
-                            f"Time: {_elapsed:.1f}s"
+                            _params.append({
+                                "mu": float(_kernel["mu"]),
+                                "log_amp": float(_kernel["log_amp"]),
+                                "log_sigma": float(_kernel["log_sigma"]),
+                            })
+                        except Exception:
+                            pass
+                    return _params
+
+                def _local_covariance_variance_params(
+                    _src_model,
+                    _local_params,
+                    _base_covariance,
+                    _target_significance=3.0,
+                ):
+                    """Set local variance from the detection covariance.
+
+                    The residual optimiser returns a Gaussian height in flux
+                    units. Add only the variance still required for that height
+                    to remain a three-sigma feature after the full pre-local
+                    covariance has already been included.
+                    """
+                    if not _local_params:
+                        return []
+
+                    _target_significance = float(_target_significance)
+                    if (
+                        not np.isfinite(_target_significance)
+                        or _target_significance <= 0
+                    ):
+                        raise ValueError(
+                            "_target_significance must be finite and positive"
                         )
-                    return nll
 
-                _p0 = _model.get_param_vector()
-                _lo_arr = np.array(_lo_bounds)
-                _hi_arr = np.array(_hi_bounds)
+                    if hasattr(_base_covariance, "detach"):
+                        _base_covariance = (
+                            _base_covariance.detach().cpu().numpy()
+                        )
+                    _base_covariance = np.asarray(
+                        _base_covariance,
+                        dtype=float,
+                    )
+                    _base_diagonal = (
+                        np.diag(_base_covariance)
+                        if _base_covariance.ndim == 2
+                        else _base_covariance.reshape(-1)
+                    )
+                    _wavelength = np.asarray(
+                        _src_model.data.wave,
+                        dtype=float,
+                    )
+                    if _base_diagonal.size != _wavelength.size:
+                        raise ValueError(
+                            "Pre-local covariance diagonal does not match "
+                            "the model wavelength grid"
+                        )
 
-                # Generate starting points: first = bootstrapped x0, rest = random
-                _start_points = [_p0.copy()]
-                if _n_restarts > 1:
-                    np.random.seed(None)
-                    for _ in range(_n_restarts - 1):
-                        _rnd = _lo_arr + np.random.rand(_N) * (_hi_arr - _lo_arr)
-                        _start_points.append(_rnd)
+                    _converted = []
+                    for _kernel in _local_params:
+                        _new_kernel = dict(_kernel)
+                        _fitted_height = np.exp(
+                            float(_new_kernel["log_amp"])
+                        )
+                        _centre = float(_new_kernel["mu"])
+                        _centre_index = int(
+                            np.argmin(np.abs(_wavelength - _centre))
+                        )
+                        _base_variance = max(
+                            float(_base_diagonal[_centre_index]),
+                            0.0,
+                        )
 
-                _global_best_x = _p0.copy()
-                _global_best_nit = 0
-                _restart_summaries = []
+                        # The 4-sigma detector uses this same variance. Remove
+                        # it from the target total so existing emulator, data,
+                        # and global-GP uncertainty is not counted twice.
+                        _target_total_variance = (
+                            _fitted_height / _target_significance
+                        ) ** 2
+                        _local_variance = (
+                            _target_total_variance - _base_variance
+                        )
+                        if (
+                            not np.isfinite(_local_variance)
+                            or _local_variance <= 0
+                        ):
+                            continue
+                        _new_kernel["log_amp"] = float(
+                            np.log(_local_variance)
+                        )
+                        _converted.append(_new_kernel)
+                    return _converted
 
                 def _restart_param_label(_name):
                     return f"log10({_name})" if _name in log10_params else _name
 
-                def _capture_restart_result(_restart_number, _solution):
+                def _capture_restart_result(_restart_summaries, _restart_number, _solution):
                     _model.set_param_vector(_solution.x)
                     _values = {}
                     for _i, _p in enumerate(phys_names):
@@ -2965,117 +2959,409 @@ def _(
                         "values": _values,
                     })
 
-                for _restart_idx, _x0 in enumerate(_start_points):
-                    _cur_restart[0] = _restart_idx + 1
-                    _iter_count[0] = 0  # reset eval counter per restart
-                    _spinner.update(
-                        f"{_opt_method} | Restart {_cur_restart[0]}/{_n_restarts} | "
-                        f"Starting... | {_time.time() - _start_time:.1f}s"
-                    )
-                    _model.set_param_vector(_x0)
+                def _run_mle_pass(_phase_label):
+                    """Run one complete MLE pass for the current SpectrumModel.
 
+                    Local covariance support needs two optimiser passes: a first
+                    pass to expose residual peaks, then a final pass after fixed
+                    ``local_cov`` kernels have been inserted.  Keeping the
+                    optimiser in one helper prevents the pre-fit and final fit
+                    from drifting apart in bounds, restarts, or status reporting.
+                    """
+                    _spinner.update(f"Preparing {_phase_label} optimizer...")
+                    _opt_method = mle_method.value
+                    _active_labels = list(_model.labels)
+                    _N = len(_active_labels)
+                    _nll_history = []
+                    _restart_summaries = []
+                    _start_time = _time.time()
+                    _max_iter = int(mle_max_iter.value)
+                    _n_restarts = max(1, int(mle_restarts.value))
+
+                    from types import SimpleNamespace
+
+                    if _N == 0:
+                        _spinner.update(f"Evaluating fixed-parameter {_phase_label}...")
+                        _fun = -float(_model.log_likelihood(_priors))
+                        _nll_history.append(_fun)
+                        _soln = SimpleNamespace(
+                            x=_model.get_param_vector(),
+                            fun=_fun,
+                            success=True,
+                            message="All parameters fixed",
+                            nit=0,
+                        )
+                        _capture_restart_result(_restart_summaries, 1, _soln)
+                        return {
+                            "soln": _soln,
+                            "nll_history": _nll_history,
+                            "restart_summaries": _restart_summaries,
+                            "elapsed": _time.time() - _start_time,
+                            "eval_count": 1,
+                        }
+
+                    # Derive per-parameter bounds from the priors (used by all methods).
+                    _lo_bounds = []
+                    _hi_bounds = []
+                    _param_vector = _model.get_param_vector()
+                    for _col_idx, _label in enumerate(_active_labels):
+                        if _label in _priors:
+                            _dist = _priors[_label]
+                            _prior_bounds = bounds_for_frozen_prior(_label, _dist)
+                            if _prior_bounds is not None:
+                                _lo, _hi = _prior_bounds
+                                _lo_bounds.append(_lo)
+                                _hi_bounds.append(_hi)
+                            else:
+                                _cv = _param_vector[_col_idx]
+                                _lo_bounds.append(_cv - abs(_cv) * 0.5)
+                                _hi_bounds.append(_cv + abs(_cv) * 0.5)
+                        else:
+                            _cv = _param_vector[_col_idx]
+                            _lo_bounds.append(_cv - abs(_cv) * 0.5 - 1e-6)
+                            _hi_bounds.append(_cv + abs(_cv) * 0.5 + 1e-6)
+
+                    # Shared (min, max) pairs for every bounded optimizer.
+                    _bounds_list = list(zip(_lo_bounds, _hi_bounds))
+
+                    _simplex = None
                     if _opt_method == "Nelder-Mead":
-                        # For restart 0 use the pre-built simplex; for later
-                        # restarts use adaptive simplex from the random x0.
-                        # bounds= makes scipy clip the simplex (including the
-                        # initial one, which spans centre±2σ for normal priors
-                        # and can exceed the asymmetric log_amp ceiling).
-                        _nm_opts = dict(maxiter=_max_iter, disp=False, adaptive=True)
-                        if _restart_idx == 0 and _simplex is not None:
-                            _nm_opts["initial_simplex"] = _simplex
-                        _run_soln = scipy_minimize(
-                            _nll_with_callback,
-                            _x0,
-                            method="Nelder-Mead",
-                            bounds=_bounds_list,
-                            options=_nm_opts,
-                        )
+                        def _simplex_column_uniform(loc, scale, N):
+                            mn = loc
+                            mx = loc + scale
+                            rng = mx - mn
+                            margin = rng / 20
+                            t_mn, t_mx = mn + margin, mx - margin
+                            interval = (t_mx - t_mn) / N
+                            return [t_mn + interval * k for k in range(N + 1)]
 
-                    elif _opt_method == "L-BFGS-B":
-                        _run_soln = scipy_minimize(
-                            _nll_with_callback,
-                            _x0,
-                            method="L-BFGS-B",
-                            bounds=_bounds_list,
-                            options=dict(
-                                maxiter=_max_iter,
-                                ftol=1e-15,
-                                gtol=1e-12,
-                                eps=1e-5,
-                            ),
-                        )
+                        def _simplex_column_norm(mean, std, N):
+                            mn = mean - 2 * std
+                            mx = mean + 2 * std
+                            interval = (mx - mn) / N
+                            return [mn + interval * k for k in range(N + 1)]
 
-                    elif _opt_method == "CMA-ES":
-                        try:
-                            import cma
-                        except ImportError:
-                            raise ImportError(
-                                "CMA-ES requires the 'cma' package. "
-                                "Install it with: pip install cma"
+                        _simplex = np.zeros((_N + 1, _N))
+                        for _col_idx, _label in enumerate(_active_labels):
+                            if _label in _priors:
+                                _dist = _priors[_label]
+                                _loc, _sc = get_frozen_dist_loc_scale(_dist)
+                                if _dist.dist.name == 'uniform':
+                                    _col = _simplex_column_uniform(_loc, _sc, _N)
+                                elif _dist.dist.name == 'norm':
+                                    _col = _simplex_column_norm(_loc, _sc, _N)
+                                else:
+                                    _cv = _model.get_param_vector()[_col_idx]
+                                    _col = [_cv + (_cv * 0.01 * k) for k in range(_N + 1)]
+                            else:
+                                _cv = _model.get_param_vector()[_col_idx]
+                                _col = [_cv] * (_N + 1)
+
+                            _simplex[:, _col_idx] = _col
+                            _simplex[:, _col_idx] = np.roll(
+                                _simplex[:, _col_idx], _col_idx)
+
+                        _centroid = _simplex.mean(axis=0)
+                        _model.set_param_vector(_centroid)
+
+                    # Warm up emulator caches (Cholesky factorisation etc.).
+                    _spinner.update(f"Building emulator cache for {_phase_label}...")
+                    try:
+                        _ = _model()
+                    except Exception:
+                        pass
+
+                    _spinner.update(f"Running {_phase_label} via {_opt_method}...")
+
+                    _global_best_f = [float("inf")]
+                    _cur_restart = [0]
+                    _total_eval_count = [0]
+                    _restart_eval_count = [0]
+
+                    def _nll_with_callback(P):
+                        _model.set_param_vector(P)
+                        # Fast bounds check — skip expensive GPU eval for out-of-range proposals.
+                        _gp = np.array(_model.grid_params)
+                        if (np.any(_gp < _model.emulator.min_params) or
+                                np.any(_gp > _model.emulator.max_params)):
+                            nll = 1e30
+                        else:
+                            try:
+                                nll = -_model.log_likelihood(_priors)
+                            except (ValueError, RuntimeError, np.linalg.LinAlgError):
+                                nll = 1e30
+                        _nll_history.append(nll)
+                        _total_eval_count[0] += 1
+                        _restart_eval_count[0] += 1
+                        if _restart_eval_count[0] % 50 == 0:
+                            _elapsed = _time.time() - _start_time
+                            _spinner.update(
+                                f"{_phase_label} | {_opt_method} Restart {_cur_restart[0]}/{_n_restarts} | "
+                                f"Eval {_restart_eval_count[0]} | "
+                                f"Best NLL: {_global_best_f[0]:.10f} | "
+                                f"Time: {_elapsed:.1f}s"
                             )
-                        _cma_bounds = [_lo_bounds, _hi_bounds]
-                        _p0_cma = np.clip(
-                            _x0,
-                            _lo_arr + 1e-8,
-                            _hi_arr - 1e-8,
+                        return nll
+
+                    _p0 = _model.get_param_vector()
+                    _lo_arr = np.array(_lo_bounds)
+                    _hi_arr = np.array(_hi_bounds)
+
+                    # Generate starting points: first = bootstrapped x0, rest = random.
+                    _start_points = [_p0.copy()]
+                    if _n_restarts > 1:
+                        np.random.seed(None)
+                        for _ in range(_n_restarts - 1):
+                            _rnd = _lo_arr + np.random.rand(_N) * (_hi_arr - _lo_arr)
+                            _start_points.append(_rnd)
+
+                    _global_best_x = _p0.copy()
+                    _global_best_nit = 0
+
+                    for _restart_idx, _x0 in enumerate(_start_points):
+                        _cur_restart[0] = _restart_idx + 1
+                        _restart_eval_count[0] = 0
+                        _spinner.update(
+                            f"{_phase_label} | {_opt_method} | Restart {_cur_restart[0]}/{_n_restarts} | "
+                            f"Starting... | {_time.time() - _start_time:.1f}s"
                         )
-                        _cma_stds = [0.2 * (hi - lo) for lo, hi in zip(_lo_bounds, _hi_bounds)]
-                        _popsize = 2 * (4 + int(3 * np.log(_N)))
-                        _es = cma.CMAEvolutionStrategy(
-                            _p0_cma.tolist(), 1.0,
-                            {
-                                "bounds": _cma_bounds,
-                                "CMA_stds": _cma_stds,
-                                "popsize": _popsize,
-                                "maxfevals": _max_iter,
-                                "verbose": -9,
-                                "tolfun": 1e-10,
-                            },
+                        _model.set_param_vector(_x0)
+
+                        if _opt_method == "Nelder-Mead":
+                            _nm_opts = dict(maxiter=_max_iter, disp=False, adaptive=True)
+                            if _restart_idx == 0 and _simplex is not None:
+                                _nm_opts["initial_simplex"] = _simplex
+                            _run_soln = scipy_minimize(
+                                _nll_with_callback,
+                                _x0,
+                                method="Nelder-Mead",
+                                bounds=_bounds_list,
+                                options=_nm_opts,
+                            )
+
+                        elif _opt_method == "L-BFGS-B":
+                            _run_soln = scipy_minimize(
+                                _nll_with_callback,
+                                _x0,
+                                method="L-BFGS-B",
+                                bounds=_bounds_list,
+                                options=dict(
+                                    maxiter=_max_iter,
+                                    ftol=1e-15,
+                                    gtol=1e-12,
+                                    eps=1e-5,
+                                ),
+                            )
+
+                        elif _opt_method == "CMA-ES":
+                            try:
+                                import cma
+                            except ImportError:
+                                raise ImportError(
+                                    "CMA-ES requires the 'cma' package. "
+                                    "Install it with: pip install cma"
+                                )
+                            _cma_bounds = [_lo_bounds, _hi_bounds]
+                            _p0_cma = np.clip(
+                                _x0,
+                                _lo_arr + 1e-8,
+                                _hi_arr - 1e-8,
+                            )
+                            _cma_stds = [0.2 * (hi - lo) for lo, hi in zip(_lo_bounds, _hi_bounds)]
+                            _popsize = 2 * (4 + int(3 * np.log(_N)))
+                            _es = cma.CMAEvolutionStrategy(
+                                _p0_cma.tolist(), 1.0,
+                                {
+                                    "bounds": _cma_bounds,
+                                    "CMA_stds": _cma_stds,
+                                    "popsize": _popsize,
+                                    "maxfevals": _max_iter,
+                                    "verbose": -9,
+                                    "tolfun": 1e-10,
+                                },
+                            )
+                            _run_best_x, _run_best_f = _x0.copy(), float("inf")
+                            while not _es.stop():
+                                _solutions = _es.ask()
+                                _fits = [_nll_with_callback(np.array(s)) for s in _solutions]
+                                _es.tell(_solutions, _fits)
+                                _gen_best = min(_fits)
+                                if _gen_best < _run_best_f:
+                                    _run_best_f = _gen_best
+                                    _run_best_x = np.array(_solutions[_fits.index(_gen_best)])
+                                if _run_best_f < _global_best_f[0]:
+                                    _global_best_f[0] = _run_best_f
+                            _run_soln = SimpleNamespace(
+                                x=_run_best_x, fun=_run_best_f, success=True,
+                                message="CMA-ES terminated",
+                                nit=_es.result.iterations,
+                            )
+                        else:
+                            raise ValueError(f"Unknown optimizer: {_opt_method}")
+
+                        _capture_restart_result(_restart_summaries, _cur_restart[0], _run_soln)
+
+                        # Keep global best across restarts.
+                        if _run_soln.fun <= _global_best_f[0]:
+                            _global_best_f[0] = _run_soln.fun
+                            _global_best_x = _run_soln.x.copy()
+                            _global_best_nit = getattr(_run_soln, 'nit', 0)
+
+                    _soln = SimpleNamespace(
+                        x=_global_best_x, fun=_global_best_f[0], success=True,
+                        message=f"Best of {_n_restarts} restart(s)",
+                        nit=_global_best_nit,
+                    )
+
+                    if _soln.success:
+                        _model.set_param_vector(_soln.x)
+
+                    return {
+                        "soln": _soln,
+                        "nll_history": _nll_history,
+                        "restart_summaries": _restart_summaries,
+                        "elapsed": _time.time() - _start_time,
+                        "eval_count": _total_eval_count[0],
+                    }
+
+                _is_test_grid_source = "Test Grid" in data_source_selector.value
+                _local_cov_enabled = bool(enable_local_cov.value) and not _is_test_grid_source
+                _local_cov_meta = {
+                    "enabled": _local_cov_enabled,
+                    "n_candidates": 0,
+                    "n_kernels": 0,
+                    "mle_passes": 1,
+                    "amplitude_mode": None,
+                    "detection_covariance_mode": (
+                        "full_pre_local_diagonal"
+                        if _local_cov_enabled else None
+                    ),
+                    "message": "Local covariance disabled.",
+                    "error": None,
+                    "kernels": [],
+                }
+                _overall_start_time = _time.time()
+
+                _mle_pass = _run_mle_pass("MLE pre-fit" if _local_cov_enabled else "MLE")
+                _all_eval_count = int(_mle_pass["eval_count"])
+
+                if _local_cov_enabled:
+                    _spinner.update("Detecting fixed local covariance kernels...")
+                    try:
+                        # Starfish's local-kernel helpers operate on the model's
+                        # residual deque.  Populate it once at the MLE pre-fit
+                        # point, then freeze accepted kernels so MCMC does not
+                        # gain many narrow nuisance dimensions.
+                        _model.residuals.clear()
+                        if hasattr(_model, "_residual_call_count"):
+                            _model._residual_call_count = 0
+                        _ = _model.log_likelihood(_priors)
+                        _num_residuals = len(_model.residuals)
+                        _residual_regions = []
+                        _base_covariance_diagonal = None
+                        if _num_residuals > 0:
+                            # Evaluate the complete covariance before local
+                            # kernels are added. Its diagonal combines
+                            # observational, emulator, and global-GP variance
+                            # for the pointwise outlier score; correlations
+                            # remain active in the likelihood.
+                            _, _base_covariance = _model()
+                            _base_covariance_diagonal = (
+                                _base_covariance.diagonal()
+                            )
+                            if hasattr(
+                                _base_covariance_diagonal,
+                                "detach",
+                            ):
+                                _base_covariance_diagonal = (
+                                    _base_covariance_diagonal
+                                    .detach()
+                                    .cpu()
+                                    .numpy()
+                                )
+                            _base_covariance_diagonal = np.asarray(
+                                _base_covariance_diagonal,
+                                dtype=float,
+                            )
+                            _residual_regions = find_residual_peaks(
+                                _model,
+                                num_residuals=_num_residuals,
+                                threshold=4.0,
+                                buffer=2.0,
+                                # Preserve coherent residual-region bounds and
+                                # adaptive widths for the kernel optimiser.
+                                return_regions=True,
+                                covariance=_base_covariance_diagonal,
+                            )
+                        _local_cov_meta["n_candidates"] = len(_residual_regions)
+                        _local_params = []
+                        if _residual_regions:
+                            _local_params = optimize_residual_peaks(
+                                _model,
+                                mus=_residual_regions,
+                                sigma0=50,
+                                num_residuals=_num_residuals,
+                                covariance=_base_covariance_diagonal,
+                            )
+                            _local_params = _local_covariance_variance_params(
+                                _model,
+                                _local_params,
+                                _base_covariance_diagonal,
+                                _target_significance=3.0,
+                            )
+                            _local_cov_meta["amplitude_mode"] = (
+                                "full_covariance_target_3_sigma"
+                            )
+
+                        if _local_params:
+                            _model.params["local_cov"] = _local_params
+                            _model._loc_cov = None
+                            if hasattr(_model, "_loc_cov_gpu"):
+                                _model._loc_cov_gpu = None
+                            _model.freeze("local_cov")
+                            _local_cov_meta["n_kernels"] = len(_local_params)
+                            _local_cov_meta["kernels"] = _copy_local_cov_params(_model)
+                            _local_cov_meta["message"] = (
+                                f"Added {len(_local_params)} fixed local covariance kernel"
+                                f"{'s' if len(_local_params) != 1 else ''} with a "
+                                "3-sigma placement target."
+                            )
+                            _mle_pass = _run_mle_pass("MLE with local covariance")
+                            _all_eval_count += int(_mle_pass["eval_count"])
+                            _local_cov_meta["mle_passes"] = 2
+                            _local_cov_meta["message"] = (
+                                f"{_local_cov_meta['message']} Final MLE pass rerun with fixed kernels."
+                            )
+                        else:
+                            _local_cov_meta["message"] = (
+                                f"Detected {len(_residual_regions)} residual region"
+                                f"{'s' if len(_residual_regions) != 1 else ''} "
+                                "above 4 sigma under the full pre-local covariance, "
+                                "but added 0 local covariance kernels."
+                            )
+                    except Exception as _lc_exc:
+                        _local_cov_meta["error"] = str(_lc_exc)
+                        _local_cov_meta["message"] = (
+                            "Local covariance placement failed; continuing without local kernels."
                         )
-                        _run_best_x, _run_best_f = _x0.copy(), float("inf")
-                        while not _es.stop():
-                            _solutions = _es.ask()
-                            _fits = [_nll_with_callback(np.array(s)) for s in _solutions]
-                            _es.tell(_solutions, _fits)
-                            _gen_best = min(_fits)
-                            if _gen_best < _run_best_f:
-                                _run_best_f = _gen_best
-                                _run_best_x = np.array(_solutions[_fits.index(_gen_best)])
-                            if _run_best_f < _global_best_f[0]:
-                                _global_best_f[0] = _run_best_f
-                        from types import SimpleNamespace
-                        _run_soln = SimpleNamespace(
-                            x=_run_best_x, fun=_run_best_f, success=True,
-                            message="CMA-ES terminated",
-                            nit=_es.result.iterations,
-                        )
 
-                    _capture_restart_result(_cur_restart[0], _run_soln)
-
-                    # Keep global best across restarts
-                    if _run_soln.fun <= _global_best_f[0]:
-                        _global_best_f[0] = _run_soln.fun
-                        _global_best_x = _run_soln.x.copy()
-                        _global_best_nit = getattr(_run_soln, 'nit', 0)
-
-                from types import SimpleNamespace
-                _soln = SimpleNamespace(
-                    x=_global_best_x, fun=_global_best_f[0], success=True,
-                    message=f"Best of {_n_restarts} restart(s)",
-                    nit=_global_best_nit,
-                )
-
-                if _soln.success:
-                    _model.set_param_vector(_soln.x)
+                _soln = _mle_pass["soln"]
+                _nll_history = _mle_pass["nll_history"]
+                _restart_summaries = _mle_pass["restart_summaries"]
 
                 # Store for MCMC
                 set_mle_model(_model)
                 set_mle_priors(_priors)
 
-                _elapsed_total = _time.time() - _start_time
+                _opt_method = mle_method.value
+                _n_restarts = max(1, int(mle_restarts.value))
+                _elapsed_total = _time.time() - _overall_start_time
                 _restart_msg = f" ({_n_restarts} restart{'s' if _n_restarts > 1 else ''})" if _n_restarts > 1 else ""
+                _local_msg = ""
+                if _local_cov_enabled:
+                    _local_msg = f" Local covariance: {_local_cov_meta['n_kernels']} fixed kernel(s)."
                 fit_status = mo.callout(
-                    mo.md(f"{mo.icon('lucide:check-circle')} MLE Complete via {_opt_method}{_restart_msg}! ({_iter_count[0]} iterations, {_elapsed_total:.1f}s)"),
+                    mo.md(f"{mo.icon('lucide:check-circle')} MLE Complete via {_opt_method}{_restart_msg}! ({_all_eval_count} evaluations, {_elapsed_total:.1f}s).{_local_msg}"),
                     kind="success"
                 )
 
@@ -3115,6 +3401,13 @@ def _(
                     _plot_cov = _plot_cov.detach().cpu().numpy()
                 _plot_cov = np.asarray(_plot_cov, dtype=float)
                 _plot_cov_diag = np.diag(_plot_cov) if _plot_cov.ndim == 2 else _plot_cov.reshape(-1)
+                # Preserve the same additive covariance terms used by the
+                # likelihood so the residual plot can explain its uncertainty
+                # at each wavelength without re-evaluating the emulator.
+                _plot_covariance_components = covariance_diagonal_components(
+                    _model,
+                    _plot_cov,
+                )
                 _plot_data_flux = np.asarray(_model.data.flux, dtype=float)
                 _gp_covariance_diagnostics = global_covariance_diagnostics(
                     _model,
@@ -3127,6 +3420,11 @@ def _(
                     "data_flux": _plot_data_flux.copy(),
                     "model_flux": np.asarray(_plot_flux, dtype=float).copy(),
                     "model_cov_diag": _plot_cov_diag.copy(),
+                    "covariance_components": {
+                        _name: _values.copy()
+                        for _name, _values
+                        in _plot_covariance_components.items()
+                    },
                     "title": f"Best-Fit Model — {_model.data_name}",
                     "zoom_name": "inference_mle_bestfit_zoom",
                     "model_label": f"MLE Best Fit (NLL={_format_nll(_mle_nll)})",
@@ -3160,6 +3458,9 @@ def _(
                                     'log_amp': float(_model.params['global_cov:log_amp']),
                                     'log_ls': float(_model.params['global_cov:log_ls']),
                                 }
+                            _local_cov_for_truth = _copy_local_cov_params(_model)
+                            if _local_cov_for_truth:
+                                _truth_global_params['local_cov'] = _local_cov_for_truth
 
                             _truth_model = SpectrumModel(
                                 emulator=emu,
@@ -3265,6 +3566,11 @@ def _(
                     _global_md += f"| **ln(GP amp)** | {res_global['global_cov:log_amp']:.4f} |\n"
                 if 'global_cov:log_ls' in res_global:
                     _global_md += f"| **ln(GP length)** | {res_global['global_cov:log_ls']:.4f} |\n"
+                if _local_cov_meta.get("enabled"):
+                    _global_md += (
+                        f"| **Local covariance kernels** | "
+                        f"{int(_local_cov_meta.get('n_kernels', 0))} fixed |\n"
+                    )
 
                 _playground_distance_pc = 100.0
                 if 'log_scale' in res_global:
@@ -3323,6 +3629,7 @@ def _(
                     "global_md": _global_md,
                     "playground_payload": _playground_payload,
                     "gp_covariance_diagnostics": _gp_covariance_diagnostics,
+                    "local_covariance": _local_cov_meta,
                     "restart_table_rows": _restart_table_rows,
                     "loss_fig": _fig_loss,
                     "plot": _mle_plot_payload,
@@ -3362,6 +3669,25 @@ def _(
         _gt_payload = _plot.get("ground_truth")
         _show_gt = bool(_gt_payload) and bool(mle_show_ground_truth_spectrum.value)
         _extra_series = [_gt_payload] if _show_gt else None
+        _local_cov = _result.get("local_covariance") or {}
+        _local_cov_centers = []
+        _local_cov_regions = []
+        for _kernel in _local_cov.get("kernels", []):
+            try:
+                _mu = float(_kernel["mu"])
+                _sigma_v = float(np.exp(float(_kernel["log_sigma"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+            _local_cov_centers.append(_mu)
+            # ``local_covariance_matrix`` is identically zero beyond four
+            # velocity standard deviations from the centre. Convert that
+            # compact support to wavelength bounds for the plot.
+            _half_width = 4.0 * _sigma_v * _mu / 299792.458
+            _local_cov_regions.append({
+                "mu": _mu,
+                "lower": _mu - _half_width,
+                "upper": _mu + _half_width,
+            })
 
         _fig = build_bestfit_spectrum_altair(
             alt,
@@ -3373,6 +3699,9 @@ def _(
             zoom_name=_plot["zoom_name"],
             model_label=_plot["model_label"],
             extra_flux_series=_extra_series,
+            local_covariance_centers=_local_cov_centers,
+            local_covariance_regions=_local_cov_regions,
+            covariance_components=_plot.get("covariance_components"),
         )
 
         def _send_mle_to_playground(_):
@@ -3412,6 +3741,16 @@ def _(
             if _gp_diag.get("log_ls_at_upper_bound"):
                 _gp_msg += " log_ls is at the upper prior bound."
             _result_elements.append(mo.callout(mo.md(_gp_msg), kind="warn"))
+        if _local_cov.get("enabled"):
+            _local_kind = "warn" if _local_cov.get("error") else "neutral"
+            _local_msg = _local_cov.get("message") or (
+                f"{int(_local_cov.get('n_kernels', 0))} fixed local covariance "
+                "kernel(s) included."
+            )
+            _local_msg = f"Fixed local covariance enabled: {_local_msg}"
+            if _local_cov.get("error"):
+                _local_msg += f" Error: {_local_cov['error']}"
+            _result_elements.append(mo.callout(mo.md(_local_msg), kind=_local_kind))
         if _result.get("restart_table_rows"):
             _restart_rows = _result["restart_table_rows"]
             _restart_columns = list(_restart_rows[0].keys()) if _restart_rows else []
@@ -3542,6 +3881,7 @@ def _(emu, get_mle_model, mo, param_names, re):
 def _(
     alt,
     build_bestfit_spectrum_altair,
+    covariance_diagonal_components,
     get_mle_model,
     get_mle_priors,
     ground_truth_params,
@@ -3672,7 +4012,7 @@ def _(
                         _ball[:, _i] = _mle_val + 0.1 * np.random.randn(_nwalkers)
 
                 # Create sampler — use DEMove + DESnookerMove for better
-                # performance in ≥5D (Ter Braak 2006; Nelson et al. 2014).
+                # performance in ≥5D (Ter Braak 2008; Nelson et al. 2013).
                 # The default StretchMove becomes increasingly inefficient
                 # above ~5 dimensions.
                 _moves = [
@@ -3992,6 +4332,10 @@ def _(
                     _plot_flux = _plot_flux.detach().cpu().numpy()
                 if hasattr(_plot_cov, 'detach'):
                     _plot_cov = _plot_cov.detach().cpu().numpy()
+                _plot_covariance_components = covariance_diagonal_components(
+                    _model,
+                    _plot_cov,
+                )
                 _fig_bestfit = build_bestfit_spectrum_altair(
                     alt,
                     wavelength=_model.data.wave,
@@ -4000,6 +4344,7 @@ def _(
                     model_cov_diag=_plot_cov,
                     title=f"Best-Fit Model (MCMC Posterior Mean) — {_model.data_name}",
                     zoom_name="inference_mcmc_bestfit_zoom",
+                    covariance_components=_plot_covariance_components,
                 )
 
                 # ============================================================

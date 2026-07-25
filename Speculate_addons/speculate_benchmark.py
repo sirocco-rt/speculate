@@ -43,6 +43,7 @@ from Speculate_addons.grid_registry import (
 from Speculate_addons.gp_covariance import (
     GP_LOG_AMP_PRIOR_SIGMA,
     bounds_for_frozen_prior,
+    covariance_diagonal_components,
     estimate_log_amp_centre_from_sigma,
     global_covariance_diagnostics,
 )
@@ -166,7 +167,377 @@ def _serialise_freeze_settings(freeze_params: Optional[dict]) -> Dict[str, bool]
 
 def _snapshot_model_params(model) -> Dict[str, float]:
     """Capture the current SpectrumModel parameter state as plain floats."""
-    return {str(label): float(model.params[label]) for label in model.params.keys()}
+    params = {}
+    for label in model.params.keys():
+        try:
+            params[str(label)] = float(model.params[label])
+        except (TypeError, ValueError):
+            continue
+    return params
+
+
+def _copy_local_cov_params(model) -> List[dict]:
+    """Return JSON-safe Starfish local covariance kernel parameters.
+
+    Starfish stores grouped parameters in a flattened container. Reports need
+    ordinary dictionaries so local covariance diagnostics survive JSON
+    serialisation without keeping the live ``SpectrumModel`` object around.
+    """
+    if "local_cov" not in model.params:
+        return []
+    try:
+        raw = model.params.as_dict().get("local_cov", [])
+    except Exception:
+        return []
+    if isinstance(raw, dict):
+        def _sort_key(key):
+            text = str(key)
+            return (0, int(text)) if text.isdigit() else (1, text)
+        kernels = [raw[key] for key in sorted(raw.keys(), key=_sort_key)]
+    else:
+        kernels = list(raw)
+
+    out = []
+    for kernel in kernels:
+        try:
+            out.append({
+                "mu": float(kernel["mu"]),
+                "log_amp": float(kernel["log_amp"]),
+                "log_sigma": float(kernel["log_sigma"]),
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _empty_local_covariance_metadata(enabled: bool) -> dict:
+    """Create the common status payload for optional local covariance."""
+    return {
+        "enabled": bool(enabled),
+        "n_candidates": 0,
+        "n_kernels": 0,
+        "mle_passes": 1,
+        "amplitude_mode": None,
+        "detection_covariance_mode": (
+            "full_pre_local_diagonal" if enabled else None
+        ),
+        "message": (
+            "Local covariance enabled, but no detection pass has run."
+            if enabled else
+            "Local covariance disabled."
+        ),
+        "error": None,
+        "kernels": [],
+    }
+
+
+def _local_covariance_variance_params(
+    model,
+    local_params: Sequence[dict],
+    base_covariance,
+    target_significance: float = 3.0,
+) -> List[dict]:
+    """Set local variance using the same covariance as residual detection.
+
+    ``optimize_residual_peaks`` returns a fitted residual height in flux units.
+    Add only the variance still required to make that height a
+    ``target_significance``-sigma feature after the complete pre-local
+    covariance has already been counted.
+    """
+    if not local_params:
+        return []
+
+    target_significance = float(target_significance)
+    if not np.isfinite(target_significance) or target_significance <= 0:
+        raise ValueError("target_significance must be finite and positive")
+
+    if hasattr(base_covariance, "detach"):
+        base_covariance = base_covariance.detach().cpu().numpy()
+    base_covariance = np.asarray(base_covariance, dtype=float)
+    base_diagonal = (
+        np.diag(base_covariance)
+        if base_covariance.ndim == 2
+        else base_covariance.reshape(-1)
+    )
+    wavelength = np.asarray(model.data.wave, dtype=float)
+    if base_diagonal.size != wavelength.size:
+        raise ValueError(
+            "Pre-local covariance diagonal does not match the model wavelength grid"
+        )
+
+    converted = []
+    for kernel in local_params:
+        new_kernel = dict(kernel)
+        fitted_height = np.exp(float(new_kernel["log_amp"]))
+        centre = float(new_kernel["mu"])
+        centre_index = int(np.argmin(np.abs(wavelength - centre)))
+        base_variance = max(float(base_diagonal[centre_index]), 0.0)
+
+        # Detection now uses this same total pre-local variance. Subtracting it
+        # here prevents observational, emulator, or global-GP uncertainty from
+        # being counted a second time by the local kernel.
+        target_total_variance = (fitted_height / target_significance) ** 2
+        local_variance = target_total_variance - base_variance
+        if not np.isfinite(local_variance) or local_variance <= 0:
+            continue
+        new_kernel["log_amp"] = float(np.log(local_variance))
+        converted.append(new_kernel)
+    return converted
+
+
+def _attach_fixed_local_covariance(model, priors: dict) -> dict:
+    """Detect, optimise, insert, and freeze Starfish local covariance kernels."""
+    from Starfish.models.utils import find_residual_peaks, optimize_residual_peaks
+
+    meta = _empty_local_covariance_metadata(True)
+    try:
+        # Starfish local-kernel utilities inspect the residual deque populated
+        # by ``log_likelihood``. Evaluate once at the MLE pre-fit point so the
+        # kernels describe the best current structured residuals.
+        model.residuals.clear()
+        if hasattr(model, "_residual_call_count"):
+            model._residual_call_count = 0
+        _ = model.log_likelihood(priors)
+
+        num_residuals = len(model.residuals)
+        residual_regions = []
+        base_covariance_diagonal = None
+        if num_residuals > 0:
+            # Build the complete covariance at the pre-fit point before
+            # inserting local terms. Only its diagonal is transferred to NumPy
+            # because a wavelength-local 4-sigma score needs one marginal
+            # variance per pixel; off-diagonal terms remain in the likelihood.
+            _, base_covariance = model()
+            base_covariance_diagonal = base_covariance.diagonal()
+            if hasattr(base_covariance_diagonal, "detach"):
+                base_covariance_diagonal = (
+                    base_covariance_diagonal.detach().cpu().numpy()
+                )
+            base_covariance_diagonal = np.asarray(
+                base_covariance_diagonal,
+                dtype=float,
+            )
+            residual_regions = find_residual_peaks(
+                model,
+                num_residuals=num_residuals,
+                threshold=4.0,
+                buffer=2.0,
+                # Region metadata supplies bounded centres and a width derived
+                # from each coherent residual structure.
+                return_regions=True,
+                covariance=base_covariance_diagonal,
+            )
+        meta["n_candidates"] = len(residual_regions)
+
+        local_params = []
+        if residual_regions:
+            local_params = optimize_residual_peaks(
+                model,
+                mus=residual_regions,
+                sigma0=50,
+                num_residuals=num_residuals,
+                covariance=base_covariance_diagonal,
+            )
+            local_params = _local_covariance_variance_params(
+                model,
+                local_params,
+                base_covariance_diagonal,
+                target_significance=3.0,
+            )
+            meta["amplitude_mode"] = "full_covariance_target_3_sigma"
+
+        if local_params:
+            model.params["local_cov"] = local_params
+            model._loc_cov = None
+            if hasattr(model, "_loc_cov_gpu"):
+                model._loc_cov_gpu = None
+            model.freeze("local_cov")
+            meta["n_kernels"] = len(local_params)
+            meta["kernels"] = _copy_local_cov_params(model)
+            meta["message"] = (
+                f"Added {len(local_params)} fixed local covariance kernel"
+                f"{'s' if len(local_params) != 1 else ''} with a 3-sigma "
+                "placement target."
+            )
+        else:
+            meta["message"] = (
+                f"Detected {len(residual_regions)} residual region"
+                f"{'s' if len(residual_regions) != 1 else ''} above 4 sigma "
+                "under the full pre-local covariance, "
+                "but added 0 local covariance kernels."
+            )
+    except Exception as exc:
+        meta["error"] = str(exc)
+        meta["message"] = "Local covariance placement failed; continuing without local kernels."
+
+    return meta
+
+
+def _run_cma_mle_pass(
+    model,
+    priors: dict,
+    max_iter: int,
+    n_restarts: int,
+    iteration_callback=None,
+    custom_log_scale: bool = False,
+) -> dict:
+    """Run one benchmark CMA-ES MLE pass on the current model state."""
+    from types import SimpleNamespace
+
+    labels_before = list(model.labels)
+    active_labels = list(model.labels)
+    N = len(active_labels)
+
+    if N == 0:
+        try:
+            nll = float(-model.log_likelihood(priors))
+        except Exception:
+            nll = 1e10
+        soln = SimpleNamespace(
+            x=model.get_param_vector(),
+            fun=nll,
+            success=True,
+            message="All parameters fixed",
+            nit=0,
+        )
+        return {
+            "soln": soln,
+            "labels": labels_before,
+            "optimizer_nll": nll,
+            "success": True,
+            "n_iter": 0,
+        }
+
+    lo_bounds = []
+    hi_bounds = []
+    param_vector = model.get_param_vector()
+    for idx, label in enumerate(active_labels):
+        if label in priors:
+            dist = priors[label]
+            prior_bounds = bounds_for_frozen_prior(label, dist)
+            if prior_bounds is not None:
+                lo, hi = prior_bounds
+                lo_bounds.append(lo)
+                hi_bounds.append(hi)
+            else:
+                cv = param_vector[idx]
+                lo_bounds.append(cv - abs(cv) * 0.5)
+                hi_bounds.append(cv + abs(cv) * 0.5)
+        else:
+            cv = param_vector[idx]
+            lo_bounds.append(cv - abs(cv) * 0.5 - 1e-6)
+            hi_bounds.append(cv + abs(cv) * 0.5 + 1e-6)
+
+    # Bootstrap log_scale at each pass so observational Tier 3 fits begin from
+    # a data-informed normalisation, matching the non-local benchmark path.
+    if "log_scale" in active_labels and not custom_log_scale:
+        try:
+            _ = model()
+            if model._log_scale is not None and np.isfinite(model._log_scale):
+                model.params["log_scale"] = model._log_scale
+        except Exception:
+            pass
+
+    nll_history = []
+    iter_count = [0]
+    mle_t0 = time.time()
+    global_best_f = [float("inf")]
+    cur_restart = [0]
+
+    def nll(P):
+        model.set_param_vector(P)
+        try:
+            val = -model.log_likelihood(priors)
+        except Exception:
+            val = 1e10
+        nll_history.append(val)
+        iter_count[0] += 1
+        if iteration_callback is not None and iter_count[0] % 50 == 0:
+            best = min(global_best_f[0], min(nll_history) if nll_history else val)
+            iteration_callback(
+                iter_count[0], max_iter, best, time.time() - mle_t0,
+                cur_restart[0], n_restarts,
+            )
+        return val
+
+    p0_cma = np.clip(
+        model.get_param_vector(),
+        np.array(lo_bounds) + 1e-8,
+        np.array(hi_bounds) - 1e-8,
+    )
+
+    lo_arr = np.array(lo_bounds)
+    hi_arr = np.array(hi_bounds)
+    start_points = [p0_cma.copy()]
+    if n_restarts > 1:
+        for _ri in range(n_restarts - 1):
+            rnd = lo_arr + np.random.rand(N) * (hi_arr - lo_arr)
+            if "log_scale" in active_labels and not custom_log_scale:
+                ls_idx = active_labels.index("log_scale")
+                try:
+                    model.set_param_vector(rnd)
+                    model()
+                    if model._log_scale is not None and np.isfinite(model._log_scale):
+                        rnd[ls_idx] = model._log_scale
+                except Exception:
+                    pass
+            start_points.append(rnd)
+
+    global_best_x = p0_cma.copy()
+    global_best_nit = 0
+
+    for restart_idx, x0 in enumerate(start_points):
+        cur_restart[0] = restart_idx + 1
+        iter_count[0] = 0
+        cma_stds = [0.2 * (hi - lo) for lo, hi in zip(lo_bounds, hi_bounds)]
+        popsize = 2 * (4 + int(3 * np.log(N)))
+        x0_clipped = np.clip(x0, lo_arr + 1e-8, hi_arr - 1e-8)
+        es = cma.CMAEvolutionStrategy(
+            x0_clipped.tolist(), 1.0,
+            {
+                "bounds": [lo_bounds, hi_bounds],
+                "CMA_stds": cma_stds,
+                "popsize": popsize,
+                "maxfevals": max_iter,
+                "verbose": -9,
+                "tolfun": 1e-10,
+            },
+        )
+        run_best_x, run_best_f = x0_clipped.copy(), float("inf")
+        while not es.stop():
+            solutions = es.ask()
+            fits = [nll(np.array(s)) for s in solutions]
+            es.tell(solutions, fits)
+            gen_best = min(fits)
+            if gen_best < run_best_f:
+                run_best_f = gen_best
+                run_best_x = np.array(solutions[fits.index(gen_best)])
+            if run_best_f < global_best_f[0]:
+                global_best_f[0] = run_best_f
+
+        if run_best_f <= global_best_f[0]:
+            global_best_f[0] = run_best_f
+            global_best_x = run_best_x.copy()
+            global_best_nit = es.result.iterations
+
+    soln = SimpleNamespace(
+        x=global_best_x,
+        fun=global_best_f[0],
+        success=True,
+        message=f"Best of {n_restarts} CMA-ES restart(s)",
+        nit=global_best_nit,
+    )
+
+    if soln.success:
+        model.set_param_vector(soln.x)
+
+    return {
+        "soln": soln,
+        "labels": labels_before,
+        "optimizer_nll": float(soln.fun),
+        "success": bool(soln.success),
+        "n_iter": int(soln.nit),
+    }
 
 
 def _as_numpy_array(value) -> np.ndarray:
@@ -181,11 +552,18 @@ def _model_bestfit_spectrum(model) -> dict:
     model_flux, model_cov = model()
     model_flux = _as_numpy_array(model_flux)
     model_cov = _as_numpy_array(model_cov)
+    covariance_components = covariance_diagonal_components(model, model_cov)
     return {
         "wavelength": _as_numpy_array(model.data.wave).tolist(),
         "data_flux": _as_numpy_array(model.data.flux).tolist(),
         "model_flux": model_flux.tolist(),
         "model_cov_diag": np.diag(model_cov).tolist(),
+        # Store marginal variance sources alongside the total so both live and
+        # reloaded benchmark plots can explain the green confidence envelope.
+        "covariance_components": {
+            name: values.tolist()
+            for name, values in covariance_components.items()
+        },
     }
 
 
@@ -679,6 +1057,7 @@ def run_mle_single(
     n_restarts: int = 1,
     use_emulator_norm: bool = False,
     fixed_log_scale: Optional[float] = None,
+    enable_local_covariance: bool = False,
 ) -> dict:
     """
     Run MLE inference on a single spectrum.
@@ -721,6 +1100,11 @@ def run_mle_single(
         re-bootstrapped at each restart unless an explicit ``log_scale`` prior
         override or starting value was supplied.  The best result across all
         restarts is returned.
+    enable_local_covariance : bool
+        If True, run an initial MLE pre-fit, use Starfish residual-peak
+        utilities to insert fixed ``local_cov`` kernels, and run a second
+        reported MLE pass.  Defaults to False so Tier 2 test-grid spectra keep
+        the historical global-covariance-only benchmark likelihood.
 
     Returns
     -------
@@ -849,165 +1233,33 @@ def run_mle_single(
 
     _applied_freezes = _apply_freeze_settings(model, _requested_freeze)
 
-    labels_before = list(model.labels)
+    local_covariance = _empty_local_covariance_metadata(enable_local_covariance)
+    mle_pass = _run_cma_mle_pass(
+        model,
+        priors,
+        max_iter=max_iter,
+        n_restarts=n_restarts,
+        iteration_callback=iteration_callback,
+        custom_log_scale=_custom_log_scale,
+    )
 
-    # Derive per-parameter bounds from the priors for CMA-ES box constraints.
-    active_labels = list(model.labels)
-    N = len(active_labels)
-
-    if N == 0:
-        try:
-            _nll = float(-model.log_likelihood(priors))
-        except Exception:
-            _nll = 1e10
-        try:
-            _mle_bestfit_spec = _model_bestfit_spectrum(model)
-        except Exception:
-            _mle_bestfit_spec = {}
-        _mle_diag = _model_likelihood_diagnostics(model, priors)
-        return {
-            "grid_params": model.grid_params.tolist(),
-            "all_params": _snapshot_model_params(model),
-            "nll": _nll,
-            "optimizer_nll": _nll,
-            "mle_bestfit_spec": _mle_bestfit_spec,
-            "mle_likelihood_diagnostics": _mle_diag,
-            "success": True,
-            "n_iter": 0,
-            "labels": labels_before,
-            "freeze_params": dict(_requested_freeze),
-            "frozen_params": list(_applied_freezes),
-            "model": model,
-            "priors": priors,
-        }
-
-    lo_bounds = []
-    hi_bounds = []
-    for label in active_labels:
-        if label in priors:
-            dist = priors[label]
-            prior_bounds = bounds_for_frozen_prior(label, dist)
-            if prior_bounds is not None:
-                lo, hi = prior_bounds
-                lo_bounds.append(lo)
-                hi_bounds.append(hi)
-            else:
-                cv = model.get_param_vector()[active_labels.index(label)]
-                lo_bounds.append(cv - abs(cv) * 0.5)
-                hi_bounds.append(cv + abs(cv) * 0.5)
-        else:
-            cv = model.get_param_vector()[active_labels.index(label)]
-            lo_bounds.append(cv - abs(cv) * 0.5 - 1e-6)
-            hi_bounds.append(cv + abs(cv) * 0.5 + 1e-6)
-
-    # Bootstrap log_scale at the starting point so the optimizer begins
-    # with a data-informed normalisation.
-    if "log_scale" in active_labels and not _custom_log_scale:
-        try:
-            _ = model()  # triggers auto log_scale calc
-            if model._log_scale is not None and np.isfinite(model._log_scale):
-                model.params["log_scale"] = model._log_scale
-        except Exception:
-            pass
-
-    _nll_history = []
-    _iter_count = [0]
-    _mle_t0 = time.time()
-    _global_best_f = [float("inf")]  # mutable for callback visibility
-    _cur_restart = [0]  # 1-based index of current restart
-
-    def nll(P):
-        model.set_param_vector(P)
-        try:
-            val = -model.log_likelihood(priors)
-        except Exception:
-            val = 1e10
-        _nll_history.append(val)
-        _iter_count[0] += 1
-        if iteration_callback is not None and _iter_count[0] % 50 == 0:
-            _best = min(_global_best_f[0], min(_nll_history) if _nll_history else val)
-            iteration_callback(
-                _iter_count[0], max_iter, _best, time.time() - _mle_t0,
-                _cur_restart[0], n_restarts,
+    if enable_local_covariance:
+        local_covariance = _attach_fixed_local_covariance(model, priors)
+        if local_covariance.get("n_kernels", 0) > 0:
+            mle_pass = _run_cma_mle_pass(
+                model,
+                priors,
+                max_iter=max_iter,
+                n_restarts=n_restarts,
+                iteration_callback=iteration_callback,
+                custom_log_scale=_custom_log_scale,
             )
-        return val
+            local_covariance["mle_passes"] = 2
+            local_covariance["message"] = (
+                f"{local_covariance['message']} Final MLE pass rerun with fixed kernels."
+            )
 
-    # CMA-ES: start from the bootstrapped model state (includes the
-    # data-informed log_scale) rather than the raw bounds midpoint.
-    p0_cma = np.clip(
-        model.get_param_vector(),
-        np.array(lo_bounds) + 1e-8,
-        np.array(hi_bounds) - 1e-8,
-    )
-
-    # Generate starting points: first = bootstrapped x0, rest = random
-    lo_arr = np.array(lo_bounds)
-    hi_arr = np.array(hi_bounds)
-    start_points = [p0_cma.copy()]
-    if n_restarts > 1:
-        for _ri in range(n_restarts - 1):
-            rnd = lo_arr + np.random.rand(N) * (hi_arr - lo_arr)
-            # Bootstrap log_scale for random starts too
-            if "log_scale" in active_labels and not _custom_log_scale:
-                ls_idx = active_labels.index("log_scale")
-                try:
-                    model.set_param_vector(rnd)
-                    model()
-                    if model._log_scale is not None and np.isfinite(model._log_scale):
-                        rnd[ls_idx] = model._log_scale
-                except Exception:
-                    pass
-            start_points.append(rnd)
-
-    global_best_x = p0_cma.copy()
-    global_best_nit = 0
-
-    for restart_idx, x0 in enumerate(start_points):
-        _cur_restart[0] = restart_idx + 1
-        _iter_count[0] = 0  # reset eval counter per restart
-        # Per-coordinate initial σ = 20% of prior range.
-        cma_stds = [0.2 * (hi - lo) for lo, hi in zip(lo_bounds, hi_bounds)]
-        # Double the default popsize for better landscape sampling.
-        popsize = 2 * (4 + int(3 * np.log(N)))
-        x0_clipped = np.clip(x0, lo_arr + 1e-8, hi_arr - 1e-8)
-        es = cma.CMAEvolutionStrategy(
-            x0_clipped.tolist(), 1.0,
-            {
-                "bounds": [lo_bounds, hi_bounds],
-                "CMA_stds": cma_stds,
-                "popsize": popsize,
-                "maxfevals": max_iter,
-                "verbose": -9,
-                "tolfun": 1e-10,
-            },
-        )
-        run_best_x, run_best_f = x0_clipped.copy(), float("inf")
-        while not es.stop():
-            solutions = es.ask()
-            fits = [nll(np.array(s)) for s in solutions]
-            es.tell(solutions, fits)
-            gen_best = min(fits)
-            if gen_best < run_best_f:
-                run_best_f = gen_best
-                run_best_x = np.array(solutions[fits.index(gen_best)])
-            if run_best_f < _global_best_f[0]:
-                _global_best_f[0] = run_best_f
-
-        # Keep global best across restarts
-        if run_best_f <= _global_best_f[0]:
-            _global_best_f[0] = run_best_f
-            global_best_x = run_best_x.copy()
-            global_best_nit = es.result.iterations
-
-    from types import SimpleNamespace
-    soln = SimpleNamespace(
-        x=global_best_x, fun=_global_best_f[0], success=True,
-        message=f"Best of {n_restarts} CMA-ES restart(s)",
-        nit=global_best_nit,
-    )
-
-    if soln.success:
-        model.set_param_vector(soln.x)
+    soln = mle_pass["soln"]
 
     try:
         mle_bestfit_spec = _model_bestfit_spectrum(model)
@@ -1027,9 +1279,10 @@ def run_mle_single(
         "mle_likelihood_diagnostics": mle_diagnostics,
         "success": bool(soln.success),
         "n_iter": int(soln.nit),
-        "labels": labels_before,
+        "labels": mle_pass.get("labels", list(model.labels)),
         "freeze_params": dict(_requested_freeze),
         "frozen_params": list(_applied_freezes),
+        "local_covariance": local_covariance,
         "model": model,
         "priors": priors,
     }
@@ -2396,12 +2649,29 @@ def _save_tier3_artifacts(
     )
 
     plot_path = output_dir / f"tier3_{obs_stem}_plot_data.npz"
+    covariance_components = bestfit_spec.get("covariance_components") or {}
     np.savez_compressed(
         plot_path,
         wavelength=np.asarray(bestfit_spec.get("wavelength", []), dtype=np.float64),
         data_flux=np.asarray(bestfit_spec.get("data_flux", []), dtype=np.float64),
         model_flux=np.asarray(bestfit_spec.get("model_flux", []), dtype=np.float64),
         model_cov_diag=np.asarray(bestfit_spec.get("model_cov_diag", []), dtype=np.float64),
+        observation_variance=np.asarray(
+            covariance_components.get("observation_variance", []),
+            dtype=np.float64,
+        ),
+        emulator_variance=np.asarray(
+            covariance_components.get("emulator_variance", []),
+            dtype=np.float64,
+        ),
+        global_variance=np.asarray(
+            covariance_components.get("global_variance", []),
+            dtype=np.float64,
+        ),
+        local_variance=np.asarray(
+            covariance_components.get("local_variance", []),
+            dtype=np.float64,
+        ),
         ppc_wavelength=np.asarray(ppc_envelope.get("wavelength", []), dtype=np.float64),
         ppc_low=np.asarray(ppc_envelope.get("low", []), dtype=np.float64),
         ppc_high=np.asarray(ppc_envelope.get("high", []), dtype=np.float64),
@@ -2438,6 +2708,7 @@ def run_tier3_single(
     sirocco_cpus: int = 1,
     require_sirocco: bool = True,
     run_sirocco: bool = True,
+    enable_local_covariance: bool = False,
     mle_iteration_callback=None,
     mcmc_iteration_callback=None,
     sirocco_progress_callback=None,
@@ -2477,6 +2748,10 @@ def run_tier3_single(
         If True, missing runtime commands or failed Sirocco runs raise.
     run_sirocco : bool
         If True, run Sirocco after exporting the posterior-mean .pf file.
+    enable_local_covariance : bool
+        If True, Tier 3 uses a two-pass MLE in which Starfish residual peaks
+        from the first pass are converted into fixed local covariance kernels
+        before the final MLE and MCMC likelihood evaluations.
     mle_iteration_callback, mcmc_iteration_callback, sirocco_progress_callback : callable or None
         Optional progress callbacks forwarded to the MLE, MCMC, and Sirocco
         stages. The benchmark viewer uses these to show restart, evaluation,
@@ -2550,6 +2825,7 @@ def run_tier3_single(
         # (~1e-11), so the distance-derived log_scale (~-1.2) leaves the model
         # ~1e8-1e9x too bright and the GP log_amp inflates to absorb the mismatch.
         use_emulator_norm=True,
+        enable_local_covariance=enable_local_covariance,
     )
     model = mle["model"]
     priors = mle["priors"]
@@ -2612,18 +2888,9 @@ def run_tier3_single(
     model.set_param_dict(mcmc_means)
 
     try:
-        model_flux, model_cov = model()
-        if hasattr(model_flux, "detach"):
-            model_flux = model_flux.detach().cpu().numpy()
-        if hasattr(model_cov, "detach"):
-            model_cov = model_cov.detach().cpu().numpy()
-        model_cov = np.asarray(model_cov)
-        bestfit_spec = {
-            "wavelength": np.asarray(model.data.wave).tolist(),
-            "data_flux": np.asarray(model.data.flux).tolist(),
-            "model_flux": np.asarray(model_flux).tolist(),
-            "model_cov_diag": np.diag(model_cov).tolist() if model_cov.ndim == 2 else model_cov.tolist(),
-        }
+        # Use the common exporter so posterior-mean plots retain the same
+        # covariance-source diagnostics as their MLE counterparts.
+        bestfit_spec = _model_bestfit_spectrum(model)
     except Exception:
         bestfit_spec = mcmc.get("bestfit_spec", {})
 
@@ -2663,6 +2930,7 @@ def run_tier3_single(
         "mcmc_frozen_params": mcmc.get("frozen_params", []),
         "mcmc_frozen_param_values": mcmc.get("frozen_param_values", {}),
         "exact_inclination": exact_inclination,
+        "local_covariance": mle.get("local_covariance", _empty_local_covariance_metadata(False)),
         "export_dir": str(artifact_dir),
         "wl_range": [float(wl_range[0]), float(wl_range[1])],
         "emulator_wl_range": list(_emulator_wavelength_bounds(emu)),
@@ -2860,6 +3128,7 @@ def run_tier3_single(
         "sirocco_transform_label": sirocco_transform_label,
         "distance_prior_pc": distance_prior_meta,
         "inclination_prior_deg": inclination_prior_meta,
+        "local_covariance": result.get("local_covariance", {}),
         "metrics": {
             "reduced_chi2": reduced_chi2,
             "ppc_coverage": ppc_in,
@@ -3278,6 +3547,7 @@ def build_report_card(
                 "mle_all_params",
                 "mle_freeze_settings",
                 "mle_frozen_params",
+                "local_covariance",
                 "mcmc_summary",
                 "mcmc_freeze_settings",
                 "mcmc_frozen_params",

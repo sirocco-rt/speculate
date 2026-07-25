@@ -1343,12 +1343,19 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
 
         _obs_rows = []
         for _r in _t3:
+            _local_cov = _r.get("local_covariance") or {}
+            _local_cov_status = (
+                str(int(_local_cov.get("n_kernels", 0)))
+                if _local_cov.get("enabled")
+                else "off"
+            )
             _obs_rows.append({
                 "Observation": _r.get("obs_file", "?"),
                 "Reduced chi2": _fmt_t3(_r.get('reduced_chi2'), ".2f"),
                 "Sirocco chi2": _fmt_t3(_r.get('sirocco_reduced_chi2'), ".2f"),
                 "PPC Coverage": _fmt_t3(_r.get('ppc_coverage'), ".2f"),
                 "Inclination": _fmt_t3(_r.get('exact_inclination'), ".2f"),
+                "Local kernels": _local_cov_status,
                 "Converged": "yes" if _r.get("mcmc_converged") else "no",
             })
         _t3_items.append(mo.ui.table(_obs_rows, label="Observational Results"))
@@ -1883,6 +1890,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
             data_flux=_mle_bf["data_flux"],
             model_flux=_mle_bf["model_flux"],
             model_cov_diag=_mle_bf["model_cov_diag"],
+            covariance_components=_mle_bf.get("covariance_components"),
             title=(
                 f"MLE Best Fit — {_filename} @ {_inc:.0f}° "
                 f"({_conv_tag}{_nll_suffix(_post.get('mle_nll'), _mle_diag)})"
@@ -1897,6 +1905,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
             data_flux=_posterior_bf["data_flux"],
             model_flux=_posterior_bf["model_flux"],
             model_cov_diag=_posterior_bf["model_cov_diag"],
+            covariance_components=_posterior_bf.get("covariance_components"),
             title=(
                 f"MCMC Posterior Mean — {_filename} @ {_inc:.0f}° "
                 f"({_conv_tag}{_nll_suffix(None, _pm_diag)})"
@@ -2179,6 +2188,19 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         _data_flux = np.array(_npz["data_flux"])
         _model_flux = np.array(_npz["model_flux"])
         _model_cov_diag = np.array(_npz["model_cov_diag"])
+        # New artifacts retain the additive covariance diagonals.  Older NPZ
+        # files remain viewable and simply use the pre-existing total-only
+        # tooltip when these optional arrays are absent.
+        _covariance_components = {
+            _name: np.array(_npz[_name])
+            for _name in (
+                "observation_variance",
+                "emulator_variance",
+                "global_variance",
+                "local_variance",
+            )
+            if _name in _npz.files
+        }
         _ppc_wl = np.array(_npz["ppc_wavelength"])
         _ppc_low = np.array(_npz["ppc_low"])
         _ppc_high = np.array(_npz["ppc_high"])
@@ -2226,6 +2248,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         data_flux=_data_flux,
         model_flux=_model_flux,
         model_cov_diag=_model_cov_diag,
+        covariance_components=_covariance_components,
         title=f"Tier 3 Best Fit — {_post.get('obs_file', '?')}",
         zoom_name=f"tier3_bestfit_zoom_{t3_observation_slider.value}",
         extra_flux_series=_extra,
@@ -2865,6 +2888,10 @@ def _(glob, mo, os):
         options=dict(zip([os.path.basename(_f) for _f in obs_csvs], obs_csvs)) if obs_csvs else {},
         label="Observations (Tier 3)",
     )
+    tier3_local_cov_checkbox = mo.ui.checkbox(
+        value=False,
+        label="Enable fixed local covariance kernels (adds 1 MLE pre-fit)",
+    )
 
     tier_picker = mo.ui.multiselect(
         options={"Tier 1": 1, "Tier 2": 2, "Tier 3": 3},
@@ -2912,6 +2939,7 @@ def _(glob, mo, os):
         mle_restarts_slider,
         obs_picker,
         sirocco_cpu_slider,
+        tier3_local_cov_checkbox,
         tier_picker,
     )
 
@@ -3182,6 +3210,7 @@ def _(
     sirocco_cpu_slider,
     tier3_distance_prior_controls,
     tier3_inclination_prior_controls,
+    tier3_local_cov_checkbox,
     tier3_wl_range_slider,
     tier_picker,
 ):
@@ -3189,7 +3218,7 @@ def _(
         mo.md("### Run Benchmark"),
         mo.vstack([tier_picker, emu_picker, flux_scale_picker], gap=1),
         emu_grid_info,
-        mo.hstack([obs_picker], gap=1),
+        mo.hstack([obs_picker, tier3_local_cov_checkbox], gap=1, align="end"),
         tier3_distance_prior_controls,
         tier3_inclination_prior_controls,
         mo.vstack([inclination_picker, max_spectra_slider, mle_restarts_slider, mcmc_steps_slider], gap=1),
@@ -3285,7 +3314,8 @@ def _(emu_picker, matched_grid_name, mo, np, os):
                     mo.md(
                         "Stage 2 freezes hold parameters at the benchmark starting values: "
                         "grid midpoints, Av=0, Distance=100 pc, cheb_1=0, and the default GP initialisation. "
-                        "Stage 4 freezes hold parameters at their post-MLE values during MCMC."
+                        "Stage 4 freezes hold parameters at their post-MLE values during MCMC. "
+                        "Fixed local covariance kernels are disabled for Tier 2 test-grid spectra."
                     ),
                     kind="neutral",
                 ),
@@ -3439,6 +3469,7 @@ def _(
     tier2_mle_freeze,
     tier3_distance_prior_widgets,
     tier3_inclination_prior_widgets,
+    tier3_local_cov_checkbox,
     tier3_mcmc_freeze,
     tier3_mle_freeze,
     tier3_wl_range_slider,
@@ -3559,6 +3590,7 @@ def _(
         _mcmc_steps_val = mcmc_steps_slider.value
         _mcmc_walkers_val = 64
         _mcmc_burnin_val = 500
+        _tier3_local_cov_enabled = bool(tier3_local_cov_checkbox.value)
         _tier1_result = None
         _tier2_result = None
         _tier3_results = None
@@ -4138,6 +4170,7 @@ def _(
                 "mcmc_steps": int(_mcmc_steps_val),
                 "mcmc_burnin": int(_mcmc_burnin_val),
                 "sirocco_cpus": int(sirocco_cpu_slider.value),
+                "enable_local_covariance": bool(_tier3_local_cov_enabled),
                 "observations": sorted(_obs_keys),
                 "distance_priors_pc": _tier3_distance_priors_pc,
                 "inclination_priors_deg": _tier3_inclination_priors_deg,
@@ -4283,6 +4316,7 @@ def _(
                         sirocco_cpus=sirocco_cpu_slider.value,
                         require_sirocco=True,
                         run_sirocco=True,
+                        enable_local_covariance=_tier3_local_cov_enabled,
                         mle_iteration_callback=_t3_mle_cb,
                         mcmc_iteration_callback=_t3_mcmc_cb,
                         sirocco_progress_callback=_t3_sirocco_cb,
@@ -4332,6 +4366,7 @@ def _(
             "tier3_wl_range": list(_tier3_wl_range) if 3 in _tiers else None,
             "tier3_distance_priors_pc": _tier3_distance_priors_pc if 3 in _tiers else None,
             "tier3_inclination_priors_deg": _tier3_inclination_priors_deg if 3 in _tiers else None,
+            "tier3_local_covariance_enabled": _tier3_local_cov_enabled if 3 in _tiers else None,
             "tier3_mle_freeze": dict(_tier3_mle_freeze_settings),
             "tier3_mcmc_freeze": dict(_tier3_mcmc_freeze_settings),
             "tier2_mle_freeze": dict(_tier2_mle_freeze_settings),
@@ -4372,6 +4407,12 @@ def _(
             _summary_parts.append(" — ".join(_t2_parts))
         if _tier3_results:
             _summary_parts.append(f"Tier 3: {len(_tier3_results)} observation(s)")
+            if _tier3_local_cov_enabled:
+                _n_local = sum(
+                    int((_r.get("local_covariance") or {}).get("n_kernels", 0))
+                    for _r in _tier3_results
+                )
+                _summary_parts.append(f"Tier 3 local covariance: {_n_local} fixed kernel(s)")
 
         set_status_msg("  \n".join(_summary_parts))
 

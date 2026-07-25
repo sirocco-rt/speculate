@@ -263,6 +263,9 @@ def build_bestfit_spectrum_altair(
     y_axis_format=".2e",
     model_label="Emulated Model",
     extra_flux_series=None,
+    local_covariance_centers=None,
+    local_covariance_regions=None,
+    covariance_components=None,
 ):
     """Build the shared three-panel best-fit spectrum Altair chart.
 
@@ -281,6 +284,19 @@ def build_bestfit_spectrum_altair(
     extra_flux_series : dict, list of dict, or None
         Optional additional spectra to overlay on the main panel.  Each dict may
         contain ``wavelength``, ``flux``, ``label``, ``color``, and ``dash``.
+    local_covariance_centers : array_like or None
+        Final local-covariance kernel centres in Angstrom. When provided, each
+        centre is shown as a dashed vertical rule on the main spectrum panel.
+    local_covariance_regions : iterable of dict or None
+        Exact wavelength support of the final local kernels. Each dictionary
+        must contain ``lower`` and ``upper`` bounds in Angstrom and is rendered
+        as a translucent region on the main spectrum panel.
+    covariance_components : dict or None
+        Optional covariance-diagonal arrays named ``observation_variance``,
+        ``emulator_variance``, ``global_variance``, and ``local_variance``.
+        When supplied, the residual-panel hover tooltip reports the absolute
+        variance, equivalent 1-sigma error, and fraction of total variance from
+        each source.
     """
     wl = np.asarray(wavelength, dtype=np.float64)
     data_flux = np.asarray(data_flux, dtype=np.float64)
@@ -304,6 +320,30 @@ def build_bestfit_spectrum_altair(
     x_domain = [float(np.min(wl)), float(np.max(wl))]
     y_axis = alt.Axis(format=y_axis_format)
     x_scale = alt.Scale(domain={"param": zoom_name})
+
+    component_specs = (
+        ("observation_variance", "Observation"),
+        ("emulator_variance", "Emulator"),
+        ("global_variance", "Global GP"),
+        ("local_variance", "Local"),
+    )
+    component_arrays = {}
+    if covariance_components:
+        for key, label in component_specs:
+            values = covariance_components.get(key)
+            if values is None:
+                continue
+            values = np.asarray(values, dtype=np.float64).reshape(-1)
+            if values.size < n_pix:
+                # Old saved reports may have only the total covariance.  Skip
+                # an incomplete optional component rather than hiding the plot.
+                continue
+            values = np.maximum(values[:n_pix], 0.0)
+            # Keep the common no-local-kernel case concise.  Observation,
+            # emulator, and global terms remain visible even when one is zero.
+            if label == "Local" and not np.any(values > 0):
+                continue
+            component_arrays[label] = values
 
     main_values = []
     shared_zoom = alt.selection_interval(
@@ -387,20 +427,119 @@ def build_bestfit_spectrum_altair(
         title=title,
     ).add_params(shared_zoom)
 
+    if local_covariance_regions is not None:
+        local_region_values = []
+        for region in local_covariance_regions:
+            try:
+                lower = float(region["lower"])
+                upper = float(region["upper"])
+                center = float(region.get("mu", 0.5 * (lower + upper)))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if np.isfinite([lower, upper, center]).all() and upper > lower:
+                local_region_values.append({
+                    "Lower": lower,
+                    "Upper": upper,
+                    "Centre": center,
+                })
+
+        if local_region_values:
+            # Plot the region behind the spectra. These bounds are the exact
+            # ±4-sigma velocity support where Starfish's Hann-tapered local
+            # covariance kernel is non-zero.
+            local_regions = alt.Chart(
+                alt.Data(values=local_region_values)
+            ).mark_rect(
+                color="#CC79A7",
+                opacity=0.12,
+            ).encode(
+                x=alt.X("Lower:Q", scale=x_scale),
+                x2=alt.X2("Upper:Q"),
+                tooltip=[
+                    alt.Tooltip(
+                        "Centre:Q",
+                        title="Local kernel centre (Å)",
+                        format=".3f",
+                    ),
+                    alt.Tooltip(
+                        "Lower:Q",
+                        title="Support lower (Å)",
+                        format=".3f",
+                    ),
+                    alt.Tooltip(
+                        "Upper:Q",
+                        title="Support upper (Å)",
+                        format=".3f",
+                    ),
+                ],
+            )
+            main_chart = local_regions + main_chart
+
+    if local_covariance_centers is not None:
+        local_rule_values = []
+        for center in local_covariance_centers:
+            try:
+                center = float(center)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(center):
+                local_rule_values.append({"Wavelength": center})
+
+        if local_rule_values:
+            local_rules = alt.Chart(
+                alt.Data(values=local_rule_values)
+            ).mark_rule(
+                color="#CC79A7",
+                strokeDash=[6, 4],
+                strokeWidth=1.5,
+                opacity=0.9,
+            ).encode(
+                x=alt.X("Wavelength:Q", scale=x_scale),
+                tooltip=[
+                    alt.Tooltip(
+                        "Wavelength:Q",
+                        title="Local kernel centre (Å)",
+                        format=".3f",
+                    )
+                ],
+            )
+            main_chart = main_chart + local_rules
+
     resid_values = []
     band_1sigma = []
     band_2sigma = []
     band_3sigma = []
     rel_values = []
-    for wavelength_value, residual_value, sigma_value, relative_value in zip(
-        wl, residual, std, residual_frac
-    ):
+    for pixel_index, (
+        wavelength_value,
+        residual_value,
+        sigma_value,
+        relative_value,
+    ) in enumerate(zip(wl, residual, std, residual_frac)):
         wavelength_value = float(wavelength_value)
         sigma_value = float(sigma_value)
-        resid_values.append({
+        total_variance = max(float(cov_diag[pixel_index]), 0.0)
+        total_variance_safe = max(total_variance, np.finfo(float).tiny)
+        residual_record = {
             "Wavelength": wavelength_value,
             "Residual": float(residual_value),
-        })
+            "Total Variance": total_variance,
+            "Total Sigma": sigma_value,
+            "Residual Significance": (
+                abs(float(residual_value))
+                / max(sigma_value, np.finfo(float).tiny)
+            ),
+        }
+        for label, values in component_arrays.items():
+            variance = float(values[pixel_index])
+            residual_record[f"{label} Variance"] = variance
+            residual_record[f"{label} Sigma"] = float(np.sqrt(variance))
+            # Independent covariance terms add as variances, so this is the
+            # meaningful additive percentage; sigma percentages would not sum.
+            residual_record[f"{label} Percent"] = (
+                100.0 * variance / total_variance_safe
+            )
+        resid_values.append(residual_record)
         band_1sigma.append({
             "Wavelength": wavelength_value,
             "Lower": -sigma_value,
@@ -461,7 +600,79 @@ def build_bestfit_spectrum_altair(
             alt.Tooltip("Residual:Q", title="Data - Model", format=".4e"),
         ],
     )
-    resid_chart = (resid_band_3 + resid_band_2 + resid_band_1 + resid_zero + resid_line).properties(
+
+    # A transparent nearest-point layer makes the diagnostic available anywhere
+    # vertically in the residual panel.  Requiring the pointer to land exactly
+    # on a thin line or area boundary is frustrating on dense wavelength grids.
+    hover_tooltips = [
+        alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".3f"),
+        alt.Tooltip("Residual:Q", title="Data - Model", format=".4e"),
+        alt.Tooltip("Total Sigma:Q", title="Total σ", format=".4e"),
+        alt.Tooltip(
+            "Residual Significance:Q",
+            title="|Residual| / total σ",
+            format=".3f",
+        ),
+    ]
+    for _key, label in component_specs:
+        if label not in component_arrays:
+            continue
+        hover_tooltips.extend([
+            alt.Tooltip(
+                f"{label} Variance:Q",
+                title=f"{label} variance",
+                format=".4e",
+            ),
+            alt.Tooltip(
+                f"{label} Sigma:Q",
+                title=f"{label} σ",
+                format=".4e",
+            ),
+            alt.Tooltip(
+                f"{label} Percent:Q",
+                title=f"{label} variance share",
+                format=".1f",
+            ),
+        ])
+
+    residual_hover = alt.selection_point(
+        name=f"{zoom_name}_residual_hover",
+        fields=["Wavelength"],
+        nearest=True,
+        on="pointerover",
+        clear="pointerout",
+        empty=False,
+    )
+    hover_selectors = alt.Chart(
+        alt.Data(values=resid_values)
+    ).mark_point(
+        opacity=0,
+    ).encode(
+        x=alt.X("Wavelength:Q", scale=x_scale),
+        y=alt.Y("Residual:Q"),
+        tooltip=hover_tooltips,
+    ).add_params(residual_hover)
+    hover_rule = alt.Chart(
+        alt.Data(values=resid_values)
+    ).transform_filter(
+        residual_hover
+    ).mark_rule(
+        color="#d0d0d0",
+        opacity=0.65,
+        strokeWidth=1.0,
+    ).encode(
+        x=alt.X("Wavelength:Q", scale=x_scale),
+    )
+
+    resid_chart = (
+        resid_band_3
+        + resid_band_2
+        + resid_band_1
+        + resid_zero
+        + resid_line
+        + hover_rule
+        + hover_selectors
+    ).properties(
         width=right_width,
         height=panel_height,
         title=residual_title,
