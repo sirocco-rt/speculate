@@ -91,7 +91,14 @@ for i in range(num_samples):
 # Update the unique_combinations with the reduced combinations
 unique_combinations = reduced_combinations
 for i in range(len(unique_combinations)):
+    # Wind.mdot in units of disk mdot
     unique_combinations[i][1] = unique_combinations[i][0] * unique_combinations[i][1]
+    # Boundary Layer luminosity in units of disk luminosity
+    L_disk = 6.67e-8 * template_file['Central_object.mass(msol)']*MSOL * (unique_combinations[i][0]*MSOL/YR) / (2 * template_file['Central_object.radius(cm)']) # L_disk = G M_star * M_dotdisk/2R_star
+    unique_combinations[i][6] = unique_combinations[i][6] * L_disk
+    # Boundary Layer temperature as a function of area covering the white dwarf H/R_wd
+    area = 4 * np.pi * template_file['Central_object.radius(cm)']**2 * unique_combinations[i][7]
+    unique_combinations[i][7] = (unique_combinations[i][6] / area / STEFAN_BOLTZMANN)**0.25
     
 ####################################################################
 # ARE YOU HAPPY WITH THE GRID (UNIQUE_COMBINATIONS)? IF SO, CONTINUE 
