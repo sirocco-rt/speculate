@@ -289,6 +289,16 @@ def _(
             if "full_chain" in p:
                 entry["full_chain"] = np.array(p["full_chain"])
                 entry["burnin_used"] = p.get("burnin_used", 500)
+            for diagnostic_key in (
+                "n_retained_draws",
+                "autocorr_time",
+                "effective_sample_size",
+                "mcse_mean",
+                "acceptance_fraction",
+                "mcmc_diagnostic_reasons",
+            ):
+                if diagnostic_key in p:
+                    entry[diagnostic_key] = p[diagnostic_key]
             if "bestfit_spec" in p:
                 entry["bestfit_spec"] = p["bestfit_spec"]
             if "prior_ranges" in p:
@@ -1112,7 +1122,7 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
         if _n_fail:
             _status_parts.append(f"{_n_fail} failed")
         if _n_nc:
-            _status_parts.append(f"{_n_nc} not converged")
+            _status_parts.append(f"{_n_nc} diagnostically flagged")
         _status_parts.append(f"in {_t2_time:.0f}s")
         _t2_items.append(mo.md(" — ".join(_status_parts)))
 
@@ -1148,6 +1158,25 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
 
         _agg = _t2.get("aggregate", {})
         if _agg:
+            def _coverage_cell(_metrics, _level_key, _converged=False):
+                _field = (
+                    "coverage_converged_levels"
+                    if _converged
+                    else "coverage_levels"
+                )
+                _result = (_metrics.get(_field) or {}).get(_level_key, {})
+                _n = int(_result.get("n", 0))
+                if _n == 0:
+                    return "—"
+                _count = int(_result["covered_count"])
+                _fraction = float(_result["fraction"])
+                _ci_lo = float(_result["wilson_95_low"])
+                _ci_hi = float(_result["wilson_95_high"])
+                return (
+                    f"{_count}/{_n} ({_fraction:.0%}; "
+                    f"95% CI {_ci_lo:.0%}–{_ci_hi:.0%})"
+                )
+
             _agg_rows = []
             for _pn, _m in _agg.items():
                 _agg_rows.append({
@@ -1156,24 +1185,15 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                     "Bias": f"{_m.get('bias', float('nan')):.4f}",
                     "CRPS": f"{_m.get('crps', float('nan')):.4f}",
                     "Shrinkage": f"{_m.get('shrinkage', float('nan')):.2%}",
-                    "Cov@68%": f"{_m.get('coverage_68', float('nan')):.3f}",
-                    "Cov@95%": f"{_m.get('coverage_95', float('nan')):.3f}",
-                    "Cov@99.7%": f"{_m.get('coverage_997', float('nan')):.3f}",
+                    "All Cov@68%": _coverage_cell(_m, "0.68"),
+                    "All Cov@95%": _coverage_cell(_m, "0.95"),
+                    "All Cov@99.7%": _coverage_cell(_m, "0.997"),
+                    "Converged Cov@68%": _coverage_cell(_m, "0.68", True),
+                    "Converged Cov@95%": _coverage_cell(_m, "0.95", True),
+                    "Converged Cov@99.7%": _coverage_cell(_m, "0.997", True),
                 })
             _t2_items.append(mo.ui.table(_agg_rows, label="Aggregate Metrics"))
 
-            # This calibration plot compares nominal credible levels against empirical coverage.
-            # Points should fall near the y=x diagonal if the posterior intervals are well calibrated.
-            _pp_values = [
-                {
-                    "Parameter": _pn,
-                    "Nominal Credible Level": float(_alpha),
-                    "Empirical Coverage": float(_coverage),
-                }
-                for _pn, _m in _agg.items()
-                if "coverage_alphas" in _m and "coverage_values" in _m
-                for _alpha, _coverage in zip(_m["coverage_alphas"], _m["coverage_values"])
-            ]
             _pp_reference = [
                 {"Nominal Credible Level": 0.0, "Ideal Coverage": 0.0},
                 {"Nominal Credible Level": 1.0, "Ideal Coverage": 1.0},
@@ -1195,48 +1215,75 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                     scale=alt.Scale(domain=[0, 1]),
                 ),
             )
-            _pp_lines = alt.Chart(alt.Data(values=_pp_values)).mark_line(strokeWidth=2).encode(
-                x=alt.X(
-                    "Nominal Credible Level:Q",
-                    title="Nominal Credible Level",
-                    scale=alt.Scale(domain=[0, 1]),
+
+            def _build_pp_plot(_values, _title):
+                if not _values:
+                    return mo.md("*No diagnostically converged Tier 2 runs are available.*")
+                _lines = alt.Chart(alt.Data(values=_values)).mark_line(strokeWidth=2).encode(
+                    x=alt.X("Nominal Credible Level:Q", title="Nominal Credible Level",
+                              scale=alt.Scale(domain=[0, 1])),
+                    y=alt.Y("Empirical Coverage:Q", title="Empirical Coverage",
+                              scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color("Parameter:N", title="",
+                                    legend=alt.Legend(orient="top-left")),
+                )
+                _points = alt.Chart(alt.Data(values=_values)).mark_circle(size=40).encode(
+                    x=alt.X("Nominal Credible Level:Q", title="Nominal Credible Level",
+                              scale=alt.Scale(domain=[0, 1])),
+                    y=alt.Y("Empirical Coverage:Q", title="Empirical Coverage",
+                              scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color("Parameter:N", title="", legend=None),
+                    tooltip=[
+                        alt.Tooltip("Parameter:N", title="Parameter"),
+                        alt.Tooltip("Nominal Credible Level:Q", title="Nominal", format=".3f"),
+                        alt.Tooltip("Empirical Coverage:Q", title="Empirical", format=".3f"),
+                    ],
+                )
+                return (_pp_reference_line + _lines + _points).properties(
+                    width=420,
+                    height=420,
+                    title=_title,
+                ).interactive()
+
+            # All posterior-bearing runs remain the benchmark's primary
+            # calibration result.  The second tab is supplementary and helps
+            # diagnose sampler sensitivity without erasing hard test cases.
+            _all_pp_values = [
+                {
+                    "Parameter": _pn,
+                    "Nominal Credible Level": float(_alpha),
+                    "Empirical Coverage": float(_coverage),
+                }
+                for _pn, _m in _agg.items()
+                for _alpha, _coverage in zip(
+                    _m.get("coverage_alphas", []),
+                    _m.get("coverage_values", []),
+                )
+            ]
+            _converged_pp_values = [
+                {
+                    "Parameter": _pn,
+                    "Nominal Credible Level": float(_alpha),
+                    "Empirical Coverage": float(_coverage),
+                }
+                for _pn, _m in _agg.items()
+                for _alpha, _coverage in zip(
+                    _m.get("coverage_converged_alphas", []),
+                    _m.get("coverage_converged_values", []),
+                )
+            ]
+            _pp_tabs = mo.ui.tabs({
+                "All Runs": _build_pp_plot(_all_pp_values, "PP-Plot — All Runs"),
+                "Converged Runs": _build_pp_plot(
+                    _converged_pp_values,
+                    "PP-Plot — Converged Runs",
                 ),
-                y=alt.Y(
-                    "Empirical Coverage:Q",
-                    title="Empirical Coverage",
-                    scale=alt.Scale(domain=[0, 1]),
-                ),
-                color=alt.Color("Parameter:N", title="", legend=alt.Legend(orient="top-left")),
-            )
-            _pp_points = alt.Chart(alt.Data(values=_pp_values)).mark_circle(size=40).encode(
-                x=alt.X(
-                    "Nominal Credible Level:Q",
-                    title="Nominal Credible Level",
-                    scale=alt.Scale(domain=[0, 1]),
-                ),
-                y=alt.Y(
-                    "Empirical Coverage:Q",
-                    title="Empirical Coverage",
-                    scale=alt.Scale(domain=[0, 1]),
-                ),
-                color=alt.Color("Parameter:N", title="", legend=None),
-                tooltip=[
-                    alt.Tooltip("Parameter:N", title="Parameter"),
-                    alt.Tooltip("Nominal Credible Level:Q", title="Nominal", format=".3f"),
-                    alt.Tooltip("Empirical Coverage:Q", title="Empirical", format=".3f"),
-                ],
-            )
-            _fig2 = (_pp_reference_line + _pp_lines + _pp_points).properties(
-                width=420,
-                height=420,
-                title="PP-Plot (Calibration)",
-            ).interactive()
+            })
             _pp_info = mo.md(
                 "### PP-Plot (Calibration)\n\n"
-                "**What this shows:** For each parameter, the chart evaluates 50 nominal "
-                "credible levels between 0.01 and 0.999. Each point is the empirical "
-                "fraction of processed spectra whose ground-truth value lies inside that "
-                "posterior interval.\n\n"
+                "**What this shows:** The default tab includes every posterior-bearing "
+                "run, including important difficult cases flagged by the sampler "
+                "diagnostics. The converged-only tab is supplementary context.\n\n"
                 "**Better looks like:** Curves track the dashed y=x line across the full "
                 "range of nominal credible levels.\n\n"
                 "**Why the step pattern:** Coverage is computed over a finite number of test "
@@ -1249,7 +1296,7 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                 "intervals; curves above the diagonal indicate under-confident intervals."
             )
             _t2_items.append(mo.accordion(
-                {"PP-Plot (Calibration)": mo.hstack([_fig2, _pp_info], widths=[2, 1])}
+                {"PP-Plot (Calibration)": mo.hstack([_pp_tabs, _pp_info], widths=[2, 1])}
             ))
 
             _param_names = list(_agg.keys())
@@ -1614,7 +1661,7 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
         else render_fixed_matplotlib(mo, _fig, width_px=920)
     )
 
-    _conv_tag = "converged" if _converged else "**not converged**"
+    _conv_tag = "diagnostic passed" if _converged else "**diagnostic flagged**"
     _summary_rows = []
     for _lbl in _labels:
         if _lbl in _summary:
@@ -1727,7 +1774,12 @@ def _(get_tier2_posteriors, mo, np, os, t2_corner_export_btn, time):
                 "corner_settings": dict(_corner_settings),
                 "mcmc": {
                     "burnin_used": _post.get("burnin_used"),
-                    "effective_samples": int(_samples.shape[0]),
+                    "retained_draws": int(_samples.shape[0]),
+                    "effective_sample_size": _post.get("effective_sample_size", {}),
+                    "autocorr_time": _post.get("autocorr_time", {}),
+                    "mcse_mean": _post.get("mcse_mean", {}),
+                    "acceptance_fraction": _post.get("acceptance_fraction", {}),
+                    "diagnostic_reasons": _post.get("mcmc_diagnostic_reasons", []),
                     "full_chain_available": _post.get("full_chain") is not None,
                 },
                 "mle_all_params": _post.get("mle_all_params", {}),
@@ -1790,6 +1842,19 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
     _nsteps, _nwalkers, _ndim = _full_chain.shape
     _filename = _post.get("filename", f"run{_post['run']}.spec")
     _inc = _post.get("inclination", 55.0)
+    _acceptance = _post.get("acceptance_fraction", {})
+    _diagnostic_reasons = _post.get("mcmc_diagnostic_reasons", [])
+    _diagnostic_label = (
+        "passed"
+        if not _diagnostic_reasons
+        else "flagged: " + ", ".join(_diagnostic_reasons)
+    )
+    _acceptance_text = (
+        f"{float(_acceptance.get('mean')):.3f} "
+        f"[{float(_acceptance.get('min')):.3f}, {float(_acceptance.get('max')):.3f}]"
+        if _acceptance
+        else "not recorded"
+    )
 
     _fig, _axes = plt.subplots(
         _ndim, 1,
@@ -1840,7 +1905,9 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
         mo.md("#### Chain Trace Plot"),
         mo.md(f"Full walker chains ({_nwalkers} walkers × {_nsteps} steps). "
                f"Orange dashed line marks burn-in at step {_burnin}. "
-               "Red line marks ground truth."),
+               "Red line marks ground truth.  \n"
+               f"**Autocorrelation diagnostic:** {_diagnostic_label}.  \n"
+               f"**Acceptance fraction mean [min, max]:** {_acceptance_text}."),
         render_fixed_matplotlib(mo, _fig, width_px=960),
     ])
     return
@@ -1861,7 +1928,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
     _filename = _post.get("filename", f"run{_post['run']}.spec")
     _inc = _post.get("inclination", 55.0)
     _converged = _post.get("converged", False)
-    _conv_tag = "converged" if _converged else "not converged"
+    _conv_tag = "diagnostic passed" if _converged else "diagnostic flagged"
     _mle_bf = _post.get("mle_bestfit_spec")
     _posterior_bf = _post.get("posterior_mean_bestfit_spec") or _post.get("bestfit_spec")
 
@@ -2904,7 +2971,7 @@ def _(glob, mo, os):
         label="Max test spectra (Tier 2)",
     )
     mcmc_steps_slider = mo.ui.slider(
-        start=100, stop=5000, value=2500, step=100, show_value=True,
+        start=100, stop=5000, value=5000, step=100, show_value=True,
         label="MCMC steps (Tier 2/3)",
     )
     mle_restarts_slider = mo.ui.slider(
@@ -2917,23 +2984,8 @@ def _(glob, mo, os):
         show_value=True, label="Sirocco CPUs (Tier 3)", full_width=False,
     )
 
-    # Inclination selector for Tier 2: which viewing angle column to read from
-    # each .spec file.  "Random" assigns a reproducibly random inclination per
-    # spectrum (seeded by run index).
-    inclination_picker = mo.ui.dropdown(
-        options={
-            "30°": "30", "35°": "35", "40°": "40", "45°": "45",
-            "50°": "50", "55°": "55", "60°": "60", "65°": "65",
-            "70°": "70", "75°": "75", "80°": "80", "85°": "85",
-            "Random": "random",
-        },
-        value="55°",
-        label="Inclination (Tier 2)",
-    )
-
     return (
         emu_picker,
-        inclination_picker,
         max_spectra_slider,
         mcmc_steps_slider,
         mle_restarts_slider,
@@ -3059,9 +3111,77 @@ def _(emu_picker, glob, mo, np, os, re):
                    "Expected pattern: `{stem}_emu_{params}_{inc}inc_{wl}_{PCA}PCA.npz`"),
             kind="warn",
         )
+
+    # Tier 2 may only test truths that the selected emulator can represent.
+    # Intersect the raw .spec viewing angles with the emulator's trainable
+    # inclination bounds so, for example, an 85-degree spectrum cannot be sent
+    # to a mid-inclination emulator whose prior ends at 80 degrees.
+    from Speculate_addons.grid_registry import (
+        default_fixed_inclination as _default_fixed_inclination,
+        get_grid_config as _get_grid_config,
+        inclination_values as _inclination_values,
+    )
+
+    _supported_inclinations = [_default_fixed_inclination(matched_grid_name)]
+    if matched_grid_name:
+        _raw_inclinations = _inclination_values(matched_grid_name)
+        _grid_config = _get_grid_config(matched_grid_name)
+        _has_trainable_inclination = False
+        if _emu_val and os.path.isfile(_emu_val) and _grid_config is not None:
+            try:
+                with np.load(_emu_val, allow_pickle=True) as _emu_npz:
+                    _param_names = [
+                        _name.decode() if isinstance(_name, bytes) else str(_name)
+                        for _name in _emu_npz["param_names"].tolist()
+                    ]
+                    _param_min = np.asarray(_emu_npz["_param_min"], dtype=float)
+                    _param_max = _param_min + np.asarray(
+                        _emu_npz["_param_range"],
+                        dtype=float,
+                    )
+                _inclination_axis = next(
+                    (
+                        _idx for _idx, _name in enumerate(_param_names)
+                        if _name.startswith("param")
+                        and int(_name.replace("param", ""))
+                        in _grid_config["inclination_param_ids"]
+                    ),
+                    None,
+                )
+                if _inclination_axis is not None:
+                    _has_trainable_inclination = True
+                    _lo = _param_min[_inclination_axis]
+                    _hi = _param_max[_inclination_axis]
+                    _supported_inclinations = [
+                        _angle for _angle in _raw_inclinations
+                        if _lo <= _angle <= _hi
+                    ]
+            except Exception:
+                # Metadata failures leave the conservative fixed-inclination
+                # option rather than exposing unsupported test coordinates.
+                pass
+        if not _has_trainable_inclination:
+            _fixed_match = re.search(r"_(\d+)inc_", _emu_base)
+            if _fixed_match:
+                _fixed_angle = int(_fixed_match.group(1))
+                if _fixed_angle in _raw_inclinations:
+                    _supported_inclinations = [_fixed_angle]
+
+    _default_inclination = (
+        55 if 55 in _supported_inclinations else _supported_inclinations[0]
+    )
+    inclination_picker = mo.ui.multiselect(
+        options={
+            f"{_angle}°": str(_angle)
+            for _angle in _supported_inclinations
+        },
+        value=[f"{_default_inclination}°"],
+        label="Inclinations (Tier 2)",
+    )
     return (
         emu_grid_info,
         flux_scale_picker,
+        inclination_picker,
         matched_grid_name,
         matched_grid_path,
         matched_testgrid_path,
@@ -3616,7 +3736,6 @@ def _(
         # ---- Tier 2 (progress_bar per spectrum + spinner per stage) ----
         if 2 in _tiers and matched_testgrid_path:
             import json as _json
-            import random as _random
             _t2_t0 = time.time()
             _test_path = _Path(matched_testgrid_path)
             # Tier 2 works spectrum-by-spectrum from the decompressed test-grid files.
@@ -3625,11 +3744,27 @@ def _(
                 _spec_files = _spec_files[: max_spectra_slider.value]
             _n_t2 = len(_spec_files)
 
-            # Resolve inclination setting from UI
-            _inc_raw = inclination_picker.value
-            _inc_is_random = (_inc_raw == "random")
-            _inc_fixed = float(_inc_raw) if not _inc_is_random else 55.0
-            _VALID_INCS = _inclination_values(_grid_name)
+            # Assign exactly one manually selected, in-support inclination to
+            # each run.  Round-robin assignment keeps the total case count fixed
+            # and balances inclination counts without random seeds.
+            _selected_inclinations = [
+                float(_value) for _value in (inclination_picker.value or [])
+            ]
+            if not _selected_inclinations:
+                set_status_msg("Error: select at least one Tier 2 inclination.")
+                mo.stop(True)
+            _valid_inclinations = set(_inclination_values(_grid_name))
+            if any(_value not in _valid_inclinations for _value in _selected_inclinations):
+                set_status_msg("Error: a selected Tier 2 inclination is unavailable in the test grid.")
+                mo.stop(True)
+            _case_assignments = [
+                (_sf, _selected_inclinations[_idx % len(_selected_inclinations)])
+                for _idx, _sf in enumerate(_spec_files)
+            ]
+            _expected_cases = {
+                (int(_sf.stem.replace("run", "")), float(_inc))
+                for _sf, _inc in _case_assignments
+            }
 
             # Resolve wavelength range from emulator
             _wl_range = (float(_emu.wl.min()) + 10, float(_emu.wl.max()) - 10)
@@ -3651,7 +3786,7 @@ def _(
                 _checkpoint_dir, f"benchmark_partial_{_emu_stem}.jsonl"
             )
 
-            _completed_runs = set()
+            _completed_cases = set()
             _per_spectrum = []
             _tier2_posteriors = []  # full MCMC posteriors for corner-plot explorer
             _all_samples = {n: [] for n in _friendly}
@@ -3679,14 +3814,33 @@ def _(
                                 or _entry.get("mle_bestfit_spec")
                             ):
                                 continue
-                            _completed_runs.add(_entry["run"])
+                            # Checkpoints created with the former walker-based
+                            # R-hat cannot be mixed into the repaired result.
+                            if (
+                                "autocorr_time" not in _entry
+                                or "effective_sample_size" not in _entry
+                            ):
+                                continue
+                            _case_key = (
+                                int(_entry["run"]),
+                                float(_entry.get("inclination", 55.0)),
+                            )
+                            # A run at a different inclination is a different
+                            # recovery problem and must never satisfy resume.
+                            if _case_key not in _expected_cases:
+                                continue
+                            _completed_cases.add(_case_key)
                             _per_spectrum.append(_entry["spec_result"])
                             for _fn in _friendly:
-                                if f"{_fn}_samples" in _entry:
+                                # Resume coverage only from complete
+                                # sample/truth pairs so later cases stay aligned.
+                                if (
+                                    f"{_fn}_samples" in _entry
+                                    and f"{_fn}_truth" in _entry
+                                ):
                                     _all_samples[_fn].append(
                                         _np.array(_entry[f"{_fn}_samples"])
                                     )
-                                if f"{_fn}_truth" in _entry:
                                     _all_truths[_fn].append(_entry[f"{_fn}_truth"])
                             if not _entry.get("mcmc_converged", True):
                                 _n_not_converged += 1
@@ -3708,6 +3862,16 @@ def _(
                                 if "full_chain" in _entry:
                                     _post_entry["full_chain"] = _np.array(_entry["full_chain"])
                                     _post_entry["burnin_used"] = _entry.get("burnin_used", 500)
+                                for _diagnostic_key in (
+                                    "n_retained_draws",
+                                    "autocorr_time",
+                                    "effective_sample_size",
+                                    "mcse_mean",
+                                    "acceptance_fraction",
+                                    "mcmc_diagnostic_reasons",
+                                ):
+                                    if _diagnostic_key in _entry:
+                                        _post_entry[_diagnostic_key] = _entry[_diagnostic_key]
                                 if "bestfit_spec" in _entry:
                                     _post_entry["bestfit_spec"] = _entry["bestfit_spec"]
                                 if "posterior_mean_bestfit_spec" in _entry:
@@ -3772,7 +3936,7 @@ def _(
                 except Exception:
                     pass  # corrupted partial — start fresh
 
-            _n_resumed = len(_completed_runs)
+            _n_resumed = len(_completed_cases)
 
             with mo.status.progress_bar(
                 total=_n_t2,
@@ -3788,21 +3952,14 @@ def _(
                 if _n_resumed > 0:
                     _t2_bar.update(increment=_n_resumed, subtitle=f"Resumed {_n_resumed} spectra")
 
-                for _si, _sf in enumerate(_spec_files):
+                for _si, (_sf, _inc) in enumerate(_case_assignments):
                     # Spectrum filenames encode the run number used by the lookup table.
                     _run_idx = int(_sf.stem.replace("run", ""))
                     _sname = _sf.name
 
                     # Skip already-completed spectra (resume mode)
-                    if _run_idx in _completed_runs:
+                    if (_run_idx, float(_inc)) in _completed_cases:
                         continue
-
-                    # Resolve inclination for this spectrum
-                    if _inc_is_random:
-                        _rng = _random.Random(_run_idx)
-                        _inc = float(_rng.choice(_VALID_INCS))
-                    else:
-                        _inc = _inc_fixed
 
                     # -- Load spectrum --
                     _t2_bar.update(increment=0, subtitle=f"Loading {_sname} (i={_inc:.0f}°)…")
@@ -3888,6 +4045,7 @@ def _(
                                 iteration_callback=_mcmc_cb,
                                 freeze_params=_tier2_mcmc_freeze_settings,
                                 grid_name=_grid_name,
+                                burnin_is_cap=True,
                             )
                         except Exception as _e:
                             _failure_log.append({
@@ -3908,7 +4066,12 @@ def _(
                         "inclination": _inc,
                         "mle_success": _mle["success"],
                         "mcmc_converged": _mcmc["converged"],
-                        "n_effective": _mcmc["n_effective"],
+                        "n_retained_draws": _mcmc["n_retained_draws"],
+                        "autocorr_time": _mcmc["autocorr_time"],
+                        "effective_sample_size": _mcmc["effective_sample_size"],
+                        "mcse_mean": _mcmc["mcse_mean"],
+                        "acceptance_fraction": _mcmc["acceptance_fraction"],
+                        "mcmc_diagnostic_reasons": _mcmc["diagnostic_reasons"],
                         "mle_grid_params": _mle["grid_params"],
                         "mle_nll": _mle.get("nll"),
                         "mle_optimizer_nll": _mle.get("optimizer_nll", _mle.get("nll")),
@@ -3933,6 +4096,12 @@ def _(
                         "full_samples": _mcmc["samples"].tolist(),
                         "full_chain": _mcmc["full_chain"].tolist(),
                         "burnin_used": _mcmc.get("burnin_used", _mcmc_burnin_val),
+                        "n_retained_draws": _mcmc.get("n_retained_draws"),
+                        "autocorr_time": _mcmc.get("autocorr_time", {}),
+                        "effective_sample_size": _mcmc.get("effective_sample_size", {}),
+                        "mcse_mean": _mcmc.get("mcse_mean", {}),
+                        "acceptance_fraction": _mcmc.get("acceptance_fraction", {}),
+                        "mcmc_diagnostic_reasons": _mcmc.get("diagnostic_reasons", []),
                         "full_labels": _mcmc.get("labels", []),
                         "full_summary": {
                             k: {sk: sv for sk, sv in v.items()}
@@ -3977,10 +4146,13 @@ def _(
                             # Find correct column for this parameter
                             _col = _mcmc_labels.index(_fn) if _fn in _mcmc_labels else _pi
                             _samples_i = _mcmc["samples"][:, _col]
-                            _all_samples[_fn].append(_samples_i)
-                            _cp_entry[f"{_fn}_samples"] = _samples_i.tolist()
                             if _fn in _gt:
+                                # Store coverage inputs only as complete pairs;
+                                # otherwise a missing truth would offset every
+                                # subsequent sample/truth comparison.
+                                _all_samples[_fn].append(_samples_i)
                                 _all_truths[_fn].append(_gt[_fn])
+                                _cp_entry[f"{_fn}_samples"] = _samples_i.tolist()
                                 _spec_res[f"{_fn}_truth"] = _gt[_fn]
                                 _cp_entry[f"{_fn}_truth"] = _gt[_fn]
                                 _median = float(np.median(_samples_i))
@@ -4000,6 +4172,12 @@ def _(
                         "samples": _mcmc["samples"],  # (N, ndim) burnt+thinned flat samples
                         "full_chain": _mcmc["full_chain"],  # (nsteps, nwalkers, ndim) full chain
                         "burnin_used": _mcmc.get("burnin_used", _mcmc_burnin_val),
+                        "n_retained_draws": _mcmc.get("n_retained_draws"),
+                        "autocorr_time": _mcmc.get("autocorr_time", {}),
+                        "effective_sample_size": _mcmc.get("effective_sample_size", {}),
+                        "mcse_mean": _mcmc.get("mcse_mean", {}),
+                        "acceptance_fraction": _mcmc.get("acceptance_fraction", {}),
+                        "mcmc_diagnostic_reasons": _mcmc.get("diagnostic_reasons", []),
                         "labels": _mcmc_labels,
                         "summary": _mcmc["summary"],
                         "converged": _mcmc["converged"],
@@ -4030,7 +4208,7 @@ def _(
                     _status_lbl = (
                         f"✓ {_sname} (i={_inc:.0f}°) complete"
                         if _mcmc["converged"]
-                        else f"⚠ {_sname} (i={_inc:.0f}°, not converged)"
+                        else f"⚠ {_sname} (i={_inc:.0f}°, diagnostic flagged)"
                     )
                     _t2_bar.update(increment=1, subtitle=_status_lbl)
 
@@ -4361,6 +4539,12 @@ def _(
             "mcmc_burnin": _mcmc_burnin_val,
             "mle_restarts": mle_restarts_slider.value,
             "max_spectra": max_spectra_slider.value,
+            "tier2_inclinations": (
+                list(_selected_inclinations) if 2 in _tiers else None
+            ),
+            "tier2_inclination_assignment": (
+                "balanced_round_robin" if 2 in _tiers else None
+            ),
             "sirocco_cpus": sirocco_cpu_slider.value,
             "tier3_export_dir": _tier3_export_dir if 3 in _tiers else None,
             "tier3_wl_range": list(_tier3_wl_range) if 3 in _tiers else None,
@@ -4403,7 +4587,7 @@ def _(
             if _t2_fail:
                 _t2_parts.append(f"{_t2_fail} failed")
             if _t2_nc:
-                _t2_parts.append(f"{_t2_nc} not converged")
+                _t2_parts.append(f"{_t2_nc} diagnostically flagged")
             _summary_parts.append(" — ".join(_t2_parts))
         if _tier3_results:
             _summary_parts.append(f"Tier 3: {len(_tier3_results)} observation(s)")

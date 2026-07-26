@@ -116,14 +116,14 @@ def build_tier2_freeze_defaults(param_names: Sequence[str], grid_name: Optional[
     Grid parameter labels depend on the active registry entry, while nuisance
     labels stay shared across grids.
 
-    Tier 2 fits synthetic test-grid spectra, which carry no extinction and share
-    the reference distance, so Av and Distance (``log_scale``) default to FIXED
-    while the Chebyshev tilt and GP covariance terms (``cheb:1``,
-    ``global_cov:log_amp``, ``global_cov:log_ls``) default to FREE — for both the
-    MLE and MCMC stages.
+    Tier 2 fits synthetic test-grid spectra, which carry no extinction, share
+    the reference distance, and have no continuum-tilt systematic.  Av,
+    Distance (``log_scale``), and ``cheb:1`` therefore default to fixed for
+    both MLE and MCMC.  As with the other freeze settings, callers may
+    explicitly thaw ``cheb:1`` when testing a different policy.
     """
     label_map = build_tier2_label_map(param_names, grid_name)
-    _default_frozen = ("Av", "log_scale")
+    _default_frozen = ("Av", "log_scale", "cheb:1")
 
     mle = {label: False for label in label_map}
     for label in _default_frozen:
@@ -1288,6 +1288,53 @@ def run_mle_single(
     }
 
 
+def _autocorrelation_diagnostics(
+    tau: np.ndarray,
+    labels: Sequence[str],
+    nsteps: int,
+    nwalkers: int,
+    retained_steps: int,
+) -> dict:
+    """Build sampler-native convergence diagnostics from emcee's tau values."""
+    tau = np.asarray(tau, dtype=float)
+    tau_valid = bool(
+        len(tau) == len(labels)
+        and np.all(np.isfinite(tau))
+        and np.all(tau > 0)
+    )
+    tau_by_label = {
+        label: float(tau[idx]) if tau_valid else np.nan
+        for idx, label in enumerate(labels)
+    }
+    # N/tau is the effective number of independent draws in the complete
+    # post-burn ensemble.  This is intentionally unrelated to how many rows
+    # remain after thinning for storage and plotting.
+    ess_by_label = {
+        label: (
+            float(nwalkers * retained_steps / tau[idx])
+            if tau_valid
+            else np.nan
+        )
+        for idx, label in enumerate(labels)
+    }
+    reasons = []
+    if not tau_valid:
+        reasons.append("autocorrelation_time_unavailable")
+    else:
+        # emcee recommends about 50 autocorrelation times before trusting the
+        # estimate; shorter chains are retained but explicitly flagged.
+        if np.any(nsteps < 50.0 * tau):
+            reasons.append("chain_shorter_than_50_tau")
+        if any(value < 100.0 for value in ess_by_label.values()):
+            reasons.append("effective_sample_size_below_100")
+    return {
+        "autocorr_time": tau_by_label,
+        "effective_sample_size": ess_by_label,
+        "diagnostic_reasons": reasons,
+        "converged": not reasons,
+    }
+
+
 def run_mcmc_single(
     model,
     priors: dict,
@@ -1298,6 +1345,7 @@ def run_mcmc_single(
     freeze_nuisance: bool = False,
     freeze_params: Optional[Dict[str, bool]] = None,
     grid_name: Optional[str] = None,
+    burnin_is_cap: bool = False,
 ) -> dict:
     """
     Run MCMC on a SpectrumModel already set to MLE best-fit.
@@ -1317,16 +1365,20 @@ def run_mcmc_single(
         Optional Stage 4 freeze settings keyed by internal parameter name.
         When provided, this overrides ``freeze_nuisance`` and is applied with
         a thaw-then-refreeze pass so each run starts from a clean MCMC state.
+    burnin_is_cap : bool
+        If True, treat ``burnin`` as the maximum allowed discard and retain
+        samples after ``2*tau`` when that is smaller.  Tier 2 uses this capped
+        policy; other inference paths retain their existing minimum policy.
 
     Returns
     -------
     dict with keys:
-        'samples'     : (N, ndim) burnt+thinned flat samples
-        'summary'     : dict of {label: {mean, std, median, hdi_3, hdi_97}}
-        'r_hat'       : dict of {label: r_hat}
-        'ess_bulk'    : dict of {label: ess}
-        'converged'   : bool — all r_hat < 1.1 and ess > 100
-        'n_effective'  : int
+        'samples'               : (N, ndim) burnt+thinned flat samples
+        'summary'               : posterior summaries keyed by friendly label
+        'autocorr_time'         : integrated autocorrelation time per parameter
+        'effective_sample_size' : autocorrelation-adjusted ESS per parameter
+        'converged'             : bool — chain >= 50*tau and every ESS >= 100
+        'n_retained_draws'      : number of flattened stored draws
     """
     import emcee
 
@@ -1417,28 +1469,44 @@ def run_mcmc_single(
     else:
         sampler.run_mcmc(ball, nsteps, progress=False)
 
-    # Use the estimated autocorrelation time to choose a conservative burn-in and
-    # thinning rule, but degrade gracefully when the chain is too short for tau.
+    # ``emcee`` walkers in one ensemble are coupled, so they must not be passed
+    # to an R-hat calculation as if they were independent chains.  Integrated
+    # autocorrelation time is the sampler-native diagnostic: it measures how
+    # many steps are required before a draw carries substantially new
+    # information and therefore supports an autocorrelation-aware ESS.
     try:
         tau = sampler.get_autocorr_time(tol=0)
-        tau_valid = not (np.isnan(tau).any() or (tau == 0).any())
+        tau_valid = bool(np.all(np.isfinite(tau)) and np.all(tau > 0))
     except Exception:
         tau = np.full(ndim, np.nan)
         tau_valid = False
 
     if tau_valid:
-        auto_burnin = int(2 * tau.max())  # 2×τ (Foreman-Mackey 2013)
+        auto_burnin = int(np.ceil(2 * tau.max()))
+        if burnin_is_cap:
+            # Easy Tier 2 cases can retain samples after 2*tau, while difficult
+            # cases never discard more than the configured 500-step allowance.
+            burnin_used = min(int(burnin), auto_burnin)
+        else:
+            burnin_used = max(int(burnin), auto_burnin)
         thin = max(1, int(0.3 * np.min(tau)))
-        burnin_used = max(burnin, auto_burnin)
     else:
+        auto_burnin = None
         thin = 1
-        burnin_used = burnin
+        burnin_used = int(burnin)
 
     if burnin_used >= nsteps:
         burnin_used = max(0, nsteps // 2)
 
+    retained_steps = max(0, nsteps - burnin_used)
+    # A very long, unreliable tau estimate can otherwise choose a thinning
+    # interval larger than the retained chain and leave no samples to
+    # summarise. Such a run remains diagnostically flagged, but still returns
+    # its posterior-bearing result for the all-run coverage.
+    thin = min(thin, max(1, retained_steps))
     chain = sampler.get_chain(discard=burnin_used, thin=thin)
     flat = chain.reshape((-1, ndim))
+    acceptance = np.asarray(sampler.acceptance_fraction, dtype=float)
 
     # Summary
     friendly = internal_to_friendly(
@@ -1455,11 +1523,16 @@ def run_mcmc_single(
             all_labels.append(l)
 
     summary = {}
-    r_hat_dict = {}
-    ess_dict = {}
-
-    # Compute simple Gelman-Rubin style diagnostics from the walker-wise chains.
-    per_chain = chain.transpose(1, 0, 2)  # (walkers, steps_after, ndim)
+    mcse_dict = {}
+    _diagnostics = _autocorrelation_diagnostics(
+        tau,
+        all_labels,
+        nsteps,
+        nwalkers,
+        retained_steps,
+    )
+    tau_dict = _diagnostics["autocorr_time"]
+    ess_dict = _diagnostics["effective_sample_size"]
 
     for i, label in enumerate(all_labels):
         vals = flat[:, i]
@@ -1471,25 +1544,17 @@ def run_mcmc_single(
             "hdi_97": float(np.percentile(vals, 97)),
         }
 
-        # Compare within-walker variance to between-walker variance; r_hat values
-        # close to 1 indicate the walkers are exploring the same stationary region.
-        chain_means = np.array([np.mean(per_chain[w, :, i]) for w in range(nwalkers)])
-        chain_vars = np.array([np.var(per_chain[w, :, i]) for w in range(nwalkers)])
-        W = np.mean(chain_vars)
-        B = np.var(chain_means) * chain.shape[0]
-        var_est = (1 - 1.0 / chain.shape[0]) * W + B / chain.shape[0]
-        r_hat = np.sqrt(var_est / W) if W > 0 else np.nan
-        r_hat_dict[label] = float(r_hat)
+        _ess_i = ess_dict[label]
+        mcse_dict[label] = (
+            float(summary[label]["std"] / np.sqrt(_ess_i))
+            if np.isfinite(_ess_i) and _ess_i > 0
+            else np.nan
+        )
 
-        # The code currently uses the post-thinning flat sample count as a simple,
-        # conservative ESS proxy rather than an autocorrelation-based estimator.
-        ess_dict[label] = int(flat.shape[0])  # conservative: total thinned samples
-
-    # Treat convergence as a pragmatic quality gate for the viewer: all finite
-    # r_hat values must be below 1.1 and there must be enough retained samples
-    # to support posterior summaries Vivekananda 2019 (Vehtari et al. 2021, arXiv:1903.08008 criticizes R_hat choice).
-    converged = all(rh < 1.1 for rh in r_hat_dict.values() if np.isfinite(rh))
-    converged = converged and flat.shape[0] >= 100
+    # Keep reasons machine-readable so hard cases remain in all-run coverage
+    # while the viewer can explain why the sampler flagged them.
+    diagnostic_reasons = _diagnostics["diagnostic_reasons"]
+    converged = _diagnostics["converged"]
 
     # Best-fit spectrum at posterior means — set model params, evaluate, and
     # store the arrays so the viewer can reconstruct the Starfish-style plot
@@ -1528,12 +1593,20 @@ def run_mcmc_single(
         "samples": flat,
         "full_chain": full_chain,
         "burnin_used": burnin_used,
+        "auto_burnin": auto_burnin,
         "thin": thin,
         "summary": summary,
-        "r_hat": r_hat_dict,
-        "ess_bulk": ess_dict,
+        "autocorr_time": tau_dict,
+        "effective_sample_size": ess_dict,
+        "mcse_mean": mcse_dict,
+        "acceptance_fraction": {
+            "mean": float(np.nanmean(acceptance)),
+            "min": float(np.nanmin(acceptance)),
+            "max": float(np.nanmax(acceptance)),
+        },
+        "diagnostic_reasons": diagnostic_reasons,
         "converged": converged,
-        "n_effective": flat.shape[0],
+        "n_retained_draws": int(flat.shape[0]),
         "labels": all_labels,
         "internal_labels": _sampled_labels,
         "bestfit_spec": bestfit_spec,
@@ -1580,7 +1653,8 @@ def compute_coverage(
     truths : list of float
         Ground truth values for each test spectrum.
     alphas : ndarray or None
-        Nominal credible levels to evaluate. Default: np.linspace(0.01, 0.99, 50).
+        Nominal credible levels to evaluate. Default:
+        ``np.linspace(0.01, 0.999, 50)``.
 
     Returns
     -------
@@ -1588,7 +1662,14 @@ def compute_coverage(
     """
     if alphas is None:
         alphas = np.linspace(0.01, 0.999, 50)
+    else:
+        alphas = np.asarray(alphas, dtype=float)
 
+    if len(samples_list) != len(truths):
+        raise ValueError(
+            "Coverage requires one ground truth for every posterior sample set "
+            f"({len(samples_list)} samples, {len(truths)} truths)."
+        )
     coverage = np.zeros_like(alphas)
     n = len(samples_list)
     if n == 0:
@@ -1604,6 +1685,62 @@ def compute_coverage(
         coverage[i] = count / n
 
     return alphas, coverage
+
+
+TIER2_COVERAGE_LEVELS = (0.68, 0.95, 0.997)
+
+
+def _wilson_interval(count: int, n: int, z: float = 1.959963984540054) -> Tuple[float, float]:
+    """Return a two-sided 95% Wilson interval for a binomial proportion."""
+    if n <= 0:
+        return np.nan, np.nan
+    proportion = count / n
+    denominator = 1.0 + z**2 / n
+    centre = (proportion + z**2 / (2.0 * n)) / denominator
+    half_width = (
+        z
+        * np.sqrt(proportion * (1.0 - proportion) / n + z**2 / (4.0 * n**2))
+        / denominator
+    )
+    return float(max(0.0, centre - half_width)), float(min(1.0, centre + half_width))
+
+
+def compute_direct_coverage(
+    samples_list: List[np.ndarray],
+    truths: List[float],
+    levels: Sequence[float] = TIER2_COVERAGE_LEVELS,
+) -> Dict[str, dict]:
+    """Return direct equal-tail coverage counts without curve interpolation.
+
+    Empirical coverage is a binomial count across test cases.  Computing the
+    requested levels directly preserves that discrete result: with 50 cases the
+    reported fraction can only change in increments of 1/50, or two percentage
+    points.  Wilson intervals describe the finite-test-set uncertainty.
+    """
+    if len(samples_list) != len(truths):
+        raise ValueError(
+            "Direct coverage requires one ground truth for every posterior "
+            f"sample set ({len(samples_list)} samples, {len(truths)} truths)."
+        )
+    n = len(samples_list)
+    result: Dict[str, dict] = {}
+    for level in levels:
+        count = 0
+        for samples, truth in zip(samples_list, truths):
+            values = np.asarray(samples, dtype=float)
+            lo = np.percentile(values, (1.0 - level) * 50.0)
+            hi = np.percentile(values, (1.0 + level) * 50.0)
+            count += int(lo <= truth <= hi)
+        ci_low, ci_high = _wilson_interval(count, n)
+        result[f"{level:g}"] = {
+            "nominal": float(level),
+            "covered_count": int(count),
+            "n": int(n),
+            "fraction": float(count / n) if n else np.nan,
+            "wilson_95_low": ci_low,
+            "wilson_95_high": ci_high,
+        }
+    return result
 
 
 # --- Public aliases for helpers used by the viewer-driven loop ---------
@@ -1661,18 +1798,23 @@ def aggregate_tier2_results(
         if len(all_truths[fname]) == 0:
             continue
 
-        truths_arr = np.array(all_truths[fname])
-        means_arr = np.array(
-            [ps.get(f"{fname}_mean", np.nan) for ps in per_spectrum]
+        # Work only from records that contain both halves of the comparison.
+        # This keeps posterior arrays, truths, convergence flags, and point
+        # summaries aligned even when lookup metadata is missing for one run.
+        _parameter_results = [
+            ps for ps in per_spectrum
+            if f"{fname}_truth" in ps and f"{fname}_mean" in ps
+        ]
+        truths_arr = np.array(
+            [ps[f"{fname}_truth"] for ps in _parameter_results],
+            dtype=float,
         )
-        means_arr = means_arr[~np.isnan(means_arr)]
-
-        if len(means_arr) == len(truths_arr):
-            rmse = float(np.sqrt(np.mean((means_arr - truths_arr) ** 2)))
-            bias = float(np.mean(means_arr - truths_arr))
-        else:
-            rmse = np.nan
-            bias = np.nan
+        means_arr = np.array(
+            [ps[f"{fname}_mean"] for ps in _parameter_results],
+            dtype=float,
+        )
+        rmse = float(np.sqrt(np.mean((means_arr - truths_arr) ** 2)))
+        bias = float(np.mean(means_arr - truths_arr))
 
         crps_vals = []
         for samples, truth in zip(all_samples[fname], all_truths[fname]):
@@ -1683,7 +1825,10 @@ def aggregate_tier2_results(
             emu_max_params[friendly_names.index(fname)]
             - emu_min_params[friendly_names.index(fname)]
         ) if fname in friendly_names[:n_params] else np.nan
-        post_stds = [ps.get(f"{fname}_std", np.nan) for ps in per_spectrum]
+        post_stds = [
+            ps.get(f"{fname}_std", np.nan)
+            for ps in _parameter_results
+        ]
         mean_post_std = float(np.nanmean(post_stds))
         shrinkage = (
             1.0 - mean_post_std / (prior_range / np.sqrt(12))
@@ -1691,21 +1836,57 @@ def aggregate_tier2_results(
             else np.nan
         )
 
-        alphas, cov = compute_coverage(all_samples[fname], all_truths[fname])
-        cov_68 = float(np.interp(0.68, alphas, cov))
-        cov_95 = float(np.interp(0.95, alphas, cov))
-        cov_997 = float(np.interp(0.997, alphas, cov))
+        # The all-run result is the primary end-to-end benchmark, including
+        # difficult cases that the sampler diagnostics flag.  A converged-only
+        # view is retained solely as supplementary context in the viewer.
+        _samples = all_samples[fname]
+        _truths = all_truths[fname]
+        if not (
+            len(_samples) == len(_truths) == len(_parameter_results)
+        ):
+            raise ValueError(
+                f"Tier 2 aggregation lost case alignment for {fname!r}: "
+                f"{len(_samples)} sample sets, {len(_truths)} truths, and "
+                f"{len(_parameter_results)} per-spectrum records."
+            )
+        _coverage_levels = compute_direct_coverage(_samples, _truths)
+        alphas, cov = compute_coverage(_samples, _truths)
+
+        _converged_pairs = [
+            (samples, truth)
+            for samples, truth, ps in zip(_samples, _truths, _parameter_results)
+            if ps.get("mcmc_converged", False)
+        ]
+        _converged_samples = [pair[0] for pair in _converged_pairs]
+        _converged_truths = [pair[1] for pair in _converged_pairs]
+        _converged_levels = compute_direct_coverage(
+            _converged_samples,
+            _converged_truths,
+        )
+        if _converged_samples:
+            converged_alphas, converged_cov = compute_coverage(
+                _converged_samples,
+                _converged_truths,
+                alphas=alphas,
+            )
+        else:
+            converged_alphas = np.array([], dtype=float)
+            converged_cov = np.array([], dtype=float)
 
         aggregate[fname] = {
             "rmse": rmse,
             "bias": bias,
             "crps": crps_mean,
             "shrinkage": shrinkage,
-            "coverage_68": cov_68,
-            "coverage_95": cov_95,
-            "coverage_997": cov_997,
+            "coverage_68": _coverage_levels["0.68"]["fraction"],
+            "coverage_95": _coverage_levels["0.95"]["fraction"],
+            "coverage_997": _coverage_levels["0.997"]["fraction"],
+            "coverage_levels": _coverage_levels,
             "coverage_alphas": alphas.tolist(),
             "coverage_values": cov.tolist(),
+            "coverage_converged_levels": _converged_levels,
+            "coverage_converged_alphas": converged_alphas.tolist(),
+            "coverage_converged_values": converged_cov.tolist(),
         }
 
     return {
@@ -1725,7 +1906,7 @@ def aggregate_tier2_results(
         "mcmc_config": {
             "walkers": mcmc_walkers,
             "steps": mcmc_steps,
-            "burnin": mcmc_burnin,
+            "burnin_cap": mcmc_burnin,
             "freeze_params": _serialise_freeze_settings(mcmc_freeze_params),
             "fixed_distance_pc": 100.0,
         },
@@ -1740,7 +1921,7 @@ def run_tier2(
     wl_range: Tuple[float, float] = (850, 1850),
     inclination: float = 55.0,
     mcmc_walkers: int = 64,
-    mcmc_steps: int = 2500,
+    mcmc_steps: int = 5000,
     mcmc_burnin: int = 500,
     max_mle_iter: int = 10000,
     mle_restarts: int = 1,
@@ -1819,7 +2000,6 @@ def run_tier2(
         mle_freeze_params["log_scale"] = True
     if "log_scale" in mcmc_freeze_params:
         mcmc_freeze_params["log_scale"] = True
-
     per_spectrum = []
     all_samples = {name: [] for name in friendly_names}
     all_truths = {name: [] for name in friendly_names}
@@ -1900,6 +2080,7 @@ def run_tier2(
                 burnin=mcmc_burnin,
                 freeze_params=mcmc_freeze_params,
                 grid_name=_tier_grid_name,
+                burnin_is_cap=True,
             )
         except Exception as e:
             import traceback as _tb
@@ -1923,7 +2104,12 @@ def run_tier2(
             "inclination": inclination,
             "mle_success": mle_result["success"],
             "mcmc_converged": mcmc_result["converged"],
-            "n_effective": mcmc_result["n_effective"],
+            "n_retained_draws": mcmc_result["n_retained_draws"],
+            "autocorr_time": mcmc_result["autocorr_time"],
+            "effective_sample_size": mcmc_result["effective_sample_size"],
+            "mcse_mean": mcmc_result["mcse_mean"],
+            "acceptance_fraction": mcmc_result["acceptance_fraction"],
+            "mcmc_diagnostic_reasons": mcmc_result["diagnostic_reasons"],
             "mle_grid_params": mle_result["grid_params"],
             "mle_nll": mle_result.get("nll"),
             "mle_optimizer_nll": mle_result.get("optimizer_nll"),
@@ -1954,9 +2140,11 @@ def run_tier2(
                 else:
                     _col = i  # fallback (legacy behaviour)
                 samples_i = mcmc_result["samples"][:, _col]
-                all_samples[fname].append(samples_i)
 
                 if fname in gt:
+                    # Coverage inputs are appended as an inseparable pair.  A
+                    # missing lookup truth must not shift every later case.
+                    all_samples[fname].append(samples_i)
                     all_truths[fname].append(gt[fname])
                     spec_result[f"{fname}_truth"] = gt[fname]
                     _median = float(np.median(samples_i))
@@ -1970,89 +2158,26 @@ def run_tier2(
             _status = "done" if mcmc_result["converged"] else "done:not_converged"
             progress_callback(_spec_idx + 1, _n_total, sf.name, _status)
 
-    # ----- Aggregate metrics across all test spectra -----
-    # For each physical parameter we compute:
-    #   RMSE   — root-mean-square error of posterior means vs ground truth
-    #   Bias   — signed mean offset (positive = overestimate)
-    #   CRPS   — Continuous Ranked Probability Score (proper scoring rule that
-    #            penalises both miscalibration and low sharpness)
-    #   Shrinkage — how much the posterior narrows relative to the prior
-    #              (1 = perfectly informative, 0 = no information gain)
-    #   Coverage — empirical coverage at 68% and 95% credible levels (if
-    #             well-calibrated, ~68% and ~95% of truths fall inside the
-    #             posterior intervals at those levels)
-    aggregate = {}
-    for fname in friendly_names:
-        if len(all_truths[fname]) == 0:
-            continue
-
-        truths_arr = np.array(all_truths[fname])
-        means_arr = np.array(
-            [ps.get(f"{fname}_mean", np.nan) for ps in per_spectrum]
-        )
-        means_arr = means_arr[~np.isnan(means_arr)]
-
-        # RMSE and bias of posterior means vs ground truth
-        if len(means_arr) == len(truths_arr):
-            rmse = float(np.sqrt(np.mean((means_arr - truths_arr) ** 2)))
-            bias = float(np.mean(means_arr - truths_arr))
-        else:
-            rmse = np.nan
-            bias = np.nan
-
-        # CRPS: averaged over all test spectra for this parameter
-        crps_vals = []
-        for samples, truth in zip(all_samples[fname], all_truths[fname]):
-            crps_vals.append(compute_crps(samples, truth))
-        crps_mean = float(np.mean(crps_vals)) if crps_vals else np.nan
-
-        # Posterior shrinkage: 1 − (mean posterior σ) / (prior σ)
-        # Uses the standard deviation of the uniform prior: range / √12
-        prior_range = float(emu.max_params[friendly_names.index(fname)] - emu.min_params[friendly_names.index(fname)]) if fname in friendly_names[:n_params] else np.nan
-        post_stds = [ps.get(f"{fname}_std", np.nan) for ps in per_spectrum]
-        mean_post_std = float(np.nanmean(post_stds))
-        shrinkage = 1.0 - mean_post_std / (prior_range / np.sqrt(12)) if np.isfinite(prior_range) and prior_range > 0 else np.nan
-
-        # PP-plot coverage: the fraction of test cases whose ground truth falls
-        # inside the α-level credible interval, evaluated at many α values.
-        alphas, cov = compute_coverage(all_samples[fname], all_truths[fname])
-        # Interpolate to standard reporting levels
-        cov_68 = float(np.interp(0.68, alphas, cov))
-        cov_95 = float(np.interp(0.95, alphas, cov))
-        cov_997 = float(np.interp(0.997, alphas, cov))
-
-        aggregate[fname] = {
-            "rmse": rmse,
-            "bias": bias,
-            "crps": crps_mean,
-            "shrinkage": shrinkage,
-            "coverage_68": cov_68,
-            "coverage_95": cov_95,
-            "coverage_997": cov_997,
-            "coverage_alphas": alphas.tolist(),
-            "coverage_values": cov.tolist(),
-        }
-
     elapsed = time.time() - t0
-    return {
-        "per_spectrum": per_spectrum,
-        "aggregate": aggregate,
-        "n_spectra": len(spec_files),
-        "n_processed": len(per_spectrum),
-        "n_failures": failures,
-        "n_not_converged": n_not_converged,
-        "failure_log": failure_log,
-        "mle_config": {
-            "freeze_params": _serialise_freeze_settings(mle_freeze_params),
-        },
-        "mcmc_config": {
-            "walkers": mcmc_walkers,
-            "steps": mcmc_steps,
-            "burnin": mcmc_burnin,
-            "freeze_params": _serialise_freeze_settings(mcmc_freeze_params),
-        },
-        "tier2_time_s": elapsed,
-    }
+    return aggregate_tier2_results(
+        per_spectrum=per_spectrum,
+        all_samples=all_samples,
+        all_truths=all_truths,
+        friendly_names=friendly_names,
+        n_params=n_params,
+        emu_min_params=emu.min_params,
+        emu_max_params=emu.max_params,
+        spec_files_count=len(spec_files),
+        failures=failures,
+        failure_log=failure_log,
+        mcmc_walkers=mcmc_walkers,
+        mcmc_steps=mcmc_steps,
+        mcmc_burnin=mcmc_burnin,
+        elapsed=elapsed,
+        n_not_converged=n_not_converged,
+        mle_freeze_params=mle_freeze_params,
+        mcmc_freeze_params=mcmc_freeze_params,
+    )
 
 
 # ======================================================================
@@ -2922,7 +3047,12 @@ def run_tier3_single(
         "mle_all_params": mle.get("all_params", {}),
         "mcmc_summary": mcmc["summary"],
         "mcmc_converged": mcmc["converged"],
-        "n_effective": mcmc.get("n_effective"),
+        "n_retained_draws": mcmc.get("n_retained_draws"),
+        "autocorr_time": mcmc.get("autocorr_time", {}),
+        "effective_sample_size": mcmc.get("effective_sample_size", {}),
+        "mcse_mean": mcmc.get("mcse_mean", {}),
+        "acceptance_fraction": mcmc.get("acceptance_fraction", {}),
+        "mcmc_diagnostic_reasons": mcmc.get("diagnostic_reasons", []),
         "labels": friendly_labels,
         "mle_freeze_settings": mle.get("freeze_params", {}),
         "mle_frozen_params": mle.get("frozen_params", []),
@@ -3504,6 +3634,16 @@ def build_report_card(
                     _entry["full_chain"] = _c.tolist() if hasattr(_c, "tolist") else _c
                 if "burnin_used" in _p:
                     _entry["burnin_used"] = _p["burnin_used"]
+                for _diagnostic_key in (
+                    "n_retained_draws",
+                    "autocorr_time",
+                    "effective_sample_size",
+                    "mcse_mean",
+                    "acceptance_fraction",
+                    "mcmc_diagnostic_reasons",
+                ):
+                    if _diagnostic_key in _p:
+                        _entry[_diagnostic_key] = _p[_diagnostic_key]
                 if "bestfit_spec" in _p and _p["bestfit_spec"]:
                     _entry["bestfit_spec"] = _p["bestfit_spec"]
                 if "prior_ranges" in _p and _p["prior_ranges"]:
@@ -3541,7 +3681,12 @@ def build_report_card(
                 "mcmc_converged": r.get("mcmc_converged", None),
             }
             for key in (
-                "n_effective",
+                "n_retained_draws",
+                "autocorr_time",
+                "effective_sample_size",
+                "mcse_mean",
+                "acceptance_fraction",
+                "mcmc_diagnostic_reasons",
                 "exact_inclination",
                 "mle_params",
                 "mle_all_params",
