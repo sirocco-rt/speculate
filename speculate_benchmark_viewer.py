@@ -2408,7 +2408,9 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
             "flux": _sirocco_plot_flux,
             "label": _sirocco_label,
             "color": "#9467bd",
-            "dash": [6, 3],
+            # Keep the full Sirocco comparison visually equal to the data and
+            # emulator spectra; colour alone distinguishes the three models.
+            "dash": [],
         })
 
     _bestfit = build_bestfit_spectrum_altair(
@@ -2420,6 +2422,9 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         covariance_components=_covariance_components,
         title=f"Tier 3 Best Fit — {_post.get('obs_file', '?')}",
         zoom_name=f"tier3_bestfit_zoom_{t3_observation_slider.value}",
+        # Tier 3 includes every fitted Sirocco nuisance transform in this
+        # legend entry, so retain the full diagnostic label.
+        legend_label_limit=1000,
         extra_flux_series=_extra,
     )
 

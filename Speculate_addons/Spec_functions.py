@@ -262,6 +262,7 @@ def build_bestfit_spectrum_altair(
     relative_title="Relative Error",
     y_axis_format=".2e",
     model_label="Emulated Model",
+    legend_label_limit=240,
     extra_flux_series=None,
     local_covariance_centers=None,
     local_covariance_regions=None,
@@ -281,6 +282,9 @@ def build_bestfit_spectrum_altair(
         Chart title shown above the main spectrum panel.
     model_label : str
         Legend label for the primary emulated model spectrum.
+    legend_label_limit : int
+        Maximum legend-label width in pixels. Increase this for comparison
+        labels that include fitted nuisance-parameter values.
     extra_flux_series : dict, list of dict, or None
         Optional additional spectra to overlay on the main panel.  Each dict may
         contain ``wavelength``, ``flux``, ``label``, ``color``, and ``dash``.
@@ -409,7 +413,7 @@ def build_bestfit_spectrum_altair(
             "Series:N",
             title="Series",
             scale=alt.Scale(domain=series_order, range=series_colors),
-            legend=alt.Legend(orient="top", labelLimit=240),
+            legend=alt.Legend(orient="top", labelLimit=legend_label_limit),
         ),
         strokeDash=alt.StrokeDash(
             "Series:N",
