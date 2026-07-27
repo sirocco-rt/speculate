@@ -3,8 +3,8 @@ Speculate Benchmark Module
 ===========================
 Core functions for evaluating emulator performance across three tiers:
 
-    Tier 1 — Grid Reconstruction Fidelity (PCA + Leave-One-Out CV)
-    Tier 2 — Test Grid Parameter Recovery  (MLE + MCMC + calibration)
+    Tier 1 — Grid Reconstruction           (training LOO + test-grid RMSE)
+    Tier 2 — Inference Parameter Recovery  (MLE + MCMC + calibration)
     Tier 3 — Observational Spectra         (goodness-of-fit + PPC)
 
 Import these functions directly or use the marimo Benchmark Viewer
@@ -36,7 +36,9 @@ from Speculate_addons.grid_registry import (
     default_fixed_inclination,
     defaulted_physical_param_ids,
     emulator_values_to_physical,
+    get_grid_config,
     inclination_column,
+    inclination_values,
     infer_grid_name,
     lookup_row_to_emulator_values,
 )
@@ -663,7 +665,246 @@ def emulator_to_physical(param_names: Sequence[str], values: np.ndarray, grid_na
 # ======================================================================
 
 
-def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
+def run_test_grid_rmse(
+    emu,
+    test_grid_path: Union[str, Path],
+    grid_name: Optional[str] = None,
+    *,
+    smoothing: Optional[bool] = None,
+    prediction_batch_size: int = 64,
+) -> dict:
+    """Measure direct per-wavelength reconstruction error on a test grid.
+
+    Unlike the analytical training-grid LOO diagnostic, this routine evaluates
+    the emulator predictive mean at independent test-grid truth coordinates.
+    It returns two directly comparable curves: the PCA-only projection error
+    and the final PCA-plus-GP prediction error, both aggregated over the same
+    spectra and expressed in the emulator's scale-removed flux space.
+
+    The test spectra and lookup table must already exist locally.  Benchmarking
+    never downloads an entire test grid implicitly.
+    """
+    import io
+    import lzma
+
+    from Speculate_addons.Spec_gridinterfaces import (
+        _apply_flux_scale,
+        _maybe_smooth_flux,
+    )
+
+    test_path = Path(test_grid_path)
+    if not test_path.is_dir():
+        raise FileNotFoundError(f"Test-grid directory does not exist: {test_path}")
+
+    lookup_path = test_path / "grid_run_lookup_table.parquet"
+    if not lookup_path.exists():
+        raise FileNotFoundError(f"Test-grid lookup table does not exist: {lookup_path}")
+
+    resolved_grid_name = (
+        infer_grid_name(grid_name)
+        or infer_grid_name(getattr(emu, "name", None))
+        or infer_grid_name(str(test_path))
+    )
+    config = get_grid_config(resolved_grid_name)
+    if config is None:
+        raise ValueError(
+            "Could not identify the registered training grid for "
+            f"{test_path.name!r}."
+        )
+    resolved_grid_name = config["name"]
+
+    param_ids = []
+    for param_name in emu.param_names:
+        match = re.search(r"\d+", str(param_name))
+        if match is None:
+            raise ValueError(f"Cannot map emulator parameter {param_name!r} to the grid registry.")
+        param_ids.append(int(match.group(0)))
+
+    inclination_ids = {
+        int(param_id) for param_id in config.get("inclination_param_ids", set())
+    }
+    selected_inclination_ids = [
+        param_id for param_id in param_ids if param_id in inclination_ids
+    ]
+
+    if selected_inclination_ids:
+        inclination_axis = param_ids.index(selected_inclination_ids[0])
+        lo = float(np.asarray(emu.min_params)[inclination_axis])
+        hi = float(np.asarray(emu.max_params)[inclination_axis])
+        inclinations = [
+            angle
+            for angle in inclination_values(resolved_grid_name)
+            if lo <= angle <= hi
+        ]
+    else:
+        name_text = str(getattr(emu, "name", ""))
+        fixed_match = re.search(r"_(\d+)inc_", name_text)
+        fixed_angle = (
+            int(fixed_match.group(1))
+            if fixed_match
+            else int(default_fixed_inclination(resolved_grid_name))
+        )
+        inclinations = [fixed_angle]
+
+    if not inclinations:
+        raise ValueError("No raw test-grid inclinations fall within the emulator bounds.")
+
+    if smoothing is None:
+        smoothing = "_smooth_" in str(getattr(emu, "name", ""))
+
+    lookup_df = pd.read_parquet(lookup_path)
+    if "Run Number" not in lookup_df.columns:
+        raise ValueError(f"{lookup_path} has no 'Run Number' column.")
+
+    wavelength = np.asarray(emu.wl, dtype=np.float64)
+    wl_lo = float(np.min(wavelength))
+    wl_hi = float(np.max(wavelength))
+    flux_scale = str(getattr(emu, "flux_scale", "linear"))
+    friendly_by_id = {
+        int(param_id): friendly
+        for param_id, (friendly, _physical_key) in benchmark_param_map(
+            resolved_grid_name
+        ).items()
+    }
+
+    def _find_spectrum(run_number: int) -> Optional[Path]:
+        for suffix in (".spec", ".spec.xz"):
+            candidate = test_path / f"run{run_number}{suffix}"
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _load_spectrum_table(path: Path) -> np.ndarray:
+        opener = lzma.open if path.suffix == ".xz" else open
+        with opener(path, "rt", encoding="utf-8") as handle:
+            lines = handle.readlines()
+        data_start = None
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("Freq."):
+                continue
+            data_start = index
+            break
+        if data_start is None:
+            raise ValueError(f"No numeric spectrum rows found in {path}.")
+        return np.loadtxt(io.StringIO("".join(lines[data_start:])), unpack=True)
+
+    truth_rows = []
+    param_rows = []
+    failures = 0
+    for _, row in lookup_df.iterrows():
+        path = _find_spectrum(int(row["Run Number"]))
+        if path is None:
+            failures += len(inclinations)
+            continue
+        try:
+            raw = _load_spectrum_table(path)
+            wl_full = np.flip(np.asarray(raw[1], dtype=np.float64))
+            wl_mask = (wl_full >= wl_lo) & (wl_full <= wl_hi)
+            if not np.any(wl_mask):
+                failures += len(inclinations)
+                continue
+
+            for inclination in inclinations:
+                truth_values = lookup_row_to_emulator_values(
+                    resolved_grid_name,
+                    row,
+                    inclination,
+                )
+                params = []
+                for param_id in param_ids:
+                    if param_id in inclination_ids:
+                        params.append(float(inclination))
+                    else:
+                        params.append(float(truth_values[friendly_by_id[param_id]]))
+
+                flux_column = inclination_column(resolved_grid_name, inclination)
+                flux_full = np.flip(np.asarray(raw[flux_column], dtype=np.float64))
+                flux_full = _maybe_smooth_flux(flux_full, bool(smoothing))
+                flux_full = _apply_flux_scale(
+                    wl_full,
+                    wl_mask,
+                    flux_full.copy(),
+                    flux_scale,
+                )
+                flux_selected = flux_full[wl_mask]
+                wl_selected = wl_full[wl_mask]
+                if (
+                    len(flux_selected) != len(wavelength)
+                    or not np.allclose(wl_selected, wavelength)
+                ):
+                    flux_selected = np.interp(wavelength, wl_selected, flux_selected)
+
+                truth_rows.append(flux_selected)
+                param_rows.append(params)
+        except Exception:
+            log.debug("Skipping malformed test-grid spectrum %s", path, exc_info=True)
+            failures += len(inclinations)
+
+    if not truth_rows:
+        raise ValueError(f"No spectra could be processed from {test_path}.")
+
+    truth_flux = np.asarray(truth_rows, dtype=np.float64)
+    norm_factors = truth_flux.mean(axis=1, dtype=np.float64)
+    if flux_scale == "log":
+        truth_compare = truth_flux - norm_factors[:, np.newaxis]
+    else:
+        norm_factors = np.where(norm_factors != 0, norm_factors, 1.0)
+        truth_compare = truth_flux / norm_factors[:, np.newaxis]
+
+    flux_mean = np.asarray(emu.flux_mean, dtype=np.float64)
+    flux_std = np.asarray(emu.flux_std, dtype=np.float64)
+    eigenspectra = np.asarray(emu.eigenspectra, dtype=np.float64)
+    inverse_basis = eigenspectra * flux_std
+
+    truth_standardised = (truth_compare - flux_mean) / flux_std
+    oracle_weights = truth_standardised @ eigenspectra.T
+    pca_oracle_flux = oracle_weights @ inverse_basis + flux_mean
+
+    params = np.asarray(param_rows, dtype=np.float64)
+    predicted_weight_batches = []
+    batch_size = max(1, int(prediction_batch_size))
+    for start in range(0, len(params), batch_size):
+        stop = min(start + batch_size, len(params))
+        predicted_weights, _ = emu(
+            params[start:stop],
+            full_cov=False,
+            reinterpret_batch=True,
+        )
+        predicted_weight_batches.append(
+            np.asarray(predicted_weights, dtype=np.float64).reshape(
+                stop - start,
+                emu.ncomps,
+            )
+        )
+    predicted_weights = np.vstack(predicted_weight_batches)
+    predicted_flux = predicted_weights @ inverse_basis + flux_mean
+
+    pca_residual = truth_compare - pca_oracle_flux
+    model_residual = truth_compare - predicted_flux
+    pca_per_spectrum_rmse = np.sqrt(np.mean(pca_residual**2, axis=1))
+    model_per_spectrum_rmse = np.sqrt(np.mean(model_residual**2, axis=1))
+
+    return {
+        "wavelength": wavelength,
+        "pca_per_wl_rmse": np.sqrt(np.mean(pca_residual**2, axis=0)),
+        "model_per_wl_rmse": np.sqrt(np.mean(model_residual**2, axis=0)),
+        "pca_per_spectrum_rmse": pca_per_spectrum_rmse,
+        "model_per_spectrum_rmse": model_per_spectrum_rmse,
+        "test_grid_name": test_path.name,
+        "n_spectra": int(len(truth_compare)),
+        "n_failed": int(failures),
+        "inclinations": [int(angle) for angle in inclinations],
+        "smoothing": bool(smoothing),
+    }
+
+
+def run_tier1(
+    emu,
+    grid_path: Optional[str] = None,
+    test_grid_path: Optional[Union[str, Path]] = None,
+    grid_name: Optional[str] = None,
+) -> dict:
     """
     Tier 1 benchmark: grid reconstruction fidelity.
 
@@ -674,14 +915,20 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     grid_path : str or None
         Path to the grid NPZ file. If provided, flux-space metrics are
         computed in addition to weight-space Leave-One-Out metrics.
+    test_grid_path : str, path-like, or None
+        Paired independent test-grid directory. If provided, direct
+        per-wavelength PCA-only and PCA-plus-GP RMSE curves are computed.
+    grid_name : str or None
+        Registered training-grid name. Usually inferred from the emulator.
 
     Returns
     -------
     dict
         Benchmark results.  JSON-safe scalars/lists plus an ``'_arrays'``
         sub-dict containing large numpy arrays (``original_flux``,
-        ``pca_recon_flux``, ``loo_recon_flux``, ``wavelength``) that are
-        kept in-memory only and excluded from JSON serialisation.
+        ``pca_recon_flux``, ``loo_recon_flux``, training/test wavelengths,
+        and per-wavelength RMSE curves) that are kept in-memory only and
+        excluded from JSON serialisation.
     """
     t0 = time.time()
     results = emu.loo_cv(grid=grid_path)
@@ -698,6 +945,42 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     results["n_components"] = emu.ncomps
     results["n_grid_points"] = emu.grid_points.shape[0]
     results["n_params"] = emu.grid_points.shape[1]
+
+    test_grid_arrays = {}
+    if test_grid_path:
+        try:
+            test_grid = run_test_grid_rmse(
+                emu,
+                test_grid_path,
+                grid_name=grid_name,
+                smoothing=(
+                    "_smooth_" in str(grid_path)
+                    or "_smooth_" in str(getattr(emu, "name", ""))
+                ),
+            )
+            results.update({
+                "test_grid_name": test_grid["test_grid_name"],
+                "test_grid_n_spectra": test_grid["n_spectra"],
+                "test_grid_n_failed": test_grid["n_failed"],
+                "test_grid_inclinations": test_grid["inclinations"],
+                "test_grid_pca_rmse_median": float(
+                    np.median(test_grid["pca_per_spectrum_rmse"])
+                ),
+                "test_grid_model_rmse_median": float(
+                    np.median(test_grid["model_per_spectrum_rmse"])
+                ),
+                "test_grid_rmse_note": "",
+            })
+            test_grid_arrays = {
+                "test_wavelength": test_grid["wavelength"],
+                "test_pca_per_wl_rmse": test_grid["pca_per_wl_rmse"],
+                "test_model_per_wl_rmse": test_grid["model_per_wl_rmse"],
+                "test_pca_per_spectrum_rmse": test_grid["pca_per_spectrum_rmse"],
+                "test_model_per_spectrum_rmse": test_grid["model_per_spectrum_rmse"],
+            }
+        except Exception as exc:
+            log.warning("Test-grid RMSE diagnostic unavailable: %s", exc)
+            results["test_grid_rmse_note"] = str(exc)
     results["tier1_time_s"] = time.time() - t0
 
     # Aggregate Q² across all components (LOO R²).
@@ -743,6 +1026,7 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     for k in _ARRAY_KEYS:
         if k in results:
             arrays[k] = results.pop(k)
+    arrays.update(test_grid_arrays)
     # Also stash grid_points + param_names for the interactive viewer
     arrays["grid_points"] = emu.grid_points
     arrays["param_names"] = list(emu.param_names)
@@ -767,7 +1051,7 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
 
 
 # ======================================================================
-# Tier 2 — Test Grid Parameter Recovery
+# Tier 2 — Inference Parameter Recovery
 # ======================================================================
 
 

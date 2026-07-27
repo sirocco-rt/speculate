@@ -364,7 +364,7 @@ def _(
 
 
 @app.cell(hide_code=True)
-def _(alt, get_report, get_tier1_arrays, mo, np, plt):
+def _(alt, get_report, get_tier1_arrays, mo, np, pd, plt):
     # ── Tier result tabs ──
     # Render the active report as a set of tabs, one per benchmark tier.
     # Each tab is self-contained: Tier 1 shows EAS + LOO diagnostics,
@@ -384,7 +384,7 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
     _t1 = _report.get("tier1")
     if _t1:
         _t1_items = []
-        _t1_items.append(mo.md("## Tier 1 — Grid Reconstruction Fidelity"))
+        _t1_items.append(mo.md("## Tier 1 — Grid Reconstruction"))
 
         # Surface the composite Tier 1 score first because it is the quickest
         # sanity check for whether an emulator is usable before inspecting the
@@ -444,6 +444,9 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
             "loo_flux_rmse_median": ("LOO Flux RMSE (median)", "lower is better; total emulator error"),
             "loo_flux_rmse_95": ("LOO Flux RMSE (95th pctl)", "lower is better; worst-case emulator error"),
             "max_fractional_resid": ("Max Frac. Residual", "lower is better; worst pixel error overall"),
+            "test_grid_pca_rmse_median": ("Test-grid PCA RMSE (median)", "PCA-only projection floor on independent spectra"),
+            "test_grid_model_rmse_median": ("Test-grid GP RMSE (median)", "direct final-flux error on independent spectra"),
+            "test_grid_n_spectra": ("Test-grid Spectra", "number of independent spectra in the RMSE envelope"),
         }
         _summary_rows = []
         for _key in _metric_info:
@@ -828,7 +831,7 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                 {"Decorrelated Q\u2013Q Plot": mo.hstack([_fig_dqq, _dqq_info], widths=[2, 1])}
             ))
 
-        # --- Per-wavelength RMSE envelope ---
+        # --- Training-grid per-wavelength RMSE envelope ---
         # Source data from live arrays (if available) or serialised report.
         _arrays = get_tier1_arrays() or {}
         _pca_wl = _arrays.get("pca_per_wl_rmse")
@@ -895,8 +898,107 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                 "try a different optimiser."
             )
             _t1_items.append(mo.accordion(
-                {"Per-Wavelength RMSE Envelope": mo.hstack([_rmse_chart, _wl_info], widths=[3, 1])}
+                {"Training Grid Per-Wavelength RMSE Envelope": mo.hstack([_rmse_chart, _wl_info], widths=[3, 1])}
             ))
+
+        # --- Independent test-grid per-wavelength RMSE envelope ---
+        # These curves use direct final-flux residuals at the lookup-table truth
+        # coordinates.  This is the like-for-like architecture comparison used
+        # by the revised Tier 1 paper figure.
+        _test_pca_wl = _arrays.get("test_pca_per_wl_rmse")
+        _test_model_wl = _arrays.get("test_model_per_wl_rmse")
+        _test_wl = _arrays.get("test_wavelength")
+        if _test_pca_wl is None:
+            _test_pca_wl = _t1.get("test_pca_per_wl_rmse")
+        if _test_model_wl is None:
+            _test_model_wl = _t1.get("test_model_per_wl_rmse")
+        if _test_wl is None:
+            _test_wl = _t1.get("test_wavelength")
+
+        if _test_pca_wl is not None and _test_model_wl is not None and _test_wl is not None:
+            _test_pca_wl = np.asarray(_test_pca_wl)
+            _test_model_wl = np.asarray(_test_model_wl)
+            _test_wl = np.asarray(_test_wl)
+            _test_model_label = "Test grid (PCA + GP)"
+            _test_pca_label = "Test-grid PCA projection only"
+            _test_rmse_df = pd.concat(
+                [
+                    pd.DataFrame({
+                        "Wavelength": _test_wl,
+                        "RMSE": _test_pca_wl,
+                        "Source": _test_pca_label,
+                    }),
+                    pd.DataFrame({
+                        "Wavelength": _test_wl,
+                        "RMSE": _test_model_wl,
+                        "Source": _test_model_label,
+                    }),
+                ],
+                ignore_index=True,
+            )
+            _test_rmse_chart = alt.Chart(_test_rmse_df).mark_line(
+                strokeWidth=1.5,
+            ).encode(
+                x=alt.X(
+                    "Wavelength:Q",
+                    title="Wavelength (Å)",
+                    scale=alt.Scale(
+                        domain=[float(_test_wl.min()), float(_test_wl.max())]
+                    ),
+                ),
+                y=alt.Y(
+                    "RMSE:Q",
+                    title="RMSE (normalised flux)",
+                    axis=alt.Axis(format=".1e"),
+                ),
+                color=alt.Color(
+                    "Source:N",
+                    title="",
+                    scale=alt.Scale(
+                        domain=[_test_pca_label, _test_model_label],
+                        range=["#3498db", "#e74c3c"],
+                    ),
+                    legend=alt.Legend(orient="top"),
+                ),
+                tooltip=[
+                    alt.Tooltip("Source:N"),
+                    alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+                    alt.Tooltip("RMSE:Q", format=".4e"),
+                ],
+            ).properties(
+                width="container",
+                height=200,
+                title="Test Grid Per-Wavelength Reconstruction Error",
+            )
+            _test_wl_info = mo.md(
+                "### Independent Test-Grid RMSE\n\n"
+                "**What this shows:** Direct reconstruction error at every wavelength "
+                "across independent test-grid spectra. The blue curve projects each "
+                "true test spectrum through the retained PCA basis, while the red "
+                "curve uses the GP predictive mean at the known truth parameters.\n\n"
+                f"**Sample:** {_t1.get('test_grid_n_spectra', 'n/a')} spectra from "
+                f"`{_t1.get('test_grid_name', 'paired test grid')}`; inclinations "
+                f"{_t1.get('test_grid_inclinations', 'n/a')}.\n\n"
+                "**Use for architecture comparisons:** This tab applies the same "
+                "direct final-flux RMSE definition used by the Quick Fit GI and NN "
+                "test-grid tabs."
+            )
+            _test_rmse_content = mo.hstack(
+                [_test_rmse_chart, _test_wl_info],
+                widths=[3, 1],
+            )
+        else:
+            _test_note = _t1.get("test_grid_rmse_note") or (
+                "Run Tier 1 again with the paired local test grid available."
+            )
+            _test_rmse_content = mo.callout(
+                mo.md(f"**Test-grid RMSE unavailable.** {_test_note}"),
+                kind="warn",
+            )
+
+        _t1_items.append(mo.accordion(
+            {"Test Grid Per-Wavelength RMSE Envelope": _test_rmse_content}
+        ))
 
         # --- Worst-case spectra overlay ---
         _orig = _arrays.get("display_original_flux", _arrays.get("original_flux"))
@@ -1112,7 +1214,7 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
     _t2 = _report.get("tier2")
     if _t2:
         _t2_items = []
-        _t2_items.append(mo.md("## Tier 2 — Test Grid Parameter Recovery"))
+        _t2_items.append(mo.md("## Tier 2 — Inference Parameter Recovery"))
         _n_proc = _t2.get('n_processed', 0)
         _n_spec = _t2.get('n_spectra', '?')
         _n_fail = _t2.get('n_failures', 0)
@@ -3080,8 +3182,9 @@ def _(emu_picker, glob, mo, np, os, re):
         if _legacy_grid_tag != _grid_tag:
             _grid_tags.append(_legacy_grid_tag)
 
-        # Tier 1 consumes the processed NPZ grid, while Tier 2 consumes the raw
-        # test-grid directory that contains individual .spec files.
+        # Tier 1 consumes both the processed training-grid NPZ (analytical LOO)
+        # and the paired raw test grid (independent RMSE). Tier 2 reuses that
+        # test-grid directory for parameter-recovery inference.
         for _candidate_grid_tag in _grid_tags:
             _grid_pattern = f"Grid-Emulator_Files/{_grid_stem}_grid_{_candidate_grid_tag}.npz"
             _grid_matches = sorted(glob.glob(_grid_pattern))
@@ -3103,7 +3206,7 @@ def _(emu_picker, glob, mo, np, os, re):
 
         emu_grid_info = mo.md(
             f"**Grid (Tier 1):** {_grid_display}  \n"
-            f"**Test Grid (Tier 2):** {_tg_display}"
+            f"**Test Grid (Tier 1 RMSE / Tier 2):** {_tg_display}"
         )
     elif _emu_val:
         emu_grid_info = mo.callout(
@@ -3531,7 +3634,7 @@ def _(
         _items.append(tier3_freeze_controls)
 
     # Pre-trained emulators can be downloaded before the matching processed
-    # Tier 1 grid or decompressed Tier 2 test grid exists locally.  Surface any
+    # Tier 1 grid or decompressed Tier 1/Tier 2 test grid exists locally. Surface any
     # inferred resource that is still shown as "not found" so a fresh install
     # has an obvious path to make the affected benchmark tier runnable.
     _emu_selected = bool(emu_picker.value)
@@ -3544,7 +3647,9 @@ def _(
         )
     if _emu_selected and not matched_testgrid_path:
         _missing_messages.append(
-            "**Test Grid (Tier 2)** is missing. To retrieve the test grid, "
+            "**Test Grid (Tier 1 RMSE / Tier 2)** is missing. Tier 1 can still "
+            "run its training-grid diagnostics, but its independent RMSE envelope "
+            "will be unavailable. To retrieve the test grid, "
             "download and decompress the grid in the Model Downloader notebook."
         )
     if _missing_messages:
@@ -3722,10 +3827,15 @@ def _(
         if 1 in _tiers and matched_grid_path:
             with mo.status.spinner(
                 title="Tier 1 — Grid Reconstruction",
-                subtitle="Running LOO cross-validation…",
+                subtitle="Running training-grid LOO and independent test-grid RMSE…",
                 remove_on_exit=True,
             ):
-                _tier1_result = _run_tier1(_emu, matched_grid_path)
+                _tier1_result = _run_tier1(
+                    _emu,
+                    matched_grid_path,
+                    test_grid_path=matched_testgrid_path or None,
+                    grid_name=_grid_name,
+                )
 
             # Keep the large flux arrays in marimo state rather than in the JSON
             # report so the interactive reconstruction explorer can reuse them.
@@ -3940,9 +4050,9 @@ def _(
 
             with mo.status.progress_bar(
                 total=_n_t2,
-                title="Tier 2 — Parameter Recovery",
+                title="Tier 2 — Inference Parameter Recovery",
                 subtitle=f"Resuming from {_n_resumed} completed…" if _n_resumed else "Starting…",
-                completion_title="Tier 2 — Parameter Recovery",
+                completion_title="Tier 2 — Inference Parameter Recovery",
                 completion_subtitle="Complete ✓",
                 show_rate=True,
                 show_eta=True,

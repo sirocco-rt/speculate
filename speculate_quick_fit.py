@@ -2262,13 +2262,15 @@ def _(
             _pred_runs.append(_pred)
         return np.mean(_pred_runs, axis=0)
 
-    def _compute_test_grid_flux_r2():
+    def _compute_test_grid_diagnostics():
         """Compare local test-grid spectra to emulator predictions at truth.
 
         This is a lightweight generalisation diagnostic, not a full inference
         run.  It avoids MLE, distance/extinction nuisance parameters, and MCMC.
         Instead, each testgrid spectrum is compared directly to the Quick Fit
         spectrum predicted at that row's lookup-table ground-truth parameters.
+        Alongside the per-spectrum R² summary, it returns per-wavelength RMSE
+        curves for the PCA-only projection and the final emulator prediction.
 
         The routine is deliberately local-only for spectra and lookup metadata;
         training should not trigger large HuggingFace downloads behind the
@@ -2302,20 +2304,20 @@ def _(
             _grid_name = qf_pca_data.get("grid_name")
             _grid_config = _get_grid_config(_grid_name)
             if _grid_config is None:
-                return None, "unknown grid"
+                return None, "unknown grid", None
 
             _test_grid_name = _grid_config.get("test_grid_name") or str(_grid_name).replace("_grid_", "_testgrid_")
             _test_grid_path = os.path.join("sirocco_grids", _test_grid_name)
             _lookup_path = os.path.join(_test_grid_path, "grid_run_lookup_table.parquet")
             if not os.path.exists(_lookup_path):
-                return None, f"no local lookup table for `{_test_grid_name}`"
+                return None, f"no local lookup table for `{_test_grid_name}`", None
 
             # The lookup table links each runN.spec file to its known Sirocco
             # simulation inputs.  Those physical values are later converted to
             # the emulator-coordinate system used by the Quick Fit model.
             _lookup_df = pd.read_parquet(_lookup_path)
             if "Run Number" not in _lookup_df.columns:
-                return None, f"lookup table for `{_test_grid_name}` has no Run Number column"
+                return None, f"lookup table for `{_test_grid_name}` has no Run Number column", None
 
             # A Quick Fit model can either expose inclination as a trained input
             # axis, or bake in one fixed inclination column at grid-build time.
@@ -2464,7 +2466,7 @@ def _(
                     continue
 
             if not _flux_rows:
-                return None, f"no local test-grid spectra could be processed for `{_test_grid_name}`"
+                return None, f"no local test-grid spectra could be processed for `{_test_grid_name}`", None
 
             # Mirror the PCA preprocessing from training.  Before per-wavelength
             # standardisation, Quick Fit removes each spectrum's overall flux
@@ -2485,6 +2487,28 @@ def _(
             # procedure.
             _pred_weights = _predict_pca_weights(np.asarray(_param_rows, dtype=np.float32))
             _pred_flux = _weights_to_flux(_pred_weights)
+
+            # Project the *true* test-grid spectra through the stored training
+            # PCA basis.  This is the PCA-only oracle: it isolates truncation
+            # error from any GI/NN prediction error on exactly the same spectra.
+            _flux_mean = np.asarray(qf_pca_data["flux_mean"], dtype=np.float64)
+            _flux_std = np.asarray(qf_pca_data["flux_std"], dtype=np.float64)
+            _eigenspectra = np.asarray(qf_pca_data["eigenspectra"], dtype=np.float64)
+            _truth_standardised = (_truth_compare - _flux_mean) / _flux_std
+            _oracle_weights = _truth_standardised @ _eigenspectra.T
+            _pca_oracle_flux = (
+                _oracle_weights @ (_eigenspectra * _flux_std)
+            ) + _flux_mean
+            _test_rmse = {
+                "wavelength": _wl_model,
+                "pca_per_wl_rmse": np.sqrt(
+                    np.mean((_truth_compare - _pca_oracle_flux) ** 2, axis=0)
+                ),
+                "model_per_wl_rmse": np.sqrt(
+                    np.mean((_truth_compare - _pred_flux) ** 2, axis=0)
+                ),
+            }
+
             # Compute one R^2 value per spectrum along the wavelength axis,
             # then report the mean and worst case.  This is deliberately a
             # flux-curve score, not a parameter-recovery or likelihood score.
@@ -2493,7 +2517,7 @@ def _(
             _r2_spec = 1 - _ss_res_spec / np.where(_ss_tot_spec > 0, _ss_tot_spec, 1.0)
             _r2_stats = _summarise_r2_values(_r2_spec)
             if _r2_stats is None:
-                return None, f"test-grid R² was non-finite for `{_test_grid_name}`"
+                return None, f"test-grid R² was non-finite for `{_test_grid_name}`", None
 
             # Return a compact summary for the callout and for qf_train_info so
             # exported/debug views can distinguish regular-grid and testgrid
@@ -2506,9 +2530,9 @@ def _(
                 "min": _r2_stats["min"],
                 "bottom5": _r2_stats["bottom5"],
                 "inclinations": [int(_inc) for _inc in _inclinations],
-            }, ""
+            }, "", _test_rmse
         except Exception as _exc:
-            return None, str(_exc)
+            return None, str(_exc), None
 
     if _source == "grid_interp":
         _regular_grid_flux_r2 = _compute_regular_grid_flux_r2(_loo_true, _loo_pred, "loo")
@@ -2524,7 +2548,7 @@ def _(
     else:
         _regular_grid_flux_r2_line = f"- **{_regular_flux_r2_label}:** not available"
 
-    _test_grid_r2, _test_grid_r2_note = _compute_test_grid_flux_r2()
+    _test_grid_r2, _test_grid_r2_note, _test_grid_rmse = _compute_test_grid_diagnostics()
     if _test_grid_r2 is not None:
         _test_grid_r2_line = (
             f"- **Test Grid Flux R²:** Mean {_test_grid_r2['mean']:.6f} | "
@@ -2566,10 +2590,12 @@ def _(
         kind="success"
     )
 
-    # ── Per-Wavelength RMSE Envelope ─────────────────────────────────────
-    # Two lines, matching the Tier 1 benchmark diagnostic:
+    # ── Per-Wavelength RMSE Envelopes ────────────────────────────────────
+    # The training-grid view retains the existing diagnostic:
     #   Blue  — "PCA truncation only": irreducible floor from discarding higher components.
-    #   Red   — "LOO (PCA + model)":   total error = PCA truncation + interpolation/NN error.
+    #   Red   — total regular-grid error from the available GI/NN diagnostic.
+    # The test-grid view instead uses direct final-flux residuals for both
+    # architectures, making that tab the like-for-like comparison for Figure 4.
     _eigenspectra = qf_pca_data["eigenspectra"]   # (n_comp, n_wl)
     _flux_std = qf_pca_data["flux_std"]           # (n_wl,)
     _wl = qf_pca_data["wl"]                       # (n_wl,)
@@ -2587,7 +2613,11 @@ def _(
     # Total RMSE = sqrt(PCA_truncation² + model_prediction²) — the two sources add in quadrature
     _total_per_wl_rmse = np.sqrt(_pca_rmse ** 2 + _model_per_wl_rmse ** 2)
 
-    _model_label = f"LOO (PCA + {'Interp' if _source == 'grid_interp' else 'NN'})"
+    _model_label = (
+        "Approx. LOO (PCA + GI)"
+        if _source == "grid_interp"
+        else "Training fit (PCA + NN)"
+    )
     # VegaFusion shortens float32 inline data in compiled Vega specs; cast chart
     # data to float64 so exported RMSE values retain their available precision.
     _rmse_wavelength = np.asarray(_wl, dtype=np.float64)
@@ -2597,7 +2627,7 @@ def _(
     _total_df = pd.DataFrame({"Wavelength": _rmse_wavelength, "RMSE": _total_rmse_export, "Source": _model_label})
     _rmse_df = pd.concat([_pca_df, _total_df], ignore_index=True)
 
-    _rmse_chart = alt.Chart(_rmse_df).mark_line(
+    _training_rmse_chart = alt.Chart(_rmse_df).mark_line(
         strokeWidth=1.5,
     ).encode(
         x=alt.X("Wavelength:Q", title="Wavelength (Å)",
@@ -2614,11 +2644,82 @@ def _(
         ],
     ).properties(
         width="container", height=200,
-        title="Per-Wavelength Reconstruction Error"
+        title="Training Grid Per-Wavelength Reconstruction Error"
     ).interactive(bind_y=False)
 
+    if _test_grid_rmse is not None:
+        _test_wl = np.asarray(_test_grid_rmse["wavelength"], dtype=np.float64)
+        _test_pca_rmse = np.asarray(_test_grid_rmse["pca_per_wl_rmse"], dtype=np.float64)
+        _test_model_rmse = np.asarray(_test_grid_rmse["model_per_wl_rmse"], dtype=np.float64)
+        _test_model_label = f"Test grid (PCA + {'GI' if _source == 'grid_interp' else 'NN'})"
+        _test_rmse_df = pd.concat(
+            [
+                pd.DataFrame({
+                    "Wavelength": _test_wl,
+                    "RMSE": _test_pca_rmse,
+                    "Source": "Test-grid PCA projection only",
+                }),
+                pd.DataFrame({
+                    "Wavelength": _test_wl,
+                    "RMSE": _test_model_rmse,
+                    "Source": _test_model_label,
+                }),
+            ],
+            ignore_index=True,
+        )
+        _test_rmse_chart = alt.Chart(_test_rmse_df).mark_line(
+            strokeWidth=1.5,
+        ).encode(
+            x=alt.X(
+                "Wavelength:Q",
+                title="Wavelength (Å)",
+                scale=alt.Scale(domain=[float(_test_wl.min()), float(_test_wl.max())]),
+            ),
+            y=alt.Y("RMSE:Q", title="RMSE (normalised flux)", axis=alt.Axis(format=".1e")),
+            color=alt.Color(
+                "Source:N",
+                title="",
+                scale=alt.Scale(
+                    domain=["Test-grid PCA projection only", _test_model_label],
+                    range=["#3498db", "#e74c3c"],
+                ),
+                legend=alt.Legend(orient="top"),
+            ),
+            tooltip=[
+                alt.Tooltip("Source:N"),
+                alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+                alt.Tooltip("RMSE:Q", format=".4e"),
+            ],
+        ).properties(
+            width="container",
+            height=200,
+            title="Test Grid Per-Wavelength Reconstruction Error",
+        ).interactive(bind_y=False)
+        _test_rmse_content = mo.vstack([
+            _test_rmse_chart,
+            mo.md(
+                f"*Direct residuals across {_test_grid_r2['n_spectra']} independent "
+                f"spectra from `{_test_grid_r2['test_grid_name']}`. The blue curve "
+                "projects each true test spectrum through the retained PCA basis; "
+                "the red curve uses the emulator prediction at the known test-grid parameters.*"
+            ),
+        ])
+    else:
+        _test_rmse_content = mo.callout(
+            mo.md(
+                "**Test-grid RMSE unavailable.** "
+                f"{_test_grid_r2_note or 'No paired local test grid was found.'}"
+            ),
+            kind="warn",
+        )
+
+    _rmse_tabs = mo.ui.tabs({
+        "Training Grid": _training_rmse_chart,
+        "Test Grid": _test_rmse_content,
+    })
+
     # ── Assemble summary output ──────────────────────────────────────────
-    _elements = [_summary, _rmse_chart]
+    _elements = [_summary, _rmse_tabs]
 
     if _source == "nn" and "hparams" in qf_train_info and qf_train_info["hparams"]:
         _lines = [f"- **{k}**: `{v}`" for k, v in qf_train_info["hparams"].items()]
