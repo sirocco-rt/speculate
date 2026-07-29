@@ -2468,10 +2468,16 @@ def _(mo):
     get_mcmc_labels, set_mcmc_labels = mo.state(None)       # friendly parameter names
     get_mcmc_summary_df, set_mcmc_summary_df = mo.state(None) # ArviZ summary table
     get_mcmc_corner_meta, set_mcmc_corner_meta = mo.state(None) # corner-plot export metadata
+    # Plot inputs and the later Sirocco comparison live in separate state so
+    # adding an external model never reruns the expensive MCMC producer cell.
+    get_mcmc_bestfit_plot, set_mcmc_bestfit_plot = mo.state(None)
+    get_mcmc_sirocco_spectrum, set_mcmc_sirocco_spectrum = mo.state(None)
     return (
         get_mle_model, get_mle_priors, get_mle_result,
         set_mle_model, set_mle_priors, set_mle_result,
+        get_mcmc_bestfit_plot, set_mcmc_bestfit_plot,
         get_mcmc_samples, set_mcmc_samples,
+        get_mcmc_sirocco_spectrum, set_mcmc_sirocco_spectrum,
         get_mcmc_labels, set_mcmc_labels,
         get_mcmc_corner_meta, set_mcmc_corner_meta,
         get_mcmc_summary_df, set_mcmc_summary_df,
@@ -3879,8 +3885,6 @@ def _(emu, get_mle_model, mo, param_names, re):
 
 @app.cell
 def _(
-    alt,
-    build_bestfit_spectrum_altair,
     covariance_diagonal_components,
     get_mle_model,
     get_mle_priors,
@@ -3894,9 +3898,11 @@ def _(
     mo,
     np,
     run_mcmc_btn,
+    set_mcmc_bestfit_plot,
     set_mcmc_labels,
     set_mcmc_corner_meta,
     set_mcmc_samples,
+    set_mcmc_sirocco_spectrum,
     set_mcmc_summary_df,
     set_inf_playground_target,
     stats,
@@ -3924,6 +3930,8 @@ def _(
         set_mcmc_labels(None)
         set_mcmc_summary_df(None)
         set_mcmc_corner_meta(None)
+        set_mcmc_bestfit_plot(None)
+        set_mcmc_sirocco_spectrum(None)
 
         _model = get_mle_model()
         _priors = get_mle_priors()
@@ -4336,16 +4344,41 @@ def _(
                     _model,
                     _plot_cov,
                 )
-                _fig_bestfit = build_bestfit_spectrum_altair(
-                    alt,
-                    wavelength=_model.data.wave,
-                    data_flux=_model.data.flux,
-                    model_flux=_plot_flux,
-                    model_cov_diag=_plot_cov,
-                    title=f"Best-Fit Model (MCMC Posterior Mean) — {_model.data_name}",
-                    zoom_name="inference_mcmc_bestfit_zoom",
-                    covariance_components=_plot_covariance_components,
+                # Store only the arrays needed to rebuild the plot.  The
+                # downstream plot cell can then react to a completed Sirocco
+                # simulation without re-entering this MCMC sampling cell.
+                _fit_key = tuple(
+                    float(_mcmc_means[_label])
+                    for _label in _model.labels
                 )
+                _sirocco_transforms = {}
+                for _label in ("Av", "Rv", "log_scale"):
+                    if _label in _model.params:
+                        _sirocco_transforms[_label] = float(_model.params[_label])
+                if "Av" in _sirocco_transforms and "Rv" not in _sirocco_transforms:
+                    _sirocco_transforms["Rv"] = 3.1
+                _cheb_terms = []
+                _cheb_index = 1
+                while f"cheb:{_cheb_index}" in _model.params:
+                    _cheb_terms.append(float(_model.params[f"cheb:{_cheb_index}"]))
+                    _cheb_index += 1
+                if _cheb_terms:
+                    _sirocco_transforms["cheb"] = _cheb_terms
+
+                set_mcmc_bestfit_plot({
+                    "fit_key": _fit_key,
+                    "wavelength": np.asarray(_model.data.wave, dtype=np.float64),
+                    "data_flux": np.asarray(_model.data.flux, dtype=np.float64),
+                    "model_flux": np.asarray(_plot_flux, dtype=np.float64),
+                    "model_cov_diag": np.asarray(_plot_cov, dtype=np.float64),
+                    "covariance_components": {
+                        _key: np.asarray(_value, dtype=np.float64)
+                        for _key, _value in _plot_covariance_components.items()
+                    },
+                    "title": f"Best-Fit Model (MCMC Posterior Mean) — {_model.data_name}",
+                    "grid_params": np.asarray(_model.grid_params, dtype=np.float64),
+                    "transforms": _sirocco_transforms,
+                })
 
                 # ============================================================
                 # Results table with ground truth comparison
@@ -4431,8 +4464,6 @@ def _(
                     _chain_accordion,
                     mo.md("### Corner Plot"),
                     _corner_display,
-                    mo.md("### Best-Fit Model (MCMC Posterior Mean)"),
-                    _fig_bestfit,
                 ])
 
             except Exception as _e:
@@ -4441,6 +4472,51 @@ def _(
                 mcmc_results = mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} MCMC Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
 
     mcmc_results if mcmc_results else mo.md("*Configure and run MCMC after MLE*")
+    return
+
+
+@app.cell
+def _(
+    alt,
+    build_bestfit_spectrum_altair,
+    get_mcmc_bestfit_plot,
+    get_mcmc_sirocco_spectrum,
+    mo,
+):
+    """Render the posterior-mean plot independently of the MCMC run cell."""
+    _plot = get_mcmc_bestfit_plot()
+    if _plot is None:
+        mo.stop(True, mo.md(""))
+
+    _sirocco = get_mcmc_sirocco_spectrum()
+    _extra_series = None
+    if (
+        _sirocco is not None
+        and tuple(_sirocco.get("fit_key", ())) == tuple(_plot.get("fit_key", ()))
+    ):
+        _extra_series = {
+            "wavelength": _sirocco.get("wavelength", []),
+            "flux": _sirocco.get("flux", []),
+            "label": _sirocco.get("label", "Sirocco Model"),
+            "color": "#9B59B6",
+            "dash": [],
+        }
+
+    _bestfit_chart = build_bestfit_spectrum_altair(
+        alt,
+        wavelength=_plot["wavelength"],
+        data_flux=_plot["data_flux"],
+        model_flux=_plot["model_flux"],
+        model_cov_diag=_plot["model_cov_diag"],
+        title=_plot["title"],
+        zoom_name="inference_mcmc_bestfit_zoom",
+        covariance_components=_plot.get("covariance_components"),
+        extra_flux_series=_extra_series,
+    )
+    mo.vstack([
+        mo.md("### Best-Fit Model (MCMC Posterior Mean)"),
+        _bestfit_chart,
+    ])
     return
 
 
@@ -4458,6 +4534,26 @@ def _(mo):
     return
 
 
+@app.cell
+def _(mo, os):
+    # Sirocco subprocesses are local-only.  Do not construct or expose their
+    # controls in the hosted Hugging Face Space environment.
+    if os.environ.get("SPACE_ID") is not None:
+        inference_sirocco_cpu_slider = None
+    else:
+        _cpu_total = max(1, os.cpu_count() or 1)
+        inference_sirocco_cpu_slider = mo.ui.slider(
+            start=1,
+            stop=_cpu_total,
+            value=max(1, _cpu_total // 2),
+            step=1,
+            show_value=True,
+            label="Sirocco CPUs",
+            full_width=False,
+        )
+    return (inference_sirocco_cpu_slider,)
+
+
 @app.cell(hide_code=True)
 def _(
     emu,
@@ -4466,6 +4562,7 @@ def _(
     get_mcmc_samples,
     get_mcmc_summary_df,
     get_mle_model,
+    inference_sirocco_cpu_slider,
     mo,
     np,
     os,
@@ -4483,6 +4580,62 @@ def _(
     export_corner_btn = mo.ui.run_button(label=f"{mo.icon('lucide:download')} Export Cornerplot Data", kind="success")
     export_dir_input = mo.ui.text(value="exports", label="Output directory")
 
+    run_sirocco_model_btn = None
+    _button_row = [export_pf_btn]
+    _runtime_notes = []
+    if inference_sirocco_cpu_slider is not None:
+        # A failure in this optional probe must not suppress the ordinary
+        # posterior export buttons that share this cell.
+        try:
+            from Speculate_addons.speculate_benchmark import (
+                check_sirocco_runtime as _check_sirocco_runtime,
+            )
+            _inference_sirocco_runtime = _check_sirocco_runtime(
+                inference_sirocco_cpu_slider.value
+            )
+            _sirocco_error = None
+        except Exception as _probe_exc:
+            _inference_sirocco_runtime = {
+                "ok": False,
+                "missing": ["runtime probe"],
+            }
+            _sirocco_error = str(_probe_exc)
+        _sirocco_missing = ", ".join(
+            _inference_sirocco_runtime.get("missing", [])
+        )
+        run_sirocco_model_btn = mo.ui.run_button(
+            label=f"{mo.icon('lucide:wind')} Run Sirocco Model",
+            kind="success" if _inference_sirocco_runtime["ok"] else "danger",
+            disabled=not _inference_sirocco_runtime["ok"],
+            tooltip=(
+                "Run the MCMC posterior-mean model through Sirocco"
+                if _inference_sirocco_runtime["ok"]
+                else f"Sirocco is unavailable; missing: {_sirocco_missing}"
+            ),
+        )
+        _button_row.extend([
+            inference_sirocco_cpu_slider,
+            run_sirocco_model_btn,
+        ])
+        _runtime_notes.append(
+            (
+                mo.md("")
+                if _inference_sirocco_runtime["ok"]
+                else mo.callout(
+                    mo.md(
+                        (
+                            f"Sirocco runtime detection failed: `{_sirocco_error}`."
+                            if _sirocco_error
+                            else "Sirocco model runs are unavailable. "
+                            f"Missing command(s): `{_sirocco_missing}`."
+                        )
+                    ),
+                    kind="danger",
+                )
+            )
+        )
+    _button_row.extend([export_csv_btn, export_corner_btn])
+
     # Gate the display (not the widget creation) behind a completed MCMC run.
     mo.stop(
         _samples is None or _model is None,
@@ -4491,9 +4644,16 @@ def _(
 
     mo.vstack([
         mo.hstack([export_dir_input], gap=1),
-        mo.hstack([export_pf_btn, export_csv_btn, export_corner_btn], gap=1),
+        mo.hstack(_button_row, gap=1, align="end"),
+        *_runtime_notes,
     ])
-    return export_corner_btn, export_csv_btn, export_dir_input, export_pf_btn
+    return (
+        export_corner_btn,
+        export_csv_btn,
+        export_dir_input,
+        export_pf_btn,
+        run_sirocco_model_btn,
+    )
 
 
 @app.cell
@@ -4503,15 +4663,20 @@ def _(
     export_csv_btn,
     export_dir_input,
     export_pf_btn,
+    get_mcmc_bestfit_plot,
     get_mcmc_corner_meta,
     get_mcmc_labels,
     get_mcmc_samples,
     get_mcmc_summary_df,
     get_mle_model,
     grid_selector,
+    inference_sirocco_cpu_slider,
     mo,
     np,
+    obs_flux_scale,
     os,
+    run_sirocco_model_btn,
+    set_mcmc_sirocco_spectrum,
 ):
     import time as _time
     _samples = get_mcmc_samples()
@@ -4537,41 +4702,138 @@ def _(
 
     _summary_dict = _summary_to_dict(_summary_df)
 
+    def _write_mcmc_pf(_pf_path):
+        """Write one posterior-mean `.pf` shared by export and model runs."""
+        from Speculate_addons.speculate_benchmark import (
+            export_pf_template as _export_pf_template,
+            internal_to_friendly as _internal_to_friendly,
+            resolve_sirocco_observer_angle as _resolve_sirocco_observer_angle,
+        )
+
+        os.makedirs(os.path.dirname(_pf_path) or ".", exist_ok=True)
+        _plot_payload = get_mcmc_bestfit_plot() or {}
+        _grid_means = np.asarray(
+            _plot_payload.get("grid_params", _model.grid_params),
+            dtype=np.float64,
+        )
+        _friendly_grid = _internal_to_friendly(
+            emu.param_names,
+            grid_selector.value,
+        )
+
+        # Frozen grid parameters do not have MCMC columns.  Add uncertainty
+        # annotations only for axes that were actually sampled.
+        _uncertainties = {}
+        for _friendly_label in _friendly_grid:
+            if _friendly_label not in (_labels or []):
+                continue
+            _sample_index = list(_labels).index(_friendly_label)
+            _uncertainties[_friendly_label] = (
+                float(np.percentile(_samples[:, _sample_index], 16)),
+                float(np.percentile(_samples[:, _sample_index], 84)),
+            )
+
+        # Nuisance values are annotations in the parameter file; physical
+        # transformations are applied separately to the returned spectrum.
+        _global = {}
+        for _sample_index, _label in enumerate(_labels or []):
+            if _label not in _friendly_grid:
+                _global[_label] = float(np.mean(_samples[:, _sample_index]))
+
+        _observer_angle = _resolve_sirocco_observer_angle(
+            emu,
+            _grid_means,
+            grid_selector.value,
+        )
+        _export_pf_template(
+            emu,
+            _grid_means,
+            _pf_path,
+            uncertainties=_uncertainties,
+            global_params=_global,
+            grid_name=grid_selector.value,
+            observer_angles=[_observer_angle],
+        )
+        return _plot_payload
+
     if export_pf_btn.value and _model is not None and _samples is not None:
         try:
-            from Speculate_addons.speculate_benchmark import export_pf_template, emulator_to_physical
-
-            os.makedirs(_out_dir, exist_ok=True)
-
-            # The .pf export uses posterior-mean grid parameters as the template
-            # centre and attaches percentile-based uncertainties per grid axis.
-            _n_grid = len(emu.param_names)
-            _grid_means = np.mean(_samples[:, :_n_grid], axis=0)
-
-            # Export uncertainties as 16th/84th percentile bounds in the same
-            # friendly label space used in the results tables.
-            _uncertainties = {}
-            for _i, _label in enumerate(_labels[:_n_grid]):
-                _lo = np.percentile(_samples[:, _i], 16)
-                _hi = np.percentile(_samples[:, _i], 84)
-                _uncertainties[_label] = (_lo, _hi)
-
-            # Preserve posterior-mean nuisance parameters alongside the grid values
-            # so the exported template records the full fitted configuration.
-            _global = {}
-            for _i in range(_n_grid, _samples.shape[1]):
-                _global[_labels[_i]] = float(np.mean(_samples[:, _i]))
-
             _pf_path = os.path.join(_out_dir, f"speculate_export_{_ts}.pf")
-            export_pf_template(
-                emu, _grid_means, _pf_path,
-                uncertainties=_uncertainties,
-                global_params=_global,
-                grid_name=grid_selector.value,
-            )
+            _write_mcmc_pf(_pf_path)
             _msg += f"{mo.icon('lucide:check-circle')} .pf template exported to `{_pf_path}`\n\n"
         except Exception as _e:
             _msg += f"{mo.icon('lucide:x-circle')} .pf export failed: {_e}\n\n"
+
+    if (
+        run_sirocco_model_btn is not None
+        and run_sirocco_model_btn.value
+        and inference_sirocco_cpu_slider is not None
+        and _model is not None
+        and _samples is not None
+    ):
+        try:
+            from Speculate_addons.speculate_benchmark import (
+                check_sirocco_runtime as _check_sirocco_runtime,
+                run_sirocco_model_spectrum as _run_sirocco_model_spectrum,
+            )
+
+            _sirocco_cpus = int(inference_sirocco_cpu_slider.value)
+            _runtime = _check_sirocco_runtime(_sirocco_cpus)
+            if not _runtime["ok"]:
+                raise RuntimeError(
+                    "Missing Sirocco runtime command(s): "
+                    + ", ".join(_runtime["missing"])
+                )
+
+            import tempfile as _tempfile
+
+            os.makedirs(_out_dir, exist_ok=True)
+            _run_dir = _tempfile.mkdtemp(
+                prefix=f"speculate_sirocco_{_ts}_",
+                dir=_out_dir,
+            )
+            _pf_path = os.path.join(
+                _run_dir,
+                f"speculate_sirocco_{_ts}.pf",
+            )
+            _plot_payload = _write_mcmc_pf(_pf_path)
+            _wavelength = np.asarray(_plot_payload["wavelength"], dtype=np.float64)
+
+            with mo.status.spinner(
+                title=f"Running Sirocco model with {_sirocco_cpus} CPU(s)..."
+            ) as _spinner:
+                def _progress(_event):
+                    _spinner.update(_event.get("message", "Running Sirocco model..."))
+
+                _sirocco_result = _run_sirocco_model_spectrum(
+                    _pf_path,
+                    (float(np.min(_wavelength)), float(np.max(_wavelength))),
+                    # Use the fitted model's space rather than a live
+                    # observation-preprocessing selector.
+                    flux_scale=str(
+                        getattr(_model, "flux_scale", obs_flux_scale.value)
+                    ),
+                    transforms=_plot_payload.get("transforms"),
+                    smoothing=(
+                        "_smooth"
+                        in os.path.basename(
+                            str(getattr(emu, "name", ""))
+                        ).lower()
+                    ),
+                    cpus=_sirocco_cpus,
+                    progress_callback=_progress,
+                )
+
+            _sirocco_result["fit_key"] = tuple(_plot_payload.get("fit_key", ()))
+            set_mcmc_sirocco_spectrum(_sirocco_result)
+            _msg += (
+                f"{mo.icon('lucide:check-circle')} Sirocco model completed and "
+                f"was added to the MCMC best-fit plot using "
+                f"**{_sirocco_cpus} CPU(s)**. Output: "
+                f"`{_sirocco_result['sirocco_spec_path']}`\n\n"
+            )
+        except Exception as _e:
+            _msg += f"{mo.icon('lucide:x-circle')} Sirocco run failed: {_e}\n\n"
 
     if export_csv_btn.value and _samples is not None:
         try:
@@ -4614,8 +4876,18 @@ def _(
         except Exception as _e:
             _msg += f"{mo.icon('lucide:x-circle')} Cornerplot export failed: {_e}\n\n"
 
-    if _msg:
-        mo.output.replace(mo.callout(mo.md(_msg), kind="success"))
+    # Keep the status callout as the cell's rendered expression.  This makes
+    # long Sirocco runs and export failures visibly resolve in the notebook,
+    # instead of relying on an imperative output replacement at cell teardown.
+    _result_output = (
+        mo.callout(
+            mo.md(_msg),
+            kind="danger" if "failed:" in _msg.lower() else "success",
+        )
+        if _msg
+        else mo.md("")
+    )
+    _result_output
     return
 
 

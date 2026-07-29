@@ -2512,6 +2512,7 @@ def _configure_sirocco_environment() -> dict:
         root = root.expanduser()
         bin_dir = root / "bin"
         py_dir = root / "py_progs"
+        env_bin_dir = root / "sirocco_env" / "bin"
         if not ((bin_dir / "sirocco").is_file() and (bin_dir / "Setup_Sirocco_Dir").is_file()):
             continue
 
@@ -2523,6 +2524,12 @@ def _configure_sirocco_environment() -> dict:
             if _prepend_env_path("PATH", py_dir):
                 added.append(str(py_dir.resolve()))
             _prepend_env_path("PYTHONPATH", py_dir)
+        # Source builds commonly keep OpenMPI inside Sirocco's companion
+        # virtual environment rather than the user's login PATH.  Include that
+        # bin directory so the Tier 3 and notebook CPU controls discover the
+        # installation's own mpirun without requiring manual activation.
+        if env_bin_dir.is_dir() and _prepend_env_path("PATH", env_bin_dir):
+            added.append(str(env_bin_dir.resolve()))
 
         return {
             "configured": True,
@@ -2555,7 +2562,11 @@ def check_sirocco_runtime(cpus: int = 1) -> dict:
         "sirocco_root": os.environ.get("SIROCCO"),
         "added_paths": [],
     }
-    if shutil.which("sirocco") is None or shutil.which("Setup_Sirocco_Dir") is None:
+    if (
+        shutil.which("sirocco") is None
+        or shutil.which("Setup_Sirocco_Dir") is None
+        or (cpus > 1 and shutil.which("mpirun") is None)
+    ):
         env_setup = _configure_sirocco_environment()
 
     result = {
@@ -2857,9 +2868,12 @@ def _load_single_observer_sirocco_spectrum(
     is the comparison spectrum.
     """
     skiprows = 0
+    header_columns = None
     with open(spec_file, "r") as f:
         for i, line in enumerate(f):
             stripped = line.strip()
+            if stripped.startswith("Freq."):
+                header_columns = stripped.split()
             if not stripped or stripped.startswith("#") or stripped.startswith("Freq."):
                 skiprows = i + 1
             else:
@@ -2868,8 +2882,17 @@ def _load_single_observer_sirocco_spectrum(
     data = np.loadtxt(spec_file, skiprows=skiprows)
     if data.ndim == 1:
         data = data.reshape(1, -1)
-    if data.shape[1] < 3:
-        raise ValueError(f"Expected at least 3 columns in Sirocco spectrum {spec_file}")
+    if data.shape[1] != 3:
+        column_detail = (
+            f" ({', '.join(header_columns)})"
+            if header_columns
+            else ""
+        )
+        raise ValueError(
+            "Expected exactly frequency, wavelength, and one observer column "
+            f"in reduced Sirocco spectrum {spec_file}; found "
+            f"{data.shape[1]} columns{column_detail}"
+        )
 
     order = np.argsort(data[:, 1])
     wl = data[order, 1]
@@ -2883,6 +2906,30 @@ def _load_single_observer_sirocco_spectrum(
             f"to wl_range={wl_range} in {spec_file}"
         )
     return wl, flux
+
+
+def _reduce_single_observer_sirocco_spectrum(
+    native_spec_path: Union[str, Path],
+    output_dir: Union[str, Path],
+) -> Path:
+    """Reduce one native Sirocco spectrum to its sole observer column.
+
+    Native files place diagnostic totals such as ``Created`` before the
+    observer columns.  Both Tier 3 and notebook runs export exactly one
+    observer, so removing those diagnostics makes column 2 the fitted
+    inclination rather than an unrelated total-flux column.
+    """
+    from Speculate_addons.lighten_spec_files import reduce_spec_file
+
+    native_spec_path = Path(native_spec_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reduced_spec_path = output_dir / native_spec_path.name
+    reduce_spec_file(
+        str(native_spec_path),
+        str(reduced_spec_path),
+    )
+    return reduced_spec_path
 
 
 def _transform_flux_for_scale(
@@ -2987,6 +3034,33 @@ def _apply_spectrum_nuisance_transforms(
     return flux
 
 
+def _prepare_sirocco_flux_for_fit(
+    wl: np.ndarray,
+    flux: np.ndarray,
+    flux_scale: str,
+    transforms: Optional[dict] = None,
+    smoothing: bool = False,
+) -> np.ndarray:
+    """Apply the same spectral preprocessing and nuisance model as the fit.
+
+    Optional Gaussian smoothing happens before the flux-space conversion, just
+    as it does when Quick Fit builds its training grid.  The remaining order is
+    shared with Tier 3: flux-space conversion/continuum normalisation, then
+    extinction, Chebyshev correction, and distance/global scaling.
+    """
+    if smoothing:
+        from Speculate_addons.Spec_gridinterfaces import _maybe_smooth_flux
+
+        flux = _maybe_smooth_flux(flux, True)
+    plot_flux = _transform_flux_for_scale(wl, flux, flux_scale)
+    return _apply_spectrum_nuisance_transforms(
+        wl,
+        plot_flux,
+        flux_scale,
+        dict(transforms or {}),
+    )
+
+
 def _format_sirocco_transform_label(transforms: dict) -> str:
     """Return a compact plot legend label for the transformed Sirocco spectrum."""
     parts = []
@@ -2999,6 +3073,80 @@ def _format_sirocco_transform_label(transforms: dict) -> str:
     return "Sirocco Model" if not parts else "Sirocco Model (" + ", ".join(parts) + ")"
 
 
+def run_sirocco_model_spectrum(
+    pf_path: Union[str, Path],
+    wl_range: Tuple[float, float],
+    flux_scale: str = "linear",
+    transforms: Optional[dict] = None,
+    smoothing: bool = False,
+    cpus: int = 1,
+    progress_callback=None,
+) -> dict:
+    """Run an exported Sirocco model and return its plot-ready spectrum.
+
+    This is the notebook-facing counterpart to :func:`run_sirocco_pf`.  It
+    keeps runtime discovery, subprocess logging, native ``.spec`` parsing, and
+    fitted nuisance transformations identical to the Tier 3 benchmark while
+    returning a small payload that can be retained safely in marimo state.
+
+    Parameters
+    ----------
+    pf_path : path-like
+        Fitted Sirocco parameter file to execute.
+    wl_range : tuple of float
+        Inclusive wavelength interval to load from the generated spectrum.
+    flux_scale : {"linear", "log", "continuum-normalised"}
+        Flux space used by the notebook fit and comparison plot.
+    transforms : dict or None
+        Fitted ``Av``, ``Rv``, ``log_scale``, and/or ``cheb`` nuisance values.
+    smoothing : bool
+        Apply the same pre-scale Gaussian smoothing used by a smoothed Quick
+        Fit or Inference emulator.
+    cpus : int
+        Sirocco process count.
+    progress_callback : callable or None
+        Optional receiver for the same cycle events emitted by Tier 3.
+    """
+    sirocco_meta = run_sirocco_pf(
+        pf_path,
+        cpus=cpus,
+        progress_callback=progress_callback,
+    )
+    native_spec_path = Path(sirocco_meta["spec_files"][0])
+    reduced_spec_path = _reduce_single_observer_sirocco_spectrum(
+        native_spec_path,
+        native_spec_path.parent / "reduced_spec",
+    )
+    sirocco_wl, sirocco_flux = _load_single_observer_sirocco_spectrum(
+        reduced_spec_path,
+        wl_range,
+    )
+
+    transforms = dict(transforms or {})
+    plot_flux = _prepare_sirocco_flux_for_fit(
+        sirocco_wl,
+        sirocco_flux,
+        flux_scale,
+        transforms,
+        smoothing=smoothing,
+    )
+
+    return {
+        "wavelength": sirocco_wl,
+        "flux": plot_flux,
+        "label": _format_sirocco_transform_label(transforms),
+        "pf_path": str(pf_path),
+        "sirocco_command": sirocco_meta.get("command"),
+        "sirocco_log_path": sirocco_meta.get("run_log_path"),
+        "sirocco_setup_log_path": sirocco_meta.get("setup_log_path"),
+        "sirocco_signal_log_path": sirocco_meta.get("signal_log_path"),
+        "sirocco_spec_path": str(native_spec_path),
+        "sirocco_reduced_spec_path": str(reduced_spec_path),
+        "sirocco_transforms": transforms,
+        "sirocco_smoothing": bool(smoothing),
+    }
+
+
 def _fixed_inclination_from_emulator(emu, grid_name: Optional[str] = None) -> float:
     """Return the fixed observer angle for an emulator without an inclination axis."""
     emu_name = os.path.basename(str(getattr(emu, "name", "") or ""))
@@ -3006,6 +3154,26 @@ def _fixed_inclination_from_emulator(emu, grid_name: Optional[str] = None) -> fl
     if match:
         return float(match.group(1))
     return float(default_fixed_inclination(grid_name))
+
+
+def resolve_sirocco_observer_angle(
+    emu,
+    grid_param_values: Sequence[float],
+    grid_name: Optional[str] = None,
+) -> float:
+    """Return the single observer angle for a fitted emulator parameter vector.
+
+    Inclination is taken from the fitted grid axis when the emulator exposes
+    one.  Fixed-inclination emulator filenames and registry defaults use the
+    same fallback path as Tier 3, keeping notebook-generated ``.pf`` files to
+    one observer column that can be compared unambiguously with the fit.
+    """
+    friendly_grid = internal_to_friendly(emu.param_names, grid_name)
+    if "Inclination" in friendly_grid:
+        inclination_index = friendly_grid.index("Inclination")
+        inclination = float(np.asarray(grid_param_values)[inclination_index])
+        return float(np.clip(inclination, 0.0, 90.0))
+    return _fixed_inclination_from_emulator(emu, grid_name)
 
 
 def _extract_posterior_mean_inclination(
@@ -3422,32 +3590,17 @@ def run_tier3_single(
         )
         native_spec_path = Path(sirocco_meta["spec_files"][0])
         reduced_dir = artifact_dir / "reduced_spec"
-        from Speculate_addons.lighten_spec_files import reduce_spec_files
-
-        reduced_paths = reduce_spec_files(
-            str(artifact_dir),
-            output_dir=str(reduced_dir),
-            show_progress=False,
-            strict=True,
-        )
-        if not reduced_paths:
-            raise FileNotFoundError(f"No reduced .spec files were written in {_repo_relative(reduced_dir)}")
-        reduced_spec_path = next(
-            (Path(path) for path in reduced_paths if Path(path).name == native_spec_path.name),
-            Path(reduced_paths[0]),
+        reduced_spec_path = _reduce_single_observer_sirocco_spectrum(
+            native_spec_path,
+            reduced_dir,
         )
 
         sirocco_wl, sirocco_flux = _load_single_observer_sirocco_spectrum(
             reduced_spec_path, wl_range
         )
-        sirocco_flux_plot = _transform_flux_for_scale(
+        sirocco_flux_plot = _prepare_sirocco_flux_for_fit(
             sirocco_wl,
             sirocco_flux,
-            flux_scale,
-        )
-        sirocco_flux_plot = _apply_spectrum_nuisance_transforms(
-            sirocco_wl,
-            sirocco_flux_plot,
             flux_scale,
             sirocco_transforms,
         )

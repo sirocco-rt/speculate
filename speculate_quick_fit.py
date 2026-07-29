@@ -3276,6 +3276,11 @@ def _(
                 "max_params": np.array(_npz["grid_points"]).max(axis=0),
                 "source_file": qf_inf_model_selector.value,
                 "scale": str(_npz.get("scale", "linear")),
+                "smoothing": (
+                    bool(np.asarray(_npz["smoothing"]).item())
+                    if "smoothing" in _npz.files
+                    else "_smooth" in qf_inf_model_selector.value.lower()
+                ),
                 "selected_param_indices": _selected_param_indices,
                 "fixed_inclination": _fixed_inclination,
             }
@@ -5292,7 +5297,35 @@ def _(mo):
 @app.cell
 def _(mo):
     get_qf_playground_target, set_qf_playground_target = mo.state(None)
-    return get_qf_playground_target, set_qf_playground_target
+    # The Sirocco result is kept separately from the MLE payload so completing
+    # a long radiative-transfer run updates only the comparison overlay.
+    get_qf_sirocco_spectrum, set_qf_sirocco_spectrum = mo.state(None)
+    return (
+        get_qf_playground_target,
+        get_qf_sirocco_spectrum,
+        set_qf_playground_target,
+        set_qf_sirocco_spectrum,
+    )
+
+
+@app.cell
+def _(mo, os, qf_is_hf_mode):
+    # Sirocco is a local executable and is intentionally absent from the
+    # Hugging Face Space workflow, including the local HF-mode preview switch.
+    if qf_is_hf_mode:
+        qf_sirocco_cpu_slider = None
+    else:
+        _cpu_total = max(1, os.cpu_count() or 1)
+        qf_sirocco_cpu_slider = mo.ui.slider(
+            start=1,
+            stop=_cpu_total,
+            value=max(1, _cpu_total // 2),
+            step=1,
+            show_value=True,
+            label="Sirocco CPUs",
+            full_width=False,
+        )
+    return (qf_sirocco_cpu_slider,)
 
 
 @app.cell
@@ -5300,6 +5333,7 @@ def _(
     alt,
     chebval,
     fitzpatrick99,
+    get_qf_sirocco_spectrum,
     mo,
     np,
     pd,
@@ -5414,8 +5448,44 @@ def _(
     _mod_df = pd.DataFrame({'Wavelength': _wl_p, 'Flux': _model_p, 'Type': 'Best Fit'})
     _band_df = pd.DataFrame({'Wavelength': _wl_p, 'Lower': _elo_p, 'Upper': _ehi_p})
 
-    _combined = pd.concat([_obs_df, _mod_df], ignore_index=True)
-    _color_scale = alt.Scale(domain=['Observation', 'Best Fit'], range=['cyan', 'orange'])
+    _series_frames = [_obs_df, _mod_df]
+    _series_domain = ['Observation', 'Best Fit']
+    _series_colors = ['cyan', 'orange']
+
+    # A Sirocco simulation may finish after the MLE plot has already rendered.
+    # Match it against the complete best-fit vector so a later Quick Fit cannot
+    # accidentally inherit an overlay produced for an older solution.
+    _sirocco_result = get_qf_sirocco_spectrum()
+    _sirocco_fit_params = np.asarray(
+        _sirocco_result.get("fit_params", []) if _sirocco_result else [],
+        dtype=np.float64,
+    )
+    _sirocco_matches_fit = (
+        _sirocco_result is not None
+        and _sirocco_fit_params.shape == np.asarray(_best_full).shape
+        and np.allclose(
+            _sirocco_fit_params,
+            np.asarray(_best_full, dtype=np.float64),
+            rtol=0.0,
+            atol=1e-12,
+        )
+    )
+    if _sirocco_matches_fit:
+        _sirocco_wl = np.asarray(_sirocco_result.get("wavelength", []), dtype=np.float64)
+        _sirocco_flux = np.asarray(_sirocco_result.get("flux", []), dtype=np.float64)
+        _n_sirocco = min(len(_sirocco_wl), len(_sirocco_flux))
+        if _n_sirocco:
+            _sirocco_label = str(_sirocco_result.get("label", "Sirocco Model"))
+            _series_frames.append(pd.DataFrame({
+                'Wavelength': _sirocco_wl[:_n_sirocco],
+                'Flux': _sirocco_flux[:_n_sirocco],
+                'Type': _sirocco_label,
+            }))
+            _series_domain.append(_sirocco_label)
+            _series_colors.append('#9B59B6')
+
+    _combined = pd.concat(_series_frames, ignore_index=True)
+    _color_scale = alt.Scale(domain=_series_domain, range=_series_colors)
 
     _line = alt.Chart(_combined).mark_line(strokeWidth=1.5).encode(
         x=alt.X('Wavelength:Q', title='Wavelength (Å)'),
@@ -5588,7 +5658,17 @@ def _(mo, np, pd, qf_mle_result, qf_obs_data):
 
 
 @app.cell
-def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
+def _(
+    json,
+    mo,
+    np,
+    os,
+    pd,
+    qf_inf_emu_data,
+    qf_is_hf_mode,
+    qf_mle_result,
+    qf_sirocco_cpu_slider,
+):
     if qf_mle_result is None:
         mo.stop(True, mo.md(""))
 
@@ -5658,74 +5738,90 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
             json.dump(_out, f, indent=2)
         mo.status.toast(f"Saved {_path}")
 
-    def _export_pf(_):
-        _dir = "exports"
+    def _write_pf(output_dir="exports", filename_prefix="quickfit_export"):
+        """Write the current Quick Fit solution and return its `.pf` path.
+
+        Manual exports retain the historical top-level ``exports`` location.
+        Direct Sirocco runs pass a private per-run directory so every auxiliary
+        simulation file remains isolated with the parameter file that made it.
+        """
+        _dir = os.fspath(output_dir)
         os.makedirs(_dir, exist_ok=True)
+        from Speculate_addons.speculate_benchmark import emulator_to_physical
+        from Speculate_addons.grid_registry import (
+            benchmark_param_map as _benchmark_param_map,
+            defaulted_physical_param_ids as _defaulted_physical_param_ids,
+            infer_grid_name as _infer_grid_name,
+        )
+        from exports.templates.speculate_pf_exporter import write_pf
+        import time as _time
+
+        _labels = qf_mle_result["labels"]
+        _best = qf_mle_result["best_params"]
+        _n_phys = qf_mle_result["n_physical"]
+        _param_names = qf_inf_emu_data["param_names"]
+
+        # Recover the registry grid name from either saved model metadata or
+        # the Quick Fit filename tag used by older model archives.
+        _src = qf_inf_emu_data.get("source_file", "unknown")
+        import re as _re
+        _gn_match = _re.match(r"(.+?)_(qfnn-ensemble|qfnn|qfgi)_", _src)
+        _grid_name = qf_inf_emu_data.get("grid_name") or (
+            _gn_match.group(1) if _gn_match else _infer_grid_name(_src)
+        )
+        if not _grid_name:
+            _grid_name = _src.split("_qf")[0]
+
+        physical = emulator_to_physical(_param_names, _best[:_n_phys], _grid_name)
+        _observer_angle = None
+        if _fixed_inclination is not None:
+            _observer_angle = float(_fixed_inclination)
+        elif "Inclination" in physical:
+            _observer_angle = float(physical["Inclination"])
+
+        header = [
+            "### Sirocco .pf Template",
+            f"### Generated by Speculate Quick Fit",
+            f"### Date: {_time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"### Source model: {_src}",
+            "###",
+        ]
+        if _observer_angle is not None:
+            header.insert(-1, f"### Observer inclination: {_observer_angle:.6f}")
+
+        _defaulted_ids = _defaulted_physical_param_ids(_grid_name, _param_names)
+        if _defaulted_ids:
+            _param_map = _benchmark_param_map(_grid_name)
+            header.append("### Registry-defaulted physical parameters:")
+            for _param_id in _defaulted_ids:
+                _, _key = _param_map.get(_param_id, (f"param{_param_id}", f"param{_param_id}"))
+                if _key in physical:
+                    header.append(f"###   {_key}: {physical[_key]:.6g}")
+            header.append("###")
+
+        _nuisance = {}
+        for _i in range(_n_phys, len(_labels)):
+            _nuisance[_labels[_i]] = float(_best[_i])
+        if _nuisance:
+            header.append("### Nuisance Parameters:")
+            for k, v in _nuisance.items():
+                header.append(f"###   {k}: {v:.6f}")
+            header.append("###")
+
+        _ts = _time.strftime("%Y%m%d_%H%M%S")
+        _pf_path = os.path.join(_dir, f"{filename_prefix}_{_ts}.pf")
+        write_pf(
+            grid_name=_grid_name,
+            physical_params=physical,
+            output_path=_pf_path,
+            header_lines=header,
+            observer_angles=[_observer_angle] if _observer_angle is not None else None,
+        )
+        return _pf_path
+
+    def _export_pf(_):
         try:
-            from Speculate_addons.speculate_benchmark import emulator_to_physical
-            from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map, defaulted_physical_param_ids as _defaulted_physical_param_ids, infer_grid_name as _infer_grid_name
-            from exports.templates.speculate_pf_exporter import write_pf
-            import time as _time
-
-            _labels = qf_mle_result["labels"]
-            _best = qf_mle_result["best_params"]
-            _n_phys = qf_mle_result["n_physical"]
-            _param_names = qf_inf_emu_data["param_names"]
-
-            # Determine grid name from source file
-            _src = qf_inf_emu_data.get("source_file", "unknown")
-            # Strip _qfnn_/_qfnn-ensemble_/_qfgi_ suffix to recover grid name
-            import re as _re
-            _gn_match = _re.match(r"(.+?)_(qfnn-ensemble|qfnn|qfgi)_", _src)
-            _grid_name = qf_inf_emu_data.get("grid_name") or (_gn_match.group(1) if _gn_match else _infer_grid_name(_src))
-            if not _grid_name:
-                _grid_name = _src.split("_qf")[0]
-
-            physical = emulator_to_physical(_param_names, _best[:_n_phys], _grid_name)
-            _observer_angle = None
-            if _fixed_inclination is not None:
-                _observer_angle = float(_fixed_inclination)
-            elif "Inclination" in physical:
-                _observer_angle = float(physical["Inclination"])
-
-            header = [
-                "### Sirocco .pf Template",
-                f"### Generated by Speculate Quick Fit",
-                f"### Date: {_time.strftime('%Y-%m-%d %H:%M:%S')}",
-                f"### Source model: {_src}",
-                "###",
-            ]
-            if _observer_angle is not None:
-                header.insert(-1, f"### Observer inclination: {_observer_angle:.6f}")
-
-            _defaulted_ids = _defaulted_physical_param_ids(_grid_name, _param_names)
-            if _defaulted_ids:
-                _param_map = _benchmark_param_map(_grid_name)
-                header.append("### Registry-defaulted physical parameters:")
-                for _param_id in _defaulted_ids:
-                    _, _key = _param_map.get(_param_id, (f"param{_param_id}", f"param{_param_id}"))
-                    if _key in physical:
-                        header.append(f"###   {_key}: {physical[_key]:.6g}")
-                header.append("###")
-
-            _nuisance = {}
-            for _i in range(_n_phys, len(_labels)):
-                _nuisance[_labels[_i]] = float(_best[_i])
-            if _nuisance:
-                header.append("### Nuisance Parameters:")
-                for k, v in _nuisance.items():
-                    header.append(f"###   {k}: {v:.6f}")
-                header.append("###")
-
-            _ts = _time.strftime("%Y%m%d_%H%M%S")
-            _pf_path = os.path.join(_dir, f"quickfit_export_{_ts}.pf")
-            write_pf(
-                grid_name=_grid_name,
-                physical_params=physical,
-                output_path=_pf_path,
-                header_lines=header,
-                observer_angles=[_observer_angle] if _observer_angle is not None else None,
-            )
+            _pf_path = _write_pf()
             mo.status.toast(f"Exported {_pf_path}")
         except Exception as _e:
             mo.status.toast(f".pf export failed: {_e}", kind="danger")
@@ -5734,7 +5830,186 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
     _json_btn = mo.ui.button(label=f"{mo.icon('lucide:file-json')} Export JSON", on_click=_export_json)
     _pf_btn = mo.ui.button(label=f"{mo.icon('lucide:file-text')} Export .pf", on_click=_export_pf, kind="success")
 
-    mo.hstack([_csv_btn, _json_btn, _pf_btn], justify="start")
+    qf_sirocco_run_btn = None
+    _button_row = [_csv_btn, _json_btn, _pf_btn]
+    _runtime_notes = []
+    if not qf_is_hf_mode and qf_sirocco_cpu_slider is not None:
+        # Recheck with the selected process count because MPI is required only
+        # when the user requests more than one Sirocco process.  Keep probing
+        # defensive so a broken optional runtime can never hide CSV/JSON/.pf.
+        try:
+            from Speculate_addons.speculate_benchmark import (
+                check_sirocco_runtime as _check_sirocco_runtime,
+            )
+            _sirocco_runtime = _check_sirocco_runtime(
+                qf_sirocco_cpu_slider.value
+            )
+            _sirocco_error = None
+        except Exception as _probe_exc:
+            _sirocco_runtime = {"ok": False, "missing": ["runtime probe"]}
+            _sirocco_error = str(_probe_exc)
+        _sirocco_missing = ", ".join(_sirocco_runtime.get("missing", []))
+        qf_sirocco_run_btn = mo.ui.run_button(
+            label=f"{mo.icon('lucide:wind')} Run Sirocco Model",
+            kind="success" if _sirocco_runtime["ok"] else "danger",
+            disabled=not _sirocco_runtime["ok"],
+            tooltip=(
+                "Run the current best-fit parameters through Sirocco"
+                if _sirocco_runtime["ok"]
+                else f"Sirocco is unavailable; missing: {_sirocco_missing}"
+            ),
+        )
+        _button_row.extend([qf_sirocco_cpu_slider, qf_sirocco_run_btn])
+        _runtime_notes.append(
+            (
+                mo.md("")
+                if _sirocco_runtime["ok"]
+                else mo.callout(
+                    mo.md(
+                        (
+                            f"Sirocco runtime detection failed: `{_sirocco_error}`."
+                            if _sirocco_error
+                            else "Sirocco model runs are unavailable. "
+                            f"Missing command(s): `{_sirocco_missing}`."
+                        )
+                    ),
+                    kind="danger",
+                )
+            )
+        )
+
+    # Publicly expose the writer before the display expression.  Marimo renders
+    # the final expression in a cell; assigning this after ``mo.vstack`` would
+    # make the cell output ``None`` and hide every export control.
+    qf_write_fit_pf = _write_pf
+
+    mo.vstack([
+        mo.hstack(_button_row, justify="start", align="end"),
+        *_runtime_notes,
+    ])
+    return qf_sirocco_run_btn, qf_write_fit_pf
+
+
+@app.cell
+def _(
+    mo,
+    np,
+    os,
+    qf_inf_emu_data,
+    qf_inf_wl_slider,
+    qf_is_hf_mode,
+    qf_mle_result,
+    qf_sirocco_cpu_slider,
+    qf_sirocco_run_btn,
+    qf_write_fit_pf,
+    set_qf_sirocco_spectrum,
+):
+    # A separate reactive run cell makes the click observable immediately and
+    # avoids blocking inside a button callback while Sirocco performs many
+    # ionization and spectrum cycles.
+    if (
+        qf_is_hf_mode
+        or qf_sirocco_run_btn is None
+        or not qf_sirocco_run_btn.value
+    ):
+        mo.stop(True, mo.md(""))
+
+    try:
+        from Speculate_addons.distance_scale import (
+            distance_to_log_scale as _distance_to_log_scale,
+        )
+        from Speculate_addons.speculate_benchmark import (
+            check_sirocco_runtime as _check_sirocco_runtime,
+            run_sirocco_model_spectrum as _run_sirocco_model_spectrum,
+        )
+
+        _cpus = int(qf_sirocco_cpu_slider.value)
+        _runtime = _check_sirocco_runtime(_cpus)
+        if not _runtime["ok"]:
+            raise RuntimeError(
+                "Missing Sirocco runtime command(s): "
+                + ", ".join(_runtime["missing"])
+            )
+
+        _best = np.asarray(qf_mle_result["best_params"], dtype=np.float64)
+        _n_phys = int(qf_mle_result["n_physical"])
+        _av = float(_best[_n_phys]) if len(_best) > _n_phys else 0.0
+        _distance_pc = (
+            float(_best[_n_phys + 1])
+            if len(_best) > _n_phys + 1
+            else 100.0
+        )
+        _cheb1 = (
+            float(_best[_n_phys + 2])
+            if len(_best) > _n_phys + 2
+            else 0.0
+        )
+        _transforms = {
+            "Av": _av,
+            "Rv": 3.1,
+            "log_scale": float(_distance_to_log_scale(_distance_pc)),
+            "cheb": [_cheb1],
+        }
+        # Sirocco writes many sidecar files beside the input `.pf`.  Give each
+        # click a collision-safe directory under exports so those artifacts do
+        # not litter the manual-export directory or mix with an earlier run.
+        import tempfile as _tempfile
+        import time as _time
+
+        _export_root = "exports"
+        os.makedirs(_export_root, exist_ok=True)
+        _run_dir = _tempfile.mkdtemp(
+            prefix=f"quickfit_sirocco_{_time.strftime('%Y%m%d_%H%M%S')}_",
+            dir=_export_root,
+        )
+        _pf_path = qf_write_fit_pf(
+            output_dir=_run_dir,
+            filename_prefix="quickfit_sirocco",
+        )
+
+        with mo.status.spinner(
+            title=f"Running Sirocco model with {_cpus} CPU(s)..."
+        ) as _spinner:
+            def _progress(_event):
+                _spinner.update(
+                    _event.get("message", "Running Sirocco model...")
+                )
+
+            _result = _run_sirocco_model_spectrum(
+                _pf_path,
+                tuple(float(_value) for _value in qf_inf_wl_slider.value),
+                # The observation dropdown may be "linear" when the supplied
+                # data are already preprocessed.  The Sirocco model is native
+                # linear flux, so convert it using the fitted emulator's scale.
+                flux_scale=str(qf_inf_emu_data.get("scale", "linear")),
+                transforms=_transforms,
+                smoothing=bool(qf_inf_emu_data.get("smoothing", False)),
+                cpus=_cpus,
+                progress_callback=_progress,
+            )
+
+        # Retain the exact MLE vector with the spectrum to prevent a stale
+        # comparison line from being displayed after a subsequent fit.
+        _result["fit_params"] = _best.copy()
+        set_qf_sirocco_spectrum(_result)
+        _run_output = mo.callout(
+            mo.md(
+                f"{mo.icon('lucide:check-circle')} Sirocco completed with "
+                f"**{_cpus} CPU(s)**. The solid purple model was added to the "
+                f"best-fit overlay. Output: `{_result['sirocco_spec_path']}`"
+            ),
+            kind="success",
+        )
+    except Exception as _exc:
+        _run_output = mo.callout(
+            mo.md(
+                f"{mo.icon('lucide:x-circle')} **Sirocco run failed:** "
+                f"{_exc}"
+            ),
+            kind="danger",
+        )
+
+    _run_output
     return
 
 
