@@ -574,6 +574,7 @@ def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
     # Build the selectable observation-file list and, when possible, the paired
     # test-grid metadata derived from the currently selected emulator grid.
     from Speculate_addons.grid_registry import get_grid_config as _get_grid_config
+    from Speculate_addons.observation_priors import filter_observation_files_for_grid as _filter_observation_files_for_grid
 
     # Trigger refresh on upload or delete
     _ = obs_file_uploader.value
@@ -585,6 +586,7 @@ def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
     if os.path.exists(_obs_dir):
         # Filter for likely data files
         obs_files = sorted([f for f in os.listdir(_obs_dir) if f.endswith(('.csv', '.txt', '.dat'))])
+        obs_files = _filter_observation_files_for_grid(obs_files, grid_selector.value)
 
     if not obs_files:
         obs_files = [] # Ensure it's empty list if no files found
@@ -842,7 +844,6 @@ def _(
     build_synthetic_sirocco_sigma,
     data_source_selector,
     emu,
-    emulator_selector,
     grid_selector,
     mo,
     np,
@@ -945,19 +946,11 @@ def _(
         except Exception as e:
              mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Error reading file: {e}"), kind="danger"))
 
-    # Infer the most likely flux transform from the emulator filename so the UI
-    # starts on the training scale, while still letting the user override it.
-    _detected_scale = "linear"  # default
-    if emulator_selector.value:
-        _emu_name = emulator_selector.value.lower()
-        if '_log_' in _emu_name:
-            _detected_scale = "log"
-        elif '_continuum-normalised_' in _emu_name:
-            _detected_scale = "continuum-normalised"
-
+    # Observations may already be transformed, so changing emulator must not
+    # silently change how the selected data are interpreted.
     obs_flux_scale = mo.ui.dropdown(
         options=["linear", "log", "continuum-normalised"],
-        value=_detected_scale,
+        value="linear",
         label="Observation Flux Transform:",
         full_width=True,
     )
@@ -2194,7 +2187,14 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
                 _applied_min = max(float(_inclination_prior["min"]), _emu_inc_min)
                 _applied_max = min(float(_inclination_prior["max"]), _emu_inc_max)
                 bounds[_inclination_name] = [_applied_min, _applied_max]
-                defaults[_inclination_name] = 0.5 * (_applied_min + _applied_max)
+                _requested_start = float(_inclination_prior.get(
+                    "start",
+                    0.5 * (_applied_min + _applied_max),
+                ))
+                defaults[_inclination_name] = min(
+                    max(_requested_start, _applied_min),
+                    _applied_max,
+                )
             prior_kinds[_inclination_name] = _inclination_kind
 
     # Add Inference Parameters (Global / Nuisance)

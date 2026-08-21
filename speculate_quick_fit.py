@@ -3421,12 +3421,19 @@ def _(mo):
 
 
 @app.cell
-def _(get_qf_last_uploaded_obs, get_qf_obs_refresh, mo, os):
+def _(get_qf_last_uploaded_obs, get_qf_obs_refresh, mo, os, qf_inf_emu_data, qf_inf_model_selector):
+    from Speculate_addons.grid_registry import infer_grid_name as _infer_grid_name
+    from Speculate_addons.observation_priors import filter_observation_files_for_grid as _filter_observation_files_for_grid
+
     _ = get_qf_obs_refresh()
     _obs_dir = "observation_files"
     qf_obs_files = []
     if os.path.exists(_obs_dir):
         qf_obs_files = sorted([f for f in os.listdir(_obs_dir) if f.endswith(('.csv', '.txt', '.dat'))])
+        _grid_name = qf_inf_emu_data.get("grid_name") if qf_inf_emu_data is not None else None
+        if not _grid_name and qf_inf_model_selector is not None:
+            _grid_name = _infer_grid_name(qf_inf_model_selector.value)
+        qf_obs_files = _filter_observation_files_for_grid(qf_obs_files, _grid_name)
 
     if qf_obs_files:
         _last_uploaded = get_qf_last_uploaded_obs()
@@ -3796,10 +3803,8 @@ def _(mo, qf_inf_emu_data, qf_obs_data):
 
 @app.cell
 def _(mo, qf_inf_emu_data, qf_inf_model_selector):
-    # Auto-detect the emulator's training scale from its metadata so the
-    # observation transform dropdown starts on a sensible default.  Users can
-    # override this when their observation is already pre-processed (e.g. a
-    # pre-computed continuum-normalised spectrum would just use "linear").
+    # Limit choices to transformations compatible with the loaded model, but
+    # never infer the observation's current representation from that model.
     _detected_scale = "linear"
     if qf_inf_emu_data is not None:
         _detected_scale = qf_inf_emu_data.get("scale", "linear")
@@ -3823,7 +3828,7 @@ def _(mo, qf_inf_emu_data, qf_inf_model_selector):
 
     qf_obs_scale_selector = mo.ui.dropdown(
         options=_options,
-        value=_detected_scale,
+        value="linear",
         label="Observation Flux Transform:",
         full_width=True,
     )
@@ -4194,7 +4199,7 @@ def _(
         qf_obs_data is not None and qf_obs_data.attrs.get("is_test_grid", False)
     )
     # Observation loaders preserve the selected filename in dataframe attrs.
-    # The five shipped names match the catalogue exactly; other uploads keep
+    # The shipped names match the catalogue exactly; other uploads keep
     # the existing generic controls.
     _observation_prior = (
         _OBSERVATION_PRIORS.get(
@@ -4246,7 +4251,11 @@ def _(
                 # Dash-separated ranges are Uniform and stay inside the model grid.
                 _ui_lo = max(_lo, float(_inclination_prior["min"]))
                 _ui_hi = min(_hi, float(_inclination_prior["max"]))
-                _value = 0.5 * (_ui_lo + _ui_hi)
+                _requested_start = float(_inclination_prior.get(
+                    "start",
+                    0.5 * (_ui_lo + _ui_hi),
+                ))
+                _value = min(max(_requested_start, _ui_lo), _ui_hi)
         _labels.append(_display)
         _prior_kinds.append(_kind)
 

@@ -3046,21 +3046,17 @@ def _(alt, get_comparison_reports, mo, np, os):
 @app.cell(hide_code=True)
 def _(glob, mo, os):
     # ── Live benchmark runner: file pickers ──
-    # Discover available emulators and observation CSVs on disk so the user
-    # can launch a fresh Tier 1/2/3 benchmark without leaving this notebook.
+    # Discover available emulators on disk so the user can launch a fresh
+    # Tier 1/2/3 benchmark without leaving this notebook.
     mo.md("---")
 
-    # Discover files
+    # Observation discovery lives in the next cell because it depends on the
+    # selected emulator family.
     emu_files = sorted(glob.glob("Grid-Emulator_Files/*emu*.npz"))
-    obs_csvs = sorted(glob.glob("observation_files/*.csv"))
 
     emu_picker = mo.ui.dropdown(
         options=dict(zip([os.path.basename(_f) for _f in emu_files], emu_files)) if emu_files else {"(none)": ""},
         label="Emulator",
-    )
-    obs_picker = mo.ui.multiselect(
-        options=dict(zip([os.path.basename(_f) for _f in obs_csvs], obs_csvs)) if obs_csvs else {},
-        label="Observations (Tier 3)",
     )
     tier3_local_cov_checkbox = mo.ui.checkbox(
         value=False,
@@ -3096,11 +3092,29 @@ def _(glob, mo, os):
         max_spectra_slider,
         mcmc_steps_slider,
         mle_restarts_slider,
-        obs_picker,
         sirocco_cpu_slider,
         tier3_local_cov_checkbox,
         tier_picker,
     )
+
+
+@app.cell(hide_code=True)
+def _(emu_picker, glob, mo, os):
+    """Show bundled observations compatible with the selected emulator family."""
+    from Speculate_addons.grid_registry import infer_grid_name as _infer_grid_name
+    from Speculate_addons.observation_priors import filter_observation_files_for_grid as _filter_observation_files_for_grid
+
+    _grid_name = _infer_grid_name(emu_picker.value)
+    _obs_csvs = sorted(glob.glob("observation_files/*.csv"))
+    _compatible_obs_csvs = _filter_observation_files_for_grid(_obs_csvs, _grid_name)
+    obs_picker = mo.ui.multiselect(
+        options=dict(zip(
+            [os.path.basename(_file) for _file in _compatible_obs_csvs],
+            _compatible_obs_csvs,
+        )) if _compatible_obs_csvs else {},
+        label="Observations (Tier 3)",
+    )
+    return (obs_picker,)
 
 
 @app.cell(hide_code=True)
@@ -3109,21 +3123,11 @@ def _(emu_picker, glob, mo, np, os, re):
     _emu_val = emu_picker.value or ""
     _emu_base = os.path.basename(_emu_val)
 
-    # Flux scale selector for Tier 2/3 — auto-detected from the emulator
-    # filename when possible, but user can override.  Created here (not in
-    # the picker cell) because marimo forbids reading .value in the same
-    # cell that creates a UIElement.
-    _detected_scale = "linear"
-    if _emu_val:
-        _emu_name = _emu_base.lower()
-        if '_log_' in _emu_name:
-            _detected_scale = "log"
-        elif '_continuum-normalised_' in _emu_name:
-            _detected_scale = "continuum-normalised"
-
+    # The selected emulator cannot determine whether an observation is already
+    # transformed, so always leave that decision to the user.
     flux_scale_picker = mo.ui.dropdown(
         options=["linear", "log", "continuum-normalised"],
-        value=_detected_scale,
+        value="linear",
         label="Flux Transform",
     )
 
@@ -3373,10 +3377,13 @@ def _(mo, obs_picker, os, tier_picker):
                     _widgets = {
                         "kind": "uniform",
                         "mean_deg": mo.ui.number(
-                            value=0.5 * (
-                                float(_inclination_prior["min"])
-                                + float(_inclination_prior["max"])
-                            ),
+                            value=float(_inclination_prior.get(
+                                "start",
+                                0.5 * (
+                                    float(_inclination_prior["min"])
+                                    + float(_inclination_prior["max"])
+                                ),
+                            )),
                             step=0.05,
                             label="Start (deg)",
                         ),
