@@ -2,6 +2,53 @@
 
 <!-- version list -->
 
+## v0.5.0 (2026-08-21)
+
+### Bug Fixes
+
+- Boundary layer luminosity and temperature now correctly calculated for latin hypercube samples
+  ([`9de3751`](https://github.com/sirocco-rt/speculate/commit/9de37519d5e74b49e73a3524f466cadccbbc8141))
+
+- Enhance MCMC diagnostics and coverage reporting in benchmark viewer
+  ([`39054ab`](https://github.com/sirocco-rt/speculate/commit/39054ab9079b9670b7378213c724de265d7553cb))
+
+- Refactor parameter playground export buttons and enhance prior handling
+  ([`c573bea`](https://github.com/sirocco-rt/speculate/commit/c573beadb2db2e5f8333750b20852d8a4a186ea1))
+
+- **benchmark**: Normalisation scales (in testing)
+  ([`0fc7391`](https://github.com/sirocco-rt/speculate/commit/0fc7391c07146f9d8b73b34aa19f6401c5594d46))
+
+### Build System
+
+- Allows for more build flexibility
+  ([`11a7e13`](https://github.com/sirocco-rt/speculate/commit/11a7e13869a16398bda5c768b67c89ef8af65d14))
+
+- Flatdict versions fix for HF
+  ([`e68aa85`](https://github.com/sirocco-rt/speculate/commit/e68aa851bebe921ad62fb8bd89ed5199ed6fac52))
+
+### Documentation
+
+- Notes on uploading grids to HF and example sirocco grid maker script
+  ([`74007fe`](https://github.com/sirocco-rt/speculate/commit/74007fe39e6de9aec57761cb94320b0a34c3ef13))
+
+### Features
+
+- Add test-grid RMSE envelope diagnostics and update benchmark viewer for these benchmark tests
+  ([`575b994`](https://github.com/sirocco-rt/speculate/commit/575b9944e8c49a81e86e50374511365642ad13e4))
+
+- Enhance observation prior handling and filtering for emulator compatibility
+  ([`24c5452`](https://github.com/sirocco-rt/speculate/commit/24c54522b81da91a1b37bed051b16f7f2ba087e6))
+
+- Enhance Sirocco integration in inference and quick fit modules
+  ([`b406315`](https://github.com/sirocco-rt/speculate/commit/b406315ec6f087b1421c8185aa4c891eaac4b6ba))
+
+- Initial addition - support for local covariance kernels in MLE optimization/MCMC
+  ([`987f11b`](https://github.com/sirocco-rt/speculate/commit/987f11bdbc05cb0ac23c01665c5a0dea3ad5dd9a))
+
+- Reichard et al. 2003 Adding AGN observational qso composites as demo spectra
+  ([`bcea0a9`](https://github.com/sirocco-rt/speculate/commit/bcea0a9491ced47dca3bd354a59802a7e455aab6))
+
+
 ## v0.4.0 (2026-06-11)
 
 ### Bug Fixes
