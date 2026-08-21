@@ -64,6 +64,7 @@ If any item affects science or file interpretation and cannot be verified, stop 
 - Do not mutate marimo widgets directly. Model mutual exclusion with separate controls and downstream merge cells.
 - Do not hard-code CV inclination arithmetic. Use table-driven angle-to-column mapping.
 - Do not delete dataset utilities or scratch files unless the user asks and references are checked.
+- Do not run marimo check as it takes too long for general use.
 
 ## Validation
 

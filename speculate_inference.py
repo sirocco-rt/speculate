@@ -41,6 +41,7 @@ def _():
     import importlib
     from Starfish.emulator import Emulator
     from Starfish.spectrum import Spectrum
+    from Starfish.models.utils import find_residual_peaks, optimize_residual_peaks
     import Starfish.models.spectrum_model as _spectrum_model_module
     _spectrum_model_module = importlib.reload(_spectrum_model_module)
     SpectrumModel = _spectrum_model_module.SpectrumModel
@@ -50,6 +51,7 @@ def _():
     from Speculate_addons.gp_covariance import (
         GP_LOG_AMP_PRIOR_SIGMA,
         bounds_for_frozen_prior,
+        covariance_diagonal_components,
         estimate_log_amp_centre_from_sigma,
         get_frozen_dist_loc_scale,
         global_covariance_diagnostics,
@@ -102,7 +104,9 @@ def _():
         build_bestfit_spectrum_altair,
         build_default_observation_sigma,
         build_synthetic_sirocco_sigma,
+        covariance_diagonal_components,
         estimate_log_amp_centre_from_sigma,
+        find_residual_peaks,
         fit_power_law_continuum,
         get_frozen_dist_loc_scale,
         global_covariance_diagnostics,
@@ -111,6 +115,7 @@ def _():
         os,
         pd,
         re,
+        optimize_residual_peaks,
         stats,
     )
 
@@ -569,6 +574,7 @@ def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
     # Build the selectable observation-file list and, when possible, the paired
     # test-grid metadata derived from the currently selected emulator grid.
     from Speculate_addons.grid_registry import get_grid_config as _get_grid_config
+    from Speculate_addons.observation_priors import filter_observation_files_for_grid as _filter_observation_files_for_grid
 
     # Trigger refresh on upload or delete
     _ = obs_file_uploader.value
@@ -580,6 +586,7 @@ def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
     if os.path.exists(_obs_dir):
         # Filter for likely data files
         obs_files = sorted([f for f in os.listdir(_obs_dir) if f.endswith(('.csv', '.txt', '.dat'))])
+        obs_files = _filter_observation_files_for_grid(obs_files, grid_selector.value)
 
     if not obs_files:
         obs_files = [] # Ensure it's empty list if no files found
@@ -837,7 +844,6 @@ def _(
     build_synthetic_sirocco_sigma,
     data_source_selector,
     emu,
-    emulator_selector,
     grid_selector,
     mo,
     np,
@@ -940,19 +946,11 @@ def _(
         except Exception as e:
              mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Error reading file: {e}"), kind="danger"))
 
-    # Infer the most likely flux transform from the emulator filename so the UI
-    # starts on the training scale, while still letting the user override it.
-    _detected_scale = "linear"  # default
-    if emulator_selector.value:
-        _emu_name = emulator_selector.value.lower()
-        if '_log_' in _emu_name:
-            _detected_scale = "log"
-        elif '_continuum-normalised_' in _emu_name:
-            _detected_scale = "continuum-normalised"
-
+    # Observations may already be transformed, so changing emulator must not
+    # silently change how the selected data are interpreted.
     obs_flux_scale = mo.ui.dropdown(
         options=["linear", "log", "continuum-normalised"],
-        value=_detected_scale,
+        value="linear",
         label="Observation Flux Transform:",
         full_width=True,
     )
@@ -1244,12 +1242,17 @@ def _(
                 })
                 mo.status.toast("Loaded ground truth into the Parameter Playground")
 
-            _gt_export_btn = mo.ui.button(
+            # Keep callback widgets publicly bound so Marimo registers their
+            # on_click handlers with the reactive runtime.
+            inf_ground_truth_playground_export_button = mo.ui.button(
                 label=f"{mo.icon('lucide:sliders-horizontal')} Export ground truth to parameter playground",
                 on_click=_send_ground_truth_to_playground,
                 kind="success",
             )
-            gt_display = mo.vstack([_gt_body, _gt_export_btn])
+            gt_display = mo.vstack([
+                _gt_body,
+                inf_ground_truth_playground_export_button,
+            ])
         elif emu is None:
             gt_display = mo.vstack([
                 _gt_body,
@@ -2070,7 +2073,7 @@ def _(
 
 
 @app.cell
-def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_sirocco_sigma, data_source_selector, emu, estimate_log_amp_centre_from_sigma, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_flux_scale, re, wl_range_slider):
+def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_sirocco_sigma, data_source_selector, emu, estimate_log_amp_centre_from_sigma, fit_power_law_continuum, grid_indices, grid_selector, inf_param_map_db_for_grid, mo, np, obs_data, obs_file_selector, obs_flux_scale, re, wl_range_slider):
     # ── Stage 2: Prior & Parameter Setup ──
     # Build per-parameter UI widgets (fixed/free toggle, value, min, max) that
     # drive the prior construction in Stage 3.  Parameters fall into two groups:
@@ -2091,6 +2094,23 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
     defaults = {}
     bounds = {}
     log10_params = set()  # names of params whose values are log10-scaled
+    # ``bounds`` serves two UI meanings: hard lower/upper support for Uniform
+    # rows and finite -2σ/+2σ controls for Normal rows. Keep the kind alongside
+    # every parameter so Stage 3 never has to infer scientific semantics from
+    # the shape of three numbers.
+    prior_kinds = {}
+
+    from Speculate_addons.observation_priors import OBSERVATION_PRIORS as _OBSERVATION_PRIORS
+
+    _is_test_grid = "Test Grid" in (data_source_selector.value or "")
+    # Only real observation filenames participate in the published catalogue.
+    # Synthetic validation spectra retain their known 100 pc/fixed-data setup
+    # and the emulator-wide physical parameter priors.
+    _observation_prior = (
+        _OBSERVATION_PRIORS.get(str(obs_file_selector.value).lower())
+        if not _is_test_grid and obs_file_selector.value
+        else None
+    )
 
     # Parameter Mapping Dictionary
     if emu is not None:
@@ -2135,10 +2155,47 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
                 mx = float(emu.max_params[_i])
                 bounds[_name] = [mn, mx]
                 defaults[_name] = (mn + mx) / 2.0
+                prior_kinds[_name] = "uniform"
         else:
              for _name in current_names:
                 bounds[_name] = [0.0, 1.0]
                 defaults[_name] = 0.5
+                prior_kinds[_name] = "uniform"
+
+        # A recognised observation overrides the generic inclination controls:
+        # quoted uncertainties are Normal; cited ranges are Uniform.
+        _inclination_name = next(
+            (_name for _name in current_names if "inclination" in _name.lower()),
+            None,
+        )
+        if _observation_prior is not None and _inclination_name is not None:
+            _inclination_index = current_names.index(_inclination_name)
+            _inclination_prior = _observation_prior["inclination_deg"]
+            _inclination_kind = _inclination_prior["kind"]
+            _emu_inc_min = float(emu.min_params[_inclination_index])
+            _emu_inc_max = float(emu.max_params[_inclination_index])
+            if _inclination_kind == "normal":
+                _inc_mean = float(_inclination_prior["mean"])
+                _inc_sigma = float(_inclination_prior["sigma"])
+                defaults[_inclination_name] = _inc_mean
+                bounds[_inclination_name] = [
+                    _inc_mean - 2.0 * _inc_sigma,
+                    _inc_mean + 2.0 * _inc_sigma,
+                ]
+            else:
+                # RW Sex starts at 28°, below this grid's 30° lower edge.
+                _applied_min = max(float(_inclination_prior["min"]), _emu_inc_min)
+                _applied_max = min(float(_inclination_prior["max"]), _emu_inc_max)
+                bounds[_inclination_name] = [_applied_min, _applied_max]
+                _requested_start = float(_inclination_prior.get(
+                    "start",
+                    0.5 * (_applied_min + _applied_max),
+                ))
+                defaults[_inclination_name] = min(
+                    max(_requested_start, _applied_min),
+                    _applied_max,
+                )
+            prior_kinds[_inclination_name] = _inclination_kind
 
     # Add Inference Parameters (Global / Nuisance)
     # These are not part of the emulator grid but are optimised alongside
@@ -2162,11 +2219,20 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
         # Defaults for Global Params
         bounds['Av'] = [0.0, 2.0]
         defaults['Av'] = 0.0
+        prior_kinds['Av'] = "uniform"
 
         # log_scale is exposed as a distance prior. With SpectrumModel(norm=True),
         # the emulator's stored normalisation is the 100 pc reference and
         # backend log_scale=0 means Distance=100 pc.
-        _distance_default = 100.0
+        _distance_prior = (
+            _observation_prior["distance_pc"]
+            if _observation_prior is not None
+            else {"kind": "normal", "mean": 100.0, "sigma": 5.0}
+        )
+        # The catalogue stores native (mean, 1σ) values. Stage 2 continues to
+        # use the established Inference UI convention of centre/-2σ/+2σ; the
+        # backend recovers one sigma from that displayed four-sigma span.
+        _distance_default = float(_distance_prior["mean"])
         _la_default = -60.0 if obs_flux_scale.value == "linear" else -5.0
         if obs_data is not None:
             try:
@@ -2206,14 +2272,20 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
                 pass
         _la_default = round(_la_default, 1)
 
-        bounds['log_scale'] = [90.0, 110.0]
+        _distance_sigma = float(_distance_prior["sigma"])
+        bounds['log_scale'] = [
+            _distance_default - 2.0 * _distance_sigma,
+            _distance_default + 2.0 * _distance_sigma,
+        ]
         defaults['log_scale'] = _distance_default
+        prior_kinds['log_scale'] = "normal"
 
         # cheb_1: Chebyshev c1 coefficient – linear continuum tilt
         # Multiplies the model by a Chebyshev polynomial; c0 is fixed to 1.
         # Small values nudge the continuum gradient without changing lines.
         bounds['cheb_1'] = [-0.5, 0.5]
         defaults['cheb_1'] = 0.0
+        prior_kinds['cheb_1'] = "uniform"
 
         # log_amp: GP global covariance amplitude (natural log)
         # Normal prior: center is tied to observational uncertainty, while the
@@ -2222,10 +2294,12 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
         _log_amp_half_width = 2.0 * GP_LOG_AMP_PRIOR_SIGMA
         bounds['log_amp'] = [_la_default - _log_amp_half_width, _la_default + _log_amp_half_width]
         defaults['log_amp'] = _la_default
+        prior_kinds['log_amp'] = "normal"
 
         # log_ls: GP global covariance length scale (natural log)
         bounds['log_ls'] = [1.0, 8.0]
         defaults['log_ls'] = 4.5
+        prior_kinds['log_ls'] = "uniform"
 
     # Build one widget bundle per parameter: a fixed/free toggle, a point value,
     # and lower/upper controls for the prior bounds shown in Stage 2.
@@ -2237,6 +2311,10 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
         value=False,
         label="I have entered the target distance and uncertainty",
     )
+    enable_local_cov = mo.ui.checkbox(
+        value=False,
+        label="Enable fixed local covariance kernels (adds 1 MLE pre-fit)",
+    )
 
     # Default fix/free tickboxes reflect the migration to including the nuisance
     # parameters in inference:
@@ -2247,7 +2325,6 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
     #   • Observational spectra: every nuisance parameter defaults to FREE.
     # Grid (physical) parameters always default to FREE.  Continuum-normalised
     # fits still pin Distance because the overall flux scale is degenerate there.
-    _is_test_grid = "Test Grid" in (data_source_selector.value or "")
     _fix_distance_for_shape_only = obs_flux_scale.value == "continuum-normalised"
     _default_fixed = {"Av", "log_scale"} if _is_test_grid else set()
     if _fix_distance_for_shape_only:
@@ -2267,18 +2344,16 @@ def _(GP_LOG_AMP_PRIOR_SIGMA, build_default_observation_sigma, build_synthetic_s
     # Wrap in mo.ui.dictionary for Marimo reactivity
     w_fix = mo.ui.dictionary(_fix_dict) if _fix_dict else mo.ui.dictionary({})
     w_val = mo.ui.dictionary(_val_dict) if _val_dict else mo.ui.dictionary({})
-    return bounds, distance_prior_ack, log10_params, param_names, w_fix, w_max, w_min, w_val
+    return bounds, distance_prior_ack, enable_local_cov, log10_params, param_names, prior_kinds, w_fix, w_max, w_min, w_val
 
 
 @app.cell(hide_code=True)
-def _(bounds, distance_prior_ack, log10_params, mo, param_names, w_fix, w_max, w_min, w_val):
+def _(bounds, data_source_selector, distance_prior_ack, enable_local_cov, log10_params, mo, param_names, prior_kinds, w_fix, w_max, w_min, w_val):
     # Render Parameter UI
     if not param_names:
          param_settings = mo.md("*Load an emulator to see parameters.*")
     else:
-        # Parameters that use a normal prior instead of uniform
-        _normal_prior_params = {'log_amp', 'log_scale'}
-
+        _is_test_grid = "Test Grid" in data_source_selector.value
         # Friendly display names
         _label_map = {
             'log_scale': 'Distance (pc)',
@@ -2316,7 +2391,7 @@ def _(bounds, distance_prior_ack, log10_params, mo, param_names, w_fix, w_max, w
                 ], widths=[3, 2], align="center")
             else:
                 # FREE: show prior distribution controls
-                if _name in _normal_prior_params:
+                if prior_kinds.get(_name) == "normal":
                     # Normal prior: Value = center, Min/Max define ±2σ range
                     _prior_col = mo.hstack([
                         mo.vstack([mo.md("<small>Center</small>"), _val_elements[_name]], gap=0),
@@ -2351,6 +2426,8 @@ def _(bounds, distance_prior_ack, log10_params, mo, param_names, w_fix, w_max, w
             _sections.append(mo.md("---"))
             _sections.append(mo.md("#### Inference / Nuisance Parameters"))
             _sections.extend(_global_rows)
+            if not _is_test_grid:
+                _sections.append(enable_local_cov)
             if 'log_scale' in param_names and not _fix_values.get('log_scale', False):
                 _sections.append(distance_prior_ack)
 
@@ -2361,8 +2438,9 @@ def _(bounds, distance_prior_ack, log10_params, mo, param_names, w_fix, w_max, w
         mo.callout(mo.md(
             "Set prior distributions for each parameter. "
             "**Fix** a parameter to lock it at a specific value (tight δ-prior). "
-            "Free parameters use **Uniform** priors (lower–upper) except "
-            "Distance and GP Log Amp, which use **Normal** priors (center ± 2σ)."
+            "Free parameters show either **Uniform** lower–upper bounds or "
+            "**Normal** center ±2σ controls. Recognised observation files "
+            "automatically load their published distance and inclination prior types."
         ), kind="neutral"),
         param_settings
     ])
@@ -2390,10 +2468,16 @@ def _(mo):
     get_mcmc_labels, set_mcmc_labels = mo.state(None)       # friendly parameter names
     get_mcmc_summary_df, set_mcmc_summary_df = mo.state(None) # ArviZ summary table
     get_mcmc_corner_meta, set_mcmc_corner_meta = mo.state(None) # corner-plot export metadata
+    # Plot inputs and the later Sirocco comparison live in separate state so
+    # adding an external model never reruns the expensive MCMC producer cell.
+    get_mcmc_bestfit_plot, set_mcmc_bestfit_plot = mo.state(None)
+    get_mcmc_sirocco_spectrum, set_mcmc_sirocco_spectrum = mo.state(None)
     return (
         get_mle_model, get_mle_priors, get_mle_result,
         set_mle_model, set_mle_priors, set_mle_result,
+        get_mcmc_bestfit_plot, set_mcmc_bestfit_plot,
         get_mcmc_samples, set_mcmc_samples,
+        get_mcmc_sirocco_spectrum, set_mcmc_sirocco_spectrum,
         get_mcmc_labels, set_mcmc_labels,
         get_mcmc_corner_meta, set_mcmc_corner_meta,
         get_mcmc_summary_df, set_mcmc_summary_df,
@@ -2457,11 +2541,15 @@ def _(mo):
 def _(
     build_default_observation_sigma,
     distance_prior_ack,
+    enable_local_cov,
     Spectrum,
     SpectrumModel,
     bounds_for_frozen_prior,
     build_synthetic_sirocco_sigma,
+    covariance_diagonal_components,
+    data_source_selector,
     emu,
+    find_residual_peaks,
     fit_power_law_continuum,
     get_frozen_dist_loc_scale,
     global_covariance_diagnostics,
@@ -2474,7 +2562,9 @@ def _(
     mo,
     np,
     obs_data,
+    optimize_residual_peaks,
     param_names,
+    prior_kinds,
     run_mle_btn,
     set_mle_model,
     set_mle_priors,
@@ -2649,7 +2739,26 @@ def _(
                         _mn = w_min[_ui].value
                         _mx = w_max[_ui].value
                         if _mx > _mn:
-                            _priors[_internal] = stats.uniform(loc=_mn, scale=_mx - _mn)
+                            if prior_kinds.get(_ui) == "normal":
+                                # Inclination uses the same Center/±2σ
+                                # convention as the existing Normal priors.
+                                _center = float(w_val.value[_ui])
+                                _prior_sigma = (_mx - _mn) / 4.0
+                                if _prior_sigma <= 0:
+                                    raise ValueError(
+                                        f"Normal prior for {_ui} needs a positive ±2σ range."
+                                    )
+                                _priors[_internal] = stats.norm(
+                                    loc=_center,
+                                    scale=_prior_sigma,
+                                )
+                            else:
+                                # Generic grid axes and cited inclination
+                                # ranges remain flat inside their UI bounds.
+                                _priors[_internal] = stats.uniform(
+                                    loc=_mn,
+                                    scale=_mx - _mn,
+                                )
 
                 # B. Global Parameter Priors
                 if 'Av' in param_names:
@@ -2712,149 +2821,126 @@ def _(
                         _mx = w_max['cheb_1'].value
                         _priors['cheb:1'] = stats.uniform(loc=_mn, scale=_mx - _mn)
 
-                # 4. Build Initial Simplex / Bounds
-                _spinner.update("Preparing optimizer...")
-                _opt_method = mle_method.value
+                def _copy_local_cov_params(_src_model):
+                    """Return plain-Python local-kernel dictionaries for reuse.
 
-                _active_labels = list(_model.labels)
-                _N = len(_active_labels)
-
-                # Derive per-parameter bounds from the priors (used by all methods).
-                _lo_bounds = []
-                _hi_bounds = []
-                for _label in _active_labels:
-                    if _label in _priors:
-                        _dist = _priors[_label]
-                        _prior_bounds = bounds_for_frozen_prior(_label, _dist)
-                        if _prior_bounds is not None:
-                            _lo, _hi = _prior_bounds
-                            _lo_bounds.append(_lo)
-                            _hi_bounds.append(_hi)
-                        else:
-                            _cv = _model.get_param_vector()[_active_labels.index(_label)]
-                            _lo_bounds.append(_cv - abs(_cv) * 0.5)
-                            _hi_bounds.append(_cv + abs(_cv) * 0.5)
+                    Starfish stores grouped parameters in a FlatterDict.  The
+                    truth-overlay model is constructed from scratch, so it needs
+                    normal dictionaries rather than references into the fitted
+                    model's mutable parameter container.
+                    """
+                    if 'local_cov' not in _src_model.params:
+                        return []
+                    try:
+                        _raw = _src_model.params.as_dict().get('local_cov', [])
+                    except Exception:
+                        return []
+                    if isinstance(_raw, dict):
+                        def _sort_key(_key):
+                            _text = str(_key)
+                            return (0, int(_text)) if _text.isdigit() else (1, _text)
+                        _items = [_raw[_key] for _key in sorted(_raw.keys(), key=_sort_key)]
                     else:
-                        _cv = _model.get_param_vector()[_active_labels.index(_label)]
-                        _lo_bounds.append(_cv - abs(_cv) * 0.5 - 1e-6)
-                        _hi_bounds.append(_cv + abs(_cv) * 0.5 + 1e-6)
-
-                # Shared (min, max) pairs for every bounded optimizer. All three
-                # methods must respect the same box — in particular the asymmetric
-                # log_amp ceiling — so the GP amplitude cannot blow up to absorb
-                # model-data mismatch under any optimizer choice.
-                _bounds_list = list(zip(_lo_bounds, _hi_bounds))
-
-                _simplex = None
-                if _opt_method == "Nelder-Mead":
-                    # Build an initial simplex spanning the prior volume.
-                    def _simplex_column_uniform(loc, scale, N):
-                        mn = loc
-                        mx = loc + scale
-                        rng = mx - mn
-                        margin = rng / 20
-                        t_mn, t_mx = mn + margin, mx - margin
-                        interval = (t_mx - t_mn) / N
-                        return [t_mn + interval * k for k in range(N + 1)]
-
-                    def _simplex_column_norm(mean, std, N):
-                        mn = mean - 2 * std
-                        mx = mean + 2 * std
-                        interval = (mx - mn) / N
-                        return [mn + interval * k for k in range(N + 1)]
-
-                    _simplex = np.zeros((_N + 1, _N))
-                    _simplex_info = []
-
-                    for _col_idx, _label in enumerate(_active_labels):
-                        if _label in _priors:
-                            _dist = _priors[_label]
-                            _loc, _sc = get_frozen_dist_loc_scale(_dist)
-                            if _dist.dist.name == 'uniform':
-                                _col = _simplex_column_uniform(_loc, _sc, _N)
-                            elif _dist.dist.name == 'norm':
-                                _col = _simplex_column_norm(_loc, _sc, _N)
-                            else:
-                                _cv = _model.get_param_vector()[_col_idx]
-                                _col = [_cv + (_cv * 0.01 * k) for k in range(_N + 1)]
-                        else:
-                            _cv = _model.get_param_vector()[_col_idx]
-                            _col = [_cv] * (_N + 1)
-
-                        _simplex[:, _col_idx] = _col
-                        _simplex_info.append(
-                            f"  {_label}: [{min(_col):.4f} .. {max(_col):.4f}]")
-                        _simplex[:, _col_idx] = np.roll(
-                            _simplex[:, _col_idx], _col_idx)
-
-                    _centroid = _simplex.mean(axis=0)
-                    _model.set_param_vector(_centroid)
-
-                # 5. Run MLE Optimization
-                # Warm up emulator caches (Cholesky factorisation etc.)
-                # before starting the optimizer timer, so the first eval
-                # isn't artificially slow.
-                _spinner.update("Building emulator cache (one-time)...")
-                try:
-                    _ = _model()
-                except Exception:
-                    pass
-
-                _spinner.update(f"Running {_opt_method} optimisation...")
-
-                _nll_history = []
-                _iter_count = [0]
-                _start_time = _time.time()
-                _max_iter = int(mle_max_iter.value)
-                _n_restarts = max(1, int(mle_restarts.value))
-
-                _global_best_f = [float("inf")]  # mutable for callback
-                _cur_restart = [0]
-
-                def _nll_with_callback(P):
-                    _model.set_param_vector(P)
-                    # Fast bounds check — skip expensive GPU eval for out-of-range proposals
-                    _gp = np.array(_model.grid_params)
-                    if (np.any(_gp < _model.emulator.min_params) or
-                            np.any(_gp > _model.emulator.max_params)):
-                        nll = 1e30
-                    else:
+                        _items = list(_raw)
+                    _params = []
+                    for _kernel in _items:
                         try:
-                            nll = -_model.log_likelihood(_priors)
-                        except (ValueError, np.linalg.LinAlgError):
-                            nll = 1e30
-                    _nll_history.append(nll)
-                    _iter_count[0] += 1
-                    if _iter_count[0] % 50 == 0:
-                        _elapsed = _time.time() - _start_time
-                        _spinner.update(
-                            f"{_opt_method} Restart {_cur_restart[0]}/{_n_restarts} | "
-                            f"Eval {_iter_count[0]} | "
-                            f"Best NLL: {_global_best_f[0]:.10f} | "
-                            f"Time: {_elapsed:.1f}s"
+                            _params.append({
+                                "mu": float(_kernel["mu"]),
+                                "log_amp": float(_kernel["log_amp"]),
+                                "log_sigma": float(_kernel["log_sigma"]),
+                            })
+                        except Exception:
+                            pass
+                    return _params
+
+                def _local_covariance_variance_params(
+                    _src_model,
+                    _local_params,
+                    _base_covariance,
+                    _target_significance=3.0,
+                ):
+                    """Set local variance from the detection covariance.
+
+                    The residual optimiser returns a Gaussian height in flux
+                    units. Add only the variance still required for that height
+                    to remain a three-sigma feature after the full pre-local
+                    covariance has already been included.
+                    """
+                    if not _local_params:
+                        return []
+
+                    _target_significance = float(_target_significance)
+                    if (
+                        not np.isfinite(_target_significance)
+                        or _target_significance <= 0
+                    ):
+                        raise ValueError(
+                            "_target_significance must be finite and positive"
                         )
-                    return nll
 
-                _p0 = _model.get_param_vector()
-                _lo_arr = np.array(_lo_bounds)
-                _hi_arr = np.array(_hi_bounds)
+                    if hasattr(_base_covariance, "detach"):
+                        _base_covariance = (
+                            _base_covariance.detach().cpu().numpy()
+                        )
+                    _base_covariance = np.asarray(
+                        _base_covariance,
+                        dtype=float,
+                    )
+                    _base_diagonal = (
+                        np.diag(_base_covariance)
+                        if _base_covariance.ndim == 2
+                        else _base_covariance.reshape(-1)
+                    )
+                    _wavelength = np.asarray(
+                        _src_model.data.wave,
+                        dtype=float,
+                    )
+                    if _base_diagonal.size != _wavelength.size:
+                        raise ValueError(
+                            "Pre-local covariance diagonal does not match "
+                            "the model wavelength grid"
+                        )
 
-                # Generate starting points: first = bootstrapped x0, rest = random
-                _start_points = [_p0.copy()]
-                if _n_restarts > 1:
-                    np.random.seed(None)
-                    for _ in range(_n_restarts - 1):
-                        _rnd = _lo_arr + np.random.rand(_N) * (_hi_arr - _lo_arr)
-                        _start_points.append(_rnd)
+                    _converted = []
+                    for _kernel in _local_params:
+                        _new_kernel = dict(_kernel)
+                        _fitted_height = np.exp(
+                            float(_new_kernel["log_amp"])
+                        )
+                        _centre = float(_new_kernel["mu"])
+                        _centre_index = int(
+                            np.argmin(np.abs(_wavelength - _centre))
+                        )
+                        _base_variance = max(
+                            float(_base_diagonal[_centre_index]),
+                            0.0,
+                        )
 
-                _global_best_x = _p0.copy()
-                _global_best_nit = 0
-                _restart_summaries = []
+                        # The 4-sigma detector uses this same variance. Remove
+                        # it from the target total so existing emulator, data,
+                        # and global-GP uncertainty is not counted twice.
+                        _target_total_variance = (
+                            _fitted_height / _target_significance
+                        ) ** 2
+                        _local_variance = (
+                            _target_total_variance - _base_variance
+                        )
+                        if (
+                            not np.isfinite(_local_variance)
+                            or _local_variance <= 0
+                        ):
+                            continue
+                        _new_kernel["log_amp"] = float(
+                            np.log(_local_variance)
+                        )
+                        _converted.append(_new_kernel)
+                    return _converted
 
                 def _restart_param_label(_name):
                     return f"log10({_name})" if _name in log10_params else _name
 
-                def _capture_restart_result(_restart_number, _solution):
+                def _capture_restart_result(_restart_summaries, _restart_number, _solution):
                     _model.set_param_vector(_solution.x)
                     _values = {}
                     for _i, _p in enumerate(phys_names):
@@ -2879,117 +2965,409 @@ def _(
                         "values": _values,
                     })
 
-                for _restart_idx, _x0 in enumerate(_start_points):
-                    _cur_restart[0] = _restart_idx + 1
-                    _iter_count[0] = 0  # reset eval counter per restart
-                    _spinner.update(
-                        f"{_opt_method} | Restart {_cur_restart[0]}/{_n_restarts} | "
-                        f"Starting... | {_time.time() - _start_time:.1f}s"
-                    )
-                    _model.set_param_vector(_x0)
+                def _run_mle_pass(_phase_label):
+                    """Run one complete MLE pass for the current SpectrumModel.
 
+                    Local covariance support needs two optimiser passes: a first
+                    pass to expose residual peaks, then a final pass after fixed
+                    ``local_cov`` kernels have been inserted.  Keeping the
+                    optimiser in one helper prevents the pre-fit and final fit
+                    from drifting apart in bounds, restarts, or status reporting.
+                    """
+                    _spinner.update(f"Preparing {_phase_label} optimizer...")
+                    _opt_method = mle_method.value
+                    _active_labels = list(_model.labels)
+                    _N = len(_active_labels)
+                    _nll_history = []
+                    _restart_summaries = []
+                    _start_time = _time.time()
+                    _max_iter = int(mle_max_iter.value)
+                    _n_restarts = max(1, int(mle_restarts.value))
+
+                    from types import SimpleNamespace
+
+                    if _N == 0:
+                        _spinner.update(f"Evaluating fixed-parameter {_phase_label}...")
+                        _fun = -float(_model.log_likelihood(_priors))
+                        _nll_history.append(_fun)
+                        _soln = SimpleNamespace(
+                            x=_model.get_param_vector(),
+                            fun=_fun,
+                            success=True,
+                            message="All parameters fixed",
+                            nit=0,
+                        )
+                        _capture_restart_result(_restart_summaries, 1, _soln)
+                        return {
+                            "soln": _soln,
+                            "nll_history": _nll_history,
+                            "restart_summaries": _restart_summaries,
+                            "elapsed": _time.time() - _start_time,
+                            "eval_count": 1,
+                        }
+
+                    # Derive per-parameter bounds from the priors (used by all methods).
+                    _lo_bounds = []
+                    _hi_bounds = []
+                    _param_vector = _model.get_param_vector()
+                    for _col_idx, _label in enumerate(_active_labels):
+                        if _label in _priors:
+                            _dist = _priors[_label]
+                            _prior_bounds = bounds_for_frozen_prior(_label, _dist)
+                            if _prior_bounds is not None:
+                                _lo, _hi = _prior_bounds
+                                _lo_bounds.append(_lo)
+                                _hi_bounds.append(_hi)
+                            else:
+                                _cv = _param_vector[_col_idx]
+                                _lo_bounds.append(_cv - abs(_cv) * 0.5)
+                                _hi_bounds.append(_cv + abs(_cv) * 0.5)
+                        else:
+                            _cv = _param_vector[_col_idx]
+                            _lo_bounds.append(_cv - abs(_cv) * 0.5 - 1e-6)
+                            _hi_bounds.append(_cv + abs(_cv) * 0.5 + 1e-6)
+
+                    # Shared (min, max) pairs for every bounded optimizer.
+                    _bounds_list = list(zip(_lo_bounds, _hi_bounds))
+
+                    _simplex = None
                     if _opt_method == "Nelder-Mead":
-                        # For restart 0 use the pre-built simplex; for later
-                        # restarts use adaptive simplex from the random x0.
-                        # bounds= makes scipy clip the simplex (including the
-                        # initial one, which spans centre±2σ for normal priors
-                        # and can exceed the asymmetric log_amp ceiling).
-                        _nm_opts = dict(maxiter=_max_iter, disp=False, adaptive=True)
-                        if _restart_idx == 0 and _simplex is not None:
-                            _nm_opts["initial_simplex"] = _simplex
-                        _run_soln = scipy_minimize(
-                            _nll_with_callback,
-                            _x0,
-                            method="Nelder-Mead",
-                            bounds=_bounds_list,
-                            options=_nm_opts,
-                        )
+                        def _simplex_column_uniform(loc, scale, N):
+                            mn = loc
+                            mx = loc + scale
+                            rng = mx - mn
+                            margin = rng / 20
+                            t_mn, t_mx = mn + margin, mx - margin
+                            interval = (t_mx - t_mn) / N
+                            return [t_mn + interval * k for k in range(N + 1)]
 
-                    elif _opt_method == "L-BFGS-B":
-                        _run_soln = scipy_minimize(
-                            _nll_with_callback,
-                            _x0,
-                            method="L-BFGS-B",
-                            bounds=_bounds_list,
-                            options=dict(
-                                maxiter=_max_iter,
-                                ftol=1e-15,
-                                gtol=1e-12,
-                                eps=1e-5,
-                            ),
-                        )
+                        def _simplex_column_norm(mean, std, N):
+                            mn = mean - 2 * std
+                            mx = mean + 2 * std
+                            interval = (mx - mn) / N
+                            return [mn + interval * k for k in range(N + 1)]
 
-                    elif _opt_method == "CMA-ES":
-                        try:
-                            import cma
-                        except ImportError:
-                            raise ImportError(
-                                "CMA-ES requires the 'cma' package. "
-                                "Install it with: pip install cma"
+                        _simplex = np.zeros((_N + 1, _N))
+                        for _col_idx, _label in enumerate(_active_labels):
+                            if _label in _priors:
+                                _dist = _priors[_label]
+                                _loc, _sc = get_frozen_dist_loc_scale(_dist)
+                                if _dist.dist.name == 'uniform':
+                                    _col = _simplex_column_uniform(_loc, _sc, _N)
+                                elif _dist.dist.name == 'norm':
+                                    _col = _simplex_column_norm(_loc, _sc, _N)
+                                else:
+                                    _cv = _model.get_param_vector()[_col_idx]
+                                    _col = [_cv + (_cv * 0.01 * k) for k in range(_N + 1)]
+                            else:
+                                _cv = _model.get_param_vector()[_col_idx]
+                                _col = [_cv] * (_N + 1)
+
+                            _simplex[:, _col_idx] = _col
+                            _simplex[:, _col_idx] = np.roll(
+                                _simplex[:, _col_idx], _col_idx)
+
+                        _centroid = _simplex.mean(axis=0)
+                        _model.set_param_vector(_centroid)
+
+                    # Warm up emulator caches (Cholesky factorisation etc.).
+                    _spinner.update(f"Building emulator cache for {_phase_label}...")
+                    try:
+                        _ = _model()
+                    except Exception:
+                        pass
+
+                    _spinner.update(f"Running {_phase_label} via {_opt_method}...")
+
+                    _global_best_f = [float("inf")]
+                    _cur_restart = [0]
+                    _total_eval_count = [0]
+                    _restart_eval_count = [0]
+
+                    def _nll_with_callback(P):
+                        _model.set_param_vector(P)
+                        # Fast bounds check — skip expensive GPU eval for out-of-range proposals.
+                        _gp = np.array(_model.grid_params)
+                        if (np.any(_gp < _model.emulator.min_params) or
+                                np.any(_gp > _model.emulator.max_params)):
+                            nll = 1e30
+                        else:
+                            try:
+                                nll = -_model.log_likelihood(_priors)
+                            except (ValueError, RuntimeError, np.linalg.LinAlgError):
+                                nll = 1e30
+                        _nll_history.append(nll)
+                        _total_eval_count[0] += 1
+                        _restart_eval_count[0] += 1
+                        if _restart_eval_count[0] % 50 == 0:
+                            _elapsed = _time.time() - _start_time
+                            _spinner.update(
+                                f"{_phase_label} | {_opt_method} Restart {_cur_restart[0]}/{_n_restarts} | "
+                                f"Eval {_restart_eval_count[0]} | "
+                                f"Best NLL: {_global_best_f[0]:.10f} | "
+                                f"Time: {_elapsed:.1f}s"
                             )
-                        _cma_bounds = [_lo_bounds, _hi_bounds]
-                        _p0_cma = np.clip(
-                            _x0,
-                            _lo_arr + 1e-8,
-                            _hi_arr - 1e-8,
+                        return nll
+
+                    _p0 = _model.get_param_vector()
+                    _lo_arr = np.array(_lo_bounds)
+                    _hi_arr = np.array(_hi_bounds)
+
+                    # Generate starting points: first = bootstrapped x0, rest = random.
+                    _start_points = [_p0.copy()]
+                    if _n_restarts > 1:
+                        np.random.seed(None)
+                        for _ in range(_n_restarts - 1):
+                            _rnd = _lo_arr + np.random.rand(_N) * (_hi_arr - _lo_arr)
+                            _start_points.append(_rnd)
+
+                    _global_best_x = _p0.copy()
+                    _global_best_nit = 0
+
+                    for _restart_idx, _x0 in enumerate(_start_points):
+                        _cur_restart[0] = _restart_idx + 1
+                        _restart_eval_count[0] = 0
+                        _spinner.update(
+                            f"{_phase_label} | {_opt_method} | Restart {_cur_restart[0]}/{_n_restarts} | "
+                            f"Starting... | {_time.time() - _start_time:.1f}s"
                         )
-                        _cma_stds = [0.2 * (hi - lo) for lo, hi in zip(_lo_bounds, _hi_bounds)]
-                        _popsize = 2 * (4 + int(3 * np.log(_N)))
-                        _es = cma.CMAEvolutionStrategy(
-                            _p0_cma.tolist(), 1.0,
-                            {
-                                "bounds": _cma_bounds,
-                                "CMA_stds": _cma_stds,
-                                "popsize": _popsize,
-                                "maxfevals": _max_iter,
-                                "verbose": -9,
-                                "tolfun": 1e-10,
-                            },
+                        _model.set_param_vector(_x0)
+
+                        if _opt_method == "Nelder-Mead":
+                            _nm_opts = dict(maxiter=_max_iter, disp=False, adaptive=True)
+                            if _restart_idx == 0 and _simplex is not None:
+                                _nm_opts["initial_simplex"] = _simplex
+                            _run_soln = scipy_minimize(
+                                _nll_with_callback,
+                                _x0,
+                                method="Nelder-Mead",
+                                bounds=_bounds_list,
+                                options=_nm_opts,
+                            )
+
+                        elif _opt_method == "L-BFGS-B":
+                            _run_soln = scipy_minimize(
+                                _nll_with_callback,
+                                _x0,
+                                method="L-BFGS-B",
+                                bounds=_bounds_list,
+                                options=dict(
+                                    maxiter=_max_iter,
+                                    ftol=1e-15,
+                                    gtol=1e-12,
+                                    eps=1e-5,
+                                ),
+                            )
+
+                        elif _opt_method == "CMA-ES":
+                            try:
+                                import cma
+                            except ImportError:
+                                raise ImportError(
+                                    "CMA-ES requires the 'cma' package. "
+                                    "Install it with: pip install cma"
+                                )
+                            _cma_bounds = [_lo_bounds, _hi_bounds]
+                            _p0_cma = np.clip(
+                                _x0,
+                                _lo_arr + 1e-8,
+                                _hi_arr - 1e-8,
+                            )
+                            _cma_stds = [0.2 * (hi - lo) for lo, hi in zip(_lo_bounds, _hi_bounds)]
+                            _popsize = 2 * (4 + int(3 * np.log(_N)))
+                            _es = cma.CMAEvolutionStrategy(
+                                _p0_cma.tolist(), 1.0,
+                                {
+                                    "bounds": _cma_bounds,
+                                    "CMA_stds": _cma_stds,
+                                    "popsize": _popsize,
+                                    "maxfevals": _max_iter,
+                                    "verbose": -9,
+                                    "tolfun": 1e-10,
+                                },
+                            )
+                            _run_best_x, _run_best_f = _x0.copy(), float("inf")
+                            while not _es.stop():
+                                _solutions = _es.ask()
+                                _fits = [_nll_with_callback(np.array(s)) for s in _solutions]
+                                _es.tell(_solutions, _fits)
+                                _gen_best = min(_fits)
+                                if _gen_best < _run_best_f:
+                                    _run_best_f = _gen_best
+                                    _run_best_x = np.array(_solutions[_fits.index(_gen_best)])
+                                if _run_best_f < _global_best_f[0]:
+                                    _global_best_f[0] = _run_best_f
+                            _run_soln = SimpleNamespace(
+                                x=_run_best_x, fun=_run_best_f, success=True,
+                                message="CMA-ES terminated",
+                                nit=_es.result.iterations,
+                            )
+                        else:
+                            raise ValueError(f"Unknown optimizer: {_opt_method}")
+
+                        _capture_restart_result(_restart_summaries, _cur_restart[0], _run_soln)
+
+                        # Keep global best across restarts.
+                        if _run_soln.fun <= _global_best_f[0]:
+                            _global_best_f[0] = _run_soln.fun
+                            _global_best_x = _run_soln.x.copy()
+                            _global_best_nit = getattr(_run_soln, 'nit', 0)
+
+                    _soln = SimpleNamespace(
+                        x=_global_best_x, fun=_global_best_f[0], success=True,
+                        message=f"Best of {_n_restarts} restart(s)",
+                        nit=_global_best_nit,
+                    )
+
+                    if _soln.success:
+                        _model.set_param_vector(_soln.x)
+
+                    return {
+                        "soln": _soln,
+                        "nll_history": _nll_history,
+                        "restart_summaries": _restart_summaries,
+                        "elapsed": _time.time() - _start_time,
+                        "eval_count": _total_eval_count[0],
+                    }
+
+                _is_test_grid_source = "Test Grid" in data_source_selector.value
+                _local_cov_enabled = bool(enable_local_cov.value) and not _is_test_grid_source
+                _local_cov_meta = {
+                    "enabled": _local_cov_enabled,
+                    "n_candidates": 0,
+                    "n_kernels": 0,
+                    "mle_passes": 1,
+                    "amplitude_mode": None,
+                    "detection_covariance_mode": (
+                        "full_pre_local_diagonal"
+                        if _local_cov_enabled else None
+                    ),
+                    "message": "Local covariance disabled.",
+                    "error": None,
+                    "kernels": [],
+                }
+                _overall_start_time = _time.time()
+
+                _mle_pass = _run_mle_pass("MLE pre-fit" if _local_cov_enabled else "MLE")
+                _all_eval_count = int(_mle_pass["eval_count"])
+
+                if _local_cov_enabled:
+                    _spinner.update("Detecting fixed local covariance kernels...")
+                    try:
+                        # Starfish's local-kernel helpers operate on the model's
+                        # residual deque.  Populate it once at the MLE pre-fit
+                        # point, then freeze accepted kernels so MCMC does not
+                        # gain many narrow nuisance dimensions.
+                        _model.residuals.clear()
+                        if hasattr(_model, "_residual_call_count"):
+                            _model._residual_call_count = 0
+                        _ = _model.log_likelihood(_priors)
+                        _num_residuals = len(_model.residuals)
+                        _residual_regions = []
+                        _base_covariance_diagonal = None
+                        if _num_residuals > 0:
+                            # Evaluate the complete covariance before local
+                            # kernels are added. Its diagonal combines
+                            # observational, emulator, and global-GP variance
+                            # for the pointwise outlier score; correlations
+                            # remain active in the likelihood.
+                            _, _base_covariance = _model()
+                            _base_covariance_diagonal = (
+                                _base_covariance.diagonal()
+                            )
+                            if hasattr(
+                                _base_covariance_diagonal,
+                                "detach",
+                            ):
+                                _base_covariance_diagonal = (
+                                    _base_covariance_diagonal
+                                    .detach()
+                                    .cpu()
+                                    .numpy()
+                                )
+                            _base_covariance_diagonal = np.asarray(
+                                _base_covariance_diagonal,
+                                dtype=float,
+                            )
+                            _residual_regions = find_residual_peaks(
+                                _model,
+                                num_residuals=_num_residuals,
+                                threshold=4.0,
+                                buffer=2.0,
+                                # Preserve coherent residual-region bounds and
+                                # adaptive widths for the kernel optimiser.
+                                return_regions=True,
+                                covariance=_base_covariance_diagonal,
+                            )
+                        _local_cov_meta["n_candidates"] = len(_residual_regions)
+                        _local_params = []
+                        if _residual_regions:
+                            _local_params = optimize_residual_peaks(
+                                _model,
+                                mus=_residual_regions,
+                                sigma0=50,
+                                num_residuals=_num_residuals,
+                                covariance=_base_covariance_diagonal,
+                            )
+                            _local_params = _local_covariance_variance_params(
+                                _model,
+                                _local_params,
+                                _base_covariance_diagonal,
+                                _target_significance=3.0,
+                            )
+                            _local_cov_meta["amplitude_mode"] = (
+                                "full_covariance_target_3_sigma"
+                            )
+
+                        if _local_params:
+                            _model.params["local_cov"] = _local_params
+                            _model._loc_cov = None
+                            if hasattr(_model, "_loc_cov_gpu"):
+                                _model._loc_cov_gpu = None
+                            _model.freeze("local_cov")
+                            _local_cov_meta["n_kernels"] = len(_local_params)
+                            _local_cov_meta["kernels"] = _copy_local_cov_params(_model)
+                            _local_cov_meta["message"] = (
+                                f"Added {len(_local_params)} fixed local covariance kernel"
+                                f"{'s' if len(_local_params) != 1 else ''} with a "
+                                "3-sigma placement target."
+                            )
+                            _mle_pass = _run_mle_pass("MLE with local covariance")
+                            _all_eval_count += int(_mle_pass["eval_count"])
+                            _local_cov_meta["mle_passes"] = 2
+                            _local_cov_meta["message"] = (
+                                f"{_local_cov_meta['message']} Final MLE pass rerun with fixed kernels."
+                            )
+                        else:
+                            _local_cov_meta["message"] = (
+                                f"Detected {len(_residual_regions)} residual region"
+                                f"{'s' if len(_residual_regions) != 1 else ''} "
+                                "above 4 sigma under the full pre-local covariance, "
+                                "but added 0 local covariance kernels."
+                            )
+                    except Exception as _lc_exc:
+                        _local_cov_meta["error"] = str(_lc_exc)
+                        _local_cov_meta["message"] = (
+                            "Local covariance placement failed; continuing without local kernels."
                         )
-                        _run_best_x, _run_best_f = _x0.copy(), float("inf")
-                        while not _es.stop():
-                            _solutions = _es.ask()
-                            _fits = [_nll_with_callback(np.array(s)) for s in _solutions]
-                            _es.tell(_solutions, _fits)
-                            _gen_best = min(_fits)
-                            if _gen_best < _run_best_f:
-                                _run_best_f = _gen_best
-                                _run_best_x = np.array(_solutions[_fits.index(_gen_best)])
-                            if _run_best_f < _global_best_f[0]:
-                                _global_best_f[0] = _run_best_f
-                        from types import SimpleNamespace
-                        _run_soln = SimpleNamespace(
-                            x=_run_best_x, fun=_run_best_f, success=True,
-                            message="CMA-ES terminated",
-                            nit=_es.result.iterations,
-                        )
 
-                    _capture_restart_result(_cur_restart[0], _run_soln)
-
-                    # Keep global best across restarts
-                    if _run_soln.fun <= _global_best_f[0]:
-                        _global_best_f[0] = _run_soln.fun
-                        _global_best_x = _run_soln.x.copy()
-                        _global_best_nit = getattr(_run_soln, 'nit', 0)
-
-                from types import SimpleNamespace
-                _soln = SimpleNamespace(
-                    x=_global_best_x, fun=_global_best_f[0], success=True,
-                    message=f"Best of {_n_restarts} restart(s)",
-                    nit=_global_best_nit,
-                )
-
-                if _soln.success:
-                    _model.set_param_vector(_soln.x)
+                _soln = _mle_pass["soln"]
+                _nll_history = _mle_pass["nll_history"]
+                _restart_summaries = _mle_pass["restart_summaries"]
 
                 # Store for MCMC
                 set_mle_model(_model)
                 set_mle_priors(_priors)
 
-                _elapsed_total = _time.time() - _start_time
+                _opt_method = mle_method.value
+                _n_restarts = max(1, int(mle_restarts.value))
+                _elapsed_total = _time.time() - _overall_start_time
                 _restart_msg = f" ({_n_restarts} restart{'s' if _n_restarts > 1 else ''})" if _n_restarts > 1 else ""
+                _local_msg = ""
+                if _local_cov_enabled:
+                    _local_msg = f" Local covariance: {_local_cov_meta['n_kernels']} fixed kernel(s)."
                 fit_status = mo.callout(
-                    mo.md(f"{mo.icon('lucide:check-circle')} MLE Complete via {_opt_method}{_restart_msg}! ({_iter_count[0]} iterations, {_elapsed_total:.1f}s)"),
+                    mo.md(f"{mo.icon('lucide:check-circle')} MLE Complete via {_opt_method}{_restart_msg}! ({_all_eval_count} evaluations, {_elapsed_total:.1f}s).{_local_msg}"),
                     kind="success"
                 )
 
@@ -3029,6 +3407,13 @@ def _(
                     _plot_cov = _plot_cov.detach().cpu().numpy()
                 _plot_cov = np.asarray(_plot_cov, dtype=float)
                 _plot_cov_diag = np.diag(_plot_cov) if _plot_cov.ndim == 2 else _plot_cov.reshape(-1)
+                # Preserve the same additive covariance terms used by the
+                # likelihood so the residual plot can explain its uncertainty
+                # at each wavelength without re-evaluating the emulator.
+                _plot_covariance_components = covariance_diagonal_components(
+                    _model,
+                    _plot_cov,
+                )
                 _plot_data_flux = np.asarray(_model.data.flux, dtype=float)
                 _gp_covariance_diagnostics = global_covariance_diagnostics(
                     _model,
@@ -3041,6 +3426,11 @@ def _(
                     "data_flux": _plot_data_flux.copy(),
                     "model_flux": np.asarray(_plot_flux, dtype=float).copy(),
                     "model_cov_diag": _plot_cov_diag.copy(),
+                    "covariance_components": {
+                        _name: _values.copy()
+                        for _name, _values
+                        in _plot_covariance_components.items()
+                    },
                     "title": f"Best-Fit Model — {_model.data_name}",
                     "zoom_name": "inference_mle_bestfit_zoom",
                     "model_label": f"MLE Best Fit (NLL={_format_nll(_mle_nll)})",
@@ -3074,6 +3464,9 @@ def _(
                                     'log_amp': float(_model.params['global_cov:log_amp']),
                                     'log_ls': float(_model.params['global_cov:log_ls']),
                                 }
+                            _local_cov_for_truth = _copy_local_cov_params(_model)
+                            if _local_cov_for_truth:
+                                _truth_global_params['local_cov'] = _local_cov_for_truth
 
                             _truth_model = SpectrumModel(
                                 emulator=emu,
@@ -3179,6 +3572,11 @@ def _(
                     _global_md += f"| **ln(GP amp)** | {res_global['global_cov:log_amp']:.4f} |\n"
                 if 'global_cov:log_ls' in res_global:
                     _global_md += f"| **ln(GP length)** | {res_global['global_cov:log_ls']:.4f} |\n"
+                if _local_cov_meta.get("enabled"):
+                    _global_md += (
+                        f"| **Local covariance kernels** | "
+                        f"{int(_local_cov_meta.get('n_kernels', 0))} fixed |\n"
+                    )
 
                 _playground_distance_pc = 100.0
                 if 'log_scale' in res_global:
@@ -3237,6 +3635,7 @@ def _(
                     "global_md": _global_md,
                     "playground_payload": _playground_payload,
                     "gp_covariance_diagnostics": _gp_covariance_diagnostics,
+                    "local_covariance": _local_cov_meta,
                     "restart_table_rows": _restart_table_rows,
                     "loss_fig": _fig_loss,
                     "plot": _mle_plot_payload,
@@ -3276,6 +3675,25 @@ def _(
         _gt_payload = _plot.get("ground_truth")
         _show_gt = bool(_gt_payload) and bool(mle_show_ground_truth_spectrum.value)
         _extra_series = [_gt_payload] if _show_gt else None
+        _local_cov = _result.get("local_covariance") or {}
+        _local_cov_centers = []
+        _local_cov_regions = []
+        for _kernel in _local_cov.get("kernels", []):
+            try:
+                _mu = float(_kernel["mu"])
+                _sigma_v = float(np.exp(float(_kernel["log_sigma"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+            _local_cov_centers.append(_mu)
+            # ``local_covariance_matrix`` is identically zero beyond four
+            # velocity standard deviations from the centre. Convert that
+            # compact support to wavelength bounds for the plot.
+            _half_width = 4.0 * _sigma_v * _mu / 299792.458
+            _local_cov_regions.append({
+                "mu": _mu,
+                "lower": _mu - _half_width,
+                "upper": _mu + _half_width,
+            })
 
         _fig = build_bestfit_spectrum_altair(
             alt,
@@ -3287,13 +3705,19 @@ def _(
             zoom_name=_plot["zoom_name"],
             model_label=_plot["model_label"],
             extra_flux_series=_extra_series,
+            local_covariance_centers=_local_cov_centers,
+            local_covariance_regions=_local_cov_regions,
+            covariance_components=_plot.get("covariance_components"),
         )
 
         def _send_mle_to_playground(_):
             set_inf_playground_target(_result["playground_payload"])
             mo.status.toast("Loaded MLE best fit into the Parameter Playground")
 
-        _playground_button = mo.ui.button(
+        # Marimo only registers UI callbacks for elements bound to public
+        # cell names; an underscore-prefixed button can render while its
+        # on_click handler is skipped.
+        mle_playground_export_button = mo.ui.button(
             label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
             on_click=_send_mle_to_playground,
             kind="success",
@@ -3301,7 +3725,7 @@ def _(
 
         _result_elements = [
             _result["fit_status"],
-            _playground_button,
+            mle_playground_export_button,
             mo.hstack([
                 mo.md(_result["results_md"]),
                 mo.md(_result["global_md"]),
@@ -3323,6 +3747,16 @@ def _(
             if _gp_diag.get("log_ls_at_upper_bound"):
                 _gp_msg += " log_ls is at the upper prior bound."
             _result_elements.append(mo.callout(mo.md(_gp_msg), kind="warn"))
+        if _local_cov.get("enabled"):
+            _local_kind = "warn" if _local_cov.get("error") else "neutral"
+            _local_msg = _local_cov.get("message") or (
+                f"{int(_local_cov.get('n_kernels', 0))} fixed local covariance "
+                "kernel(s) included."
+            )
+            _local_msg = f"Fixed local covariance enabled: {_local_msg}"
+            if _local_cov.get("error"):
+                _local_msg += f" Error: {_local_cov['error']}"
+            _result_elements.append(mo.callout(mo.md(_local_msg), kind=_local_kind))
         if _result.get("restart_table_rows"):
             _restart_rows = _result["restart_table_rows"]
             _restart_columns = list(_restart_rows[0].keys()) if _restart_rows else []
@@ -3451,8 +3885,7 @@ def _(emu, get_mle_model, mo, param_names, re):
 
 @app.cell
 def _(
-    alt,
-    build_bestfit_spectrum_altair,
+    covariance_diagonal_components,
     get_mle_model,
     get_mle_priors,
     ground_truth_params,
@@ -3465,9 +3898,11 @@ def _(
     mo,
     np,
     run_mcmc_btn,
+    set_mcmc_bestfit_plot,
     set_mcmc_labels,
     set_mcmc_corner_meta,
     set_mcmc_samples,
+    set_mcmc_sirocco_spectrum,
     set_mcmc_summary_df,
     set_inf_playground_target,
     stats,
@@ -3495,6 +3930,8 @@ def _(
         set_mcmc_labels(None)
         set_mcmc_summary_df(None)
         set_mcmc_corner_meta(None)
+        set_mcmc_bestfit_plot(None)
+        set_mcmc_sirocco_spectrum(None)
 
         _model = get_mle_model()
         _priors = get_mle_priors()
@@ -3583,7 +4020,7 @@ def _(
                         _ball[:, _i] = _mle_val + 0.1 * np.random.randn(_nwalkers)
 
                 # Create sampler — use DEMove + DESnookerMove for better
-                # performance in ≥5D (Ter Braak 2006; Nelson et al. 2014).
+                # performance in ≥5D (Ter Braak 2008; Nelson et al. 2013).
                 # The default StretchMove becomes increasingly inefficient
                 # above ~5 dimensions.
                 _moves = [
@@ -3903,15 +4340,45 @@ def _(
                     _plot_flux = _plot_flux.detach().cpu().numpy()
                 if hasattr(_plot_cov, 'detach'):
                     _plot_cov = _plot_cov.detach().cpu().numpy()
-                _fig_bestfit = build_bestfit_spectrum_altair(
-                    alt,
-                    wavelength=_model.data.wave,
-                    data_flux=_model.data.flux,
-                    model_flux=_plot_flux,
-                    model_cov_diag=_plot_cov,
-                    title=f"Best-Fit Model (MCMC Posterior Mean) — {_model.data_name}",
-                    zoom_name="inference_mcmc_bestfit_zoom",
+                _plot_covariance_components = covariance_diagonal_components(
+                    _model,
+                    _plot_cov,
                 )
+                # Store only the arrays needed to rebuild the plot.  The
+                # downstream plot cell can then react to a completed Sirocco
+                # simulation without re-entering this MCMC sampling cell.
+                _fit_key = tuple(
+                    float(_mcmc_means[_label])
+                    for _label in _model.labels
+                )
+                _sirocco_transforms = {}
+                for _label in ("Av", "Rv", "log_scale"):
+                    if _label in _model.params:
+                        _sirocco_transforms[_label] = float(_model.params[_label])
+                if "Av" in _sirocco_transforms and "Rv" not in _sirocco_transforms:
+                    _sirocco_transforms["Rv"] = 3.1
+                _cheb_terms = []
+                _cheb_index = 1
+                while f"cheb:{_cheb_index}" in _model.params:
+                    _cheb_terms.append(float(_model.params[f"cheb:{_cheb_index}"]))
+                    _cheb_index += 1
+                if _cheb_terms:
+                    _sirocco_transforms["cheb"] = _cheb_terms
+
+                set_mcmc_bestfit_plot({
+                    "fit_key": _fit_key,
+                    "wavelength": np.asarray(_model.data.wave, dtype=np.float64),
+                    "data_flux": np.asarray(_model.data.flux, dtype=np.float64),
+                    "model_flux": np.asarray(_plot_flux, dtype=np.float64),
+                    "model_cov_diag": np.asarray(_plot_cov, dtype=np.float64),
+                    "covariance_components": {
+                        _key: np.asarray(_value, dtype=np.float64)
+                        for _key, _value in _plot_covariance_components.items()
+                    },
+                    "title": f"Best-Fit Model (MCMC Posterior Mean) — {_model.data_name}",
+                    "grid_params": np.asarray(_model.grid_params, dtype=np.float64),
+                    "transforms": _sirocco_transforms,
+                })
 
                 # ============================================================
                 # Results table with ground truth comparison
@@ -3965,7 +4432,9 @@ def _(
                     set_inf_playground_target(_mcmc_playground_payload)
                     mo.status.toast("Loaded MCMC posterior mean into the Parameter Playground")
 
-                _playground_button = mo.ui.button(
+                # This button must have a public cell name for Marimo to keep
+                # the state-updating callback registered after MCMC completes.
+                mcmc_playground_export_button = mo.ui.button(
                     label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
                     on_click=_send_mcmc_to_playground,
                     kind="success",
@@ -3990,13 +4459,11 @@ def _(
 
                 mcmc_results = mo.vstack([
                     _status_callout,
-                    _playground_button,
+                    mcmc_playground_export_button,
                     mo.md(_results_md),
                     _chain_accordion,
                     mo.md("### Corner Plot"),
                     _corner_display,
-                    mo.md("### Best-Fit Model (MCMC Posterior Mean)"),
-                    _fig_bestfit,
                 ])
 
             except Exception as _e:
@@ -4005,6 +4472,51 @@ def _(
                 mcmc_results = mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} MCMC Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
 
     mcmc_results if mcmc_results else mo.md("*Configure and run MCMC after MLE*")
+    return
+
+
+@app.cell
+def _(
+    alt,
+    build_bestfit_spectrum_altair,
+    get_mcmc_bestfit_plot,
+    get_mcmc_sirocco_spectrum,
+    mo,
+):
+    """Render the posterior-mean plot independently of the MCMC run cell."""
+    _plot = get_mcmc_bestfit_plot()
+    if _plot is None:
+        mo.stop(True, mo.md(""))
+
+    _sirocco = get_mcmc_sirocco_spectrum()
+    _extra_series = None
+    if (
+        _sirocco is not None
+        and tuple(_sirocco.get("fit_key", ())) == tuple(_plot.get("fit_key", ()))
+    ):
+        _extra_series = {
+            "wavelength": _sirocco.get("wavelength", []),
+            "flux": _sirocco.get("flux", []),
+            "label": _sirocco.get("label", "Sirocco Model"),
+            "color": "#9B59B6",
+            "dash": [],
+        }
+
+    _bestfit_chart = build_bestfit_spectrum_altair(
+        alt,
+        wavelength=_plot["wavelength"],
+        data_flux=_plot["data_flux"],
+        model_flux=_plot["model_flux"],
+        model_cov_diag=_plot["model_cov_diag"],
+        title=_plot["title"],
+        zoom_name="inference_mcmc_bestfit_zoom",
+        covariance_components=_plot.get("covariance_components"),
+        extra_flux_series=_extra_series,
+    )
+    mo.vstack([
+        mo.md("### Best-Fit Model (MCMC Posterior Mean)"),
+        _bestfit_chart,
+    ])
     return
 
 
@@ -4022,6 +4534,26 @@ def _(mo):
     return
 
 
+@app.cell
+def _(mo, os):
+    # Sirocco subprocesses are local-only.  Do not construct or expose their
+    # controls in the hosted Hugging Face Space environment.
+    if os.environ.get("SPACE_ID") is not None:
+        inference_sirocco_cpu_slider = None
+    else:
+        _cpu_total = max(1, os.cpu_count() or 1)
+        inference_sirocco_cpu_slider = mo.ui.slider(
+            start=1,
+            stop=_cpu_total,
+            value=max(1, _cpu_total // 2),
+            step=1,
+            show_value=True,
+            label="Sirocco CPUs",
+            full_width=False,
+        )
+    return (inference_sirocco_cpu_slider,)
+
+
 @app.cell(hide_code=True)
 def _(
     emu,
@@ -4030,6 +4562,7 @@ def _(
     get_mcmc_samples,
     get_mcmc_summary_df,
     get_mle_model,
+    inference_sirocco_cpu_slider,
     mo,
     np,
     os,
@@ -4047,6 +4580,62 @@ def _(
     export_corner_btn = mo.ui.run_button(label=f"{mo.icon('lucide:download')} Export Cornerplot Data", kind="success")
     export_dir_input = mo.ui.text(value="exports", label="Output directory")
 
+    run_sirocco_model_btn = None
+    _button_row = [export_pf_btn]
+    _runtime_notes = []
+    if inference_sirocco_cpu_slider is not None:
+        # A failure in this optional probe must not suppress the ordinary
+        # posterior export buttons that share this cell.
+        try:
+            from Speculate_addons.speculate_benchmark import (
+                check_sirocco_runtime as _check_sirocco_runtime,
+            )
+            _inference_sirocco_runtime = _check_sirocco_runtime(
+                inference_sirocco_cpu_slider.value
+            )
+            _sirocco_error = None
+        except Exception as _probe_exc:
+            _inference_sirocco_runtime = {
+                "ok": False,
+                "missing": ["runtime probe"],
+            }
+            _sirocco_error = str(_probe_exc)
+        _sirocco_missing = ", ".join(
+            _inference_sirocco_runtime.get("missing", [])
+        )
+        run_sirocco_model_btn = mo.ui.run_button(
+            label=f"{mo.icon('lucide:wind')} Run Sirocco Model",
+            kind="success" if _inference_sirocco_runtime["ok"] else "danger",
+            disabled=not _inference_sirocco_runtime["ok"],
+            tooltip=(
+                "Run the MCMC posterior-mean model through Sirocco"
+                if _inference_sirocco_runtime["ok"]
+                else f"Sirocco is unavailable; missing: {_sirocco_missing}"
+            ),
+        )
+        _button_row.extend([
+            inference_sirocco_cpu_slider,
+            run_sirocco_model_btn,
+        ])
+        _runtime_notes.append(
+            (
+                mo.md("")
+                if _inference_sirocco_runtime["ok"]
+                else mo.callout(
+                    mo.md(
+                        (
+                            f"Sirocco runtime detection failed: `{_sirocco_error}`."
+                            if _sirocco_error
+                            else "Sirocco model runs are unavailable. "
+                            f"Missing command(s): `{_sirocco_missing}`."
+                        )
+                    ),
+                    kind="danger",
+                )
+            )
+        )
+    _button_row.extend([export_csv_btn, export_corner_btn])
+
     # Gate the display (not the widget creation) behind a completed MCMC run.
     mo.stop(
         _samples is None or _model is None,
@@ -4055,9 +4644,16 @@ def _(
 
     mo.vstack([
         mo.hstack([export_dir_input], gap=1),
-        mo.hstack([export_pf_btn, export_csv_btn, export_corner_btn], gap=1),
+        mo.hstack(_button_row, gap=1, align="end"),
+        *_runtime_notes,
     ])
-    return export_corner_btn, export_csv_btn, export_dir_input, export_pf_btn
+    return (
+        export_corner_btn,
+        export_csv_btn,
+        export_dir_input,
+        export_pf_btn,
+        run_sirocco_model_btn,
+    )
 
 
 @app.cell
@@ -4067,15 +4663,20 @@ def _(
     export_csv_btn,
     export_dir_input,
     export_pf_btn,
+    get_mcmc_bestfit_plot,
     get_mcmc_corner_meta,
     get_mcmc_labels,
     get_mcmc_samples,
     get_mcmc_summary_df,
     get_mle_model,
     grid_selector,
+    inference_sirocco_cpu_slider,
     mo,
     np,
+    obs_flux_scale,
     os,
+    run_sirocco_model_btn,
+    set_mcmc_sirocco_spectrum,
 ):
     import time as _time
     _samples = get_mcmc_samples()
@@ -4101,41 +4702,138 @@ def _(
 
     _summary_dict = _summary_to_dict(_summary_df)
 
+    def _write_mcmc_pf(_pf_path):
+        """Write one posterior-mean `.pf` shared by export and model runs."""
+        from Speculate_addons.speculate_benchmark import (
+            export_pf_template as _export_pf_template,
+            internal_to_friendly as _internal_to_friendly,
+            resolve_sirocco_observer_angle as _resolve_sirocco_observer_angle,
+        )
+
+        os.makedirs(os.path.dirname(_pf_path) or ".", exist_ok=True)
+        _plot_payload = get_mcmc_bestfit_plot() or {}
+        _grid_means = np.asarray(
+            _plot_payload.get("grid_params", _model.grid_params),
+            dtype=np.float64,
+        )
+        _friendly_grid = _internal_to_friendly(
+            emu.param_names,
+            grid_selector.value,
+        )
+
+        # Frozen grid parameters do not have MCMC columns.  Add uncertainty
+        # annotations only for axes that were actually sampled.
+        _uncertainties = {}
+        for _friendly_label in _friendly_grid:
+            if _friendly_label not in (_labels or []):
+                continue
+            _sample_index = list(_labels).index(_friendly_label)
+            _uncertainties[_friendly_label] = (
+                float(np.percentile(_samples[:, _sample_index], 16)),
+                float(np.percentile(_samples[:, _sample_index], 84)),
+            )
+
+        # Nuisance values are annotations in the parameter file; physical
+        # transformations are applied separately to the returned spectrum.
+        _global = {}
+        for _sample_index, _label in enumerate(_labels or []):
+            if _label not in _friendly_grid:
+                _global[_label] = float(np.mean(_samples[:, _sample_index]))
+
+        _observer_angle = _resolve_sirocco_observer_angle(
+            emu,
+            _grid_means,
+            grid_selector.value,
+        )
+        _export_pf_template(
+            emu,
+            _grid_means,
+            _pf_path,
+            uncertainties=_uncertainties,
+            global_params=_global,
+            grid_name=grid_selector.value,
+            observer_angles=[_observer_angle],
+        )
+        return _plot_payload
+
     if export_pf_btn.value and _model is not None and _samples is not None:
         try:
-            from Speculate_addons.speculate_benchmark import export_pf_template, emulator_to_physical
-
-            os.makedirs(_out_dir, exist_ok=True)
-
-            # The .pf export uses posterior-mean grid parameters as the template
-            # centre and attaches percentile-based uncertainties per grid axis.
-            _n_grid = len(emu.param_names)
-            _grid_means = np.mean(_samples[:, :_n_grid], axis=0)
-
-            # Export uncertainties as 16th/84th percentile bounds in the same
-            # friendly label space used in the results tables.
-            _uncertainties = {}
-            for _i, _label in enumerate(_labels[:_n_grid]):
-                _lo = np.percentile(_samples[:, _i], 16)
-                _hi = np.percentile(_samples[:, _i], 84)
-                _uncertainties[_label] = (_lo, _hi)
-
-            # Preserve posterior-mean nuisance parameters alongside the grid values
-            # so the exported template records the full fitted configuration.
-            _global = {}
-            for _i in range(_n_grid, _samples.shape[1]):
-                _global[_labels[_i]] = float(np.mean(_samples[:, _i]))
-
             _pf_path = os.path.join(_out_dir, f"speculate_export_{_ts}.pf")
-            export_pf_template(
-                emu, _grid_means, _pf_path,
-                uncertainties=_uncertainties,
-                global_params=_global,
-                grid_name=grid_selector.value,
-            )
+            _write_mcmc_pf(_pf_path)
             _msg += f"{mo.icon('lucide:check-circle')} .pf template exported to `{_pf_path}`\n\n"
         except Exception as _e:
             _msg += f"{mo.icon('lucide:x-circle')} .pf export failed: {_e}\n\n"
+
+    if (
+        run_sirocco_model_btn is not None
+        and run_sirocco_model_btn.value
+        and inference_sirocco_cpu_slider is not None
+        and _model is not None
+        and _samples is not None
+    ):
+        try:
+            from Speculate_addons.speculate_benchmark import (
+                check_sirocco_runtime as _check_sirocco_runtime,
+                run_sirocco_model_spectrum as _run_sirocco_model_spectrum,
+            )
+
+            _sirocco_cpus = int(inference_sirocco_cpu_slider.value)
+            _runtime = _check_sirocco_runtime(_sirocco_cpus)
+            if not _runtime["ok"]:
+                raise RuntimeError(
+                    "Missing Sirocco runtime command(s): "
+                    + ", ".join(_runtime["missing"])
+                )
+
+            import tempfile as _tempfile
+
+            os.makedirs(_out_dir, exist_ok=True)
+            _run_dir = _tempfile.mkdtemp(
+                prefix=f"speculate_sirocco_{_ts}_",
+                dir=_out_dir,
+            )
+            _pf_path = os.path.join(
+                _run_dir,
+                f"speculate_sirocco_{_ts}.pf",
+            )
+            _plot_payload = _write_mcmc_pf(_pf_path)
+            _wavelength = np.asarray(_plot_payload["wavelength"], dtype=np.float64)
+
+            with mo.status.spinner(
+                title=f"Running Sirocco model with {_sirocco_cpus} CPU(s)..."
+            ) as _spinner:
+                def _progress(_event):
+                    _spinner.update(_event.get("message", "Running Sirocco model..."))
+
+                _sirocco_result = _run_sirocco_model_spectrum(
+                    _pf_path,
+                    (float(np.min(_wavelength)), float(np.max(_wavelength))),
+                    # Use the fitted model's space rather than a live
+                    # observation-preprocessing selector.
+                    flux_scale=str(
+                        getattr(_model, "flux_scale", obs_flux_scale.value)
+                    ),
+                    transforms=_plot_payload.get("transforms"),
+                    smoothing=(
+                        "_smooth"
+                        in os.path.basename(
+                            str(getattr(emu, "name", ""))
+                        ).lower()
+                    ),
+                    cpus=_sirocco_cpus,
+                    progress_callback=_progress,
+                )
+
+            _sirocco_result["fit_key"] = tuple(_plot_payload.get("fit_key", ()))
+            set_mcmc_sirocco_spectrum(_sirocco_result)
+            _msg += (
+                f"{mo.icon('lucide:check-circle')} Sirocco model completed and "
+                f"was added to the MCMC best-fit plot using "
+                f"**{_sirocco_cpus} CPU(s)**. Output: "
+                f"`{_sirocco_result['sirocco_spec_path']}`\n\n"
+            )
+        except Exception as _e:
+            _msg += f"{mo.icon('lucide:x-circle')} Sirocco run failed: {_e}\n\n"
 
     if export_csv_btn.value and _samples is not None:
         try:
@@ -4178,8 +4876,18 @@ def _(
         except Exception as _e:
             _msg += f"{mo.icon('lucide:x-circle')} Cornerplot export failed: {_e}\n\n"
 
-    if _msg:
-        mo.output.replace(mo.callout(mo.md(_msg), kind="success"))
+    # Keep the status callout as the cell's rendered expression.  This makes
+    # long Sirocco runs and export failures visibly resolve in the notebook,
+    # instead of relying on an imperative output replacement at cell teardown.
+    _result_output = (
+        mo.callout(
+            mo.md(_msg),
+            kind="danger" if "failed:" in _msg.lower() else "success",
+        )
+        if _msg
+        else mo.md("")
+    )
+    _result_output
     return
 
 

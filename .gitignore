@@ -232,5 +232,6 @@ raw_scripts_of_notebooks/
 old_scripts/
 benchmark_results/*
 papers/
-
+to_delete/
+regression_tests/
 

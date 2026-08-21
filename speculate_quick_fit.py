@@ -2262,13 +2262,15 @@ def _(
             _pred_runs.append(_pred)
         return np.mean(_pred_runs, axis=0)
 
-    def _compute_test_grid_flux_r2():
+    def _compute_test_grid_diagnostics():
         """Compare local test-grid spectra to emulator predictions at truth.
 
         This is a lightweight generalisation diagnostic, not a full inference
         run.  It avoids MLE, distance/extinction nuisance parameters, and MCMC.
         Instead, each testgrid spectrum is compared directly to the Quick Fit
         spectrum predicted at that row's lookup-table ground-truth parameters.
+        Alongside the per-spectrum R² summary, it returns per-wavelength RMSE
+        curves for the PCA-only projection and the final emulator prediction.
 
         The routine is deliberately local-only for spectra and lookup metadata;
         training should not trigger large HuggingFace downloads behind the
@@ -2302,20 +2304,20 @@ def _(
             _grid_name = qf_pca_data.get("grid_name")
             _grid_config = _get_grid_config(_grid_name)
             if _grid_config is None:
-                return None, "unknown grid"
+                return None, "unknown grid", None
 
             _test_grid_name = _grid_config.get("test_grid_name") or str(_grid_name).replace("_grid_", "_testgrid_")
             _test_grid_path = os.path.join("sirocco_grids", _test_grid_name)
             _lookup_path = os.path.join(_test_grid_path, "grid_run_lookup_table.parquet")
             if not os.path.exists(_lookup_path):
-                return None, f"no local lookup table for `{_test_grid_name}`"
+                return None, f"no local lookup table for `{_test_grid_name}`", None
 
             # The lookup table links each runN.spec file to its known Sirocco
             # simulation inputs.  Those physical values are later converted to
             # the emulator-coordinate system used by the Quick Fit model.
             _lookup_df = pd.read_parquet(_lookup_path)
             if "Run Number" not in _lookup_df.columns:
-                return None, f"lookup table for `{_test_grid_name}` has no Run Number column"
+                return None, f"lookup table for `{_test_grid_name}` has no Run Number column", None
 
             # A Quick Fit model can either expose inclination as a trained input
             # axis, or bake in one fixed inclination column at grid-build time.
@@ -2464,7 +2466,7 @@ def _(
                     continue
 
             if not _flux_rows:
-                return None, f"no local test-grid spectra could be processed for `{_test_grid_name}`"
+                return None, f"no local test-grid spectra could be processed for `{_test_grid_name}`", None
 
             # Mirror the PCA preprocessing from training.  Before per-wavelength
             # standardisation, Quick Fit removes each spectrum's overall flux
@@ -2485,6 +2487,28 @@ def _(
             # procedure.
             _pred_weights = _predict_pca_weights(np.asarray(_param_rows, dtype=np.float32))
             _pred_flux = _weights_to_flux(_pred_weights)
+
+            # Project the *true* test-grid spectra through the stored training
+            # PCA basis.  This is the PCA-only oracle: it isolates truncation
+            # error from any GI/NN prediction error on exactly the same spectra.
+            _flux_mean = np.asarray(qf_pca_data["flux_mean"], dtype=np.float64)
+            _flux_std = np.asarray(qf_pca_data["flux_std"], dtype=np.float64)
+            _eigenspectra = np.asarray(qf_pca_data["eigenspectra"], dtype=np.float64)
+            _truth_standardised = (_truth_compare - _flux_mean) / _flux_std
+            _oracle_weights = _truth_standardised @ _eigenspectra.T
+            _pca_oracle_flux = (
+                _oracle_weights @ (_eigenspectra * _flux_std)
+            ) + _flux_mean
+            _test_rmse = {
+                "wavelength": _wl_model,
+                "pca_per_wl_rmse": np.sqrt(
+                    np.mean((_truth_compare - _pca_oracle_flux) ** 2, axis=0)
+                ),
+                "model_per_wl_rmse": np.sqrt(
+                    np.mean((_truth_compare - _pred_flux) ** 2, axis=0)
+                ),
+            }
+
             # Compute one R^2 value per spectrum along the wavelength axis,
             # then report the mean and worst case.  This is deliberately a
             # flux-curve score, not a parameter-recovery or likelihood score.
@@ -2493,7 +2517,7 @@ def _(
             _r2_spec = 1 - _ss_res_spec / np.where(_ss_tot_spec > 0, _ss_tot_spec, 1.0)
             _r2_stats = _summarise_r2_values(_r2_spec)
             if _r2_stats is None:
-                return None, f"test-grid R² was non-finite for `{_test_grid_name}`"
+                return None, f"test-grid R² was non-finite for `{_test_grid_name}`", None
 
             # Return a compact summary for the callout and for qf_train_info so
             # exported/debug views can distinguish regular-grid and testgrid
@@ -2506,9 +2530,9 @@ def _(
                 "min": _r2_stats["min"],
                 "bottom5": _r2_stats["bottom5"],
                 "inclinations": [int(_inc) for _inc in _inclinations],
-            }, ""
+            }, "", _test_rmse
         except Exception as _exc:
-            return None, str(_exc)
+            return None, str(_exc), None
 
     if _source == "grid_interp":
         _regular_grid_flux_r2 = _compute_regular_grid_flux_r2(_loo_true, _loo_pred, "loo")
@@ -2524,7 +2548,7 @@ def _(
     else:
         _regular_grid_flux_r2_line = f"- **{_regular_flux_r2_label}:** not available"
 
-    _test_grid_r2, _test_grid_r2_note = _compute_test_grid_flux_r2()
+    _test_grid_r2, _test_grid_r2_note, _test_grid_rmse = _compute_test_grid_diagnostics()
     if _test_grid_r2 is not None:
         _test_grid_r2_line = (
             f"- **Test Grid Flux R²:** Mean {_test_grid_r2['mean']:.6f} | "
@@ -2566,10 +2590,12 @@ def _(
         kind="success"
     )
 
-    # ── Per-Wavelength RMSE Envelope ─────────────────────────────────────
-    # Two lines, matching the Tier 1 benchmark diagnostic:
+    # ── Per-Wavelength RMSE Envelopes ────────────────────────────────────
+    # The training-grid view retains the existing diagnostic:
     #   Blue  — "PCA truncation only": irreducible floor from discarding higher components.
-    #   Red   — "LOO (PCA + model)":   total error = PCA truncation + interpolation/NN error.
+    #   Red   — total regular-grid error from the available GI/NN diagnostic.
+    # The test-grid view instead uses direct final-flux residuals for both
+    # architectures, making that tab the like-for-like comparison for Figure 4.
     _eigenspectra = qf_pca_data["eigenspectra"]   # (n_comp, n_wl)
     _flux_std = qf_pca_data["flux_std"]           # (n_wl,)
     _wl = qf_pca_data["wl"]                       # (n_wl,)
@@ -2587,7 +2613,11 @@ def _(
     # Total RMSE = sqrt(PCA_truncation² + model_prediction²) — the two sources add in quadrature
     _total_per_wl_rmse = np.sqrt(_pca_rmse ** 2 + _model_per_wl_rmse ** 2)
 
-    _model_label = f"LOO (PCA + {'Interp' if _source == 'grid_interp' else 'NN'})"
+    _model_label = (
+        "Approx. LOO (PCA + GI)"
+        if _source == "grid_interp"
+        else "Training fit (PCA + NN)"
+    )
     # VegaFusion shortens float32 inline data in compiled Vega specs; cast chart
     # data to float64 so exported RMSE values retain their available precision.
     _rmse_wavelength = np.asarray(_wl, dtype=np.float64)
@@ -2597,7 +2627,7 @@ def _(
     _total_df = pd.DataFrame({"Wavelength": _rmse_wavelength, "RMSE": _total_rmse_export, "Source": _model_label})
     _rmse_df = pd.concat([_pca_df, _total_df], ignore_index=True)
 
-    _rmse_chart = alt.Chart(_rmse_df).mark_line(
+    _training_rmse_chart = alt.Chart(_rmse_df).mark_line(
         strokeWidth=1.5,
     ).encode(
         x=alt.X("Wavelength:Q", title="Wavelength (Å)",
@@ -2614,11 +2644,82 @@ def _(
         ],
     ).properties(
         width="container", height=200,
-        title="Per-Wavelength Reconstruction Error"
+        title="Training Grid Per-Wavelength Reconstruction Error"
     ).interactive(bind_y=False)
 
+    if _test_grid_rmse is not None:
+        _test_wl = np.asarray(_test_grid_rmse["wavelength"], dtype=np.float64)
+        _test_pca_rmse = np.asarray(_test_grid_rmse["pca_per_wl_rmse"], dtype=np.float64)
+        _test_model_rmse = np.asarray(_test_grid_rmse["model_per_wl_rmse"], dtype=np.float64)
+        _test_model_label = f"Test grid (PCA + {'GI' if _source == 'grid_interp' else 'NN'})"
+        _test_rmse_df = pd.concat(
+            [
+                pd.DataFrame({
+                    "Wavelength": _test_wl,
+                    "RMSE": _test_pca_rmse,
+                    "Source": "Test-grid PCA projection only",
+                }),
+                pd.DataFrame({
+                    "Wavelength": _test_wl,
+                    "RMSE": _test_model_rmse,
+                    "Source": _test_model_label,
+                }),
+            ],
+            ignore_index=True,
+        )
+        _test_rmse_chart = alt.Chart(_test_rmse_df).mark_line(
+            strokeWidth=1.5,
+        ).encode(
+            x=alt.X(
+                "Wavelength:Q",
+                title="Wavelength (Å)",
+                scale=alt.Scale(domain=[float(_test_wl.min()), float(_test_wl.max())]),
+            ),
+            y=alt.Y("RMSE:Q", title="RMSE (normalised flux)", axis=alt.Axis(format=".1e")),
+            color=alt.Color(
+                "Source:N",
+                title="",
+                scale=alt.Scale(
+                    domain=["Test-grid PCA projection only", _test_model_label],
+                    range=["#3498db", "#e74c3c"],
+                ),
+                legend=alt.Legend(orient="top"),
+            ),
+            tooltip=[
+                alt.Tooltip("Source:N"),
+                alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+                alt.Tooltip("RMSE:Q", format=".4e"),
+            ],
+        ).properties(
+            width="container",
+            height=200,
+            title="Test Grid Per-Wavelength Reconstruction Error",
+        ).interactive(bind_y=False)
+        _test_rmse_content = mo.vstack([
+            _test_rmse_chart,
+            mo.md(
+                f"*Direct residuals across {_test_grid_r2['n_spectra']} independent "
+                f"spectra from `{_test_grid_r2['test_grid_name']}`. The blue curve "
+                "projects each true test spectrum through the retained PCA basis; "
+                "the red curve uses the emulator prediction at the known test-grid parameters.*"
+            ),
+        ])
+    else:
+        _test_rmse_content = mo.callout(
+            mo.md(
+                "**Test-grid RMSE unavailable.** "
+                f"{_test_grid_r2_note or 'No paired local test grid was found.'}"
+            ),
+            kind="warn",
+        )
+
+    _rmse_tabs = mo.ui.tabs({
+        "Training Grid": _training_rmse_chart,
+        "Test Grid": _test_rmse_content,
+    })
+
     # ── Assemble summary output ──────────────────────────────────────────
-    _elements = [_summary, _rmse_chart]
+    _elements = [_summary, _rmse_tabs]
 
     if _source == "nn" and "hparams" in qf_train_info and qf_train_info["hparams"]:
         _lines = [f"- **{k}**: `{v}`" for k, v in qf_train_info["hparams"].items()]
@@ -3175,6 +3276,11 @@ def _(
                 "max_params": np.array(_npz["grid_points"]).max(axis=0),
                 "source_file": qf_inf_model_selector.value,
                 "scale": str(_npz.get("scale", "linear")),
+                "smoothing": (
+                    bool(np.asarray(_npz["smoothing"]).item())
+                    if "smoothing" in _npz.files
+                    else "_smooth" in qf_inf_model_selector.value.lower()
+                ),
                 "selected_param_indices": _selected_param_indices,
                 "fixed_inclination": _fixed_inclination,
             }
@@ -3315,12 +3421,19 @@ def _(mo):
 
 
 @app.cell
-def _(get_qf_last_uploaded_obs, get_qf_obs_refresh, mo, os):
+def _(get_qf_last_uploaded_obs, get_qf_obs_refresh, mo, os, qf_inf_emu_data, qf_inf_model_selector):
+    from Speculate_addons.grid_registry import infer_grid_name as _infer_grid_name
+    from Speculate_addons.observation_priors import filter_observation_files_for_grid as _filter_observation_files_for_grid
+
     _ = get_qf_obs_refresh()
     _obs_dir = "observation_files"
     qf_obs_files = []
     if os.path.exists(_obs_dir):
         qf_obs_files = sorted([f for f in os.listdir(_obs_dir) if f.endswith(('.csv', '.txt', '.dat'))])
+        _grid_name = qf_inf_emu_data.get("grid_name") if qf_inf_emu_data is not None else None
+        if not _grid_name and qf_inf_model_selector is not None:
+            _grid_name = _infer_grid_name(qf_inf_model_selector.value)
+        qf_obs_files = _filter_observation_files_for_grid(qf_obs_files, _grid_name)
 
     if qf_obs_files:
         _last_uploaded = get_qf_last_uploaded_obs()
@@ -3690,10 +3803,8 @@ def _(mo, qf_inf_emu_data, qf_obs_data):
 
 @app.cell
 def _(mo, qf_inf_emu_data, qf_inf_model_selector):
-    # Auto-detect the emulator's training scale from its metadata so the
-    # observation transform dropdown starts on a sensible default.  Users can
-    # override this when their observation is already pre-processed (e.g. a
-    # pre-computed continuum-normalised spectrum would just use "linear").
+    # Limit choices to transformations compatible with the loaded model, but
+    # never infer the observation's current representation from that model.
     _detected_scale = "linear"
     if qf_inf_emu_data is not None:
         _detected_scale = qf_inf_emu_data.get("scale", "linear")
@@ -3717,7 +3828,7 @@ def _(mo, qf_inf_emu_data, qf_inf_model_selector):
 
     qf_obs_scale_selector = mo.ui.dropdown(
         options=_options,
-        value=_detected_scale,
+        value="linear",
         label="Observation Flux Transform:",
         full_width=True,
     )
@@ -3868,13 +3979,16 @@ def _(
                 })
                 mo.status.toast("Loaded ground truth into the Parameter Playground")
 
+            # A direct, anonymous button does not retain its on_click handler
+            # in Marimo; bind it to a unique public cell name first.
+            qf_ground_truth_playground_export_button = mo.ui.button(
+                label=f"{mo.icon('lucide:sliders-horizontal')} Export ground truth to parameter playground",
+                on_click=_send_ground_truth_to_playground,
+                kind="success",
+            )
             _obs_status = mo.vstack([
                 _obs_status,
-                mo.ui.button(
-                    label=f"{mo.icon('lucide:sliders-horizontal')} Export ground truth to parameter playground",
-                    on_click=_send_ground_truth_to_playground,
-                    kind="success",
-                ),
+                qf_ground_truth_playground_export_button,
             ])
 
     _is_test_grid_source = "Test Grid" in qf_data_source_selector.value
@@ -4079,6 +4193,21 @@ def _(
     _fixed_inclination = qf_inf_emu_data.get("fixed_inclination")
     _n_params = len(_param_names)
     _param_map_db = qf_param_map_db_for_grid(qf_inf_emu_data.get("grid_name"))
+    from Speculate_addons.observation_priors import OBSERVATION_PRIORS as _OBSERVATION_PRIORS
+
+    _is_test_grid_data = bool(
+        qf_obs_data is not None and qf_obs_data.attrs.get("is_test_grid", False)
+    )
+    # Observation loaders preserve the selected filename in dataframe attrs.
+    # The shipped names match the catalogue exactly; other uploads keep
+    # the existing generic controls.
+    _observation_prior = (
+        _OBSERVATION_PRIORS.get(
+            str(qf_obs_data.attrs.get("source_label", "")).lower()
+        )
+        if qf_obs_data is not None and not _is_test_grid_data
+        else None
+    )
     qf_distance_prior_ack = mo.ui.checkbox(
         value=False,
         label="I have entered the target distance and uncertainty",
@@ -4089,6 +4218,9 @@ def _(
     _min_inputs = []
     _max_inputs = []
     _labels = []
+    # The distribution kind only changes the row labels and catalogue defaults:
+    # Quick Fit continues to minimise spectral chi-squared within these bounds.
+    _prior_kinds = []
 
     for _i in range(_n_params):
         _name = _param_names[_i]
@@ -4101,15 +4233,47 @@ def _(
         _lo = float(_min_p[_i])
         _hi = float(_max_p[_i])
         _mid = (_lo + _hi) / 2.0
+        _kind = "uniform"
+        _ui_lo = _lo
+        _ui_hi = _hi
+        _value = _mid
+
+        if "inclination" in _display.lower() and _observation_prior is not None:
+            _inclination_prior = _observation_prior["inclination_deg"]
+            _kind = _inclination_prior["kind"]
+            if _kind == "normal":
+                # Quoted inclinations use their cited mean and ±2σ interval.
+                _value = float(_inclination_prior["mean"])
+                _inc_sigma = float(_inclination_prior["sigma"])
+                _ui_lo = _value - 2.0 * _inc_sigma
+                _ui_hi = _value + 2.0 * _inc_sigma
+            else:
+                # Dash-separated ranges are Uniform and stay inside the model grid.
+                _ui_lo = max(_lo, float(_inclination_prior["min"]))
+                _ui_hi = min(_hi, float(_inclination_prior["max"]))
+                _requested_start = float(_inclination_prior.get(
+                    "start",
+                    0.5 * (_ui_lo + _ui_hi),
+                ))
+                _value = min(max(_requested_start, _ui_lo), _ui_hi)
         _labels.append(_display)
+        _prior_kinds.append(_kind)
 
         _fixed_toggles.append(mo.ui.checkbox(label="Fix", value=False))
-        _value_inputs.append(mo.ui.number(value=round(_mid, 4), step=0.001, label="Value"))
-        _min_inputs.append(mo.ui.number(value=round(_lo, 4), step=0.001, label="Min"))
-        _max_inputs.append(mo.ui.number(value=round(_hi, 4), step=0.001, label="Max"))
+        _value_inputs.append(mo.ui.number(
+            value=round(_value, 4), step=0.001,
+            label="Center" if _kind == "normal" else "Value", full_width=True,
+        ))
+        _min_inputs.append(mo.ui.number(
+            value=round(_ui_lo, 4), step=0.001,
+            label="-2σ" if _kind == "normal" else "Min", full_width=True,
+        ))
+        _max_inputs.append(mo.ui.number(
+            value=round(_ui_hi, 4), step=0.001,
+            label="+2σ" if _kind == "normal" else "Max", full_width=True,
+        ))
 
     _model_flux_scale = str(qf_inf_emu_data.get("scale", "linear"))
-    _is_test_grid_data = bool(qf_obs_data is not None and qf_obs_data.attrs.get("is_test_grid", False))
     _fix_distance_for_shape_only = (
         qf_obs_scale_selector.value == "continuum-normalised"
         or _model_flux_scale == "continuum-normalised"
@@ -4122,17 +4286,46 @@ def _(
     #   • Observational spectra: every nuisance parameter defaults to FREE.
     # Continuum-normalised fits still pin Distance because the flux scale is
     # degenerate there.  (Quick Fit has no GP covariance nuisance parameters.)
+    _distance_prior = (
+        _observation_prior["distance_pc"]
+        if _observation_prior is not None
+        else {"kind": "normal", "mean": 100.0, "sigma": 5.0}
+    )
+    _distance_value = float(_distance_prior["mean"])
+    # All current Table A1 distances are quoted measurements, so they are
+    # Normal. Unknown files keep the historical 100 pc centre and 90/110 pc
+    # -2σ/+2σ display, equivalent to sigma=5 pc.
+    _distance_sigma = float(_distance_prior["sigma"])
+    _distance_lo = _distance_value - 2.0 * _distance_sigma
+    _distance_hi = _distance_value + 2.0 * _distance_sigma
     _nuisance = [
-        ("Av",        0.0,         0.0,               2.0, _is_test_grid_data),
-        ("Distance (pc)", 100.0, 90.0, 110.0, _is_test_grid_data or _fix_distance_for_shape_only),
-        ("cheb_1",    0.0,         -0.5,              0.5, False),
+        ("Av", 0.0, 0.0, 2.0, _is_test_grid_data, "uniform"),
+        (
+            "Distance (pc)",
+            _distance_value,
+            _distance_lo,
+            _distance_hi,
+            _is_test_grid_data or _fix_distance_for_shape_only,
+            "normal",
+        ),
+        ("cheb_1", 0.0, -0.5, 0.5, False, "uniform"),
     ]
-    for _name, _val, _lo, _hi, _fixed_default in _nuisance:
+    for _name, _val, _lo, _hi, _fixed_default, _kind in _nuisance:
         _labels.append(_name)
+        _prior_kinds.append(_kind)
         _fixed_toggles.append(mo.ui.checkbox(label="Fix", value=_fixed_default))
-        _value_inputs.append(mo.ui.number(value=round(_val, 4), step=0.01, label="Value"))
-        _min_inputs.append(mo.ui.number(value=round(_lo, 4), step=0.01, label="Min"))
-        _max_inputs.append(mo.ui.number(value=round(_hi, 4), step=0.01, label="Max"))
+        _value_inputs.append(mo.ui.number(
+            value=round(_val, 4), step=0.01,
+            label="Center" if _kind == "normal" else "Value", full_width=True,
+        ))
+        _min_inputs.append(mo.ui.number(
+            value=round(_lo, 4), step=0.01,
+            label="-2σ" if _kind == "normal" else "Min", full_width=True,
+        ))
+        _max_inputs.append(mo.ui.number(
+            value=round(_hi, 4), step=0.01,
+            label="+2σ" if _kind == "normal" else "Max", full_width=True,
+        ))
 
     qf_param_config = {
         "labels": _labels,
@@ -4140,6 +4333,7 @@ def _(
         "values": _value_inputs,
         "mins": _min_inputs,
         "maxs": _max_inputs,
+        "prior_kinds": _prior_kinds,
         "n_physical": _n_params,
         "distance_prior_ack": qf_distance_prior_ack,
         "fixed_inclination": _fixed_inclination,
@@ -4158,6 +4352,7 @@ def _(mo, qf_param_config):
     _value_inputs = qf_param_config["values"]
     _min_inputs = qf_param_config["mins"]
     _max_inputs = qf_param_config["maxs"]
+    _prior_kinds = qf_param_config["prior_kinds"]
     _distance_prior_ack = qf_param_config["distance_prior_ack"]
     _fixed_inclination = qf_param_config.get("fixed_inclination")
     _fix_distance_for_shape_only = qf_param_config.get("fix_distance_for_shape_only", False)
@@ -4166,15 +4361,19 @@ def _(mo, qf_param_config):
     for _i, _name in enumerate(_labels):
         _row = mo.hstack([
             mo.md(f"**{_name}**"),
+            mo.md(f"`{'Normal' if _prior_kinds[_i] == 'normal' else 'Uniform'}`"),
             _fixed_toggles[_i],
             _value_inputs[_i],
             _min_inputs[_i],
             _max_inputs[_i],
-        ], justify="start", gap="0.5rem")
+        ], widths=[3, 1, 1, 2, 2, 2], align="end", gap="0.75rem")
         _config_elements.append(_row)
 
     _config_accordion = mo.accordion({
-        f"{mo.icon('lucide:sliders-horizontal')} Parameter Configuration": mo.vstack(_config_elements)
+        f"{mo.icon('lucide:sliders-horizontal')} Parameter Configuration": mo.vstack(
+            _config_elements,
+            gap="0.75rem",
+        )
     }, lazy=True)
 
     # Marimo only allows reactive widget-value reads in downstream cells, so the
@@ -4731,7 +4930,8 @@ def _(
             mo.callout(
                 mo.md(
                     "Confirm the Distance (pc) prior in the parameter configuration before running Quick Fit. "
-                    "The center is the target distance and the min/max fields define its uncertainty range."
+                    "The center is the target distance and the −2σ/+2σ fields "
+                    "define its Normal uncertainty."
                 ),
                 kind="warn",
             ),
@@ -4777,6 +4977,7 @@ def _(
         mo.stop(True, mo.callout(mo.md("No emulator wavelengths fall within the selected wavelength range."), kind="warn"))
 
     from Speculate_addons.distance_scale import distance_to_log_scale as _distance_to_log_scale
+    _fit_dof = max(1, len(_obs_wl) - len(_active_idx))
 
     def _chi2(active_params):
         # ── Enforce prior bounds ─────────────────────────────────────────
@@ -4844,6 +5045,7 @@ def _(
         _t0 = time_mod.time()
 
         _global_best_f = [float("inf")]  # mutable for callback access
+        _best_reduced_chi2 = [float("inf")]
         _cur_restart = [0]
 
         def _chi2_cb(P):
@@ -4852,12 +5054,14 @@ def _(
             except (ValueError, np.linalg.LinAlgError):
                 val = 1e30
             _nll_history.append(val)
+            if np.isfinite(val):
+                _best_reduced_chi2[0] = min(_best_reduced_chi2[0], val / _fit_dof)
             _iter_count[0] += 1
             if _iter_count[0] % 50 == 0:
                 _spinner.update(
                     f"{qf_opt_method.value} | Restart {_cur_restart[0]}/{_n_restarts} | "
                     f"Eval {_iter_count[0]} | "
-                    f"Best χ² = {_global_best_f[0]:.4f} | "
+                    f"Best reduced χ² = {_best_reduced_chi2[0]:.4f} | "
                     f"{time_mod.time() - _t0:.1f}s"
                 )
             return val
@@ -5102,7 +5306,35 @@ def _(mo):
 @app.cell
 def _(mo):
     get_qf_playground_target, set_qf_playground_target = mo.state(None)
-    return get_qf_playground_target, set_qf_playground_target
+    # The Sirocco result is kept separately from the MLE payload so completing
+    # a long radiative-transfer run updates only the comparison overlay.
+    get_qf_sirocco_spectrum, set_qf_sirocco_spectrum = mo.state(None)
+    return (
+        get_qf_playground_target,
+        get_qf_sirocco_spectrum,
+        set_qf_playground_target,
+        set_qf_sirocco_spectrum,
+    )
+
+
+@app.cell
+def _(mo, os, qf_is_hf_mode):
+    # Sirocco is a local executable and is intentionally absent from the
+    # Hugging Face Space workflow, including the local HF-mode preview switch.
+    if qf_is_hf_mode:
+        qf_sirocco_cpu_slider = None
+    else:
+        _cpu_total = max(1, os.cpu_count() or 1)
+        qf_sirocco_cpu_slider = mo.ui.slider(
+            start=1,
+            stop=_cpu_total,
+            value=max(1, _cpu_total // 2),
+            step=1,
+            show_value=True,
+            label="Sirocco CPUs",
+            full_width=False,
+        )
+    return (qf_sirocco_cpu_slider,)
 
 
 @app.cell
@@ -5110,6 +5342,7 @@ def _(
     alt,
     chebval,
     fitzpatrick99,
+    get_qf_sirocco_spectrum,
     mo,
     np,
     pd,
@@ -5224,8 +5457,44 @@ def _(
     _mod_df = pd.DataFrame({'Wavelength': _wl_p, 'Flux': _model_p, 'Type': 'Best Fit'})
     _band_df = pd.DataFrame({'Wavelength': _wl_p, 'Lower': _elo_p, 'Upper': _ehi_p})
 
-    _combined = pd.concat([_obs_df, _mod_df], ignore_index=True)
-    _color_scale = alt.Scale(domain=['Observation', 'Best Fit'], range=['cyan', 'orange'])
+    _series_frames = [_obs_df, _mod_df]
+    _series_domain = ['Observation', 'Best Fit']
+    _series_colors = ['cyan', 'orange']
+
+    # A Sirocco simulation may finish after the MLE plot has already rendered.
+    # Match it against the complete best-fit vector so a later Quick Fit cannot
+    # accidentally inherit an overlay produced for an older solution.
+    _sirocco_result = get_qf_sirocco_spectrum()
+    _sirocco_fit_params = np.asarray(
+        _sirocco_result.get("fit_params", []) if _sirocco_result else [],
+        dtype=np.float64,
+    )
+    _sirocco_matches_fit = (
+        _sirocco_result is not None
+        and _sirocco_fit_params.shape == np.asarray(_best_full).shape
+        and np.allclose(
+            _sirocco_fit_params,
+            np.asarray(_best_full, dtype=np.float64),
+            rtol=0.0,
+            atol=1e-12,
+        )
+    )
+    if _sirocco_matches_fit:
+        _sirocco_wl = np.asarray(_sirocco_result.get("wavelength", []), dtype=np.float64)
+        _sirocco_flux = np.asarray(_sirocco_result.get("flux", []), dtype=np.float64)
+        _n_sirocco = min(len(_sirocco_wl), len(_sirocco_flux))
+        if _n_sirocco:
+            _sirocco_label = str(_sirocco_result.get("label", "Sirocco Model"))
+            _series_frames.append(pd.DataFrame({
+                'Wavelength': _sirocco_wl[:_n_sirocco],
+                'Flux': _sirocco_flux[:_n_sirocco],
+                'Type': _sirocco_label,
+            }))
+            _series_domain.append(_sirocco_label)
+            _series_colors.append('#9B59B6')
+
+    _combined = pd.concat(_series_frames, ignore_index=True)
+    _color_scale = alt.Scale(domain=_series_domain, range=_series_colors)
 
     _line = alt.Chart(_combined).mark_line(strokeWidth=1.5).encode(
         x=alt.X('Wavelength:Q', title='Wavelength (Å)'),
@@ -5278,13 +5547,19 @@ def _(
         })
         mo.status.toast("Loaded MLE best fit into the Parameter Playground")
 
-    _playground_btn = mo.ui.button(
+    # Keep the callback widget public so clicking it updates playground state.
+    qf_mle_playground_export_button = mo.ui.button(
         label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
         on_click=_send_mle_to_playground,
         kind="success",
     )
 
-    mo.vstack([_status, _playground_btn, _overlay_chart, _resid_chart + _zero_line])
+    mo.vstack([
+        _status,
+        qf_mle_playground_export_button,
+        _overlay_chart,
+        _resid_chart + _zero_line,
+    ])
     return
 
 
@@ -5392,7 +5667,17 @@ def _(mo, np, pd, qf_mle_result, qf_obs_data):
 
 
 @app.cell
-def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
+def _(
+    json,
+    mo,
+    np,
+    os,
+    pd,
+    qf_inf_emu_data,
+    qf_is_hf_mode,
+    qf_mle_result,
+    qf_sirocco_cpu_slider,
+):
     if qf_mle_result is None:
         mo.stop(True, mo.md(""))
 
@@ -5462,74 +5747,90 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
             json.dump(_out, f, indent=2)
         mo.status.toast(f"Saved {_path}")
 
-    def _export_pf(_):
-        _dir = "exports"
+    def _write_pf(output_dir="exports", filename_prefix="quickfit_export"):
+        """Write the current Quick Fit solution and return its `.pf` path.
+
+        Manual exports retain the historical top-level ``exports`` location.
+        Direct Sirocco runs pass a private per-run directory so every auxiliary
+        simulation file remains isolated with the parameter file that made it.
+        """
+        _dir = os.fspath(output_dir)
         os.makedirs(_dir, exist_ok=True)
+        from Speculate_addons.speculate_benchmark import emulator_to_physical
+        from Speculate_addons.grid_registry import (
+            benchmark_param_map as _benchmark_param_map,
+            defaulted_physical_param_ids as _defaulted_physical_param_ids,
+            infer_grid_name as _infer_grid_name,
+        )
+        from exports.templates.speculate_pf_exporter import write_pf
+        import time as _time
+
+        _labels = qf_mle_result["labels"]
+        _best = qf_mle_result["best_params"]
+        _n_phys = qf_mle_result["n_physical"]
+        _param_names = qf_inf_emu_data["param_names"]
+
+        # Recover the registry grid name from either saved model metadata or
+        # the Quick Fit filename tag used by older model archives.
+        _src = qf_inf_emu_data.get("source_file", "unknown")
+        import re as _re
+        _gn_match = _re.match(r"(.+?)_(qfnn-ensemble|qfnn|qfgi)_", _src)
+        _grid_name = qf_inf_emu_data.get("grid_name") or (
+            _gn_match.group(1) if _gn_match else _infer_grid_name(_src)
+        )
+        if not _grid_name:
+            _grid_name = _src.split("_qf")[0]
+
+        physical = emulator_to_physical(_param_names, _best[:_n_phys], _grid_name)
+        _observer_angle = None
+        if _fixed_inclination is not None:
+            _observer_angle = float(_fixed_inclination)
+        elif "Inclination" in physical:
+            _observer_angle = float(physical["Inclination"])
+
+        header = [
+            "### Sirocco .pf Template",
+            f"### Generated by Speculate Quick Fit",
+            f"### Date: {_time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"### Source model: {_src}",
+            "###",
+        ]
+        if _observer_angle is not None:
+            header.insert(-1, f"### Observer inclination: {_observer_angle:.6f}")
+
+        _defaulted_ids = _defaulted_physical_param_ids(_grid_name, _param_names)
+        if _defaulted_ids:
+            _param_map = _benchmark_param_map(_grid_name)
+            header.append("### Registry-defaulted physical parameters:")
+            for _param_id in _defaulted_ids:
+                _, _key = _param_map.get(_param_id, (f"param{_param_id}", f"param{_param_id}"))
+                if _key in physical:
+                    header.append(f"###   {_key}: {physical[_key]:.6g}")
+            header.append("###")
+
+        _nuisance = {}
+        for _i in range(_n_phys, len(_labels)):
+            _nuisance[_labels[_i]] = float(_best[_i])
+        if _nuisance:
+            header.append("### Nuisance Parameters:")
+            for k, v in _nuisance.items():
+                header.append(f"###   {k}: {v:.6f}")
+            header.append("###")
+
+        _ts = _time.strftime("%Y%m%d_%H%M%S")
+        _pf_path = os.path.join(_dir, f"{filename_prefix}_{_ts}.pf")
+        write_pf(
+            grid_name=_grid_name,
+            physical_params=physical,
+            output_path=_pf_path,
+            header_lines=header,
+            observer_angles=[_observer_angle] if _observer_angle is not None else None,
+        )
+        return _pf_path
+
+    def _export_pf(_):
         try:
-            from Speculate_addons.speculate_benchmark import emulator_to_physical
-            from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map, defaulted_physical_param_ids as _defaulted_physical_param_ids, infer_grid_name as _infer_grid_name
-            from exports.templates.speculate_pf_exporter import write_pf
-            import time as _time
-
-            _labels = qf_mle_result["labels"]
-            _best = qf_mle_result["best_params"]
-            _n_phys = qf_mle_result["n_physical"]
-            _param_names = qf_inf_emu_data["param_names"]
-
-            # Determine grid name from source file
-            _src = qf_inf_emu_data.get("source_file", "unknown")
-            # Strip _qfnn_/_qfnn-ensemble_/_qfgi_ suffix to recover grid name
-            import re as _re
-            _gn_match = _re.match(r"(.+?)_(qfnn-ensemble|qfnn|qfgi)_", _src)
-            _grid_name = qf_inf_emu_data.get("grid_name") or (_gn_match.group(1) if _gn_match else _infer_grid_name(_src))
-            if not _grid_name:
-                _grid_name = _src.split("_qf")[0]
-
-            physical = emulator_to_physical(_param_names, _best[:_n_phys], _grid_name)
-            _observer_angle = None
-            if _fixed_inclination is not None:
-                _observer_angle = float(_fixed_inclination)
-            elif "Inclination" in physical:
-                _observer_angle = float(physical["Inclination"])
-
-            header = [
-                "### Sirocco .pf Template",
-                f"### Generated by Speculate Quick Fit",
-                f"### Date: {_time.strftime('%Y-%m-%d %H:%M:%S')}",
-                f"### Source model: {_src}",
-                "###",
-            ]
-            if _observer_angle is not None:
-                header.insert(-1, f"### Observer inclination: {_observer_angle:.6f}")
-
-            _defaulted_ids = _defaulted_physical_param_ids(_grid_name, _param_names)
-            if _defaulted_ids:
-                _param_map = _benchmark_param_map(_grid_name)
-                header.append("### Registry-defaulted physical parameters:")
-                for _param_id in _defaulted_ids:
-                    _, _key = _param_map.get(_param_id, (f"param{_param_id}", f"param{_param_id}"))
-                    if _key in physical:
-                        header.append(f"###   {_key}: {physical[_key]:.6g}")
-                header.append("###")
-
-            _nuisance = {}
-            for _i in range(_n_phys, len(_labels)):
-                _nuisance[_labels[_i]] = float(_best[_i])
-            if _nuisance:
-                header.append("### Nuisance Parameters:")
-                for k, v in _nuisance.items():
-                    header.append(f"###   {k}: {v:.6f}")
-                header.append("###")
-
-            _ts = _time.strftime("%Y%m%d_%H%M%S")
-            _pf_path = os.path.join(_dir, f"quickfit_export_{_ts}.pf")
-            write_pf(
-                grid_name=_grid_name,
-                physical_params=physical,
-                output_path=_pf_path,
-                header_lines=header,
-                observer_angles=[_observer_angle] if _observer_angle is not None else None,
-            )
+            _pf_path = _write_pf()
             mo.status.toast(f"Exported {_pf_path}")
         except Exception as _e:
             mo.status.toast(f".pf export failed: {_e}", kind="danger")
@@ -5538,7 +5839,186 @@ def _(json, mo, np, os, pd, qf_inf_emu_data, qf_mle_result):
     _json_btn = mo.ui.button(label=f"{mo.icon('lucide:file-json')} Export JSON", on_click=_export_json)
     _pf_btn = mo.ui.button(label=f"{mo.icon('lucide:file-text')} Export .pf", on_click=_export_pf, kind="success")
 
-    mo.hstack([_csv_btn, _json_btn, _pf_btn], justify="start")
+    qf_sirocco_run_btn = None
+    _button_row = [_csv_btn, _json_btn, _pf_btn]
+    _runtime_notes = []
+    if not qf_is_hf_mode and qf_sirocco_cpu_slider is not None:
+        # Recheck with the selected process count because MPI is required only
+        # when the user requests more than one Sirocco process.  Keep probing
+        # defensive so a broken optional runtime can never hide CSV/JSON/.pf.
+        try:
+            from Speculate_addons.speculate_benchmark import (
+                check_sirocco_runtime as _check_sirocco_runtime,
+            )
+            _sirocco_runtime = _check_sirocco_runtime(
+                qf_sirocco_cpu_slider.value
+            )
+            _sirocco_error = None
+        except Exception as _probe_exc:
+            _sirocco_runtime = {"ok": False, "missing": ["runtime probe"]}
+            _sirocco_error = str(_probe_exc)
+        _sirocco_missing = ", ".join(_sirocco_runtime.get("missing", []))
+        qf_sirocco_run_btn = mo.ui.run_button(
+            label=f"{mo.icon('lucide:wind')} Run Sirocco Model",
+            kind="success" if _sirocco_runtime["ok"] else "danger",
+            disabled=not _sirocco_runtime["ok"],
+            tooltip=(
+                "Run the current best-fit parameters through Sirocco"
+                if _sirocco_runtime["ok"]
+                else f"Sirocco is unavailable; missing: {_sirocco_missing}"
+            ),
+        )
+        _button_row.extend([qf_sirocco_cpu_slider, qf_sirocco_run_btn])
+        _runtime_notes.append(
+            (
+                mo.md("")
+                if _sirocco_runtime["ok"]
+                else mo.callout(
+                    mo.md(
+                        (
+                            f"Sirocco runtime detection failed: `{_sirocco_error}`."
+                            if _sirocco_error
+                            else "Sirocco model runs are unavailable. "
+                            f"Missing command(s): `{_sirocco_missing}`."
+                        )
+                    ),
+                    kind="danger",
+                )
+            )
+        )
+
+    # Publicly expose the writer before the display expression.  Marimo renders
+    # the final expression in a cell; assigning this after ``mo.vstack`` would
+    # make the cell output ``None`` and hide every export control.
+    qf_write_fit_pf = _write_pf
+
+    mo.vstack([
+        mo.hstack(_button_row, justify="start", align="end"),
+        *_runtime_notes,
+    ])
+    return qf_sirocco_run_btn, qf_write_fit_pf
+
+
+@app.cell
+def _(
+    mo,
+    np,
+    os,
+    qf_inf_emu_data,
+    qf_inf_wl_slider,
+    qf_is_hf_mode,
+    qf_mle_result,
+    qf_sirocco_cpu_slider,
+    qf_sirocco_run_btn,
+    qf_write_fit_pf,
+    set_qf_sirocco_spectrum,
+):
+    # A separate reactive run cell makes the click observable immediately and
+    # avoids blocking inside a button callback while Sirocco performs many
+    # ionization and spectrum cycles.
+    if (
+        qf_is_hf_mode
+        or qf_sirocco_run_btn is None
+        or not qf_sirocco_run_btn.value
+    ):
+        mo.stop(True, mo.md(""))
+
+    try:
+        from Speculate_addons.distance_scale import (
+            distance_to_log_scale as _distance_to_log_scale,
+        )
+        from Speculate_addons.speculate_benchmark import (
+            check_sirocco_runtime as _check_sirocco_runtime,
+            run_sirocco_model_spectrum as _run_sirocco_model_spectrum,
+        )
+
+        _cpus = int(qf_sirocco_cpu_slider.value)
+        _runtime = _check_sirocco_runtime(_cpus)
+        if not _runtime["ok"]:
+            raise RuntimeError(
+                "Missing Sirocco runtime command(s): "
+                + ", ".join(_runtime["missing"])
+            )
+
+        _best = np.asarray(qf_mle_result["best_params"], dtype=np.float64)
+        _n_phys = int(qf_mle_result["n_physical"])
+        _av = float(_best[_n_phys]) if len(_best) > _n_phys else 0.0
+        _distance_pc = (
+            float(_best[_n_phys + 1])
+            if len(_best) > _n_phys + 1
+            else 100.0
+        )
+        _cheb1 = (
+            float(_best[_n_phys + 2])
+            if len(_best) > _n_phys + 2
+            else 0.0
+        )
+        _transforms = {
+            "Av": _av,
+            "Rv": 3.1,
+            "log_scale": float(_distance_to_log_scale(_distance_pc)),
+            "cheb": [_cheb1],
+        }
+        # Sirocco writes many sidecar files beside the input `.pf`.  Give each
+        # click a collision-safe directory under exports so those artifacts do
+        # not litter the manual-export directory or mix with an earlier run.
+        import tempfile as _tempfile
+        import time as _time
+
+        _export_root = "exports"
+        os.makedirs(_export_root, exist_ok=True)
+        _run_dir = _tempfile.mkdtemp(
+            prefix=f"quickfit_sirocco_{_time.strftime('%Y%m%d_%H%M%S')}_",
+            dir=_export_root,
+        )
+        _pf_path = qf_write_fit_pf(
+            output_dir=_run_dir,
+            filename_prefix="quickfit_sirocco",
+        )
+
+        with mo.status.spinner(
+            title=f"Running Sirocco model with {_cpus} CPU(s)..."
+        ) as _spinner:
+            def _progress(_event):
+                _spinner.update(
+                    _event.get("message", "Running Sirocco model...")
+                )
+
+            _result = _run_sirocco_model_spectrum(
+                _pf_path,
+                tuple(float(_value) for _value in qf_inf_wl_slider.value),
+                # The observation dropdown may be "linear" when the supplied
+                # data are already preprocessed.  The Sirocco model is native
+                # linear flux, so convert it using the fitted emulator's scale.
+                flux_scale=str(qf_inf_emu_data.get("scale", "linear")),
+                transforms=_transforms,
+                smoothing=bool(qf_inf_emu_data.get("smoothing", False)),
+                cpus=_cpus,
+                progress_callback=_progress,
+            )
+
+        # Retain the exact MLE vector with the spectrum to prevent a stale
+        # comparison line from being displayed after a subsequent fit.
+        _result["fit_params"] = _best.copy()
+        set_qf_sirocco_spectrum(_result)
+        _run_output = mo.callout(
+            mo.md(
+                f"{mo.icon('lucide:check-circle')} Sirocco completed with "
+                f"**{_cpus} CPU(s)**. The solid purple model was added to the "
+                f"best-fit overlay. Output: `{_result['sirocco_spec_path']}`"
+            ),
+            kind="success",
+        )
+    except Exception as _exc:
+        _run_output = mo.callout(
+            mo.md(
+                f"{mo.icon('lucide:x-circle')} **Sirocco run failed:** "
+                f"{_exc}"
+            ),
+            kind="danger",
+        )
+
+    _run_output
     return
 
 

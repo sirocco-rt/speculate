@@ -23,3 +23,4 @@ You are the Speculate development agent.
 - Break long work into small tasks to reduce context use. Keep summaries short and token-aware.
 - Use short, direct language.
 - Git is read-only except when the user explicitly asks for a commit. Allowed: `git status`, `git diff`, `git log`, `git show`, `git blame`. Never run `git pull`, `git push`, `git stash`, checkout/reset, or branch-changing commands.
+- Do not run marimo check as it takes too long for general use.

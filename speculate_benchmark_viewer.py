@@ -289,6 +289,16 @@ def _(
             if "full_chain" in p:
                 entry["full_chain"] = np.array(p["full_chain"])
                 entry["burnin_used"] = p.get("burnin_used", 500)
+            for diagnostic_key in (
+                "n_retained_draws",
+                "autocorr_time",
+                "effective_sample_size",
+                "mcse_mean",
+                "acceptance_fraction",
+                "mcmc_diagnostic_reasons",
+            ):
+                if diagnostic_key in p:
+                    entry[diagnostic_key] = p[diagnostic_key]
             if "bestfit_spec" in p:
                 entry["bestfit_spec"] = p["bestfit_spec"]
             if "prior_ranges" in p:
@@ -354,7 +364,7 @@ def _(
 
 
 @app.cell(hide_code=True)
-def _(alt, get_report, get_tier1_arrays, mo, np, plt):
+def _(alt, get_report, get_tier1_arrays, mo, np, pd, plt):
     # ── Tier result tabs ──
     # Render the active report as a set of tabs, one per benchmark tier.
     # Each tab is self-contained: Tier 1 shows EAS + LOO diagnostics,
@@ -374,7 +384,7 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
     _t1 = _report.get("tier1")
     if _t1:
         _t1_items = []
-        _t1_items.append(mo.md("## Tier 1 — Grid Reconstruction Fidelity"))
+        _t1_items.append(mo.md("## Tier 1 — Grid Reconstruction"))
 
         # Surface the composite Tier 1 score first because it is the quickest
         # sanity check for whether an emulator is usable before inspecting the
@@ -434,6 +444,9 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
             "loo_flux_rmse_median": ("LOO Flux RMSE (median)", "lower is better; total emulator error"),
             "loo_flux_rmse_95": ("LOO Flux RMSE (95th pctl)", "lower is better; worst-case emulator error"),
             "max_fractional_resid": ("Max Frac. Residual", "lower is better; worst pixel error overall"),
+            "test_grid_pca_rmse_median": ("Test-grid PCA RMSE (median)", "PCA-only projection floor on independent spectra"),
+            "test_grid_model_rmse_median": ("Test-grid GP RMSE (median)", "direct final-flux error on independent spectra"),
+            "test_grid_n_spectra": ("Test-grid Spectra", "number of independent spectra in the RMSE envelope"),
         }
         _summary_rows = []
         for _key in _metric_info:
@@ -818,7 +831,7 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                 {"Decorrelated Q\u2013Q Plot": mo.hstack([_fig_dqq, _dqq_info], widths=[2, 1])}
             ))
 
-        # --- Per-wavelength RMSE envelope ---
+        # --- Training-grid per-wavelength RMSE envelope ---
         # Source data from live arrays (if available) or serialised report.
         _arrays = get_tier1_arrays() or {}
         _pca_wl = _arrays.get("pca_per_wl_rmse")
@@ -885,8 +898,107 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                 "try a different optimiser."
             )
             _t1_items.append(mo.accordion(
-                {"Per-Wavelength RMSE Envelope": mo.hstack([_rmse_chart, _wl_info], widths=[3, 1])}
+                {"Training Grid Per-Wavelength RMSE Envelope": mo.hstack([_rmse_chart, _wl_info], widths=[3, 1])}
             ))
+
+        # --- Independent test-grid per-wavelength RMSE envelope ---
+        # These curves use direct final-flux residuals at the lookup-table truth
+        # coordinates.  This is the like-for-like architecture comparison used
+        # by the revised Tier 1 paper figure.
+        _test_pca_wl = _arrays.get("test_pca_per_wl_rmse")
+        _test_model_wl = _arrays.get("test_model_per_wl_rmse")
+        _test_wl = _arrays.get("test_wavelength")
+        if _test_pca_wl is None:
+            _test_pca_wl = _t1.get("test_pca_per_wl_rmse")
+        if _test_model_wl is None:
+            _test_model_wl = _t1.get("test_model_per_wl_rmse")
+        if _test_wl is None:
+            _test_wl = _t1.get("test_wavelength")
+
+        if _test_pca_wl is not None and _test_model_wl is not None and _test_wl is not None:
+            _test_pca_wl = np.asarray(_test_pca_wl)
+            _test_model_wl = np.asarray(_test_model_wl)
+            _test_wl = np.asarray(_test_wl)
+            _test_model_label = "Test grid (PCA + GP)"
+            _test_pca_label = "Test-grid PCA projection only"
+            _test_rmse_df = pd.concat(
+                [
+                    pd.DataFrame({
+                        "Wavelength": _test_wl,
+                        "RMSE": _test_pca_wl,
+                        "Source": _test_pca_label,
+                    }),
+                    pd.DataFrame({
+                        "Wavelength": _test_wl,
+                        "RMSE": _test_model_wl,
+                        "Source": _test_model_label,
+                    }),
+                ],
+                ignore_index=True,
+            )
+            _test_rmse_chart = alt.Chart(_test_rmse_df).mark_line(
+                strokeWidth=1.5,
+            ).encode(
+                x=alt.X(
+                    "Wavelength:Q",
+                    title="Wavelength (Å)",
+                    scale=alt.Scale(
+                        domain=[float(_test_wl.min()), float(_test_wl.max())]
+                    ),
+                ),
+                y=alt.Y(
+                    "RMSE:Q",
+                    title="RMSE (normalised flux)",
+                    axis=alt.Axis(format=".1e"),
+                ),
+                color=alt.Color(
+                    "Source:N",
+                    title="",
+                    scale=alt.Scale(
+                        domain=[_test_pca_label, _test_model_label],
+                        range=["#3498db", "#e74c3c"],
+                    ),
+                    legend=alt.Legend(orient="top"),
+                ),
+                tooltip=[
+                    alt.Tooltip("Source:N"),
+                    alt.Tooltip("Wavelength:Q", title="Wavelength (Å)", format=".1f"),
+                    alt.Tooltip("RMSE:Q", format=".4e"),
+                ],
+            ).properties(
+                width="container",
+                height=200,
+                title="Test Grid Per-Wavelength Reconstruction Error",
+            )
+            _test_wl_info = mo.md(
+                "### Independent Test-Grid RMSE\n\n"
+                "**What this shows:** Direct reconstruction error at every wavelength "
+                "across independent test-grid spectra. The blue curve projects each "
+                "true test spectrum through the retained PCA basis, while the red "
+                "curve uses the GP predictive mean at the known truth parameters.\n\n"
+                f"**Sample:** {_t1.get('test_grid_n_spectra', 'n/a')} spectra from "
+                f"`{_t1.get('test_grid_name', 'paired test grid')}`; inclinations "
+                f"{_t1.get('test_grid_inclinations', 'n/a')}.\n\n"
+                "**Use for architecture comparisons:** This tab applies the same "
+                "direct final-flux RMSE definition used by the Quick Fit GI and NN "
+                "test-grid tabs."
+            )
+            _test_rmse_content = mo.hstack(
+                [_test_rmse_chart, _test_wl_info],
+                widths=[3, 1],
+            )
+        else:
+            _test_note = _t1.get("test_grid_rmse_note") or (
+                "Run Tier 1 again with the paired local test grid available."
+            )
+            _test_rmse_content = mo.callout(
+                mo.md(f"**Test-grid RMSE unavailable.** {_test_note}"),
+                kind="warn",
+            )
+
+        _t1_items.append(mo.accordion(
+            {"Test Grid Per-Wavelength RMSE Envelope": _test_rmse_content}
+        ))
 
         # --- Worst-case spectra overlay ---
         _orig = _arrays.get("display_original_flux", _arrays.get("original_flux"))
@@ -1102,7 +1214,7 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
     _t2 = _report.get("tier2")
     if _t2:
         _t2_items = []
-        _t2_items.append(mo.md("## Tier 2 — Test Grid Parameter Recovery"))
+        _t2_items.append(mo.md("## Tier 2 — Inference Parameter Recovery"))
         _n_proc = _t2.get('n_processed', 0)
         _n_spec = _t2.get('n_spectra', '?')
         _n_fail = _t2.get('n_failures', 0)
@@ -1112,7 +1224,7 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
         if _n_fail:
             _status_parts.append(f"{_n_fail} failed")
         if _n_nc:
-            _status_parts.append(f"{_n_nc} not converged")
+            _status_parts.append(f"{_n_nc} diagnostically flagged")
         _status_parts.append(f"in {_t2_time:.0f}s")
         _t2_items.append(mo.md(" — ".join(_status_parts)))
 
@@ -1148,6 +1260,25 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
 
         _agg = _t2.get("aggregate", {})
         if _agg:
+            def _coverage_cell(_metrics, _level_key, _converged=False):
+                _field = (
+                    "coverage_converged_levels"
+                    if _converged
+                    else "coverage_levels"
+                )
+                _result = (_metrics.get(_field) or {}).get(_level_key, {})
+                _n = int(_result.get("n", 0))
+                if _n == 0:
+                    return "—"
+                _count = int(_result["covered_count"])
+                _fraction = float(_result["fraction"])
+                _ci_lo = float(_result["wilson_95_low"])
+                _ci_hi = float(_result["wilson_95_high"])
+                return (
+                    f"{_count}/{_n} ({_fraction:.0%}; "
+                    f"95% CI {_ci_lo:.0%}–{_ci_hi:.0%})"
+                )
+
             _agg_rows = []
             for _pn, _m in _agg.items():
                 _agg_rows.append({
@@ -1156,24 +1287,15 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                     "Bias": f"{_m.get('bias', float('nan')):.4f}",
                     "CRPS": f"{_m.get('crps', float('nan')):.4f}",
                     "Shrinkage": f"{_m.get('shrinkage', float('nan')):.2%}",
-                    "Cov@68%": f"{_m.get('coverage_68', float('nan')):.3f}",
-                    "Cov@95%": f"{_m.get('coverage_95', float('nan')):.3f}",
-                    "Cov@99.7%": f"{_m.get('coverage_997', float('nan')):.3f}",
+                    "All Cov@68%": _coverage_cell(_m, "0.68"),
+                    "All Cov@95%": _coverage_cell(_m, "0.95"),
+                    "All Cov@99.7%": _coverage_cell(_m, "0.997"),
+                    "Converged Cov@68%": _coverage_cell(_m, "0.68", True),
+                    "Converged Cov@95%": _coverage_cell(_m, "0.95", True),
+                    "Converged Cov@99.7%": _coverage_cell(_m, "0.997", True),
                 })
             _t2_items.append(mo.ui.table(_agg_rows, label="Aggregate Metrics"))
 
-            # This calibration plot compares nominal credible levels against empirical coverage.
-            # Points should fall near the y=x diagonal if the posterior intervals are well calibrated.
-            _pp_values = [
-                {
-                    "Parameter": _pn,
-                    "Nominal Credible Level": float(_alpha),
-                    "Empirical Coverage": float(_coverage),
-                }
-                for _pn, _m in _agg.items()
-                if "coverage_alphas" in _m and "coverage_values" in _m
-                for _alpha, _coverage in zip(_m["coverage_alphas"], _m["coverage_values"])
-            ]
             _pp_reference = [
                 {"Nominal Credible Level": 0.0, "Ideal Coverage": 0.0},
                 {"Nominal Credible Level": 1.0, "Ideal Coverage": 1.0},
@@ -1195,48 +1317,75 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                     scale=alt.Scale(domain=[0, 1]),
                 ),
             )
-            _pp_lines = alt.Chart(alt.Data(values=_pp_values)).mark_line(strokeWidth=2).encode(
-                x=alt.X(
-                    "Nominal Credible Level:Q",
-                    title="Nominal Credible Level",
-                    scale=alt.Scale(domain=[0, 1]),
+
+            def _build_pp_plot(_values, _title):
+                if not _values:
+                    return mo.md("*No diagnostically converged Tier 2 runs are available.*")
+                _lines = alt.Chart(alt.Data(values=_values)).mark_line(strokeWidth=2).encode(
+                    x=alt.X("Nominal Credible Level:Q", title="Nominal Credible Level",
+                              scale=alt.Scale(domain=[0, 1])),
+                    y=alt.Y("Empirical Coverage:Q", title="Empirical Coverage",
+                              scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color("Parameter:N", title="",
+                                    legend=alt.Legend(orient="top-left")),
+                )
+                _points = alt.Chart(alt.Data(values=_values)).mark_circle(size=40).encode(
+                    x=alt.X("Nominal Credible Level:Q", title="Nominal Credible Level",
+                              scale=alt.Scale(domain=[0, 1])),
+                    y=alt.Y("Empirical Coverage:Q", title="Empirical Coverage",
+                              scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color("Parameter:N", title="", legend=None),
+                    tooltip=[
+                        alt.Tooltip("Parameter:N", title="Parameter"),
+                        alt.Tooltip("Nominal Credible Level:Q", title="Nominal", format=".3f"),
+                        alt.Tooltip("Empirical Coverage:Q", title="Empirical", format=".3f"),
+                    ],
+                )
+                return (_pp_reference_line + _lines + _points).properties(
+                    width=420,
+                    height=420,
+                    title=_title,
+                ).interactive()
+
+            # All posterior-bearing runs remain the benchmark's primary
+            # calibration result.  The second tab is supplementary and helps
+            # diagnose sampler sensitivity without erasing hard test cases.
+            _all_pp_values = [
+                {
+                    "Parameter": _pn,
+                    "Nominal Credible Level": float(_alpha),
+                    "Empirical Coverage": float(_coverage),
+                }
+                for _pn, _m in _agg.items()
+                for _alpha, _coverage in zip(
+                    _m.get("coverage_alphas", []),
+                    _m.get("coverage_values", []),
+                )
+            ]
+            _converged_pp_values = [
+                {
+                    "Parameter": _pn,
+                    "Nominal Credible Level": float(_alpha),
+                    "Empirical Coverage": float(_coverage),
+                }
+                for _pn, _m in _agg.items()
+                for _alpha, _coverage in zip(
+                    _m.get("coverage_converged_alphas", []),
+                    _m.get("coverage_converged_values", []),
+                )
+            ]
+            _pp_tabs = mo.ui.tabs({
+                "All Runs": _build_pp_plot(_all_pp_values, "PP-Plot — All Runs"),
+                "Converged Runs": _build_pp_plot(
+                    _converged_pp_values,
+                    "PP-Plot — Converged Runs",
                 ),
-                y=alt.Y(
-                    "Empirical Coverage:Q",
-                    title="Empirical Coverage",
-                    scale=alt.Scale(domain=[0, 1]),
-                ),
-                color=alt.Color("Parameter:N", title="", legend=alt.Legend(orient="top-left")),
-            )
-            _pp_points = alt.Chart(alt.Data(values=_pp_values)).mark_circle(size=40).encode(
-                x=alt.X(
-                    "Nominal Credible Level:Q",
-                    title="Nominal Credible Level",
-                    scale=alt.Scale(domain=[0, 1]),
-                ),
-                y=alt.Y(
-                    "Empirical Coverage:Q",
-                    title="Empirical Coverage",
-                    scale=alt.Scale(domain=[0, 1]),
-                ),
-                color=alt.Color("Parameter:N", title="", legend=None),
-                tooltip=[
-                    alt.Tooltip("Parameter:N", title="Parameter"),
-                    alt.Tooltip("Nominal Credible Level:Q", title="Nominal", format=".3f"),
-                    alt.Tooltip("Empirical Coverage:Q", title="Empirical", format=".3f"),
-                ],
-            )
-            _fig2 = (_pp_reference_line + _pp_lines + _pp_points).properties(
-                width=420,
-                height=420,
-                title="PP-Plot (Calibration)",
-            ).interactive()
+            })
             _pp_info = mo.md(
                 "### PP-Plot (Calibration)\n\n"
-                "**What this shows:** For each parameter, the chart evaluates 50 nominal "
-                "credible levels between 0.01 and 0.999. Each point is the empirical "
-                "fraction of processed spectra whose ground-truth value lies inside that "
-                "posterior interval.\n\n"
+                "**What this shows:** The default tab includes every posterior-bearing "
+                "run, including important difficult cases flagged by the sampler "
+                "diagnostics. The converged-only tab is supplementary context.\n\n"
                 "**Better looks like:** Curves track the dashed y=x line across the full "
                 "range of nominal credible levels.\n\n"
                 "**Why the step pattern:** Coverage is computed over a finite number of test "
@@ -1249,7 +1398,7 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                 "intervals; curves above the diagonal indicate under-confident intervals."
             )
             _t2_items.append(mo.accordion(
-                {"PP-Plot (Calibration)": mo.hstack([_fig2, _pp_info], widths=[2, 1])}
+                {"PP-Plot (Calibration)": mo.hstack([_pp_tabs, _pp_info], widths=[2, 1])}
             ))
 
             _param_names = list(_agg.keys())
@@ -1343,12 +1492,19 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
 
         _obs_rows = []
         for _r in _t3:
+            _local_cov = _r.get("local_covariance") or {}
+            _local_cov_status = (
+                str(int(_local_cov.get("n_kernels", 0)))
+                if _local_cov.get("enabled")
+                else "off"
+            )
             _obs_rows.append({
                 "Observation": _r.get("obs_file", "?"),
                 "Reduced chi2": _fmt_t3(_r.get('reduced_chi2'), ".2f"),
                 "Sirocco chi2": _fmt_t3(_r.get('sirocco_reduced_chi2'), ".2f"),
                 "PPC Coverage": _fmt_t3(_r.get('ppc_coverage'), ".2f"),
                 "Inclination": _fmt_t3(_r.get('exact_inclination'), ".2f"),
+                "Local kernels": _local_cov_status,
                 "Converged": "yes" if _r.get("mcmc_converged") else "no",
             })
         _t3_items.append(mo.ui.table(_obs_rows, label="Observational Results"))
@@ -1420,15 +1576,24 @@ def _(alt, get_report, get_tier1_arrays, mo, np, plt):
                     alt.Tooltip("PPC Coverage:Q", title="PPC Coverage", format=".3f"),
                 ],
             )
+            # Enable pan/zoom per panel with explicitly named interval
+            # selections.  Calling .interactive() on the combined hconcat would
+            # add an identically-configured (and identically auto-named)
+            # selection to both panels, which Altair then silently deduplicates
+            # with a UserWarning; under the vegafusion data transformer that
+            # warning is raised while building the spec and the chart fails to
+            # render.  Naming the two selections differently avoids the clash.
             _fig4 = ((_fig4_chi2_rule + _fig4_chi2_bars).properties(
                 width=_obs_chart_width,
                 height=320,
                 title="Reduced chi2",
-            ) | (_fig4_ppc_rule + _fig4_ppc_bars).properties(
+            ).interactive(name="tier3_obs_chi2_zoom") | (
+                _fig4_ppc_rule + _fig4_ppc_bars
+            ).properties(
                 width=_obs_chart_width,
                 height=320,
                 title="Posterior Predictive Coverage",
-            )).resolve_scale(y="independent").interactive()
+            ).interactive(name="tier3_obs_ppc_zoom")).resolve_scale(y="independent")
             _t3_items.append(_fig4)
         except Exception:
             pass
@@ -1598,7 +1763,7 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
         else render_fixed_matplotlib(mo, _fig, width_px=920)
     )
 
-    _conv_tag = "converged" if _converged else "**not converged**"
+    _conv_tag = "diagnostic passed" if _converged else "**diagnostic flagged**"
     _summary_rows = []
     for _lbl in _labels:
         if _lbl in _summary:
@@ -1711,7 +1876,12 @@ def _(get_tier2_posteriors, mo, np, os, t2_corner_export_btn, time):
                 "corner_settings": dict(_corner_settings),
                 "mcmc": {
                     "burnin_used": _post.get("burnin_used"),
-                    "effective_samples": int(_samples.shape[0]),
+                    "retained_draws": int(_samples.shape[0]),
+                    "effective_sample_size": _post.get("effective_sample_size", {}),
+                    "autocorr_time": _post.get("autocorr_time", {}),
+                    "mcse_mean": _post.get("mcse_mean", {}),
+                    "acceptance_fraction": _post.get("acceptance_fraction", {}),
+                    "diagnostic_reasons": _post.get("mcmc_diagnostic_reasons", []),
                     "full_chain_available": _post.get("full_chain") is not None,
                 },
                 "mle_all_params": _post.get("mle_all_params", {}),
@@ -1774,6 +1944,19 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
     _nsteps, _nwalkers, _ndim = _full_chain.shape
     _filename = _post.get("filename", f"run{_post['run']}.spec")
     _inc = _post.get("inclination", 55.0)
+    _acceptance = _post.get("acceptance_fraction", {})
+    _diagnostic_reasons = _post.get("mcmc_diagnostic_reasons", [])
+    _diagnostic_label = (
+        "passed"
+        if not _diagnostic_reasons
+        else "flagged: " + ", ".join(_diagnostic_reasons)
+    )
+    _acceptance_text = (
+        f"{float(_acceptance.get('mean')):.3f} "
+        f"[{float(_acceptance.get('min')):.3f}, {float(_acceptance.get('max')):.3f}]"
+        if _acceptance
+        else "not recorded"
+    )
 
     _fig, _axes = plt.subplots(
         _ndim, 1,
@@ -1824,7 +2007,9 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
         mo.md("#### Chain Trace Plot"),
         mo.md(f"Full walker chains ({_nwalkers} walkers × {_nsteps} steps). "
                f"Orange dashed line marks burn-in at step {_burnin}. "
-               "Red line marks ground truth."),
+               "Red line marks ground truth.  \n"
+               f"**Autocorrelation diagnostic:** {_diagnostic_label}.  \n"
+               f"**Acceptance fraction mean [min, max]:** {_acceptance_text}."),
         render_fixed_matplotlib(mo, _fig, width_px=960),
     ])
     return
@@ -1845,7 +2030,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
     _filename = _post.get("filename", f"run{_post['run']}.spec")
     _inc = _post.get("inclination", 55.0)
     _converged = _post.get("converged", False)
-    _conv_tag = "converged" if _converged else "not converged"
+    _conv_tag = "diagnostic passed" if _converged else "diagnostic flagged"
     _mle_bf = _post.get("mle_bestfit_spec")
     _posterior_bf = _post.get("posterior_mean_bestfit_spec") or _post.get("bestfit_spec")
 
@@ -1874,6 +2059,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
             data_flux=_mle_bf["data_flux"],
             model_flux=_mle_bf["model_flux"],
             model_cov_diag=_mle_bf["model_cov_diag"],
+            covariance_components=_mle_bf.get("covariance_components"),
             title=(
                 f"MLE Best Fit — {_filename} @ {_inc:.0f}° "
                 f"({_conv_tag}{_nll_suffix(_post.get('mle_nll'), _mle_diag)})"
@@ -1888,6 +2074,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
             data_flux=_posterior_bf["data_flux"],
             model_flux=_posterior_bf["model_flux"],
             model_cov_diag=_posterior_bf["model_cov_diag"],
+            covariance_components=_posterior_bf.get("covariance_components"),
             title=(
                 f"MCMC Posterior Mean — {_filename} @ {_inc:.0f}° "
                 f"({_conv_tag}{_nll_suffix(None, _pm_diag)})"
@@ -1950,6 +2137,21 @@ def _(get_tier3_posteriors, mo, np, os, render_fixed_matplotlib, t3_observation_
         _samples.size == 0 or len(_labels) == 0,
         mo.md("*Tier 3 posterior artifact has no samples to plot.*"),
     )
+
+    # The backend samples distance as ``log_scale`` (natural-log flux scale), but
+    # it is presented to users as Distance (pc) — matching Tier 2 and the
+    # inference / quick-fit tools. Convert the sampled column (the mapping is
+    # non-linear, so the marginal must be built from the converted draws) and
+    # relabel before plotting and tabulating.
+    if "log_scale" in _labels:
+        from Speculate_addons.distance_scale import (
+            log_scale_to_distance_pc as _ls_to_distance_pc,
+        )
+
+        _ls_idx = _labels.index("log_scale")
+        _samples = _samples.copy()
+        _samples[:, _ls_idx] = _ls_to_distance_pc(_samples[:, _ls_idx])
+        _labels[_ls_idx] = "Distance (pc)"
 
     def _corner_fig(_data, _lbls):
         return _corner.corner(
@@ -2155,6 +2357,19 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         _data_flux = np.array(_npz["data_flux"])
         _model_flux = np.array(_npz["model_flux"])
         _model_cov_diag = np.array(_npz["model_cov_diag"])
+        # New artifacts retain the additive covariance diagonals.  Older NPZ
+        # files remain viewable and simply use the pre-existing total-only
+        # tooltip when these optional arrays are absent.
+        _covariance_components = {
+            _name: np.array(_npz[_name])
+            for _name in (
+                "observation_variance",
+                "emulator_variance",
+                "global_variance",
+                "local_variance",
+            )
+            if _name in _npz.files
+        }
         _ppc_wl = np.array(_npz["ppc_wavelength"])
         _ppc_low = np.array(_npz["ppc_low"])
         _ppc_high = np.array(_npz["ppc_high"])
@@ -2193,7 +2408,9 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
             "flux": _sirocco_plot_flux,
             "label": _sirocco_label,
             "color": "#9467bd",
-            "dash": [6, 3],
+            # Keep the full Sirocco comparison visually equal to the data and
+            # emulator spectra; colour alone distinguishes the three models.
+            "dash": [],
         })
 
     _bestfit = build_bestfit_spectrum_altair(
@@ -2202,8 +2419,12 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         data_flux=_data_flux,
         model_flux=_model_flux,
         model_cov_diag=_model_cov_diag,
+        covariance_components=_covariance_components,
         title=f"Tier 3 Best Fit — {_post.get('obs_file', '?')}",
         zoom_name=f"tier3_bestfit_zoom_{t3_observation_slider.value}",
+        # Tier 3 includes every fitted Sirocco nuisance transform in this
+        # legend entry, so retain the full diagnostic label.
+        legend_label_limit=1000,
         extra_flux_series=_extra,
     )
 
@@ -2825,21 +3046,21 @@ def _(alt, get_comparison_reports, mo, np, os):
 @app.cell(hide_code=True)
 def _(glob, mo, os):
     # ── Live benchmark runner: file pickers ──
-    # Discover available emulators and observation CSVs on disk so the user
-    # can launch a fresh Tier 1/2/3 benchmark without leaving this notebook.
+    # Discover available emulators on disk so the user can launch a fresh
+    # Tier 1/2/3 benchmark without leaving this notebook.
     mo.md("---")
 
-    # Discover files
+    # Observation discovery lives in the next cell because it depends on the
+    # selected emulator family.
     emu_files = sorted(glob.glob("Grid-Emulator_Files/*emu*.npz"))
-    obs_csvs = sorted(glob.glob("observation_files/*.csv"))
 
     emu_picker = mo.ui.dropdown(
         options=dict(zip([os.path.basename(_f) for _f in emu_files], emu_files)) if emu_files else {"(none)": ""},
         label="Emulator",
     )
-    obs_picker = mo.ui.multiselect(
-        options=dict(zip([os.path.basename(_f) for _f in obs_csvs], obs_csvs)) if obs_csvs else {},
-        label="Observations (Tier 3)",
+    tier3_local_cov_checkbox = mo.ui.checkbox(
+        value=False,
+        label="Enable fixed local covariance kernels (adds 1 MLE pre-fit)",
     )
 
     tier_picker = mo.ui.multiselect(
@@ -2853,7 +3074,7 @@ def _(glob, mo, os):
         label="Max test spectra (Tier 2)",
     )
     mcmc_steps_slider = mo.ui.slider(
-        start=100, stop=5000, value=2500, step=100, show_value=True,
+        start=100, stop=5000, value=5000, step=100, show_value=True,
         label="MCMC steps (Tier 2/3)",
     )
     mle_restarts_slider = mo.ui.slider(
@@ -2866,30 +3087,34 @@ def _(glob, mo, os):
         show_value=True, label="Sirocco CPUs (Tier 3)", full_width=False,
     )
 
-    # Inclination selector for Tier 2: which viewing angle column to read from
-    # each .spec file.  "Random" assigns a reproducibly random inclination per
-    # spectrum (seeded by run index).
-    inclination_picker = mo.ui.dropdown(
-        options={
-            "30°": "30", "35°": "35", "40°": "40", "45°": "45",
-            "50°": "50", "55°": "55", "60°": "60", "65°": "65",
-            "70°": "70", "75°": "75", "80°": "80", "85°": "85",
-            "Random": "random",
-        },
-        value="55°",
-        label="Inclination (Tier 2)",
-    )
-
     return (
         emu_picker,
-        inclination_picker,
         max_spectra_slider,
         mcmc_steps_slider,
         mle_restarts_slider,
-        obs_picker,
         sirocco_cpu_slider,
+        tier3_local_cov_checkbox,
         tier_picker,
     )
+
+
+@app.cell(hide_code=True)
+def _(emu_picker, glob, mo, os):
+    """Show bundled observations compatible with the selected emulator family."""
+    from Speculate_addons.grid_registry import infer_grid_name as _infer_grid_name
+    from Speculate_addons.observation_priors import filter_observation_files_for_grid as _filter_observation_files_for_grid
+
+    _grid_name = _infer_grid_name(emu_picker.value)
+    _obs_csvs = sorted(glob.glob("observation_files/*.csv"))
+    _compatible_obs_csvs = _filter_observation_files_for_grid(_obs_csvs, _grid_name)
+    obs_picker = mo.ui.multiselect(
+        options=dict(zip(
+            [os.path.basename(_file) for _file in _compatible_obs_csvs],
+            _compatible_obs_csvs,
+        )) if _compatible_obs_csvs else {},
+        label="Observations (Tier 3)",
+    )
+    return (obs_picker,)
 
 
 @app.cell(hide_code=True)
@@ -2898,21 +3123,11 @@ def _(emu_picker, glob, mo, np, os, re):
     _emu_val = emu_picker.value or ""
     _emu_base = os.path.basename(_emu_val)
 
-    # Flux scale selector for Tier 2/3 — auto-detected from the emulator
-    # filename when possible, but user can override.  Created here (not in
-    # the picker cell) because marimo forbids reading .value in the same
-    # cell that creates a UIElement.
-    _detected_scale = "linear"
-    if _emu_val:
-        _emu_name = _emu_base.lower()
-        if '_log_' in _emu_name:
-            _detected_scale = "log"
-        elif '_continuum-normalised_' in _emu_name:
-            _detected_scale = "continuum-normalised"
-
+    # The selected emulator cannot determine whether an observation is already
+    # transformed, so always leave that decision to the user.
     flux_scale_picker = mo.ui.dropdown(
         options=["linear", "log", "continuum-normalised"],
-        value=_detected_scale,
+        value="linear",
         label="Flux Transform",
     )
 
@@ -2976,8 +3191,9 @@ def _(emu_picker, glob, mo, np, os, re):
         if _legacy_grid_tag != _grid_tag:
             _grid_tags.append(_legacy_grid_tag)
 
-        # Tier 1 consumes the processed NPZ grid, while Tier 2 consumes the raw
-        # test-grid directory that contains individual .spec files.
+        # Tier 1 consumes both the processed training-grid NPZ (analytical LOO)
+        # and the paired raw test grid (independent RMSE). Tier 2 reuses that
+        # test-grid directory for parameter-recovery inference.
         for _candidate_grid_tag in _grid_tags:
             _grid_pattern = f"Grid-Emulator_Files/{_grid_stem}_grid_{_candidate_grid_tag}.npz"
             _grid_matches = sorted(glob.glob(_grid_pattern))
@@ -2999,7 +3215,7 @@ def _(emu_picker, glob, mo, np, os, re):
 
         emu_grid_info = mo.md(
             f"**Grid (Tier 1):** {_grid_display}  \n"
-            f"**Test Grid (Tier 2):** {_tg_display}"
+            f"**Test Grid (Tier 1 RMSE / Tier 2):** {_tg_display}"
         )
     elif _emu_val:
         emu_grid_info = mo.callout(
@@ -3007,9 +3223,77 @@ def _(emu_picker, glob, mo, np, os, re):
                    "Expected pattern: `{stem}_emu_{params}_{inc}inc_{wl}_{PCA}PCA.npz`"),
             kind="warn",
         )
+
+    # Tier 2 may only test truths that the selected emulator can represent.
+    # Intersect the raw .spec viewing angles with the emulator's trainable
+    # inclination bounds so, for example, an 85-degree spectrum cannot be sent
+    # to a mid-inclination emulator whose prior ends at 80 degrees.
+    from Speculate_addons.grid_registry import (
+        default_fixed_inclination as _default_fixed_inclination,
+        get_grid_config as _get_grid_config,
+        inclination_values as _inclination_values,
+    )
+
+    _supported_inclinations = [_default_fixed_inclination(matched_grid_name)]
+    if matched_grid_name:
+        _raw_inclinations = _inclination_values(matched_grid_name)
+        _grid_config = _get_grid_config(matched_grid_name)
+        _has_trainable_inclination = False
+        if _emu_val and os.path.isfile(_emu_val) and _grid_config is not None:
+            try:
+                with np.load(_emu_val, allow_pickle=True) as _emu_npz:
+                    _param_names = [
+                        _name.decode() if isinstance(_name, bytes) else str(_name)
+                        for _name in _emu_npz["param_names"].tolist()
+                    ]
+                    _param_min = np.asarray(_emu_npz["_param_min"], dtype=float)
+                    _param_max = _param_min + np.asarray(
+                        _emu_npz["_param_range"],
+                        dtype=float,
+                    )
+                _inclination_axis = next(
+                    (
+                        _idx for _idx, _name in enumerate(_param_names)
+                        if _name.startswith("param")
+                        and int(_name.replace("param", ""))
+                        in _grid_config["inclination_param_ids"]
+                    ),
+                    None,
+                )
+                if _inclination_axis is not None:
+                    _has_trainable_inclination = True
+                    _lo = _param_min[_inclination_axis]
+                    _hi = _param_max[_inclination_axis]
+                    _supported_inclinations = [
+                        _angle for _angle in _raw_inclinations
+                        if _lo <= _angle <= _hi
+                    ]
+            except Exception:
+                # Metadata failures leave the conservative fixed-inclination
+                # option rather than exposing unsupported test coordinates.
+                pass
+        if not _has_trainable_inclination:
+            _fixed_match = re.search(r"_(\d+)inc_", _emu_base)
+            if _fixed_match:
+                _fixed_angle = int(_fixed_match.group(1))
+                if _fixed_angle in _raw_inclinations:
+                    _supported_inclinations = [_fixed_angle]
+
+    _default_inclination = (
+        55 if 55 in _supported_inclinations else _supported_inclinations[0]
+    )
+    inclination_picker = mo.ui.multiselect(
+        options={
+            f"{_angle}°": str(_angle)
+            for _angle in _supported_inclinations
+        },
+        value=[f"{_default_inclination}°"],
+        label="Inclinations (Tier 2)",
+    )
     return (
         emu_grid_info,
         flux_scale_picker,
+        inclination_picker,
         matched_grid_name,
         matched_grid_path,
         matched_testgrid_path,
@@ -3019,57 +3303,132 @@ def _(emu_picker, glob, mo, np, os, re):
 
 @app.cell(hide_code=True)
 def _(mo, obs_picker, os, tier_picker):
-    # Tier 3 needs per-observation distance priors because observational
-    # spectra do not share the synthetic 100 pc reference scale used by test
-    # grids.  The widgets stay keyed by observation path so the run cell can
-    # pass the correct pc prior to each independent Tier 3 fit.
-    _known_distance_priors_pc = {
-        "ixvel": (88.8, 85.6, 92.0),
-        "rwsex": (150.0, 113.0, 187.0),
-        "rwtri": (306.0, 296.0, 316.0),
-        "uxuma": (263.5, 233.1, 293.9),
-        "v3885sgr": (135.9, 127.6, 144.2),
-    }
-
-    def _distance_defaults_for_observation(_obs_path):
-        """Return known pc prior defaults from the observation filename."""
-        _stem = os.path.splitext(os.path.basename(_obs_path))[0].lower()
-        _normalised = "".join(_ch for _ch in _stem if _ch.isalnum())
-        for _key, _defaults in _known_distance_priors_pc.items():
-            if _key in _normalised:
-                return _defaults
-        return (100.0, 90.0, 110.0)
+    # Exact filenames are shared by all three notebooks; unknown uploads retain
+    # the existing generic distance controls and no inclination override.
+    from Speculate_addons.observation_priors import OBSERVATION_PRIORS as _OBSERVATION_PRIORS
 
     tier3_distance_prior_widgets = {}
     tier3_distance_prior_controls = mo.md("")
+    tier3_inclination_prior_widgets = {}
+    tier3_inclination_prior_controls = mo.md("")
 
     _selected_tiers = set(tier_picker.value or [])
     _tier3_selected = 3 in _selected_tiers or "Tier 3" in _selected_tiers
     _obs_paths = list(obs_picker.value or [])
     if _tier3_selected and _obs_paths:
-        _rows = []
+        _distance_rows = []
+        _inclination_rows = []
         for _obs_path in _obs_paths:
-            _mean_pc, _min_pc, _max_pc = _distance_defaults_for_observation(_obs_path)
+            _filename = os.path.basename(_obs_path)
+            _known = _OBSERVATION_PRIORS.get(_filename.lower())
+            _distance_prior = (
+                _known["distance_pc"]
+                if _known is not None
+                else {"mean": 100.0, "sigma": 5.0}
+            )
+            # Table A1 quotes every distance as mean ± 1σ.
             _widgets = {
-                "mean_pc": mo.ui.number(value=_mean_pc, step=0.1, label="Mean (pc)"),
-                "min_pc": mo.ui.number(value=_min_pc, step=0.1, label="Min (pc)"),
-                "max_pc": mo.ui.number(value=_max_pc, step=0.1, label="Max (pc)"),
+                "mean_pc": mo.ui.number(
+                    value=float(_distance_prior["mean"]),
+                    step=0.01,
+                    label="Mean (pc)",
+                ),
+                "sigma_pc": mo.ui.number(
+                    value=float(_distance_prior["sigma"]),
+                    step=0.01,
+                    label="σ (pc)",
+                ),
             }
             tier3_distance_prior_widgets[_obs_path] = _widgets
-            _rows.append(
+            _distance_rows.append(
                 mo.hstack([
-                    mo.md(f"**{os.path.basename(_obs_path)}**"),
+                    mo.md(f"**{_filename}**"),
+                    mo.md("`Normal`"),
                     _widgets["mean_pc"],
-                    _widgets["min_pc"],
-                    _widgets["max_pc"],
+                    _widgets["sigma_pc"],
                 ], justify="start", gap="0.5rem")
             )
 
-        tier3_distance_prior_controls = mo.accordion({
-            f"{mo.icon('lucide:sliders-horizontal')} Tier 3 Distance Priors": mo.vstack(_rows)
-        }, lazy=False)
+            if _known is not None:
+                _inclination_prior = _known["inclination_deg"]
+                _inclination_kind = _inclination_prior["kind"]
+                if _inclination_kind == "normal":
+                    _widgets = {
+                        "kind": "normal",
+                        "mean_deg": mo.ui.number(
+                            value=float(_inclination_prior["mean"]),
+                            step=0.05,
+                            label="Mean (deg)",
+                        ),
+                        "sigma_deg": mo.ui.number(
+                            value=float(_inclination_prior["sigma"]),
+                            step=0.05,
+                            label="σ (deg)",
+                        ),
+                    }
+                    _row_controls = [
+                        _widgets["mean_deg"],
+                        _widgets["sigma_deg"],
+                    ]
+                    _kind_label = "Normal"
+                else:
+                    # A dash-separated citation is a hard Uniform range; its
+                    # midpoint is only the optimiser's starting value.
+                    _widgets = {
+                        "kind": "uniform",
+                        "mean_deg": mo.ui.number(
+                            value=float(_inclination_prior.get(
+                                "start",
+                                0.5 * (
+                                    float(_inclination_prior["min"])
+                                    + float(_inclination_prior["max"])
+                                ),
+                            )),
+                            step=0.05,
+                            label="Start (deg)",
+                        ),
+                        "min_deg": mo.ui.number(
+                            value=float(_inclination_prior["min"]),
+                            step=0.05,
+                            label="Min (deg)",
+                        ),
+                        "max_deg": mo.ui.number(
+                            value=float(_inclination_prior["max"]),
+                            step=0.05,
+                            label="Max (deg)",
+                        ),
+                    }
+                    _row_controls = [
+                        _widgets["mean_deg"],
+                        _widgets["min_deg"],
+                        _widgets["max_deg"],
+                    ]
+                    _kind_label = "Uniform"
+                tier3_inclination_prior_widgets[_obs_path] = _widgets
+                _inclination_rows.append(
+                    mo.hstack([
+                        mo.md(f"**{_filename}**"),
+                        mo.md(f"`{_kind_label}`"),
+                        *_row_controls,
+                    ], justify="start", gap="0.5rem")
+                )
 
-    return tier3_distance_prior_controls, tier3_distance_prior_widgets
+        tier3_distance_prior_controls = mo.accordion({
+            f"{mo.icon('lucide:sliders-horizontal')} Tier 3 Distance Priors":
+                mo.vstack(_distance_rows)
+        }, lazy=False)
+        if _inclination_rows:
+            tier3_inclination_prior_controls = mo.accordion({
+                f"{mo.icon('lucide:scan')} Tier 3 Inclination Priors":
+                    mo.vstack(_inclination_rows)
+            }, lazy=False)
+
+    return (
+        tier3_distance_prior_controls,
+        tier3_distance_prior_widgets,
+        tier3_inclination_prior_controls,
+        tier3_inclination_prior_widgets,
+    )
 
 
 @app.cell(hide_code=True)
@@ -3085,6 +3444,8 @@ def _(
     obs_picker,
     sirocco_cpu_slider,
     tier3_distance_prior_controls,
+    tier3_inclination_prior_controls,
+    tier3_local_cov_checkbox,
     tier3_wl_range_slider,
     tier_picker,
 ):
@@ -3092,8 +3453,9 @@ def _(
         mo.md("### Run Benchmark"),
         mo.vstack([tier_picker, emu_picker, flux_scale_picker], gap=1),
         emu_grid_info,
-        mo.hstack([obs_picker], gap=1),
+        mo.hstack([obs_picker, tier3_local_cov_checkbox], gap=1, align="end"),
         tier3_distance_prior_controls,
+        tier3_inclination_prior_controls,
         mo.vstack([inclination_picker, max_spectra_slider, mle_restarts_slider, mcmc_steps_slider], gap=1),
         tier3_wl_range_slider,
         sirocco_cpu_slider,
@@ -3135,18 +3497,27 @@ def _(mo, sirocco_cpu_slider, tier_picker):
 
 
 @app.cell(hide_code=True)
-def _(emu_picker, mo, np, os):
+def _(emu_picker, matched_grid_name, mo, np, os):
     tier2_mle_freeze = mo.ui.dictionary({})
     tier2_mcmc_freeze = mo.ui.dictionary({})
     tier2_freeze_controls = mo.callout(
         mo.md("Select an emulator to configure Tier 2 MLE/MCMC freeze settings."),
         kind="neutral",
     )
+    tier3_mle_freeze = mo.ui.dictionary({})
+    tier3_mcmc_freeze = mo.ui.dictionary({})
+    tier3_freeze_controls = mo.callout(
+        mo.md("Select an emulator to configure Tier 3 MLE/MCMC freeze settings."),
+        kind="neutral",
+    )
 
     _emu_val = emu_picker.value or ""
     if _emu_val and os.path.isfile(_emu_val):
         try:
-            from Speculate_addons.speculate_benchmark import build_tier2_freeze_defaults
+            from Speculate_addons.speculate_benchmark import (
+                build_tier2_freeze_defaults,
+                build_tier3_freeze_defaults,
+            )
 
             with np.load(_emu_val, allow_pickle=True) as _npz:
                 _raw_param_names = _npz["param_names"].tolist()
@@ -3155,29 +3526,31 @@ def _(emu_picker, mo, np, os):
                 _name.decode() if isinstance(_name, bytes) else str(_name)
                 for _name in _raw_param_names
             ]
-            _defaults = build_tier2_freeze_defaults(_param_names)
+            _tier2_defaults = build_tier2_freeze_defaults(_param_names, matched_grid_name)
+            _tier3_defaults = build_tier3_freeze_defaults(_param_names, matched_grid_name)
 
-            _mle_widgets = {}
-            _mcmc_widgets = {}
-            for _label, _friendly in _defaults["labels"].items():
-                _mle_widgets[_label] = mo.ui.checkbox(
-                    value=bool(_defaults["mle"].get(_label, False)),
+            _tier2_mle_widgets = {}
+            _tier2_mcmc_widgets = {}
+            for _label, _friendly in _tier2_defaults["labels"].items():
+                _tier2_mle_widgets[_label] = mo.ui.checkbox(
+                    value=bool(_tier2_defaults["mle"].get(_label, False)),
                     label=_friendly,
                 )
-                _mcmc_widgets[_label] = mo.ui.checkbox(
-                    value=bool(_defaults["mcmc"].get(_label, False)),
+                _tier2_mcmc_widgets[_label] = mo.ui.checkbox(
+                    value=bool(_tier2_defaults["mcmc"].get(_label, False)),
                     label=_friendly,
                 )
 
-            tier2_mle_freeze = mo.ui.dictionary(_mle_widgets)
-            tier2_mcmc_freeze = mo.ui.dictionary(_mcmc_widgets)
+            tier2_mle_freeze = mo.ui.dictionary(_tier2_mle_widgets)
+            tier2_mcmc_freeze = mo.ui.dictionary(_tier2_mcmc_widgets)
             tier2_freeze_controls = mo.vstack([
                 mo.md("### Tier 2 Freeze Controls"),
                 mo.callout(
                     mo.md(
                         "Stage 2 freezes hold parameters at the benchmark starting values: "
                         "grid midpoints, Av=0, Distance=100 pc, cheb_1=0, and the default GP initialisation. "
-                        "Stage 4 freezes hold parameters at their post-MLE values during MCMC."
+                        "Stage 4 freezes hold parameters at their post-MLE values during MCMC. "
+                        "Fixed local covariance kernels are disabled for Tier 2 test-grid spectra."
                     ),
                     kind="neutral",
                 ),
@@ -3192,13 +3565,60 @@ def _(emu_picker, mo, np, os):
                     ]),
                 ], widths=[1, 1], align="start", gap=2),
             ])
+
+            _tier3_mle_widgets = {}
+            _tier3_mcmc_widgets = {}
+            for _label, _friendly in _tier3_defaults["labels"].items():
+                _tier3_mle_widgets[_label] = mo.ui.checkbox(
+                    value=bool(_tier3_defaults["mle"].get(_label, False)),
+                    label=_friendly,
+                )
+                _tier3_mcmc_widgets[_label] = mo.ui.checkbox(
+                    value=bool(_tier3_defaults["mcmc"].get(_label, False)),
+                    label=_friendly,
+                )
+
+            tier3_mle_freeze = mo.ui.dictionary(_tier3_mle_widgets)
+            tier3_mcmc_freeze = mo.ui.dictionary(_tier3_mcmc_widgets)
+            tier3_freeze_controls = mo.vstack([
+                mo.md("### Tier 3 Freeze Controls"),
+                mo.callout(
+                    mo.md(
+                        "MLE freezes hold parameters at the benchmark starting values, including each "
+                        "observation's selected distance-prior mean. MCMC freezes hold parameters at "
+                        "their post-MLE values. All Tier 3 parameters are free by default."
+                    ),
+                    kind="neutral",
+                ),
+                mo.hstack([
+                    mo.vstack([
+                        mo.md("#### MLE"),
+                        tier3_mle_freeze,
+                    ]),
+                    mo.vstack([
+                        mo.md("#### MCMC"),
+                        tier3_mcmc_freeze,
+                    ]),
+                ], widths=[1, 1], align="start", gap=2),
+            ])
         except Exception as _exc:
             tier2_freeze_controls = mo.callout(
                 mo.md(f"Could not load Tier 2 freeze controls from emulator metadata: {_exc}"),
                 kind="warn",
             )
+            tier3_freeze_controls = mo.callout(
+                mo.md(f"Could not load Tier 3 freeze controls from emulator metadata: {_exc}"),
+                kind="warn",
+            )
 
-    return tier2_freeze_controls, tier2_mcmc_freeze, tier2_mle_freeze
+    return (
+        tier2_freeze_controls,
+        tier2_mcmc_freeze,
+        tier2_mle_freeze,
+        tier3_freeze_controls,
+        tier3_mcmc_freeze,
+        tier3_mle_freeze,
+    )
 
 
 @app.cell(hide_code=True)
@@ -3208,14 +3628,25 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(emu_picker, matched_grid_path, matched_testgrid_path, mo, run_btn, tier2_freeze_controls, tier_picker):
+def _(
+    emu_picker,
+    matched_grid_path,
+    matched_testgrid_path,
+    mo,
+    run_btn,
+    tier2_freeze_controls,
+    tier3_freeze_controls,
+    tier_picker,
+):
     _selected_tiers = set(tier_picker.value or [])
     _items = []
     if 2 in _selected_tiers or "Tier 2" in _selected_tiers:
         _items.append(tier2_freeze_controls)
+    if 3 in _selected_tiers or "Tier 3" in _selected_tiers:
+        _items.append(tier3_freeze_controls)
 
     # Pre-trained emulators can be downloaded before the matching processed
-    # Tier 1 grid or decompressed Tier 2 test grid exists locally.  Surface any
+    # Tier 1 grid or decompressed Tier 1/Tier 2 test grid exists locally. Surface any
     # inferred resource that is still shown as "not found" so a fresh install
     # has an obvious path to make the affected benchmark tier runnable.
     _emu_selected = bool(emu_picker.value)
@@ -3228,7 +3659,9 @@ def _(emu_picker, matched_grid_path, matched_testgrid_path, mo, run_btn, tier2_f
         )
     if _emu_selected and not matched_testgrid_path:
         _missing_messages.append(
-            "**Test Grid (Tier 2)** is missing. To retrieve the test grid, "
+            "**Test Grid (Tier 1 RMSE / Tier 2)** is missing. Tier 1 can still "
+            "run its training-grid diagnostics, but its independent RMSE envelope "
+            "will be unavailable. To retrieve the test grid, "
             "download and decompress the grid in the Model Downloader notebook."
         )
     if _missing_messages:
@@ -3272,6 +3705,10 @@ def _(
     tier2_mcmc_freeze,
     tier2_mle_freeze,
     tier3_distance_prior_widgets,
+    tier3_inclination_prior_widgets,
+    tier3_local_cov_checkbox,
+    tier3_mcmc_freeze,
+    tier3_mle_freeze,
     tier3_wl_range_slider,
     tier_picker,
     time,
@@ -3295,6 +3732,7 @@ def _(
             check_sirocco_runtime as _check_sirocco_runtime,
             build_report_card as _build_report_card,
             build_tier2_freeze_defaults as _build_tier2_freeze_defaults,
+            build_tier3_freeze_defaults as _build_tier3_freeze_defaults,
             save_report as _save_report,
             # Tier 2 helpers — viewer drives the loop for nested progress
             load_test_grid_spectrum as _load_spec,
@@ -3383,23 +3821,33 @@ def _(
             _tier2_mle_freeze_settings["log_scale"] = True
         if "log_scale" in _tier2_mcmc_freeze_settings:
             _tier2_mcmc_freeze_settings["log_scale"] = True
+        _tier3_defaults = _build_tier3_freeze_defaults(_emu.param_names, _grid_name)
+        _tier3_mle_freeze_settings = dict(tier3_mle_freeze.value or _tier3_defaults["mle"])
+        _tier3_mcmc_freeze_settings = dict(tier3_mcmc_freeze.value or _tier3_defaults["mcmc"])
         _mcmc_steps_val = mcmc_steps_slider.value
         _mcmc_walkers_val = 64
         _mcmc_burnin_val = 500
+        _tier3_local_cov_enabled = bool(tier3_local_cov_checkbox.value)
         _tier1_result = None
         _tier2_result = None
         _tier3_results = None
         _tier3_distance_priors_pc = None
+        _tier3_inclination_priors_deg = None
         _tier3_checkpoint_path_to_remove = None
 
         # ---- Tier 1 (spinner — single LOO cross-validation pass) ----
         if 1 in _tiers and matched_grid_path:
             with mo.status.spinner(
                 title="Tier 1 — Grid Reconstruction",
-                subtitle="Running LOO cross-validation…",
+                subtitle="Running training-grid LOO and independent test-grid RMSE…",
                 remove_on_exit=True,
             ):
-                _tier1_result = _run_tier1(_emu, matched_grid_path)
+                _tier1_result = _run_tier1(
+                    _emu,
+                    matched_grid_path,
+                    test_grid_path=matched_testgrid_path or None,
+                    grid_name=_grid_name,
+                )
 
             # Keep the large flux arrays in marimo state rather than in the JSON
             # report so the interactive reconstruction explorer can reuse them.
@@ -3410,7 +3858,6 @@ def _(
         # ---- Tier 2 (progress_bar per spectrum + spinner per stage) ----
         if 2 in _tiers and matched_testgrid_path:
             import json as _json
-            import random as _random
             _t2_t0 = time.time()
             _test_path = _Path(matched_testgrid_path)
             # Tier 2 works spectrum-by-spectrum from the decompressed test-grid files.
@@ -3419,11 +3866,27 @@ def _(
                 _spec_files = _spec_files[: max_spectra_slider.value]
             _n_t2 = len(_spec_files)
 
-            # Resolve inclination setting from UI
-            _inc_raw = inclination_picker.value
-            _inc_is_random = (_inc_raw == "random")
-            _inc_fixed = float(_inc_raw) if not _inc_is_random else 55.0
-            _VALID_INCS = _inclination_values(_grid_name)
+            # Assign exactly one manually selected, in-support inclination to
+            # each run.  Round-robin assignment keeps the total case count fixed
+            # and balances inclination counts without random seeds.
+            _selected_inclinations = [
+                float(_value) for _value in (inclination_picker.value or [])
+            ]
+            if not _selected_inclinations:
+                set_status_msg("Error: select at least one Tier 2 inclination.")
+                mo.stop(True)
+            _valid_inclinations = set(_inclination_values(_grid_name))
+            if any(_value not in _valid_inclinations for _value in _selected_inclinations):
+                set_status_msg("Error: a selected Tier 2 inclination is unavailable in the test grid.")
+                mo.stop(True)
+            _case_assignments = [
+                (_sf, _selected_inclinations[_idx % len(_selected_inclinations)])
+                for _idx, _sf in enumerate(_spec_files)
+            ]
+            _expected_cases = {
+                (int(_sf.stem.replace("run", "")), float(_inc))
+                for _sf, _inc in _case_assignments
+            }
 
             # Resolve wavelength range from emulator
             _wl_range = (float(_emu.wl.min()) + 10, float(_emu.wl.max()) - 10)
@@ -3445,7 +3908,7 @@ def _(
                 _checkpoint_dir, f"benchmark_partial_{_emu_stem}.jsonl"
             )
 
-            _completed_runs = set()
+            _completed_cases = set()
             _per_spectrum = []
             _tier2_posteriors = []  # full MCMC posteriors for corner-plot explorer
             _all_samples = {n: [] for n in _friendly}
@@ -3473,14 +3936,33 @@ def _(
                                 or _entry.get("mle_bestfit_spec")
                             ):
                                 continue
-                            _completed_runs.add(_entry["run"])
+                            # Checkpoints created with the former walker-based
+                            # R-hat cannot be mixed into the repaired result.
+                            if (
+                                "autocorr_time" not in _entry
+                                or "effective_sample_size" not in _entry
+                            ):
+                                continue
+                            _case_key = (
+                                int(_entry["run"]),
+                                float(_entry.get("inclination", 55.0)),
+                            )
+                            # A run at a different inclination is a different
+                            # recovery problem and must never satisfy resume.
+                            if _case_key not in _expected_cases:
+                                continue
+                            _completed_cases.add(_case_key)
                             _per_spectrum.append(_entry["spec_result"])
                             for _fn in _friendly:
-                                if f"{_fn}_samples" in _entry:
+                                # Resume coverage only from complete
+                                # sample/truth pairs so later cases stay aligned.
+                                if (
+                                    f"{_fn}_samples" in _entry
+                                    and f"{_fn}_truth" in _entry
+                                ):
                                     _all_samples[_fn].append(
                                         _np.array(_entry[f"{_fn}_samples"])
                                     )
-                                if f"{_fn}_truth" in _entry:
                                     _all_truths[_fn].append(_entry[f"{_fn}_truth"])
                             if not _entry.get("mcmc_converged", True):
                                 _n_not_converged += 1
@@ -3502,6 +3984,16 @@ def _(
                                 if "full_chain" in _entry:
                                     _post_entry["full_chain"] = _np.array(_entry["full_chain"])
                                     _post_entry["burnin_used"] = _entry.get("burnin_used", 500)
+                                for _diagnostic_key in (
+                                    "n_retained_draws",
+                                    "autocorr_time",
+                                    "effective_sample_size",
+                                    "mcse_mean",
+                                    "acceptance_fraction",
+                                    "mcmc_diagnostic_reasons",
+                                ):
+                                    if _diagnostic_key in _entry:
+                                        _post_entry[_diagnostic_key] = _entry[_diagnostic_key]
                                 if "bestfit_spec" in _entry:
                                     _post_entry["bestfit_spec"] = _entry["bestfit_spec"]
                                 if "posterior_mean_bestfit_spec" in _entry:
@@ -3566,13 +4058,13 @@ def _(
                 except Exception:
                     pass  # corrupted partial — start fresh
 
-            _n_resumed = len(_completed_runs)
+            _n_resumed = len(_completed_cases)
 
             with mo.status.progress_bar(
                 total=_n_t2,
-                title="Tier 2 — Parameter Recovery",
+                title="Tier 2 — Inference Parameter Recovery",
                 subtitle=f"Resuming from {_n_resumed} completed…" if _n_resumed else "Starting…",
-                completion_title="Tier 2 — Parameter Recovery",
+                completion_title="Tier 2 — Inference Parameter Recovery",
                 completion_subtitle="Complete ✓",
                 show_rate=True,
                 show_eta=True,
@@ -3582,21 +4074,14 @@ def _(
                 if _n_resumed > 0:
                     _t2_bar.update(increment=_n_resumed, subtitle=f"Resumed {_n_resumed} spectra")
 
-                for _si, _sf in enumerate(_spec_files):
+                for _si, (_sf, _inc) in enumerate(_case_assignments):
                     # Spectrum filenames encode the run number used by the lookup table.
                     _run_idx = int(_sf.stem.replace("run", ""))
                     _sname = _sf.name
 
                     # Skip already-completed spectra (resume mode)
-                    if _run_idx in _completed_runs:
+                    if (_run_idx, float(_inc)) in _completed_cases:
                         continue
-
-                    # Resolve inclination for this spectrum
-                    if _inc_is_random:
-                        _rng = _random.Random(_run_idx)
-                        _inc = float(_rng.choice(_VALID_INCS))
-                    else:
-                        _inc = _inc_fixed
 
                     # -- Load spectrum --
                     _t2_bar.update(increment=0, subtitle=f"Loading {_sname} (i={_inc:.0f}°)…")
@@ -3682,6 +4167,7 @@ def _(
                                 iteration_callback=_mcmc_cb,
                                 freeze_params=_tier2_mcmc_freeze_settings,
                                 grid_name=_grid_name,
+                                burnin_is_cap=True,
                             )
                         except Exception as _e:
                             _failure_log.append({
@@ -3702,7 +4188,12 @@ def _(
                         "inclination": _inc,
                         "mle_success": _mle["success"],
                         "mcmc_converged": _mcmc["converged"],
-                        "n_effective": _mcmc["n_effective"],
+                        "n_retained_draws": _mcmc["n_retained_draws"],
+                        "autocorr_time": _mcmc["autocorr_time"],
+                        "effective_sample_size": _mcmc["effective_sample_size"],
+                        "mcse_mean": _mcmc["mcse_mean"],
+                        "acceptance_fraction": _mcmc["acceptance_fraction"],
+                        "mcmc_diagnostic_reasons": _mcmc["diagnostic_reasons"],
                         "mle_grid_params": _mle["grid_params"],
                         "mle_nll": _mle.get("nll"),
                         "mle_optimizer_nll": _mle.get("optimizer_nll", _mle.get("nll")),
@@ -3727,6 +4218,12 @@ def _(
                         "full_samples": _mcmc["samples"].tolist(),
                         "full_chain": _mcmc["full_chain"].tolist(),
                         "burnin_used": _mcmc.get("burnin_used", _mcmc_burnin_val),
+                        "n_retained_draws": _mcmc.get("n_retained_draws"),
+                        "autocorr_time": _mcmc.get("autocorr_time", {}),
+                        "effective_sample_size": _mcmc.get("effective_sample_size", {}),
+                        "mcse_mean": _mcmc.get("mcse_mean", {}),
+                        "acceptance_fraction": _mcmc.get("acceptance_fraction", {}),
+                        "mcmc_diagnostic_reasons": _mcmc.get("diagnostic_reasons", []),
                         "full_labels": _mcmc.get("labels", []),
                         "full_summary": {
                             k: {sk: sv for sk, sv in v.items()}
@@ -3771,10 +4268,13 @@ def _(
                             # Find correct column for this parameter
                             _col = _mcmc_labels.index(_fn) if _fn in _mcmc_labels else _pi
                             _samples_i = _mcmc["samples"][:, _col]
-                            _all_samples[_fn].append(_samples_i)
-                            _cp_entry[f"{_fn}_samples"] = _samples_i.tolist()
                             if _fn in _gt:
+                                # Store coverage inputs only as complete pairs;
+                                # otherwise a missing truth would offset every
+                                # subsequent sample/truth comparison.
+                                _all_samples[_fn].append(_samples_i)
                                 _all_truths[_fn].append(_gt[_fn])
+                                _cp_entry[f"{_fn}_samples"] = _samples_i.tolist()
                                 _spec_res[f"{_fn}_truth"] = _gt[_fn]
                                 _cp_entry[f"{_fn}_truth"] = _gt[_fn]
                                 _median = float(np.median(_samples_i))
@@ -3794,6 +4294,12 @@ def _(
                         "samples": _mcmc["samples"],  # (N, ndim) burnt+thinned flat samples
                         "full_chain": _mcmc["full_chain"],  # (nsteps, nwalkers, ndim) full chain
                         "burnin_used": _mcmc.get("burnin_used", _mcmc_burnin_val),
+                        "n_retained_draws": _mcmc.get("n_retained_draws"),
+                        "autocorr_time": _mcmc.get("autocorr_time", {}),
+                        "effective_sample_size": _mcmc.get("effective_sample_size", {}),
+                        "mcse_mean": _mcmc.get("mcse_mean", {}),
+                        "acceptance_fraction": _mcmc.get("acceptance_fraction", {}),
+                        "mcmc_diagnostic_reasons": _mcmc.get("diagnostic_reasons", []),
                         "labels": _mcmc_labels,
                         "summary": _mcmc["summary"],
                         "converged": _mcmc["converged"],
@@ -3824,7 +4330,7 @@ def _(
                     _status_lbl = (
                         f"✓ {_sname} (i={_inc:.0f}°) complete"
                         if _mcmc["converged"]
-                        else f"⚠ {_sname} (i={_inc:.0f}°, not converged)"
+                        else f"⚠ {_sname} (i={_inc:.0f}°, diagnostic flagged)"
                     )
                     _t2_bar.update(increment=1, subtitle=_status_lbl)
 
@@ -3871,25 +4377,73 @@ def _(
             def _read_tier3_distance_prior(_obs_path):
                 """Read and validate the pc distance prior widgets for one observation."""
                 _widgets = tier3_distance_prior_widgets.get(_obs_path) or {}
-                _prior = {
-                    "mean_pc": float(_widgets.get("mean_pc").value) if _widgets.get("mean_pc") else 100.0,
-                    "min_pc": float(_widgets.get("min_pc").value) if _widgets.get("min_pc") else 90.0,
-                    "max_pc": float(_widgets.get("max_pc").value) if _widgets.get("max_pc") else 110.0,
+                _mean_pc = (
+                    float(_widgets["mean_pc"].value)
+                    if _widgets.get("mean_pc")
+                    else 100.0
+                )
+                if not (_np.isfinite(_mean_pc) and _mean_pc > 0):
+                    raise ValueError(
+                        f"Tier 3 distance-prior mean for {os.path.basename(_obs_path)} "
+                        "must be finite and positive."
+                    )
+                # The five source distances and the fallback are all Normal.
+                _sigma_pc = float(_widgets["sigma_pc"].value)
+                if not (_np.isfinite(_sigma_pc) and _sigma_pc > 0):
+                    raise ValueError(
+                        f"Tier 3 distance-prior σ for {os.path.basename(_obs_path)} "
+                        "must be finite and positive."
+                    )
+                return {
+                    "kind": "normal",
+                    "mean_pc": _mean_pc,
+                    "sigma_pc": _sigma_pc,
                 }
-                _vals = [_prior["mean_pc"], _prior["min_pc"], _prior["max_pc"]]
-                if not all(_np.isfinite(_v) and _v > 0 for _v in _vals):
+
+            def _read_tier3_inclination_prior(_obs_path):
+                """Read and validate the inclination prior widgets for one observation."""
+                _widgets = tier3_inclination_prior_widgets.get(_obs_path) or {}
+                if not _widgets:
+                    return None
+                _kind = str(_widgets.get("kind", "uniform")).lower()
+                _mean_deg = float(_widgets["mean_deg"].value)
+                if not _np.isfinite(_mean_deg):
                     raise ValueError(
-                        f"Tier 3 distance prior for {os.path.basename(_obs_path)} must be finite and positive."
+                        f"Tier 3 inclination-prior centre for {os.path.basename(_obs_path)} "
+                        "must be finite."
                     )
-                if _prior["min_pc"] >= _prior["max_pc"]:
+                if _kind == "normal":
+                    # The quoted uncertainty is 1σ; the backend constructs the
+                    # corresponding Normal prior on the inclination parameter.
+                    _sigma_deg = float(_widgets["sigma_deg"].value)
+                    if not (_np.isfinite(_sigma_deg) and _sigma_deg > 0):
+                        raise ValueError(
+                            f"Tier 3 inclination-prior σ for {os.path.basename(_obs_path)} "
+                            "must be finite and positive."
+                        )
+                    return {
+                        "kind": "normal",
+                        "mean_deg": _mean_deg,
+                        "sigma_deg": _sigma_deg,
+                    }
+
+                _min_deg = float(_widgets["min_deg"].value)
+                _max_deg = float(_widgets["max_deg"].value)
+                if not (0.0 <= _min_deg < _max_deg <= 90.0):
                     raise ValueError(
-                        f"Tier 3 distance prior for {os.path.basename(_obs_path)} needs Min < Max."
+                        f"Tier 3 inclination prior for {os.path.basename(_obs_path)} needs "
+                        "0 <= Min < Max <= 90 deg."
                     )
-                if not (_prior["min_pc"] <= _prior["mean_pc"] <= _prior["max_pc"]):
+                if not (_min_deg <= _mean_deg <= _max_deg):
                     raise ValueError(
-                        f"Tier 3 distance prior mean for {os.path.basename(_obs_path)} must lie within Min/Max."
+                        f"Tier 3 inclination start for {os.path.basename(_obs_path)} must lie within Min/Max."
                     )
-                return _prior
+                return {
+                    "kind": "uniform",
+                    "mean_deg": _mean_deg,
+                    "min_deg": _min_deg,
+                    "max_deg": _max_deg,
+                }
 
             # ---- Checkpoint / Resume ----
             # Tier 3 observations are independent but expensive: each completed
@@ -3899,6 +4453,10 @@ def _(
             _obs_keys = [str(_Path(_obs).expanduser().resolve()) for _obs in _obs_list]
             _tier3_distance_priors_pc = {
                 str(_Path(_obs).expanduser().resolve()): _read_tier3_distance_prior(_obs)
+                for _obs in _obs_list
+            }
+            _tier3_inclination_priors_deg = {
+                str(_Path(_obs).expanduser().resolve()): _read_tier3_inclination_prior(_obs)
                 for _obs in _obs_list
             }
             _tier3_checkpoint_config = {
@@ -3912,8 +4470,12 @@ def _(
                 "mcmc_steps": int(_mcmc_steps_val),
                 "mcmc_burnin": int(_mcmc_burnin_val),
                 "sirocco_cpus": int(sirocco_cpu_slider.value),
+                "enable_local_covariance": bool(_tier3_local_cov_enabled),
                 "observations": sorted(_obs_keys),
                 "distance_priors_pc": _tier3_distance_priors_pc,
+                "inclination_priors_deg": _tier3_inclination_priors_deg,
+                "mle_freeze": dict(_tier3_mle_freeze_settings),
+                "mcmc_freeze": dict(_tier3_mcmc_freeze_settings),
             }
             _tier3_checkpoint_hash = _hashlib.sha256(
                 _json.dumps(_tier3_checkpoint_config, sort_keys=True).encode("utf-8")
@@ -3983,6 +4545,7 @@ def _(
                     _obs_name = os.path.basename(_obs_path)
                     _obs_key = str(_Path(_obs_path).expanduser().resolve())
                     _distance_prior_pc = _tier3_distance_priors_pc.get(_obs_key)
+                    _inclination_prior_deg = _tier3_inclination_priors_deg.get(_obs_key)
                     if _obs_key in _resumed_tier3_results:
                         _tier3_results.append(_resumed_tier3_results[_obs_key])
                         continue
@@ -4041,6 +4604,9 @@ def _(
                         flux_scale=_flux_scale,
                         wl_range=_tier3_wl_range,
                         distance_prior_pc=_distance_prior_pc,
+                        inclination_prior_deg=_inclination_prior_deg,
+                        mle_freeze_params=_tier3_mle_freeze_settings,
+                        mcmc_freeze_params=_tier3_mcmc_freeze_settings,
                         mle_restarts=mle_restarts_slider.value,
                         mcmc_walkers=_mcmc_walkers_val,
                         mcmc_steps=_mcmc_steps_val,
@@ -4050,6 +4616,7 @@ def _(
                         sirocco_cpus=sirocco_cpu_slider.value,
                         require_sirocco=True,
                         run_sirocco=True,
+                        enable_local_covariance=_tier3_local_cov_enabled,
                         mle_iteration_callback=_t3_mle_cb,
                         mcmc_iteration_callback=_t3_mcmc_cb,
                         sirocco_progress_callback=_t3_sirocco_cb,
@@ -4094,10 +4661,20 @@ def _(
             "mcmc_burnin": _mcmc_burnin_val,
             "mle_restarts": mle_restarts_slider.value,
             "max_spectra": max_spectra_slider.value,
+            "tier2_inclinations": (
+                list(_selected_inclinations) if 2 in _tiers else None
+            ),
+            "tier2_inclination_assignment": (
+                "balanced_round_robin" if 2 in _tiers else None
+            ),
             "sirocco_cpus": sirocco_cpu_slider.value,
             "tier3_export_dir": _tier3_export_dir if 3 in _tiers else None,
             "tier3_wl_range": list(_tier3_wl_range) if 3 in _tiers else None,
             "tier3_distance_priors_pc": _tier3_distance_priors_pc if 3 in _tiers else None,
+            "tier3_inclination_priors_deg": _tier3_inclination_priors_deg if 3 in _tiers else None,
+            "tier3_local_covariance_enabled": _tier3_local_cov_enabled if 3 in _tiers else None,
+            "tier3_mle_freeze": dict(_tier3_mle_freeze_settings),
+            "tier3_mcmc_freeze": dict(_tier3_mcmc_freeze_settings),
             "tier2_mle_freeze": dict(_tier2_mle_freeze_settings),
             "tier2_mcmc_freeze": dict(_tier2_mcmc_freeze_settings),
         }
@@ -4132,10 +4709,16 @@ def _(
             if _t2_fail:
                 _t2_parts.append(f"{_t2_fail} failed")
             if _t2_nc:
-                _t2_parts.append(f"{_t2_nc} not converged")
+                _t2_parts.append(f"{_t2_nc} diagnostically flagged")
             _summary_parts.append(" — ".join(_t2_parts))
         if _tier3_results:
             _summary_parts.append(f"Tier 3: {len(_tier3_results)} observation(s)")
+            if _tier3_local_cov_enabled:
+                _n_local = sum(
+                    int((_r.get("local_covariance") or {}).get("n_kernels", 0))
+                    for _r in _tier3_results
+                )
+                _summary_parts.append(f"Tier 3 local covariance: {_n_local} fixed kernel(s)")
 
         set_status_msg("  \n".join(_summary_parts))
 

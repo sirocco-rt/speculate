@@ -172,3 +172,97 @@ def global_covariance_diagnostics(model, priors: Optional[dict], residual: np.nd
         "log_amp_optimizer_bounds": log_amp_bounds,
     })
     return diagnostics
+
+
+def covariance_diagonal_components(model, total_covariance=None) -> dict:
+    """Return the additive marginal-variance terms used by ``SpectrumModel``.
+
+    The model constructs its covariance as emulator + observation + global GP
+    + local kernels.  Reporting the diagonal of each term is sufficient for a
+    wavelength-local uncertainty tooltip, while avoiding another expensive
+    emulator evaluation when the caller already has ``total_covariance``.
+
+    Parameters
+    ----------
+    model : Starfish.models.SpectrumModel
+        Evaluated model whose current covariance caches match its parameters.
+    total_covariance : array_like or None
+        Full covariance matrix or its diagonal.  When omitted, ``model()`` is
+        evaluated once to obtain it.
+
+    Returns
+    -------
+    dict
+        NumPy arrays named ``total_variance``, ``observation_variance``,
+        ``emulator_variance``, ``global_variance``, and ``local_variance``.
+    """
+
+    def _as_numpy(value):
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        return np.asarray(value, dtype=np.float64)
+
+    if total_covariance is None:
+        _, total_covariance = model()
+
+    total_array = _as_numpy(total_covariance)
+    total_variance = (
+        np.diag(total_array)
+        if total_array.ndim == 2
+        else total_array.reshape(-1)
+    ).copy()
+    n_pix = total_variance.size
+
+    observation_variance = _as_numpy(model.data.sigma).reshape(-1) ** 2
+    if observation_variance.size != n_pix:
+        raise ValueError(
+            "Observation variance does not match the model covariance diagonal"
+        )
+
+    def _cached_component_diagonal(value, name):
+        """Convert an optional cached covariance term to a validated diagonal."""
+        if value is None or np.isscalar(value):
+            return np.zeros(n_pix, dtype=np.float64)
+        component = _as_numpy(value)
+        diagonal = (
+            np.diag(component)
+            if component.ndim == 2
+            else component.reshape(-1)
+        )
+        if diagonal.size != n_pix:
+            raise ValueError(
+                f"{name} variance does not match the model covariance diagonal"
+            )
+        # Covariance diagonals are non-negative.  Clipping protects the report
+        # from insignificant negative round-off without changing the likelihood.
+        return np.maximum(diagonal, 0.0)
+
+    # ``model()`` refreshes these caches at the current parameter point before
+    # this helper is called, so they exactly match the terms added to the total.
+    global_variance = _cached_component_diagonal(
+        getattr(model, "_glob_cov", None),
+        "Global GP",
+    )
+    local_variance = _cached_component_diagonal(
+        getattr(model, "_loc_cov", None),
+        "Local covariance",
+    )
+
+    # SpectrumModel begins with X Σ_w Xᵀ (the propagated emulator covariance)
+    # and then adds the three explicit terms above.  Recovering that remainder
+    # avoids duplicating all wavelength resampling and nuisance transformations.
+    emulator_variance = (
+        total_variance
+        - observation_variance
+        - global_variance
+        - local_variance
+    )
+    emulator_variance = np.maximum(emulator_variance, 0.0)
+
+    return {
+        "total_variance": np.maximum(total_variance, 0.0),
+        "observation_variance": np.maximum(observation_variance, 0.0),
+        "emulator_variance": emulator_variance,
+        "global_variance": global_variance,
+        "local_variance": local_variance,
+    }

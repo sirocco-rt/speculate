@@ -3,8 +3,8 @@ Speculate Benchmark Module
 ===========================
 Core functions for evaluating emulator performance across three tiers:
 
-    Tier 1 — Grid Reconstruction Fidelity (PCA + Leave-One-Out CV)
-    Tier 2 — Test Grid Parameter Recovery  (MLE + MCMC + calibration)
+    Tier 1 — Grid Reconstruction           (training LOO + test-grid RMSE)
+    Tier 2 — Inference Parameter Recovery  (MLE + MCMC + calibration)
     Tier 3 — Observational Spectra         (goodness-of-fit + PPC)
 
 Import these functions directly or use the marimo Benchmark Viewer
@@ -36,13 +36,16 @@ from Speculate_addons.grid_registry import (
     default_fixed_inclination,
     defaulted_physical_param_ids,
     emulator_values_to_physical,
+    get_grid_config,
     inclination_column,
+    inclination_values,
     infer_grid_name,
     lookup_row_to_emulator_values,
 )
 from Speculate_addons.gp_covariance import (
     GP_LOG_AMP_PRIOR_SIGMA,
     bounds_for_frozen_prior,
+    covariance_diagonal_components,
     estimate_log_amp_centre_from_sigma,
     global_covariance_diagnostics,
 )
@@ -115,14 +118,14 @@ def build_tier2_freeze_defaults(param_names: Sequence[str], grid_name: Optional[
     Grid parameter labels depend on the active registry entry, while nuisance
     labels stay shared across grids.
 
-    Tier 2 fits synthetic test-grid spectra, which carry no extinction and share
-    the reference distance, so Av and Distance (``log_scale``) default to FIXED
-    while the Chebyshev tilt and GP covariance terms (``cheb:1``,
-    ``global_cov:log_amp``, ``global_cov:log_ls``) default to FREE — for both the
-    MLE and MCMC stages.
+    Tier 2 fits synthetic test-grid spectra, which carry no extinction, share
+    the reference distance, and have no continuum-tilt systematic.  Av,
+    Distance (``log_scale``), and ``cheb:1`` therefore default to fixed for
+    both MLE and MCMC.  As with the other freeze settings, callers may
+    explicitly thaw ``cheb:1`` when testing a different policy.
     """
     label_map = build_tier2_label_map(param_names, grid_name)
-    _default_frozen = ("Av", "log_scale")
+    _default_frozen = ("Av", "log_scale", "cheb:1")
 
     mle = {label: False for label in label_map}
     for label in _default_frozen:
@@ -141,6 +144,21 @@ def build_tier2_freeze_defaults(param_names: Sequence[str], grid_name: Optional[
     }
 
 
+def build_tier3_freeze_defaults(param_names: Sequence[str], grid_name: Optional[str] = None) -> dict:
+    """Return editable Tier 3 MLE/MCMC freeze dictionaries.
+
+    Observational fits keep every grid and nuisance parameter free by default.
+    The viewer can selectively freeze MLE parameters at their initial values or
+    MCMC parameters at the post-MLE values without changing that default policy.
+    """
+    label_map = build_tier2_label_map(param_names, grid_name)
+    return {
+        "labels": label_map,
+        "mle": {label: False for label in label_map},
+        "mcmc": {label: False for label in label_map},
+    }
+
+
 def _serialise_freeze_settings(freeze_params: Optional[dict]) -> Dict[str, bool]:
     """Coerce a freeze settings mapping to JSON-safe bools."""
     return {
@@ -151,7 +169,377 @@ def _serialise_freeze_settings(freeze_params: Optional[dict]) -> Dict[str, bool]
 
 def _snapshot_model_params(model) -> Dict[str, float]:
     """Capture the current SpectrumModel parameter state as plain floats."""
-    return {str(label): float(model.params[label]) for label in model.params.keys()}
+    params = {}
+    for label in model.params.keys():
+        try:
+            params[str(label)] = float(model.params[label])
+        except (TypeError, ValueError):
+            continue
+    return params
+
+
+def _copy_local_cov_params(model) -> List[dict]:
+    """Return JSON-safe Starfish local covariance kernel parameters.
+
+    Starfish stores grouped parameters in a flattened container. Reports need
+    ordinary dictionaries so local covariance diagnostics survive JSON
+    serialisation without keeping the live ``SpectrumModel`` object around.
+    """
+    if "local_cov" not in model.params:
+        return []
+    try:
+        raw = model.params.as_dict().get("local_cov", [])
+    except Exception:
+        return []
+    if isinstance(raw, dict):
+        def _sort_key(key):
+            text = str(key)
+            return (0, int(text)) if text.isdigit() else (1, text)
+        kernels = [raw[key] for key in sorted(raw.keys(), key=_sort_key)]
+    else:
+        kernels = list(raw)
+
+    out = []
+    for kernel in kernels:
+        try:
+            out.append({
+                "mu": float(kernel["mu"]),
+                "log_amp": float(kernel["log_amp"]),
+                "log_sigma": float(kernel["log_sigma"]),
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _empty_local_covariance_metadata(enabled: bool) -> dict:
+    """Create the common status payload for optional local covariance."""
+    return {
+        "enabled": bool(enabled),
+        "n_candidates": 0,
+        "n_kernels": 0,
+        "mle_passes": 1,
+        "amplitude_mode": None,
+        "detection_covariance_mode": (
+            "full_pre_local_diagonal" if enabled else None
+        ),
+        "message": (
+            "Local covariance enabled, but no detection pass has run."
+            if enabled else
+            "Local covariance disabled."
+        ),
+        "error": None,
+        "kernels": [],
+    }
+
+
+def _local_covariance_variance_params(
+    model,
+    local_params: Sequence[dict],
+    base_covariance,
+    target_significance: float = 3.0,
+) -> List[dict]:
+    """Set local variance using the same covariance as residual detection.
+
+    ``optimize_residual_peaks`` returns a fitted residual height in flux units.
+    Add only the variance still required to make that height a
+    ``target_significance``-sigma feature after the complete pre-local
+    covariance has already been counted.
+    """
+    if not local_params:
+        return []
+
+    target_significance = float(target_significance)
+    if not np.isfinite(target_significance) or target_significance <= 0:
+        raise ValueError("target_significance must be finite and positive")
+
+    if hasattr(base_covariance, "detach"):
+        base_covariance = base_covariance.detach().cpu().numpy()
+    base_covariance = np.asarray(base_covariance, dtype=float)
+    base_diagonal = (
+        np.diag(base_covariance)
+        if base_covariance.ndim == 2
+        else base_covariance.reshape(-1)
+    )
+    wavelength = np.asarray(model.data.wave, dtype=float)
+    if base_diagonal.size != wavelength.size:
+        raise ValueError(
+            "Pre-local covariance diagonal does not match the model wavelength grid"
+        )
+
+    converted = []
+    for kernel in local_params:
+        new_kernel = dict(kernel)
+        fitted_height = np.exp(float(new_kernel["log_amp"]))
+        centre = float(new_kernel["mu"])
+        centre_index = int(np.argmin(np.abs(wavelength - centre)))
+        base_variance = max(float(base_diagonal[centre_index]), 0.0)
+
+        # Detection now uses this same total pre-local variance. Subtracting it
+        # here prevents observational, emulator, or global-GP uncertainty from
+        # being counted a second time by the local kernel.
+        target_total_variance = (fitted_height / target_significance) ** 2
+        local_variance = target_total_variance - base_variance
+        if not np.isfinite(local_variance) or local_variance <= 0:
+            continue
+        new_kernel["log_amp"] = float(np.log(local_variance))
+        converted.append(new_kernel)
+    return converted
+
+
+def _attach_fixed_local_covariance(model, priors: dict) -> dict:
+    """Detect, optimise, insert, and freeze Starfish local covariance kernels."""
+    from Starfish.models.utils import find_residual_peaks, optimize_residual_peaks
+
+    meta = _empty_local_covariance_metadata(True)
+    try:
+        # Starfish local-kernel utilities inspect the residual deque populated
+        # by ``log_likelihood``. Evaluate once at the MLE pre-fit point so the
+        # kernels describe the best current structured residuals.
+        model.residuals.clear()
+        if hasattr(model, "_residual_call_count"):
+            model._residual_call_count = 0
+        _ = model.log_likelihood(priors)
+
+        num_residuals = len(model.residuals)
+        residual_regions = []
+        base_covariance_diagonal = None
+        if num_residuals > 0:
+            # Build the complete covariance at the pre-fit point before
+            # inserting local terms. Only its diagonal is transferred to NumPy
+            # because a wavelength-local 4-sigma score needs one marginal
+            # variance per pixel; off-diagonal terms remain in the likelihood.
+            _, base_covariance = model()
+            base_covariance_diagonal = base_covariance.diagonal()
+            if hasattr(base_covariance_diagonal, "detach"):
+                base_covariance_diagonal = (
+                    base_covariance_diagonal.detach().cpu().numpy()
+                )
+            base_covariance_diagonal = np.asarray(
+                base_covariance_diagonal,
+                dtype=float,
+            )
+            residual_regions = find_residual_peaks(
+                model,
+                num_residuals=num_residuals,
+                threshold=4.0,
+                buffer=2.0,
+                # Region metadata supplies bounded centres and a width derived
+                # from each coherent residual structure.
+                return_regions=True,
+                covariance=base_covariance_diagonal,
+            )
+        meta["n_candidates"] = len(residual_regions)
+
+        local_params = []
+        if residual_regions:
+            local_params = optimize_residual_peaks(
+                model,
+                mus=residual_regions,
+                sigma0=50,
+                num_residuals=num_residuals,
+                covariance=base_covariance_diagonal,
+            )
+            local_params = _local_covariance_variance_params(
+                model,
+                local_params,
+                base_covariance_diagonal,
+                target_significance=3.0,
+            )
+            meta["amplitude_mode"] = "full_covariance_target_3_sigma"
+
+        if local_params:
+            model.params["local_cov"] = local_params
+            model._loc_cov = None
+            if hasattr(model, "_loc_cov_gpu"):
+                model._loc_cov_gpu = None
+            model.freeze("local_cov")
+            meta["n_kernels"] = len(local_params)
+            meta["kernels"] = _copy_local_cov_params(model)
+            meta["message"] = (
+                f"Added {len(local_params)} fixed local covariance kernel"
+                f"{'s' if len(local_params) != 1 else ''} with a 3-sigma "
+                "placement target."
+            )
+        else:
+            meta["message"] = (
+                f"Detected {len(residual_regions)} residual region"
+                f"{'s' if len(residual_regions) != 1 else ''} above 4 sigma "
+                "under the full pre-local covariance, "
+                "but added 0 local covariance kernels."
+            )
+    except Exception as exc:
+        meta["error"] = str(exc)
+        meta["message"] = "Local covariance placement failed; continuing without local kernels."
+
+    return meta
+
+
+def _run_cma_mle_pass(
+    model,
+    priors: dict,
+    max_iter: int,
+    n_restarts: int,
+    iteration_callback=None,
+    custom_log_scale: bool = False,
+) -> dict:
+    """Run one benchmark CMA-ES MLE pass on the current model state."""
+    from types import SimpleNamespace
+
+    labels_before = list(model.labels)
+    active_labels = list(model.labels)
+    N = len(active_labels)
+
+    if N == 0:
+        try:
+            nll = float(-model.log_likelihood(priors))
+        except Exception:
+            nll = 1e10
+        soln = SimpleNamespace(
+            x=model.get_param_vector(),
+            fun=nll,
+            success=True,
+            message="All parameters fixed",
+            nit=0,
+        )
+        return {
+            "soln": soln,
+            "labels": labels_before,
+            "optimizer_nll": nll,
+            "success": True,
+            "n_iter": 0,
+        }
+
+    lo_bounds = []
+    hi_bounds = []
+    param_vector = model.get_param_vector()
+    for idx, label in enumerate(active_labels):
+        if label in priors:
+            dist = priors[label]
+            prior_bounds = bounds_for_frozen_prior(label, dist)
+            if prior_bounds is not None:
+                lo, hi = prior_bounds
+                lo_bounds.append(lo)
+                hi_bounds.append(hi)
+            else:
+                cv = param_vector[idx]
+                lo_bounds.append(cv - abs(cv) * 0.5)
+                hi_bounds.append(cv + abs(cv) * 0.5)
+        else:
+            cv = param_vector[idx]
+            lo_bounds.append(cv - abs(cv) * 0.5 - 1e-6)
+            hi_bounds.append(cv + abs(cv) * 0.5 + 1e-6)
+
+    # Bootstrap log_scale at each pass so observational Tier 3 fits begin from
+    # a data-informed normalisation, matching the non-local benchmark path.
+    if "log_scale" in active_labels and not custom_log_scale:
+        try:
+            _ = model()
+            if model._log_scale is not None and np.isfinite(model._log_scale):
+                model.params["log_scale"] = model._log_scale
+        except Exception:
+            pass
+
+    nll_history = []
+    iter_count = [0]
+    mle_t0 = time.time()
+    global_best_f = [float("inf")]
+    cur_restart = [0]
+
+    def nll(P):
+        model.set_param_vector(P)
+        try:
+            val = -model.log_likelihood(priors)
+        except Exception:
+            val = 1e10
+        nll_history.append(val)
+        iter_count[0] += 1
+        if iteration_callback is not None and iter_count[0] % 50 == 0:
+            best = min(global_best_f[0], min(nll_history) if nll_history else val)
+            iteration_callback(
+                iter_count[0], max_iter, best, time.time() - mle_t0,
+                cur_restart[0], n_restarts,
+            )
+        return val
+
+    p0_cma = np.clip(
+        model.get_param_vector(),
+        np.array(lo_bounds) + 1e-8,
+        np.array(hi_bounds) - 1e-8,
+    )
+
+    lo_arr = np.array(lo_bounds)
+    hi_arr = np.array(hi_bounds)
+    start_points = [p0_cma.copy()]
+    if n_restarts > 1:
+        for _ri in range(n_restarts - 1):
+            rnd = lo_arr + np.random.rand(N) * (hi_arr - lo_arr)
+            if "log_scale" in active_labels and not custom_log_scale:
+                ls_idx = active_labels.index("log_scale")
+                try:
+                    model.set_param_vector(rnd)
+                    model()
+                    if model._log_scale is not None and np.isfinite(model._log_scale):
+                        rnd[ls_idx] = model._log_scale
+                except Exception:
+                    pass
+            start_points.append(rnd)
+
+    global_best_x = p0_cma.copy()
+    global_best_nit = 0
+
+    for restart_idx, x0 in enumerate(start_points):
+        cur_restart[0] = restart_idx + 1
+        iter_count[0] = 0
+        cma_stds = [0.2 * (hi - lo) for lo, hi in zip(lo_bounds, hi_bounds)]
+        popsize = 2 * (4 + int(3 * np.log(N)))
+        x0_clipped = np.clip(x0, lo_arr + 1e-8, hi_arr - 1e-8)
+        es = cma.CMAEvolutionStrategy(
+            x0_clipped.tolist(), 1.0,
+            {
+                "bounds": [lo_bounds, hi_bounds],
+                "CMA_stds": cma_stds,
+                "popsize": popsize,
+                "maxfevals": max_iter,
+                "verbose": -9,
+                "tolfun": 1e-10,
+            },
+        )
+        run_best_x, run_best_f = x0_clipped.copy(), float("inf")
+        while not es.stop():
+            solutions = es.ask()
+            fits = [nll(np.array(s)) for s in solutions]
+            es.tell(solutions, fits)
+            gen_best = min(fits)
+            if gen_best < run_best_f:
+                run_best_f = gen_best
+                run_best_x = np.array(solutions[fits.index(gen_best)])
+            if run_best_f < global_best_f[0]:
+                global_best_f[0] = run_best_f
+
+        if run_best_f <= global_best_f[0]:
+            global_best_f[0] = run_best_f
+            global_best_x = run_best_x.copy()
+            global_best_nit = es.result.iterations
+
+    soln = SimpleNamespace(
+        x=global_best_x,
+        fun=global_best_f[0],
+        success=True,
+        message=f"Best of {n_restarts} CMA-ES restart(s)",
+        nit=global_best_nit,
+    )
+
+    if soln.success:
+        model.set_param_vector(soln.x)
+
+    return {
+        "soln": soln,
+        "labels": labels_before,
+        "optimizer_nll": float(soln.fun),
+        "success": bool(soln.success),
+        "n_iter": int(soln.nit),
+    }
 
 
 def _as_numpy_array(value) -> np.ndarray:
@@ -166,11 +554,18 @@ def _model_bestfit_spectrum(model) -> dict:
     model_flux, model_cov = model()
     model_flux = _as_numpy_array(model_flux)
     model_cov = _as_numpy_array(model_cov)
+    covariance_components = covariance_diagonal_components(model, model_cov)
     return {
         "wavelength": _as_numpy_array(model.data.wave).tolist(),
         "data_flux": _as_numpy_array(model.data.flux).tolist(),
         "model_flux": model_flux.tolist(),
         "model_cov_diag": np.diag(model_cov).tolist(),
+        # Store marginal variance sources alongside the total so both live and
+        # reloaded benchmark plots can explain the green confidence envelope.
+        "covariance_components": {
+            name: values.tolist()
+            for name, values in covariance_components.items()
+        },
     }
 
 
@@ -270,7 +665,246 @@ def emulator_to_physical(param_names: Sequence[str], values: np.ndarray, grid_na
 # ======================================================================
 
 
-def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
+def run_test_grid_rmse(
+    emu,
+    test_grid_path: Union[str, Path],
+    grid_name: Optional[str] = None,
+    *,
+    smoothing: Optional[bool] = None,
+    prediction_batch_size: int = 64,
+) -> dict:
+    """Measure direct per-wavelength reconstruction error on a test grid.
+
+    Unlike the analytical training-grid LOO diagnostic, this routine evaluates
+    the emulator predictive mean at independent test-grid truth coordinates.
+    It returns two directly comparable curves: the PCA-only projection error
+    and the final PCA-plus-GP prediction error, both aggregated over the same
+    spectra and expressed in the emulator's scale-removed flux space.
+
+    The test spectra and lookup table must already exist locally.  Benchmarking
+    never downloads an entire test grid implicitly.
+    """
+    import io
+    import lzma
+
+    from Speculate_addons.Spec_gridinterfaces import (
+        _apply_flux_scale,
+        _maybe_smooth_flux,
+    )
+
+    test_path = Path(test_grid_path)
+    if not test_path.is_dir():
+        raise FileNotFoundError(f"Test-grid directory does not exist: {test_path}")
+
+    lookup_path = test_path / "grid_run_lookup_table.parquet"
+    if not lookup_path.exists():
+        raise FileNotFoundError(f"Test-grid lookup table does not exist: {lookup_path}")
+
+    resolved_grid_name = (
+        infer_grid_name(grid_name)
+        or infer_grid_name(getattr(emu, "name", None))
+        or infer_grid_name(str(test_path))
+    )
+    config = get_grid_config(resolved_grid_name)
+    if config is None:
+        raise ValueError(
+            "Could not identify the registered training grid for "
+            f"{test_path.name!r}."
+        )
+    resolved_grid_name = config["name"]
+
+    param_ids = []
+    for param_name in emu.param_names:
+        match = re.search(r"\d+", str(param_name))
+        if match is None:
+            raise ValueError(f"Cannot map emulator parameter {param_name!r} to the grid registry.")
+        param_ids.append(int(match.group(0)))
+
+    inclination_ids = {
+        int(param_id) for param_id in config.get("inclination_param_ids", set())
+    }
+    selected_inclination_ids = [
+        param_id for param_id in param_ids if param_id in inclination_ids
+    ]
+
+    if selected_inclination_ids:
+        inclination_axis = param_ids.index(selected_inclination_ids[0])
+        lo = float(np.asarray(emu.min_params)[inclination_axis])
+        hi = float(np.asarray(emu.max_params)[inclination_axis])
+        inclinations = [
+            angle
+            for angle in inclination_values(resolved_grid_name)
+            if lo <= angle <= hi
+        ]
+    else:
+        name_text = str(getattr(emu, "name", ""))
+        fixed_match = re.search(r"_(\d+)inc_", name_text)
+        fixed_angle = (
+            int(fixed_match.group(1))
+            if fixed_match
+            else int(default_fixed_inclination(resolved_grid_name))
+        )
+        inclinations = [fixed_angle]
+
+    if not inclinations:
+        raise ValueError("No raw test-grid inclinations fall within the emulator bounds.")
+
+    if smoothing is None:
+        smoothing = "_smooth_" in str(getattr(emu, "name", ""))
+
+    lookup_df = pd.read_parquet(lookup_path)
+    if "Run Number" not in lookup_df.columns:
+        raise ValueError(f"{lookup_path} has no 'Run Number' column.")
+
+    wavelength = np.asarray(emu.wl, dtype=np.float64)
+    wl_lo = float(np.min(wavelength))
+    wl_hi = float(np.max(wavelength))
+    flux_scale = str(getattr(emu, "flux_scale", "linear"))
+    friendly_by_id = {
+        int(param_id): friendly
+        for param_id, (friendly, _physical_key) in benchmark_param_map(
+            resolved_grid_name
+        ).items()
+    }
+
+    def _find_spectrum(run_number: int) -> Optional[Path]:
+        for suffix in (".spec", ".spec.xz"):
+            candidate = test_path / f"run{run_number}{suffix}"
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _load_spectrum_table(path: Path) -> np.ndarray:
+        opener = lzma.open if path.suffix == ".xz" else open
+        with opener(path, "rt", encoding="utf-8") as handle:
+            lines = handle.readlines()
+        data_start = None
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("Freq."):
+                continue
+            data_start = index
+            break
+        if data_start is None:
+            raise ValueError(f"No numeric spectrum rows found in {path}.")
+        return np.loadtxt(io.StringIO("".join(lines[data_start:])), unpack=True)
+
+    truth_rows = []
+    param_rows = []
+    failures = 0
+    for _, row in lookup_df.iterrows():
+        path = _find_spectrum(int(row["Run Number"]))
+        if path is None:
+            failures += len(inclinations)
+            continue
+        try:
+            raw = _load_spectrum_table(path)
+            wl_full = np.flip(np.asarray(raw[1], dtype=np.float64))
+            wl_mask = (wl_full >= wl_lo) & (wl_full <= wl_hi)
+            if not np.any(wl_mask):
+                failures += len(inclinations)
+                continue
+
+            for inclination in inclinations:
+                truth_values = lookup_row_to_emulator_values(
+                    resolved_grid_name,
+                    row,
+                    inclination,
+                )
+                params = []
+                for param_id in param_ids:
+                    if param_id in inclination_ids:
+                        params.append(float(inclination))
+                    else:
+                        params.append(float(truth_values[friendly_by_id[param_id]]))
+
+                flux_column = inclination_column(resolved_grid_name, inclination)
+                flux_full = np.flip(np.asarray(raw[flux_column], dtype=np.float64))
+                flux_full = _maybe_smooth_flux(flux_full, bool(smoothing))
+                flux_full = _apply_flux_scale(
+                    wl_full,
+                    wl_mask,
+                    flux_full.copy(),
+                    flux_scale,
+                )
+                flux_selected = flux_full[wl_mask]
+                wl_selected = wl_full[wl_mask]
+                if (
+                    len(flux_selected) != len(wavelength)
+                    or not np.allclose(wl_selected, wavelength)
+                ):
+                    flux_selected = np.interp(wavelength, wl_selected, flux_selected)
+
+                truth_rows.append(flux_selected)
+                param_rows.append(params)
+        except Exception:
+            log.debug("Skipping malformed test-grid spectrum %s", path, exc_info=True)
+            failures += len(inclinations)
+
+    if not truth_rows:
+        raise ValueError(f"No spectra could be processed from {test_path}.")
+
+    truth_flux = np.asarray(truth_rows, dtype=np.float64)
+    norm_factors = truth_flux.mean(axis=1, dtype=np.float64)
+    if flux_scale == "log":
+        truth_compare = truth_flux - norm_factors[:, np.newaxis]
+    else:
+        norm_factors = np.where(norm_factors != 0, norm_factors, 1.0)
+        truth_compare = truth_flux / norm_factors[:, np.newaxis]
+
+    flux_mean = np.asarray(emu.flux_mean, dtype=np.float64)
+    flux_std = np.asarray(emu.flux_std, dtype=np.float64)
+    eigenspectra = np.asarray(emu.eigenspectra, dtype=np.float64)
+    inverse_basis = eigenspectra * flux_std
+
+    truth_standardised = (truth_compare - flux_mean) / flux_std
+    oracle_weights = truth_standardised @ eigenspectra.T
+    pca_oracle_flux = oracle_weights @ inverse_basis + flux_mean
+
+    params = np.asarray(param_rows, dtype=np.float64)
+    predicted_weight_batches = []
+    batch_size = max(1, int(prediction_batch_size))
+    for start in range(0, len(params), batch_size):
+        stop = min(start + batch_size, len(params))
+        predicted_weights, _ = emu(
+            params[start:stop],
+            full_cov=False,
+            reinterpret_batch=True,
+        )
+        predicted_weight_batches.append(
+            np.asarray(predicted_weights, dtype=np.float64).reshape(
+                stop - start,
+                emu.ncomps,
+            )
+        )
+    predicted_weights = np.vstack(predicted_weight_batches)
+    predicted_flux = predicted_weights @ inverse_basis + flux_mean
+
+    pca_residual = truth_compare - pca_oracle_flux
+    model_residual = truth_compare - predicted_flux
+    pca_per_spectrum_rmse = np.sqrt(np.mean(pca_residual**2, axis=1))
+    model_per_spectrum_rmse = np.sqrt(np.mean(model_residual**2, axis=1))
+
+    return {
+        "wavelength": wavelength,
+        "pca_per_wl_rmse": np.sqrt(np.mean(pca_residual**2, axis=0)),
+        "model_per_wl_rmse": np.sqrt(np.mean(model_residual**2, axis=0)),
+        "pca_per_spectrum_rmse": pca_per_spectrum_rmse,
+        "model_per_spectrum_rmse": model_per_spectrum_rmse,
+        "test_grid_name": test_path.name,
+        "n_spectra": int(len(truth_compare)),
+        "n_failed": int(failures),
+        "inclinations": [int(angle) for angle in inclinations],
+        "smoothing": bool(smoothing),
+    }
+
+
+def run_tier1(
+    emu,
+    grid_path: Optional[str] = None,
+    test_grid_path: Optional[Union[str, Path]] = None,
+    grid_name: Optional[str] = None,
+) -> dict:
     """
     Tier 1 benchmark: grid reconstruction fidelity.
 
@@ -281,14 +915,20 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     grid_path : str or None
         Path to the grid NPZ file. If provided, flux-space metrics are
         computed in addition to weight-space Leave-One-Out metrics.
+    test_grid_path : str, path-like, or None
+        Paired independent test-grid directory. If provided, direct
+        per-wavelength PCA-only and PCA-plus-GP RMSE curves are computed.
+    grid_name : str or None
+        Registered training-grid name. Usually inferred from the emulator.
 
     Returns
     -------
     dict
         Benchmark results.  JSON-safe scalars/lists plus an ``'_arrays'``
         sub-dict containing large numpy arrays (``original_flux``,
-        ``pca_recon_flux``, ``loo_recon_flux``, ``wavelength``) that are
-        kept in-memory only and excluded from JSON serialisation.
+        ``pca_recon_flux``, ``loo_recon_flux``, training/test wavelengths,
+        and per-wavelength RMSE curves) that are kept in-memory only and
+        excluded from JSON serialisation.
     """
     t0 = time.time()
     results = emu.loo_cv(grid=grid_path)
@@ -305,6 +945,42 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     results["n_components"] = emu.ncomps
     results["n_grid_points"] = emu.grid_points.shape[0]
     results["n_params"] = emu.grid_points.shape[1]
+
+    test_grid_arrays = {}
+    if test_grid_path:
+        try:
+            test_grid = run_test_grid_rmse(
+                emu,
+                test_grid_path,
+                grid_name=grid_name,
+                smoothing=(
+                    "_smooth_" in str(grid_path)
+                    or "_smooth_" in str(getattr(emu, "name", ""))
+                ),
+            )
+            results.update({
+                "test_grid_name": test_grid["test_grid_name"],
+                "test_grid_n_spectra": test_grid["n_spectra"],
+                "test_grid_n_failed": test_grid["n_failed"],
+                "test_grid_inclinations": test_grid["inclinations"],
+                "test_grid_pca_rmse_median": float(
+                    np.median(test_grid["pca_per_spectrum_rmse"])
+                ),
+                "test_grid_model_rmse_median": float(
+                    np.median(test_grid["model_per_spectrum_rmse"])
+                ),
+                "test_grid_rmse_note": "",
+            })
+            test_grid_arrays = {
+                "test_wavelength": test_grid["wavelength"],
+                "test_pca_per_wl_rmse": test_grid["pca_per_wl_rmse"],
+                "test_model_per_wl_rmse": test_grid["model_per_wl_rmse"],
+                "test_pca_per_spectrum_rmse": test_grid["pca_per_spectrum_rmse"],
+                "test_model_per_spectrum_rmse": test_grid["model_per_spectrum_rmse"],
+            }
+        except Exception as exc:
+            log.warning("Test-grid RMSE diagnostic unavailable: %s", exc)
+            results["test_grid_rmse_note"] = str(exc)
     results["tier1_time_s"] = time.time() - t0
 
     # Aggregate Q² across all components (LOO R²).
@@ -350,6 +1026,7 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
     for k in _ARRAY_KEYS:
         if k in results:
             arrays[k] = results.pop(k)
+    arrays.update(test_grid_arrays)
     # Also stash grid_points + param_names for the interactive viewer
     arrays["grid_points"] = emu.grid_points
     arrays["param_names"] = list(emu.param_names)
@@ -374,7 +1051,7 @@ def run_tier1(emu, grid_path: Optional[str] = None) -> dict:
 
 
 # ======================================================================
-# Tier 2 — Test Grid Parameter Recovery
+# Tier 2 — Inference Parameter Recovery
 # ======================================================================
 
 
@@ -532,43 +1209,120 @@ def _resolve_tier3_wl_range(
 
 
 def _tier3_distance_prior_to_log_scale(distance_prior_pc: Optional[dict]):
-    """Convert a user-facing Tier 3 distance prior to backend log-scale inputs."""
+    """Convert a Normal distance prior from parsecs to backend log-scale."""
     if not distance_prior_pc:
         return None, {}, {}
 
-    from Speculate_addons.distance_scale import distance_to_log_scale
-
+    from Speculate_addons.distance_scale import (
+        distance_prior_to_log_scale_prior,
+        log_scale_to_distance_pc,
+    )
     mean_pc = float(distance_prior_pc["mean_pc"])
-    min_pc = float(distance_prior_pc["min_pc"])
-    max_pc = float(distance_prior_pc["max_pc"])
-    if not all(np.isfinite(v) and v > 0 for v in (mean_pc, min_pc, max_pc)):
-        raise ValueError("Tier 3 distance prior values must be finite positive parsecs.")
-    if min_pc >= max_pc:
-        raise ValueError("Tier 3 distance prior min_pc must be smaller than max_pc.")
-    if not (min_pc <= mean_pc <= max_pc):
-        raise ValueError("Tier 3 distance prior mean_pc must lie within [min_pc, max_pc].")
+    sigma_pc = float(distance_prior_pc["sigma_pc"])
+    if not all(np.isfinite(value) and value > 0 for value in (mean_pc, sigma_pc)):
+        raise ValueError("Tier 3 distance mean and sigma must be finite and positive.")
 
-    log_scale_mean = float(distance_to_log_scale(mean_pc))
-    log_scale_at_min_distance = float(distance_to_log_scale(min_pc))
-    log_scale_at_max_distance = float(distance_to_log_scale(max_pc))
-    log_scale_min = min(log_scale_at_min_distance, log_scale_at_max_distance)
-    log_scale_max = max(log_scale_at_min_distance, log_scale_at_max_distance)
-    if log_scale_min == log_scale_max:
-        raise ValueError("Tier 3 distance prior maps to a zero-width log_scale prior.")
-
+    # Match the Inference Tool's first-order propagation through
+    # log_scale = 2 ln(100 pc / distance). Table A1 uncertainties are all <1%.
+    log_scale_mean, log_scale_sigma = distance_prior_to_log_scale_prior(
+        mean_pc,
+        sigma_pc,
+    )
+    plot_distances = log_scale_to_distance_pc(
+        [log_scale_mean - 4.0 * log_scale_sigma,
+         log_scale_mean + 4.0 * log_scale_sigma]
+    )
     metadata = {
+        "kind": "normal",
         "mean_pc": mean_pc,
-        "min_pc": min_pc,
-        "max_pc": max_pc,
-        "log_scale_mean": log_scale_mean,
-        "log_scale_min": log_scale_min,
-        "log_scale_max": log_scale_max,
+        "sigma_pc": sigma_pc,
+        "min_pc": mean_pc - 2.0 * sigma_pc,
+        "max_pc": mean_pc + 2.0 * sigma_pc,
+        "plot_min_pc": float(np.min(plot_distances)),
+        "plot_max_pc": float(np.max(plot_distances)),
+        "log_scale_mean": float(log_scale_mean),
+        "log_scale_sigma": float(log_scale_sigma),
     }
-    prior_overrides = {
-        "log_scale": stats.uniform(loc=log_scale_min, scale=log_scale_max - log_scale_min),
-    }
-    initial_params = {"log_scale": log_scale_mean}
-    return metadata, prior_overrides, initial_params
+    return (
+        metadata,
+        {"log_scale": stats.norm(loc=log_scale_mean, scale=log_scale_sigma)},
+        {"log_scale": float(log_scale_mean)},
+    )
+
+
+def _tier3_inclination_prior_to_parameter(
+    emu,
+    inclination_prior_deg: Optional[dict],
+    grid_name: Optional[str] = None,
+):
+    """Map the published inclination prior onto the emulator inclination axis."""
+    if not inclination_prior_deg:
+        return None, {}, {}
+
+    param_names = [str(name) for name in emu.param_names]
+    friendly_names = internal_to_friendly(param_names, grid_name)
+    if "Inclination" not in friendly_names:
+        return None, {}, {}
+    inclination_index = friendly_names.index("Inclination")
+    inclination_param = param_names[inclination_index]
+    emulator_min_deg = float(emu.min_params[inclination_index])
+    emulator_max_deg = float(emu.max_params[inclination_index])
+    kind = str(inclination_prior_deg["kind"]).lower()
+
+    if kind == "normal":
+        mean_deg = float(inclination_prior_deg["mean_deg"])
+        sigma_deg = float(inclination_prior_deg["sigma_deg"])
+        if sigma_deg <= 0 or not (emulator_min_deg <= mean_deg <= emulator_max_deg):
+            raise ValueError(
+                "Tier 3 Normal inclination needs positive sigma and a mean "
+                "inside the emulator range."
+            )
+        # The UI reports ±2σ, while the existing optimiser bounds for a Normal
+        # prior extend to ±4σ. All three fixed Table A1 measurements remain
+        # within the bundled emulator's inclination range at ±4σ.
+        metadata = {
+            "kind": "normal",
+            "mean_deg": mean_deg,
+            "sigma_deg": sigma_deg,
+            "min_deg": mean_deg - 2.0 * sigma_deg,
+            "max_deg": mean_deg + 2.0 * sigma_deg,
+            "applied_min_deg": mean_deg - 4.0 * sigma_deg,
+            "applied_max_deg": mean_deg + 4.0 * sigma_deg,
+            "parameter": inclination_param,
+        }
+        prior = stats.norm(loc=mean_deg, scale=sigma_deg)
+        start_deg = mean_deg
+    else:
+        min_deg = float(inclination_prior_deg["min_deg"])
+        max_deg = float(inclination_prior_deg["max_deg"])
+        applied_min_deg = max(min_deg, emulator_min_deg)
+        applied_max_deg = min(max_deg, emulator_max_deg)
+        if not applied_min_deg < applied_max_deg:
+            raise ValueError(
+                "Tier 3 Uniform inclination does not overlap the emulator range."
+            )
+        # A dashed literature range is hard Uniform support. RW Sex begins at
+        # 28°, so its applied lower edge becomes the emulator minimum of 30°.
+        start_deg = float(np.clip(
+            inclination_prior_deg["mean_deg"],
+            applied_min_deg,
+            applied_max_deg,
+        ))
+        metadata = {
+            "kind": "uniform",
+            "mean_deg": start_deg,
+            "min_deg": min_deg,
+            "max_deg": max_deg,
+            "applied_min_deg": applied_min_deg,
+            "applied_max_deg": applied_max_deg,
+            "parameter": inclination_param,
+        }
+        prior = stats.uniform(
+            loc=applied_min_deg,
+            scale=applied_max_deg - applied_min_deg,
+        )
+
+    return metadata, {inclination_param: prior}, {inclination_param: start_deg}
 
 
 def run_mle_single(
@@ -587,6 +1341,7 @@ def run_mle_single(
     n_restarts: int = 1,
     use_emulator_norm: bool = False,
     fixed_log_scale: Optional[float] = None,
+    enable_local_covariance: bool = False,
 ) -> dict:
     """
     Run MLE inference on a single spectrum.
@@ -629,6 +1384,11 @@ def run_mle_single(
         re-bootstrapped at each restart unless an explicit ``log_scale`` prior
         override or starting value was supplied.  The best result across all
         restarts is returned.
+    enable_local_covariance : bool
+        If True, run an initial MLE pre-fit, use Starfish residual-peak
+        utilities to insert fixed ``local_cov`` kernels, and run a second
+        reported MLE pass.  Defaults to False so Tier 2 test-grid spectra keep
+        the historical global-covariance-only benchmark likelihood.
 
     Returns
     -------
@@ -732,7 +1492,7 @@ def run_mle_single(
                 loc=_bootstrapped_ls - 5.0, scale=10.0
             )
         # Chebyshev c1 continuum tilt — small correction for gradient mismatch
-        priors["cheb:1"] = stats.uniform(loc=-0.5, scale=1.0)
+        priors["cheb:1"] = stats.uniform(loc=-1.0, scale=2.0)
         # GP log_amp is a covariance variance scale. Centre it on the
         # propagated observational uncertainty rather than residuals against a
         # midpoint model, otherwise a poor starting spectrum can teach the GP to
@@ -757,165 +1517,33 @@ def run_mle_single(
 
     _applied_freezes = _apply_freeze_settings(model, _requested_freeze)
 
-    labels_before = list(model.labels)
+    local_covariance = _empty_local_covariance_metadata(enable_local_covariance)
+    mle_pass = _run_cma_mle_pass(
+        model,
+        priors,
+        max_iter=max_iter,
+        n_restarts=n_restarts,
+        iteration_callback=iteration_callback,
+        custom_log_scale=_custom_log_scale,
+    )
 
-    # Derive per-parameter bounds from the priors for CMA-ES box constraints.
-    active_labels = list(model.labels)
-    N = len(active_labels)
-
-    if N == 0:
-        try:
-            _nll = float(-model.log_likelihood(priors))
-        except Exception:
-            _nll = 1e10
-        try:
-            _mle_bestfit_spec = _model_bestfit_spectrum(model)
-        except Exception:
-            _mle_bestfit_spec = {}
-        _mle_diag = _model_likelihood_diagnostics(model, priors)
-        return {
-            "grid_params": model.grid_params.tolist(),
-            "all_params": _snapshot_model_params(model),
-            "nll": _nll,
-            "optimizer_nll": _nll,
-            "mle_bestfit_spec": _mle_bestfit_spec,
-            "mle_likelihood_diagnostics": _mle_diag,
-            "success": True,
-            "n_iter": 0,
-            "labels": labels_before,
-            "freeze_params": dict(_requested_freeze),
-            "frozen_params": list(_applied_freezes),
-            "model": model,
-            "priors": priors,
-        }
-
-    lo_bounds = []
-    hi_bounds = []
-    for label in active_labels:
-        if label in priors:
-            dist = priors[label]
-            prior_bounds = bounds_for_frozen_prior(label, dist)
-            if prior_bounds is not None:
-                lo, hi = prior_bounds
-                lo_bounds.append(lo)
-                hi_bounds.append(hi)
-            else:
-                cv = model.get_param_vector()[active_labels.index(label)]
-                lo_bounds.append(cv - abs(cv) * 0.5)
-                hi_bounds.append(cv + abs(cv) * 0.5)
-        else:
-            cv = model.get_param_vector()[active_labels.index(label)]
-            lo_bounds.append(cv - abs(cv) * 0.5 - 1e-6)
-            hi_bounds.append(cv + abs(cv) * 0.5 + 1e-6)
-
-    # Bootstrap log_scale at the starting point so the optimizer begins
-    # with a data-informed normalisation.
-    if "log_scale" in active_labels and not _custom_log_scale:
-        try:
-            _ = model()  # triggers auto log_scale calc
-            if model._log_scale is not None and np.isfinite(model._log_scale):
-                model.params["log_scale"] = model._log_scale
-        except Exception:
-            pass
-
-    _nll_history = []
-    _iter_count = [0]
-    _mle_t0 = time.time()
-    _global_best_f = [float("inf")]  # mutable for callback visibility
-    _cur_restart = [0]  # 1-based index of current restart
-
-    def nll(P):
-        model.set_param_vector(P)
-        try:
-            val = -model.log_likelihood(priors)
-        except Exception:
-            val = 1e10
-        _nll_history.append(val)
-        _iter_count[0] += 1
-        if iteration_callback is not None and _iter_count[0] % 50 == 0:
-            _best = min(_global_best_f[0], min(_nll_history) if _nll_history else val)
-            iteration_callback(
-                _iter_count[0], max_iter, _best, time.time() - _mle_t0,
-                _cur_restart[0], n_restarts,
+    if enable_local_covariance:
+        local_covariance = _attach_fixed_local_covariance(model, priors)
+        if local_covariance.get("n_kernels", 0) > 0:
+            mle_pass = _run_cma_mle_pass(
+                model,
+                priors,
+                max_iter=max_iter,
+                n_restarts=n_restarts,
+                iteration_callback=iteration_callback,
+                custom_log_scale=_custom_log_scale,
             )
-        return val
+            local_covariance["mle_passes"] = 2
+            local_covariance["message"] = (
+                f"{local_covariance['message']} Final MLE pass rerun with fixed kernels."
+            )
 
-    # CMA-ES: start from the bootstrapped model state (includes the
-    # data-informed log_scale) rather than the raw bounds midpoint.
-    p0_cma = np.clip(
-        model.get_param_vector(),
-        np.array(lo_bounds) + 1e-8,
-        np.array(hi_bounds) - 1e-8,
-    )
-
-    # Generate starting points: first = bootstrapped x0, rest = random
-    lo_arr = np.array(lo_bounds)
-    hi_arr = np.array(hi_bounds)
-    start_points = [p0_cma.copy()]
-    if n_restarts > 1:
-        for _ri in range(n_restarts - 1):
-            rnd = lo_arr + np.random.rand(N) * (hi_arr - lo_arr)
-            # Bootstrap log_scale for random starts too
-            if "log_scale" in active_labels and not _custom_log_scale:
-                ls_idx = active_labels.index("log_scale")
-                try:
-                    model.set_param_vector(rnd)
-                    model()
-                    if model._log_scale is not None and np.isfinite(model._log_scale):
-                        rnd[ls_idx] = model._log_scale
-                except Exception:
-                    pass
-            start_points.append(rnd)
-
-    global_best_x = p0_cma.copy()
-    global_best_nit = 0
-
-    for restart_idx, x0 in enumerate(start_points):
-        _cur_restart[0] = restart_idx + 1
-        _iter_count[0] = 0  # reset eval counter per restart
-        # Per-coordinate initial σ = 20% of prior range.
-        cma_stds = [0.2 * (hi - lo) for lo, hi in zip(lo_bounds, hi_bounds)]
-        # Double the default popsize for better landscape sampling.
-        popsize = 2 * (4 + int(3 * np.log(N)))
-        x0_clipped = np.clip(x0, lo_arr + 1e-8, hi_arr - 1e-8)
-        es = cma.CMAEvolutionStrategy(
-            x0_clipped.tolist(), 1.0,
-            {
-                "bounds": [lo_bounds, hi_bounds],
-                "CMA_stds": cma_stds,
-                "popsize": popsize,
-                "maxfevals": max_iter,
-                "verbose": -9,
-                "tolfun": 1e-10,
-            },
-        )
-        run_best_x, run_best_f = x0_clipped.copy(), float("inf")
-        while not es.stop():
-            solutions = es.ask()
-            fits = [nll(np.array(s)) for s in solutions]
-            es.tell(solutions, fits)
-            gen_best = min(fits)
-            if gen_best < run_best_f:
-                run_best_f = gen_best
-                run_best_x = np.array(solutions[fits.index(gen_best)])
-            if run_best_f < _global_best_f[0]:
-                _global_best_f[0] = run_best_f
-
-        # Keep global best across restarts
-        if run_best_f <= _global_best_f[0]:
-            _global_best_f[0] = run_best_f
-            global_best_x = run_best_x.copy()
-            global_best_nit = es.result.iterations
-
-    from types import SimpleNamespace
-    soln = SimpleNamespace(
-        x=global_best_x, fun=_global_best_f[0], success=True,
-        message=f"Best of {n_restarts} CMA-ES restart(s)",
-        nit=global_best_nit,
-    )
-
-    if soln.success:
-        model.set_param_vector(soln.x)
+    soln = mle_pass["soln"]
 
     try:
         mle_bestfit_spec = _model_bestfit_spectrum(model)
@@ -935,11 +1563,59 @@ def run_mle_single(
         "mle_likelihood_diagnostics": mle_diagnostics,
         "success": bool(soln.success),
         "n_iter": int(soln.nit),
-        "labels": labels_before,
+        "labels": mle_pass.get("labels", list(model.labels)),
         "freeze_params": dict(_requested_freeze),
         "frozen_params": list(_applied_freezes),
+        "local_covariance": local_covariance,
         "model": model,
         "priors": priors,
+    }
+
+
+def _autocorrelation_diagnostics(
+    tau: np.ndarray,
+    labels: Sequence[str],
+    nsteps: int,
+    nwalkers: int,
+    retained_steps: int,
+) -> dict:
+    """Build sampler-native convergence diagnostics from emcee's tau values."""
+    tau = np.asarray(tau, dtype=float)
+    tau_valid = bool(
+        len(tau) == len(labels)
+        and np.all(np.isfinite(tau))
+        and np.all(tau > 0)
+    )
+    tau_by_label = {
+        label: float(tau[idx]) if tau_valid else np.nan
+        for idx, label in enumerate(labels)
+    }
+    # N/tau is the effective number of independent draws in the complete
+    # post-burn ensemble.  This is intentionally unrelated to how many rows
+    # remain after thinning for storage and plotting.
+    ess_by_label = {
+        label: (
+            float(nwalkers * retained_steps / tau[idx])
+            if tau_valid
+            else np.nan
+        )
+        for idx, label in enumerate(labels)
+    }
+    reasons = []
+    if not tau_valid:
+        reasons.append("autocorrelation_time_unavailable")
+    else:
+        # emcee recommends about 50 autocorrelation times before trusting the
+        # estimate; shorter chains are retained but explicitly flagged.
+        if np.any(nsteps < 50.0 * tau):
+            reasons.append("chain_shorter_than_50_tau")
+        if any(value < 100.0 for value in ess_by_label.values()):
+            reasons.append("effective_sample_size_below_100")
+    return {
+        "autocorr_time": tau_by_label,
+        "effective_sample_size": ess_by_label,
+        "diagnostic_reasons": reasons,
+        "converged": not reasons,
     }
 
 
@@ -953,6 +1629,7 @@ def run_mcmc_single(
     freeze_nuisance: bool = False,
     freeze_params: Optional[Dict[str, bool]] = None,
     grid_name: Optional[str] = None,
+    burnin_is_cap: bool = False,
 ) -> dict:
     """
     Run MCMC on a SpectrumModel already set to MLE best-fit.
@@ -972,16 +1649,20 @@ def run_mcmc_single(
         Optional Stage 4 freeze settings keyed by internal parameter name.
         When provided, this overrides ``freeze_nuisance`` and is applied with
         a thaw-then-refreeze pass so each run starts from a clean MCMC state.
+    burnin_is_cap : bool
+        If True, treat ``burnin`` as the maximum allowed discard and retain
+        samples after ``2*tau`` when that is smaller.  Tier 2 uses this capped
+        policy; other inference paths retain their existing minimum policy.
 
     Returns
     -------
     dict with keys:
-        'samples'     : (N, ndim) burnt+thinned flat samples
-        'summary'     : dict of {label: {mean, std, median, hdi_3, hdi_97}}
-        'r_hat'       : dict of {label: r_hat}
-        'ess_bulk'    : dict of {label: ess}
-        'converged'   : bool — all r_hat < 1.1 and ess > 100
-        'n_effective'  : int
+        'samples'               : (N, ndim) burnt+thinned flat samples
+        'summary'               : posterior summaries keyed by friendly label
+        'autocorr_time'         : integrated autocorrelation time per parameter
+        'effective_sample_size' : autocorrelation-adjusted ESS per parameter
+        'converged'             : bool — chain >= 50*tau and every ESS >= 100
+        'n_retained_draws'      : number of flattened stored draws
     """
     import emcee
 
@@ -1072,28 +1753,44 @@ def run_mcmc_single(
     else:
         sampler.run_mcmc(ball, nsteps, progress=False)
 
-    # Use the estimated autocorrelation time to choose a conservative burn-in and
-    # thinning rule, but degrade gracefully when the chain is too short for tau.
+    # ``emcee`` walkers in one ensemble are coupled, so they must not be passed
+    # to an R-hat calculation as if they were independent chains.  Integrated
+    # autocorrelation time is the sampler-native diagnostic: it measures how
+    # many steps are required before a draw carries substantially new
+    # information and therefore supports an autocorrelation-aware ESS.
     try:
         tau = sampler.get_autocorr_time(tol=0)
-        tau_valid = not (np.isnan(tau).any() or (tau == 0).any())
+        tau_valid = bool(np.all(np.isfinite(tau)) and np.all(tau > 0))
     except Exception:
         tau = np.full(ndim, np.nan)
         tau_valid = False
 
     if tau_valid:
-        auto_burnin = int(2 * tau.max())  # 2×τ (Foreman-Mackey 2013)
+        auto_burnin = int(np.ceil(2 * tau.max()))
+        if burnin_is_cap:
+            # Easy Tier 2 cases can retain samples after 2*tau, while difficult
+            # cases never discard more than the configured 500-step allowance.
+            burnin_used = min(int(burnin), auto_burnin)
+        else:
+            burnin_used = max(int(burnin), auto_burnin)
         thin = max(1, int(0.3 * np.min(tau)))
-        burnin_used = max(burnin, auto_burnin)
     else:
+        auto_burnin = None
         thin = 1
-        burnin_used = burnin
+        burnin_used = int(burnin)
 
     if burnin_used >= nsteps:
         burnin_used = max(0, nsteps // 2)
 
+    retained_steps = max(0, nsteps - burnin_used)
+    # A very long, unreliable tau estimate can otherwise choose a thinning
+    # interval larger than the retained chain and leave no samples to
+    # summarise. Such a run remains diagnostically flagged, but still returns
+    # its posterior-bearing result for the all-run coverage.
+    thin = min(thin, max(1, retained_steps))
     chain = sampler.get_chain(discard=burnin_used, thin=thin)
     flat = chain.reshape((-1, ndim))
+    acceptance = np.asarray(sampler.acceptance_fraction, dtype=float)
 
     # Summary
     friendly = internal_to_friendly(
@@ -1110,11 +1807,16 @@ def run_mcmc_single(
             all_labels.append(l)
 
     summary = {}
-    r_hat_dict = {}
-    ess_dict = {}
-
-    # Compute simple Gelman-Rubin style diagnostics from the walker-wise chains.
-    per_chain = chain.transpose(1, 0, 2)  # (walkers, steps_after, ndim)
+    mcse_dict = {}
+    _diagnostics = _autocorrelation_diagnostics(
+        tau,
+        all_labels,
+        nsteps,
+        nwalkers,
+        retained_steps,
+    )
+    tau_dict = _diagnostics["autocorr_time"]
+    ess_dict = _diagnostics["effective_sample_size"]
 
     for i, label in enumerate(all_labels):
         vals = flat[:, i]
@@ -1126,25 +1828,17 @@ def run_mcmc_single(
             "hdi_97": float(np.percentile(vals, 97)),
         }
 
-        # Compare within-walker variance to between-walker variance; r_hat values
-        # close to 1 indicate the walkers are exploring the same stationary region.
-        chain_means = np.array([np.mean(per_chain[w, :, i]) for w in range(nwalkers)])
-        chain_vars = np.array([np.var(per_chain[w, :, i]) for w in range(nwalkers)])
-        W = np.mean(chain_vars)
-        B = np.var(chain_means) * chain.shape[0]
-        var_est = (1 - 1.0 / chain.shape[0]) * W + B / chain.shape[0]
-        r_hat = np.sqrt(var_est / W) if W > 0 else np.nan
-        r_hat_dict[label] = float(r_hat)
+        _ess_i = ess_dict[label]
+        mcse_dict[label] = (
+            float(summary[label]["std"] / np.sqrt(_ess_i))
+            if np.isfinite(_ess_i) and _ess_i > 0
+            else np.nan
+        )
 
-        # The code currently uses the post-thinning flat sample count as a simple,
-        # conservative ESS proxy rather than an autocorrelation-based estimator.
-        ess_dict[label] = int(flat.shape[0])  # conservative: total thinned samples
-
-    # Treat convergence as a pragmatic quality gate for the viewer: all finite
-    # r_hat values must be below 1.1 and there must be enough retained samples
-    # to support posterior summaries Vivekananda 2019 (Vehtari et al. 2021, arXiv:1903.08008 criticizes R_hat choice).
-    converged = all(rh < 1.1 for rh in r_hat_dict.values() if np.isfinite(rh))
-    converged = converged and flat.shape[0] >= 100
+    # Keep reasons machine-readable so hard cases remain in all-run coverage
+    # while the viewer can explain why the sampler flagged them.
+    diagnostic_reasons = _diagnostics["diagnostic_reasons"]
+    converged = _diagnostics["converged"]
 
     # Best-fit spectrum at posterior means — set model params, evaluate, and
     # store the arrays so the viewer can reconstruct the Starfish-style plot
@@ -1183,12 +1877,20 @@ def run_mcmc_single(
         "samples": flat,
         "full_chain": full_chain,
         "burnin_used": burnin_used,
+        "auto_burnin": auto_burnin,
         "thin": thin,
         "summary": summary,
-        "r_hat": r_hat_dict,
-        "ess_bulk": ess_dict,
+        "autocorr_time": tau_dict,
+        "effective_sample_size": ess_dict,
+        "mcse_mean": mcse_dict,
+        "acceptance_fraction": {
+            "mean": float(np.nanmean(acceptance)),
+            "min": float(np.nanmin(acceptance)),
+            "max": float(np.nanmax(acceptance)),
+        },
+        "diagnostic_reasons": diagnostic_reasons,
         "converged": converged,
-        "n_effective": flat.shape[0],
+        "n_retained_draws": int(flat.shape[0]),
         "labels": all_labels,
         "internal_labels": _sampled_labels,
         "bestfit_spec": bestfit_spec,
@@ -1235,7 +1937,8 @@ def compute_coverage(
     truths : list of float
         Ground truth values for each test spectrum.
     alphas : ndarray or None
-        Nominal credible levels to evaluate. Default: np.linspace(0.01, 0.99, 50).
+        Nominal credible levels to evaluate. Default:
+        ``np.linspace(0.01, 0.999, 50)``.
 
     Returns
     -------
@@ -1243,7 +1946,14 @@ def compute_coverage(
     """
     if alphas is None:
         alphas = np.linspace(0.01, 0.999, 50)
+    else:
+        alphas = np.asarray(alphas, dtype=float)
 
+    if len(samples_list) != len(truths):
+        raise ValueError(
+            "Coverage requires one ground truth for every posterior sample set "
+            f"({len(samples_list)} samples, {len(truths)} truths)."
+        )
     coverage = np.zeros_like(alphas)
     n = len(samples_list)
     if n == 0:
@@ -1259,6 +1969,62 @@ def compute_coverage(
         coverage[i] = count / n
 
     return alphas, coverage
+
+
+TIER2_COVERAGE_LEVELS = (0.68, 0.95, 0.997)
+
+
+def _wilson_interval(count: int, n: int, z: float = 1.959963984540054) -> Tuple[float, float]:
+    """Return a two-sided 95% Wilson interval for a binomial proportion."""
+    if n <= 0:
+        return np.nan, np.nan
+    proportion = count / n
+    denominator = 1.0 + z**2 / n
+    centre = (proportion + z**2 / (2.0 * n)) / denominator
+    half_width = (
+        z
+        * np.sqrt(proportion * (1.0 - proportion) / n + z**2 / (4.0 * n**2))
+        / denominator
+    )
+    return float(max(0.0, centre - half_width)), float(min(1.0, centre + half_width))
+
+
+def compute_direct_coverage(
+    samples_list: List[np.ndarray],
+    truths: List[float],
+    levels: Sequence[float] = TIER2_COVERAGE_LEVELS,
+) -> Dict[str, dict]:
+    """Return direct equal-tail coverage counts without curve interpolation.
+
+    Empirical coverage is a binomial count across test cases.  Computing the
+    requested levels directly preserves that discrete result: with 50 cases the
+    reported fraction can only change in increments of 1/50, or two percentage
+    points.  Wilson intervals describe the finite-test-set uncertainty.
+    """
+    if len(samples_list) != len(truths):
+        raise ValueError(
+            "Direct coverage requires one ground truth for every posterior "
+            f"sample set ({len(samples_list)} samples, {len(truths)} truths)."
+        )
+    n = len(samples_list)
+    result: Dict[str, dict] = {}
+    for level in levels:
+        count = 0
+        for samples, truth in zip(samples_list, truths):
+            values = np.asarray(samples, dtype=float)
+            lo = np.percentile(values, (1.0 - level) * 50.0)
+            hi = np.percentile(values, (1.0 + level) * 50.0)
+            count += int(lo <= truth <= hi)
+        ci_low, ci_high = _wilson_interval(count, n)
+        result[f"{level:g}"] = {
+            "nominal": float(level),
+            "covered_count": int(count),
+            "n": int(n),
+            "fraction": float(count / n) if n else np.nan,
+            "wilson_95_low": ci_low,
+            "wilson_95_high": ci_high,
+        }
+    return result
 
 
 # --- Public aliases for helpers used by the viewer-driven loop ---------
@@ -1316,18 +2082,23 @@ def aggregate_tier2_results(
         if len(all_truths[fname]) == 0:
             continue
 
-        truths_arr = np.array(all_truths[fname])
-        means_arr = np.array(
-            [ps.get(f"{fname}_mean", np.nan) for ps in per_spectrum]
+        # Work only from records that contain both halves of the comparison.
+        # This keeps posterior arrays, truths, convergence flags, and point
+        # summaries aligned even when lookup metadata is missing for one run.
+        _parameter_results = [
+            ps for ps in per_spectrum
+            if f"{fname}_truth" in ps and f"{fname}_mean" in ps
+        ]
+        truths_arr = np.array(
+            [ps[f"{fname}_truth"] for ps in _parameter_results],
+            dtype=float,
         )
-        means_arr = means_arr[~np.isnan(means_arr)]
-
-        if len(means_arr) == len(truths_arr):
-            rmse = float(np.sqrt(np.mean((means_arr - truths_arr) ** 2)))
-            bias = float(np.mean(means_arr - truths_arr))
-        else:
-            rmse = np.nan
-            bias = np.nan
+        means_arr = np.array(
+            [ps[f"{fname}_mean"] for ps in _parameter_results],
+            dtype=float,
+        )
+        rmse = float(np.sqrt(np.mean((means_arr - truths_arr) ** 2)))
+        bias = float(np.mean(means_arr - truths_arr))
 
         crps_vals = []
         for samples, truth in zip(all_samples[fname], all_truths[fname]):
@@ -1338,7 +2109,10 @@ def aggregate_tier2_results(
             emu_max_params[friendly_names.index(fname)]
             - emu_min_params[friendly_names.index(fname)]
         ) if fname in friendly_names[:n_params] else np.nan
-        post_stds = [ps.get(f"{fname}_std", np.nan) for ps in per_spectrum]
+        post_stds = [
+            ps.get(f"{fname}_std", np.nan)
+            for ps in _parameter_results
+        ]
         mean_post_std = float(np.nanmean(post_stds))
         shrinkage = (
             1.0 - mean_post_std / (prior_range / np.sqrt(12))
@@ -1346,21 +2120,57 @@ def aggregate_tier2_results(
             else np.nan
         )
 
-        alphas, cov = compute_coverage(all_samples[fname], all_truths[fname])
-        cov_68 = float(np.interp(0.68, alphas, cov))
-        cov_95 = float(np.interp(0.95, alphas, cov))
-        cov_997 = float(np.interp(0.997, alphas, cov))
+        # The all-run result is the primary end-to-end benchmark, including
+        # difficult cases that the sampler diagnostics flag.  A converged-only
+        # view is retained solely as supplementary context in the viewer.
+        _samples = all_samples[fname]
+        _truths = all_truths[fname]
+        if not (
+            len(_samples) == len(_truths) == len(_parameter_results)
+        ):
+            raise ValueError(
+                f"Tier 2 aggregation lost case alignment for {fname!r}: "
+                f"{len(_samples)} sample sets, {len(_truths)} truths, and "
+                f"{len(_parameter_results)} per-spectrum records."
+            )
+        _coverage_levels = compute_direct_coverage(_samples, _truths)
+        alphas, cov = compute_coverage(_samples, _truths)
+
+        _converged_pairs = [
+            (samples, truth)
+            for samples, truth, ps in zip(_samples, _truths, _parameter_results)
+            if ps.get("mcmc_converged", False)
+        ]
+        _converged_samples = [pair[0] for pair in _converged_pairs]
+        _converged_truths = [pair[1] for pair in _converged_pairs]
+        _converged_levels = compute_direct_coverage(
+            _converged_samples,
+            _converged_truths,
+        )
+        if _converged_samples:
+            converged_alphas, converged_cov = compute_coverage(
+                _converged_samples,
+                _converged_truths,
+                alphas=alphas,
+            )
+        else:
+            converged_alphas = np.array([], dtype=float)
+            converged_cov = np.array([], dtype=float)
 
         aggregate[fname] = {
             "rmse": rmse,
             "bias": bias,
             "crps": crps_mean,
             "shrinkage": shrinkage,
-            "coverage_68": cov_68,
-            "coverage_95": cov_95,
-            "coverage_997": cov_997,
+            "coverage_68": _coverage_levels["0.68"]["fraction"],
+            "coverage_95": _coverage_levels["0.95"]["fraction"],
+            "coverage_997": _coverage_levels["0.997"]["fraction"],
+            "coverage_levels": _coverage_levels,
             "coverage_alphas": alphas.tolist(),
             "coverage_values": cov.tolist(),
+            "coverage_converged_levels": _converged_levels,
+            "coverage_converged_alphas": converged_alphas.tolist(),
+            "coverage_converged_values": converged_cov.tolist(),
         }
 
     return {
@@ -1380,7 +2190,7 @@ def aggregate_tier2_results(
         "mcmc_config": {
             "walkers": mcmc_walkers,
             "steps": mcmc_steps,
-            "burnin": mcmc_burnin,
+            "burnin_cap": mcmc_burnin,
             "freeze_params": _serialise_freeze_settings(mcmc_freeze_params),
             "fixed_distance_pc": 100.0,
         },
@@ -1395,9 +2205,9 @@ def run_tier2(
     wl_range: Tuple[float, float] = (850, 1850),
     inclination: float = 55.0,
     mcmc_walkers: int = 64,
-    mcmc_steps: int = 2500,
+    mcmc_steps: int = 5000,
     mcmc_burnin: int = 500,
-    max_mle_iter: int = 5000,
+    max_mle_iter: int = 10000,
     mle_restarts: int = 1,
     max_spectra: Optional[int] = None,
     mle_freeze_params: Optional[Dict[str, bool]] = None,
@@ -1474,7 +2284,6 @@ def run_tier2(
         mle_freeze_params["log_scale"] = True
     if "log_scale" in mcmc_freeze_params:
         mcmc_freeze_params["log_scale"] = True
-
     per_spectrum = []
     all_samples = {name: [] for name in friendly_names}
     all_truths = {name: [] for name in friendly_names}
@@ -1555,6 +2364,7 @@ def run_tier2(
                 burnin=mcmc_burnin,
                 freeze_params=mcmc_freeze_params,
                 grid_name=_tier_grid_name,
+                burnin_is_cap=True,
             )
         except Exception as e:
             import traceback as _tb
@@ -1578,7 +2388,12 @@ def run_tier2(
             "inclination": inclination,
             "mle_success": mle_result["success"],
             "mcmc_converged": mcmc_result["converged"],
-            "n_effective": mcmc_result["n_effective"],
+            "n_retained_draws": mcmc_result["n_retained_draws"],
+            "autocorr_time": mcmc_result["autocorr_time"],
+            "effective_sample_size": mcmc_result["effective_sample_size"],
+            "mcse_mean": mcmc_result["mcse_mean"],
+            "acceptance_fraction": mcmc_result["acceptance_fraction"],
+            "mcmc_diagnostic_reasons": mcmc_result["diagnostic_reasons"],
             "mle_grid_params": mle_result["grid_params"],
             "mle_nll": mle_result.get("nll"),
             "mle_optimizer_nll": mle_result.get("optimizer_nll"),
@@ -1609,9 +2424,11 @@ def run_tier2(
                 else:
                     _col = i  # fallback (legacy behaviour)
                 samples_i = mcmc_result["samples"][:, _col]
-                all_samples[fname].append(samples_i)
 
                 if fname in gt:
+                    # Coverage inputs are appended as an inseparable pair.  A
+                    # missing lookup truth must not shift every later case.
+                    all_samples[fname].append(samples_i)
                     all_truths[fname].append(gt[fname])
                     spec_result[f"{fname}_truth"] = gt[fname]
                     _median = float(np.median(samples_i))
@@ -1625,89 +2442,26 @@ def run_tier2(
             _status = "done" if mcmc_result["converged"] else "done:not_converged"
             progress_callback(_spec_idx + 1, _n_total, sf.name, _status)
 
-    # ----- Aggregate metrics across all test spectra -----
-    # For each physical parameter we compute:
-    #   RMSE   — root-mean-square error of posterior means vs ground truth
-    #   Bias   — signed mean offset (positive = overestimate)
-    #   CRPS   — Continuous Ranked Probability Score (proper scoring rule that
-    #            penalises both miscalibration and low sharpness)
-    #   Shrinkage — how much the posterior narrows relative to the prior
-    #              (1 = perfectly informative, 0 = no information gain)
-    #   Coverage — empirical coverage at 68% and 95% credible levels (if
-    #             well-calibrated, ~68% and ~95% of truths fall inside the
-    #             posterior intervals at those levels)
-    aggregate = {}
-    for fname in friendly_names:
-        if len(all_truths[fname]) == 0:
-            continue
-
-        truths_arr = np.array(all_truths[fname])
-        means_arr = np.array(
-            [ps.get(f"{fname}_mean", np.nan) for ps in per_spectrum]
-        )
-        means_arr = means_arr[~np.isnan(means_arr)]
-
-        # RMSE and bias of posterior means vs ground truth
-        if len(means_arr) == len(truths_arr):
-            rmse = float(np.sqrt(np.mean((means_arr - truths_arr) ** 2)))
-            bias = float(np.mean(means_arr - truths_arr))
-        else:
-            rmse = np.nan
-            bias = np.nan
-
-        # CRPS: averaged over all test spectra for this parameter
-        crps_vals = []
-        for samples, truth in zip(all_samples[fname], all_truths[fname]):
-            crps_vals.append(compute_crps(samples, truth))
-        crps_mean = float(np.mean(crps_vals)) if crps_vals else np.nan
-
-        # Posterior shrinkage: 1 − (mean posterior σ) / (prior σ)
-        # Uses the standard deviation of the uniform prior: range / √12
-        prior_range = float(emu.max_params[friendly_names.index(fname)] - emu.min_params[friendly_names.index(fname)]) if fname in friendly_names[:n_params] else np.nan
-        post_stds = [ps.get(f"{fname}_std", np.nan) for ps in per_spectrum]
-        mean_post_std = float(np.nanmean(post_stds))
-        shrinkage = 1.0 - mean_post_std / (prior_range / np.sqrt(12)) if np.isfinite(prior_range) and prior_range > 0 else np.nan
-
-        # PP-plot coverage: the fraction of test cases whose ground truth falls
-        # inside the α-level credible interval, evaluated at many α values.
-        alphas, cov = compute_coverage(all_samples[fname], all_truths[fname])
-        # Interpolate to standard reporting levels
-        cov_68 = float(np.interp(0.68, alphas, cov))
-        cov_95 = float(np.interp(0.95, alphas, cov))
-        cov_997 = float(np.interp(0.997, alphas, cov))
-
-        aggregate[fname] = {
-            "rmse": rmse,
-            "bias": bias,
-            "crps": crps_mean,
-            "shrinkage": shrinkage,
-            "coverage_68": cov_68,
-            "coverage_95": cov_95,
-            "coverage_997": cov_997,
-            "coverage_alphas": alphas.tolist(),
-            "coverage_values": cov.tolist(),
-        }
-
     elapsed = time.time() - t0
-    return {
-        "per_spectrum": per_spectrum,
-        "aggregate": aggregate,
-        "n_spectra": len(spec_files),
-        "n_processed": len(per_spectrum),
-        "n_failures": failures,
-        "n_not_converged": n_not_converged,
-        "failure_log": failure_log,
-        "mle_config": {
-            "freeze_params": _serialise_freeze_settings(mle_freeze_params),
-        },
-        "mcmc_config": {
-            "walkers": mcmc_walkers,
-            "steps": mcmc_steps,
-            "burnin": mcmc_burnin,
-            "freeze_params": _serialise_freeze_settings(mcmc_freeze_params),
-        },
-        "tier2_time_s": elapsed,
-    }
+    return aggregate_tier2_results(
+        per_spectrum=per_spectrum,
+        all_samples=all_samples,
+        all_truths=all_truths,
+        friendly_names=friendly_names,
+        n_params=n_params,
+        emu_min_params=emu.min_params,
+        emu_max_params=emu.max_params,
+        spec_files_count=len(spec_files),
+        failures=failures,
+        failure_log=failure_log,
+        mcmc_walkers=mcmc_walkers,
+        mcmc_steps=mcmc_steps,
+        mcmc_burnin=mcmc_burnin,
+        elapsed=elapsed,
+        n_not_converged=n_not_converged,
+        mle_freeze_params=mle_freeze_params,
+        mcmc_freeze_params=mcmc_freeze_params,
+    )
 
 
 # ======================================================================
@@ -1758,6 +2512,7 @@ def _configure_sirocco_environment() -> dict:
         root = root.expanduser()
         bin_dir = root / "bin"
         py_dir = root / "py_progs"
+        env_bin_dir = root / "sirocco_env" / "bin"
         if not ((bin_dir / "sirocco").is_file() and (bin_dir / "Setup_Sirocco_Dir").is_file()):
             continue
 
@@ -1769,6 +2524,12 @@ def _configure_sirocco_environment() -> dict:
             if _prepend_env_path("PATH", py_dir):
                 added.append(str(py_dir.resolve()))
             _prepend_env_path("PYTHONPATH", py_dir)
+        # Source builds commonly keep OpenMPI inside Sirocco's companion
+        # virtual environment rather than the user's login PATH.  Include that
+        # bin directory so the Tier 3 and notebook CPU controls discover the
+        # installation's own mpirun without requiring manual activation.
+        if env_bin_dir.is_dir() and _prepend_env_path("PATH", env_bin_dir):
+            added.append(str(env_bin_dir.resolve()))
 
         return {
             "configured": True,
@@ -1801,7 +2562,11 @@ def check_sirocco_runtime(cpus: int = 1) -> dict:
         "sirocco_root": os.environ.get("SIROCCO"),
         "added_paths": [],
     }
-    if shutil.which("sirocco") is None or shutil.which("Setup_Sirocco_Dir") is None:
+    if (
+        shutil.which("sirocco") is None
+        or shutil.which("Setup_Sirocco_Dir") is None
+        or (cpus > 1 and shutil.which("mpirun") is None)
+    ):
         env_setup = _configure_sirocco_environment()
 
     result = {
@@ -2103,9 +2868,12 @@ def _load_single_observer_sirocco_spectrum(
     is the comparison spectrum.
     """
     skiprows = 0
+    header_columns = None
     with open(spec_file, "r") as f:
         for i, line in enumerate(f):
             stripped = line.strip()
+            if stripped.startswith("Freq."):
+                header_columns = stripped.split()
             if not stripped or stripped.startswith("#") or stripped.startswith("Freq."):
                 skiprows = i + 1
             else:
@@ -2114,8 +2882,17 @@ def _load_single_observer_sirocco_spectrum(
     data = np.loadtxt(spec_file, skiprows=skiprows)
     if data.ndim == 1:
         data = data.reshape(1, -1)
-    if data.shape[1] < 3:
-        raise ValueError(f"Expected at least 3 columns in Sirocco spectrum {spec_file}")
+    if data.shape[1] != 3:
+        column_detail = (
+            f" ({', '.join(header_columns)})"
+            if header_columns
+            else ""
+        )
+        raise ValueError(
+            "Expected exactly frequency, wavelength, and one observer column "
+            f"in reduced Sirocco spectrum {spec_file}; found "
+            f"{data.shape[1]} columns{column_detail}"
+        )
 
     order = np.argsort(data[:, 1])
     wl = data[order, 1]
@@ -2131,30 +2908,61 @@ def _load_single_observer_sirocco_spectrum(
     return wl, flux
 
 
+def _reduce_single_observer_sirocco_spectrum(
+    native_spec_path: Union[str, Path],
+    output_dir: Union[str, Path],
+) -> Path:
+    """Reduce one native Sirocco spectrum to its sole observer column.
+
+    Native files place diagnostic totals such as ``Created`` before the
+    observer columns.  Both Tier 3 and notebook runs export exactly one
+    observer, so removing those diagnostics makes column 2 the fitted
+    inclination rather than an unrelated total-flux column.
+    """
+    from Speculate_addons.lighten_spec_files import reduce_spec_file
+
+    native_spec_path = Path(native_spec_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reduced_spec_path = output_dir / native_spec_path.name
+    reduce_spec_file(
+        str(native_spec_path),
+        str(reduced_spec_path),
+    )
+    return reduced_spec_path
+
+
 def _transform_flux_for_scale(
     wl: np.ndarray,
     flux: np.ndarray,
     flux_scale: str,
 ) -> np.ndarray:
-    """Transform a native linear-flux spectrum onto the emulator fit scale."""
+    """Convert a native linear-flux Sirocco spectrum onto the emulator fit space.
+
+    Only the flux *space* is changed; the absolute normalisation is preserved.
+    The Tier 3 model is built with ``norm=True``, so the fit operates in
+    absolute-flux units (linear) or absolute log10-flux units (log), and the
+    Sirocco spectrum is itself absolute physical flux at its native 100 pc
+    reference distance. Preserving that calibration here is what lets the
+    subsequent ``log_scale`` (distance) transform in
+    :func:`_apply_spectrum_nuisance_transforms` rescale the Sirocco spectrum from
+    100 pc to the source distance correctly. Dividing out the mean (as an earlier
+    revision did) destroyed the 100 pc zero-point and left the Sirocco overlay
+    ~1e8-1e9x offset from the absolute observation.
+
+    Continuum-normalised fits divide out the fitted power-law continuum to match
+    the observation's own normalisation; ``log_scale`` is fixed at 0 (distance is
+    shape-only) in that mode, so no absolute scale needs to be retained.
+    """
     wl = np.asarray(wl, dtype=np.float64)
     flux = np.asarray(flux, dtype=np.float64)
     if flux_scale == "log":
-        flux = np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
-        finite = np.isfinite(flux)
-        offset = float(np.mean(flux[finite])) if np.any(finite) else 0.0
-        return flux - offset
+        return np.where(flux > 0, np.log10(flux), np.log10(np.abs(flux) + 1e-30))
     if flux_scale == "continuum-normalised":
         from Speculate_addons.Spec_functions import fit_power_law_continuum
 
         continuum, _ = fit_power_law_continuum(wl, flux)
-        flux = flux / np.where(continuum > 0, continuum, 1.0)
-
-    finite = np.isfinite(flux)
-    factor = float(np.mean(flux[finite])) if np.any(finite) else 1.0
-    if not np.isfinite(factor) or abs(factor) == 0.0:
-        factor = 1.0
-    flux = flux / factor
+        return flux / np.where(continuum > 0, continuum, 1.0)
     return flux
 
 
@@ -2226,6 +3034,33 @@ def _apply_spectrum_nuisance_transforms(
     return flux
 
 
+def _prepare_sirocco_flux_for_fit(
+    wl: np.ndarray,
+    flux: np.ndarray,
+    flux_scale: str,
+    transforms: Optional[dict] = None,
+    smoothing: bool = False,
+) -> np.ndarray:
+    """Apply the same spectral preprocessing and nuisance model as the fit.
+
+    Optional Gaussian smoothing happens before the flux-space conversion, just
+    as it does when Quick Fit builds its training grid.  The remaining order is
+    shared with Tier 3: flux-space conversion/continuum normalisation, then
+    extinction, Chebyshev correction, and distance/global scaling.
+    """
+    if smoothing:
+        from Speculate_addons.Spec_gridinterfaces import _maybe_smooth_flux
+
+        flux = _maybe_smooth_flux(flux, True)
+    plot_flux = _transform_flux_for_scale(wl, flux, flux_scale)
+    return _apply_spectrum_nuisance_transforms(
+        wl,
+        plot_flux,
+        flux_scale,
+        dict(transforms or {}),
+    )
+
+
 def _format_sirocco_transform_label(transforms: dict) -> str:
     """Return a compact plot legend label for the transformed Sirocco spectrum."""
     parts = []
@@ -2238,6 +3073,80 @@ def _format_sirocco_transform_label(transforms: dict) -> str:
     return "Sirocco Model" if not parts else "Sirocco Model (" + ", ".join(parts) + ")"
 
 
+def run_sirocco_model_spectrum(
+    pf_path: Union[str, Path],
+    wl_range: Tuple[float, float],
+    flux_scale: str = "linear",
+    transforms: Optional[dict] = None,
+    smoothing: bool = False,
+    cpus: int = 1,
+    progress_callback=None,
+) -> dict:
+    """Run an exported Sirocco model and return its plot-ready spectrum.
+
+    This is the notebook-facing counterpart to :func:`run_sirocco_pf`.  It
+    keeps runtime discovery, subprocess logging, native ``.spec`` parsing, and
+    fitted nuisance transformations identical to the Tier 3 benchmark while
+    returning a small payload that can be retained safely in marimo state.
+
+    Parameters
+    ----------
+    pf_path : path-like
+        Fitted Sirocco parameter file to execute.
+    wl_range : tuple of float
+        Inclusive wavelength interval to load from the generated spectrum.
+    flux_scale : {"linear", "log", "continuum-normalised"}
+        Flux space used by the notebook fit and comparison plot.
+    transforms : dict or None
+        Fitted ``Av``, ``Rv``, ``log_scale``, and/or ``cheb`` nuisance values.
+    smoothing : bool
+        Apply the same pre-scale Gaussian smoothing used by a smoothed Quick
+        Fit or Inference emulator.
+    cpus : int
+        Sirocco process count.
+    progress_callback : callable or None
+        Optional receiver for the same cycle events emitted by Tier 3.
+    """
+    sirocco_meta = run_sirocco_pf(
+        pf_path,
+        cpus=cpus,
+        progress_callback=progress_callback,
+    )
+    native_spec_path = Path(sirocco_meta["spec_files"][0])
+    reduced_spec_path = _reduce_single_observer_sirocco_spectrum(
+        native_spec_path,
+        native_spec_path.parent / "reduced_spec",
+    )
+    sirocco_wl, sirocco_flux = _load_single_observer_sirocco_spectrum(
+        reduced_spec_path,
+        wl_range,
+    )
+
+    transforms = dict(transforms or {})
+    plot_flux = _prepare_sirocco_flux_for_fit(
+        sirocco_wl,
+        sirocco_flux,
+        flux_scale,
+        transforms,
+        smoothing=smoothing,
+    )
+
+    return {
+        "wavelength": sirocco_wl,
+        "flux": plot_flux,
+        "label": _format_sirocco_transform_label(transforms),
+        "pf_path": str(pf_path),
+        "sirocco_command": sirocco_meta.get("command"),
+        "sirocco_log_path": sirocco_meta.get("run_log_path"),
+        "sirocco_setup_log_path": sirocco_meta.get("setup_log_path"),
+        "sirocco_signal_log_path": sirocco_meta.get("signal_log_path"),
+        "sirocco_spec_path": str(native_spec_path),
+        "sirocco_reduced_spec_path": str(reduced_spec_path),
+        "sirocco_transforms": transforms,
+        "sirocco_smoothing": bool(smoothing),
+    }
+
+
 def _fixed_inclination_from_emulator(emu, grid_name: Optional[str] = None) -> float:
     """Return the fixed observer angle for an emulator without an inclination axis."""
     emu_name = os.path.basename(str(getattr(emu, "name", "") or ""))
@@ -2247,20 +3156,49 @@ def _fixed_inclination_from_emulator(emu, grid_name: Optional[str] = None) -> fl
     return float(default_fixed_inclination(grid_name))
 
 
+def resolve_sirocco_observer_angle(
+    emu,
+    grid_param_values: Sequence[float],
+    grid_name: Optional[str] = None,
+) -> float:
+    """Return the single observer angle for a fitted emulator parameter vector.
+
+    Inclination is taken from the fitted grid axis when the emulator exposes
+    one.  Fixed-inclination emulator filenames and registry defaults use the
+    same fallback path as Tier 3, keeping notebook-generated ``.pf`` files to
+    one observer column that can be compared unambiguously with the fit.
+    """
+    friendly_grid = internal_to_friendly(emu.param_names, grid_name)
+    if "Inclination" in friendly_grid:
+        inclination_index = friendly_grid.index("Inclination")
+        inclination = float(np.asarray(grid_param_values)[inclination_index])
+        return float(np.clip(inclination, 0.0, 90.0))
+    return _fixed_inclination_from_emulator(emu, grid_name)
+
+
 def _extract_posterior_mean_inclination(
     emu,
     samples: np.ndarray,
     friendly_labels: Sequence[str],
     grid_name: Optional[str] = None,
+    frozen_param_values: Optional[Dict[str, float]] = None,
 ) -> float:
-    """Return the posterior-mean inclination used for the Sirocco observer."""
+    """Return the sampled or post-MLE frozen inclination for Sirocco."""
     friendly_grid = internal_to_friendly(emu.param_names, grid_name)
     if "Inclination" not in friendly_grid:
         return _fixed_inclination_from_emulator(emu, grid_name)
-    if "Inclination" not in friendly_labels:
-        raise ValueError("MCMC samples do not contain an Inclination column.")
-    col = list(friendly_labels).index("Inclination")
-    inclination = float(np.mean(samples[:, col]))
+    if "Inclination" in friendly_labels:
+        col = list(friendly_labels).index("Inclination")
+        inclination = float(np.mean(samples[:, col]))
+    else:
+        inclination_index = friendly_grid.index("Inclination")
+        inclination_label = emu.param_names[inclination_index]
+        frozen_param_values = frozen_param_values or {}
+        if inclination_label not in frozen_param_values:
+            raise ValueError(
+                "MCMC samples and frozen parameter values do not contain Inclination."
+            )
+        inclination = float(frozen_param_values[inclination_label])
     return float(np.clip(inclination, 0.0, 90.0))
 
 
@@ -2288,12 +3226,29 @@ def _save_tier3_artifacts(
     )
 
     plot_path = output_dir / f"tier3_{obs_stem}_plot_data.npz"
+    covariance_components = bestfit_spec.get("covariance_components") or {}
     np.savez_compressed(
         plot_path,
         wavelength=np.asarray(bestfit_spec.get("wavelength", []), dtype=np.float64),
         data_flux=np.asarray(bestfit_spec.get("data_flux", []), dtype=np.float64),
         model_flux=np.asarray(bestfit_spec.get("model_flux", []), dtype=np.float64),
         model_cov_diag=np.asarray(bestfit_spec.get("model_cov_diag", []), dtype=np.float64),
+        observation_variance=np.asarray(
+            covariance_components.get("observation_variance", []),
+            dtype=np.float64,
+        ),
+        emulator_variance=np.asarray(
+            covariance_components.get("emulator_variance", []),
+            dtype=np.float64,
+        ),
+        global_variance=np.asarray(
+            covariance_components.get("global_variance", []),
+            dtype=np.float64,
+        ),
+        local_variance=np.asarray(
+            covariance_components.get("local_variance", []),
+            dtype=np.float64,
+        ),
         ppc_wavelength=np.asarray(ppc_envelope.get("wavelength", []), dtype=np.float64),
         ppc_low=np.asarray(ppc_envelope.get("low", []), dtype=np.float64),
         ppc_high=np.asarray(ppc_envelope.get("high", []), dtype=np.float64),
@@ -2319,7 +3274,7 @@ def run_tier3_single(
     flux_scale: str = "linear",
     wl_range: Optional[Tuple[float, float]] = None,
     distance_prior_pc: Optional[dict] = None,
-    max_mle_iter: int = 5000,
+    max_mle_iter: int = 10000,
     mle_restarts: int = 5,
     n_ppc_draws: int = 100,
     mcmc_walkers: int = 64,
@@ -2330,9 +3285,13 @@ def run_tier3_single(
     sirocco_cpus: int = 1,
     require_sirocco: bool = True,
     run_sirocco: bool = True,
+    enable_local_covariance: bool = False,
     mle_iteration_callback=None,
     mcmc_iteration_callback=None,
     sirocco_progress_callback=None,
+    mle_freeze_params: Optional[Dict[str, bool]] = None,
+    mcmc_freeze_params: Optional[Dict[str, bool]] = None,
+    inclination_prior_deg: Optional[dict] = None,
 ) -> dict:
     """
     Tier 3 benchmark: goodness-of-fit for a single observational spectrum.
@@ -2350,9 +3309,15 @@ def run_tier3_single(
         the selected emulator's wavelength coverage.  Explicit ranges must sit
         inside that coverage to avoid spline extrapolation.
     distance_prior_pc : dict or None
-        User-facing distance prior for this observation with ``mean_pc``,
-        ``min_pc``, and ``max_pc``.  Tier 3 converts these parsec values to the
-        backend ``log_scale`` initial value and uniform prior bounds before MLE.
+        Normal distance prior with ``mean_pc`` and 1σ ``sigma_pc``. Tier 3
+        converts it to the backend ``log_scale`` parameter.
+    inclination_prior_deg : dict or None
+        Normal payloads provide ``mean_deg`` and 1σ ``sigma_deg``. Uniform
+        payloads provide ``mean_deg``, ``min_deg``, and ``max_deg``.
+    mle_freeze_params, mcmc_freeze_params : dict or None
+        Optional freeze settings keyed by internal parameter name. MLE freezes
+        hold parameters at their initial values; MCMC freezes hold parameters
+        at their post-MLE values. Every parameter remains free by default.
     sirocco_cpus : int
         Number of CPUs to use when launching Sirocco.  Values above 1 use
         ``mpirun -np N sirocco <pf>``.
@@ -2360,6 +3325,10 @@ def run_tier3_single(
         If True, missing runtime commands or failed Sirocco runs raise.
     run_sirocco : bool
         If True, run Sirocco after exporting the posterior-mean .pf file.
+    enable_local_covariance : bool
+        If True, Tier 3 uses a two-pass MLE in which Starfish residual peaks
+        from the first pass are converted into fixed local covariance kernels
+        before the final MLE and MCMC likelihood evaluations.
     mle_iteration_callback, mcmc_iteration_callback, sirocco_progress_callback : callable or None
         Optional progress callbacks forwarded to the MLE, MCMC, and Sirocco
         stages. The benchmark viewer uses these to show restart, evaluation,
@@ -2377,6 +3346,11 @@ def run_tier3_single(
     distance_prior_meta, prior_overrides, initial_params = _tier3_distance_prior_to_log_scale(
         distance_prior_pc
     )
+    inclination_prior_meta, inclination_priors, inclination_initial = (
+        _tier3_inclination_prior_to_parameter(emu, inclination_prior_deg, grid_name)
+    )
+    prior_overrides.update(inclination_priors)
+    initial_params.update(inclination_initial)
 
     if grid_name is None and (require_sirocco or run_sirocco):
         raise ValueError("Tier 3 Sirocco workflow requires a grid_name for .pf export.")
@@ -2419,6 +3393,16 @@ def run_tier3_single(
         iteration_callback=mle_iteration_callback,
         prior_overrides=prior_overrides,
         initial_params=initial_params,
+        freeze_params=mle_freeze_params,
+        # Build the model with the emulator's absolute-flux calibration applied,
+        # exactly like Tier 2 (line ~1531) and the inference/quick-fit tools.
+        # The distance prior maps parsecs to log_scale via 2*ln(100/d), which is
+        # only valid when norm=True so that log_scale=0 corresponds to the 100 pc
+        # reference. Without it the emulator flux carries an arbitrary zero-point
+        # (~1e-11), so the distance-derived log_scale (~-1.2) leaves the model
+        # ~1e8-1e9x too bright and the GP log_amp inflates to absorb the mismatch.
+        use_emulator_norm=True,
+        enable_local_covariance=enable_local_covariance,
     )
     model = mle["model"]
     priors = mle["priors"]
@@ -2426,20 +3410,20 @@ def run_tier3_single(
     # MCMC
     if mcmc_iteration_callback is not None:
         mcmc_iteration_callback(0, mcmc_steps, 0.0)
-    # Tier 3 fits real observational spectra, where every nuisance parameter
-    # carries physical information (extinction, distance, continuum tilt, and GP
-    # covariance).  Following the migration to including nuisance parameters in
-    # inference, the MCMC samples them all rather than freezing them at their MLE
-    # values.
+    # Tier 3 keeps all physical and nuisance parameters free by default. Explicit
+    # viewer selections can instead hold chosen parameters at their post-MLE
+    # values for this MCMC pass.
     mcmc = run_mcmc_single(
         model, priors,
         nwalkers=mcmc_walkers, nsteps=mcmc_steps, burnin=mcmc_burnin,
         freeze_nuisance=False,
+        freeze_params=mcmc_freeze_params,
         iteration_callback=mcmc_iteration_callback,
         grid_name=grid_name,
     )
     friendly_labels = mcmc.get("labels", [])
     internal_labels = mcmc.get("internal_labels", friendly_labels)
+    frozen_param_values = mcmc.get("frozen_param_values", {})
 
     # Posterior Predictive Check (PPC)
     # Draw random posterior samples, evaluate the model flux at each one, and
@@ -2481,18 +3465,9 @@ def run_tier3_single(
     model.set_param_dict(mcmc_means)
 
     try:
-        model_flux, model_cov = model()
-        if hasattr(model_flux, "detach"):
-            model_flux = model_flux.detach().cpu().numpy()
-        if hasattr(model_cov, "detach"):
-            model_cov = model_cov.detach().cpu().numpy()
-        model_cov = np.asarray(model_cov)
-        bestfit_spec = {
-            "wavelength": np.asarray(model.data.wave).tolist(),
-            "data_flux": np.asarray(model.data.flux).tolist(),
-            "model_flux": np.asarray(model_flux).tolist(),
-            "model_cov_diag": np.diag(model_cov).tolist() if model_cov.ndim == 2 else model_cov.tolist(),
-        }
+        # Use the common exporter so posterior-mean plots retain the same
+        # covariance-source diagnostics as their MLE counterparts.
+        bestfit_spec = _model_bestfit_spectrum(model)
     except Exception:
         bestfit_spec = mcmc.get("bestfit_spec", {})
 
@@ -2509,7 +3484,11 @@ def run_tier3_single(
         reduced_chi2 = np.nan
 
     exact_inclination = _extract_posterior_mean_inclination(
-        emu, mcmc["samples"], friendly_labels, grid_name
+        emu,
+        mcmc["samples"],
+        friendly_labels,
+        grid_name,
+        frozen_param_values=frozen_param_values,
     )
 
     result = {
@@ -2520,22 +3499,40 @@ def run_tier3_single(
         "mle_all_params": mle.get("all_params", {}),
         "mcmc_summary": mcmc["summary"],
         "mcmc_converged": mcmc["converged"],
-        "n_effective": mcmc.get("n_effective"),
+        "n_retained_draws": mcmc.get("n_retained_draws"),
+        "autocorr_time": mcmc.get("autocorr_time", {}),
+        "effective_sample_size": mcmc.get("effective_sample_size", {}),
+        "mcse_mean": mcmc.get("mcse_mean", {}),
+        "acceptance_fraction": mcmc.get("acceptance_fraction", {}),
+        "mcmc_diagnostic_reasons": mcmc.get("diagnostic_reasons", []),
         "labels": friendly_labels,
+        "mle_freeze_settings": mle.get("freeze_params", {}),
+        "mle_frozen_params": mle.get("frozen_params", []),
+        "mcmc_freeze_settings": mcmc.get("freeze_params", {}),
+        "mcmc_frozen_params": mcmc.get("frozen_params", []),
+        "mcmc_frozen_param_values": mcmc.get("frozen_param_values", {}),
         "exact_inclination": exact_inclination,
+        "local_covariance": mle.get("local_covariance", _empty_local_covariance_metadata(False)),
         "export_dir": str(artifact_dir),
         "wl_range": [float(wl_range[0]), float(wl_range[1])],
         "emulator_wl_range": list(_emulator_wavelength_bounds(emu)),
         "tier3_time_s": None,
     }
+    prior_ranges = {}
     if distance_prior_meta is not None:
         result["distance_prior_pc"] = distance_prior_meta
-        result["prior_ranges"] = {
-            "Distance (pc)": [
-                distance_prior_meta["min_pc"],
-                distance_prior_meta["max_pc"],
-            ]
-        }
+        prior_ranges["Distance (pc)"] = [
+            distance_prior_meta["plot_min_pc"],
+            distance_prior_meta["plot_max_pc"],
+        ]
+    if inclination_prior_meta is not None:
+        result["inclination_prior_deg"] = inclination_prior_meta
+        prior_ranges["Inclination"] = [
+            inclination_prior_meta["applied_min_deg"],
+            inclination_prior_meta["applied_max_deg"],
+        ]
+    if prior_ranges:
+        result["prior_ranges"] = prior_ranges
 
     # Export a Sirocco .pf file from the posterior-mean parameters
     if grid_name is not None:
@@ -2545,18 +3542,29 @@ def run_tier3_single(
         _uncertainties = {}
         _friendly_grid = internal_to_friendly(emu.param_names, grid_name)
         for _pn, _friendly in zip(emu.param_names, _friendly_grid):
-            if _pn not in internal_labels:
-                raise ValueError(f"MCMC samples do not contain required grid parameter {_pn}")
-            _col = list(internal_labels).index(_pn)
-            _grid_means.append(float(np.mean(mcmc["samples"][:, _col])))
-            _lo = float(np.percentile(mcmc["samples"][:, _col], 16))
-            _hi = float(np.percentile(mcmc["samples"][:, _col], 84))
+            if _pn in internal_labels:
+                _col = list(internal_labels).index(_pn)
+                _grid_value = float(np.mean(mcmc["samples"][:, _col]))
+                _lo = float(np.percentile(mcmc["samples"][:, _col], 16))
+                _hi = float(np.percentile(mcmc["samples"][:, _col], 84))
+            elif _pn in frozen_param_values:
+                _grid_value = float(frozen_param_values[_pn])
+                _lo = _grid_value
+                _hi = _grid_value
+            else:
+                raise ValueError(
+                    f"MCMC samples and frozen parameter values do not contain required grid parameter {_pn}"
+                )
+            _grid_means.append(_grid_value)
             _uncertainties[_friendly] = (_lo, _hi)
 
         _global = {}
         for _i, _label in enumerate(internal_labels):
             if not str(_label).startswith("param"):
                 _global[str(_label)] = float(np.mean(mcmc["samples"][:, _i]))
+        for _label, _value in frozen_param_values.items():
+            if not str(_label).startswith("param"):
+                _global[str(_label)] = float(_value)
 
         export_pf_template(
             emu, np.asarray(_grid_means), str(_pf_path),
@@ -2582,32 +3590,17 @@ def run_tier3_single(
         )
         native_spec_path = Path(sirocco_meta["spec_files"][0])
         reduced_dir = artifact_dir / "reduced_spec"
-        from Speculate_addons.lighten_spec_files import reduce_spec_files
-
-        reduced_paths = reduce_spec_files(
-            str(artifact_dir),
-            output_dir=str(reduced_dir),
-            show_progress=False,
-            strict=True,
-        )
-        if not reduced_paths:
-            raise FileNotFoundError(f"No reduced .spec files were written in {_repo_relative(reduced_dir)}")
-        reduced_spec_path = next(
-            (Path(path) for path in reduced_paths if Path(path).name == native_spec_path.name),
-            Path(reduced_paths[0]),
+        reduced_spec_path = _reduce_single_observer_sirocco_spectrum(
+            native_spec_path,
+            reduced_dir,
         )
 
         sirocco_wl, sirocco_flux = _load_single_observer_sirocco_spectrum(
             reduced_spec_path, wl_range
         )
-        sirocco_flux_plot = _transform_flux_for_scale(
+        sirocco_flux_plot = _prepare_sirocco_flux_for_fit(
             sirocco_wl,
             sirocco_flux,
-            flux_scale,
-        )
-        sirocco_flux_plot = _apply_spectrum_nuisance_transforms(
-            sirocco_wl,
-            sirocco_flux_plot,
             flux_scale,
             sirocco_transforms,
         )
@@ -2689,13 +3682,20 @@ def run_tier3_single(
         "mcmc_summary": mcmc["summary"],
         "mle_params": result["mle_params"],
         "mle_all_params": result.get("mle_all_params", {}),
+        "mle_freeze_settings": result["mle_freeze_settings"],
+        "mle_frozen_params": result["mle_frozen_params"],
         "mcmc_converged": result["mcmc_converged"],
+        "mcmc_freeze_settings": result["mcmc_freeze_settings"],
+        "mcmc_frozen_params": result["mcmc_frozen_params"],
+        "mcmc_frozen_param_values": result["mcmc_frozen_param_values"],
         "exact_inclination": exact_inclination,
         "wl_range": result["wl_range"],
         "emulator_wl_range": result["emulator_wl_range"],
         "sirocco_transform_params": sirocco_transforms,
         "sirocco_transform_label": sirocco_transform_label,
         "distance_prior_pc": distance_prior_meta,
+        "inclination_prior_deg": inclination_prior_meta,
+        "local_covariance": result.get("local_covariance", {}),
         "metrics": {
             "reduced_chi2": reduced_chi2,
             "ppc_coverage": ppc_in,
@@ -3071,6 +4071,16 @@ def build_report_card(
                     _entry["full_chain"] = _c.tolist() if hasattr(_c, "tolist") else _c
                 if "burnin_used" in _p:
                     _entry["burnin_used"] = _p["burnin_used"]
+                for _diagnostic_key in (
+                    "n_retained_draws",
+                    "autocorr_time",
+                    "effective_sample_size",
+                    "mcse_mean",
+                    "acceptance_fraction",
+                    "mcmc_diagnostic_reasons",
+                ):
+                    if _diagnostic_key in _p:
+                        _entry[_diagnostic_key] = _p[_diagnostic_key]
                 if "bestfit_spec" in _p and _p["bestfit_spec"]:
                     _entry["bestfit_spec"] = _p["bestfit_spec"]
                 if "prior_ranges" in _p and _p["prior_ranges"]:
@@ -3108,13 +4118,25 @@ def build_report_card(
                 "mcmc_converged": r.get("mcmc_converged", None),
             }
             for key in (
-                "n_effective",
+                "n_retained_draws",
+                "autocorr_time",
+                "effective_sample_size",
+                "mcse_mean",
+                "acceptance_fraction",
+                "mcmc_diagnostic_reasons",
                 "exact_inclination",
                 "mle_params",
                 "mle_all_params",
+                "mle_freeze_settings",
+                "mle_frozen_params",
+                "local_covariance",
                 "mcmc_summary",
+                "mcmc_freeze_settings",
+                "mcmc_frozen_params",
+                "mcmc_frozen_param_values",
                 "labels",
                 "distance_prior_pc",
+                "inclination_prior_deg",
                 "prior_ranges",
                 "wl_range",
                 "emulator_wl_range",
