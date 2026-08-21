@@ -243,18 +243,19 @@ def _(IS_HUGGINGFACE_SPACE, mo):
 @app.cell
 def _(IS_HUGGINGFACE_SPACE, Path, mo):
     # Offer the same grid picker in both execution environments, but populate it
-    # from different sources: hard-coded hub datasets in Spaces, local folders on
-    # a workstation install.
+    # from different sources: registry-backed hub datasets in Spaces, local
+    # folders on a workstation install.
     if IS_HUGGINGFACE_SPACE:
-        # In the hosted Space the available grids are fixed dataset IDs rather
-        # than directories on disk.
-        available_grids = [
-            "speculate_cv_bl_grid_v87f",
-            "speculate_cv_no-bl_grid_v87f",
-        ]
+        # The registry owns both production grids and their paired validation
+        # datasets.  The generic loader below can stream either kind because
+        # both publish the same lookup-table and runN.spec.xz contract.
+        from Speculate_addons.grid_registry import registered_grid_datasets as _registered_grid_datasets
+
+        available_grids = _registered_grid_datasets(include_test_grids=True)
+        _preferred_grid = "speculate_cv_bl_grid_v87f"
         grid_selector = mo.ui.dropdown(
             options=available_grids,
-            value="speculate_cv_bl_grid_v87f",
+            value=_preferred_grid if _preferred_grid in available_grids else available_grids[0],
             label="Select Grid Dataset:"
         )
     else:

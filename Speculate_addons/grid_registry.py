@@ -260,6 +260,21 @@ def get_grid_config(grid_name: str | None) -> Dict[str, Any] | None:
     return GRID_REGISTRY.get(inferred) if inferred else None
 
 
+def registered_grid_datasets(*, include_test_grids: bool = False) -> list[str]:
+    """Return published dataset names represented by the grid registry.
+
+    Training grids retain registry order.  When requested, each paired test
+    grid follows its training grid so hosted selectors present related datasets
+    together without maintaining a second hard-coded catalogue.
+    """
+    datasets = []
+    for grid_name, config in GRID_REGISTRY.items():
+        datasets.append(grid_name)
+        if include_test_grids and config.get("test_grid_name"):
+            datasets.append(config["test_grid_name"])
+    return list(dict.fromkeys(datasets))
+
+
 def get_grid_configs(*, quickfit: bool = False) -> Dict[str, Dict[str, Any]]:
     """Return registry entries augmented with concrete GridInterface classes.
 
