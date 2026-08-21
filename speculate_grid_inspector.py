@@ -558,9 +558,12 @@ def _(mo, obs_file_uploader, os, set_obs_refresh):
 
 
 @app.cell
-def _(get_obs_refresh, obs_file_uploader, os):
-    # Select observational spectrum - File List Calculation
+def _(get_obs_refresh, obs_file_uploader, os, selected_grid):
+    # Build the observation list for the active production or test grid.  Only
+    # bundled AGN:/CV: demonstrations are family-restricted; user uploads with
+    # ordinary filenames remain available for every grid.
     import glob
+    from Speculate_addons.observation_priors import filter_observation_files_for_grid as _filter_observation_files_for_grid
 
     # Trigger refresh on upload or delete
     _ = obs_file_uploader.value
@@ -569,6 +572,7 @@ def _(get_obs_refresh, obs_file_uploader, os):
     obs_dir = "observation_files"
     if os.path.exists(obs_dir):
         obs_files = sorted([os.path.basename(f) for f in glob.glob(os.path.join(obs_dir, "*.csv"))])
+        obs_files = _filter_observation_files_for_grid(obs_files, selected_grid)
     else:
         obs_files = []
     return (obs_files,)

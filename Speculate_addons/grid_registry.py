@@ -251,11 +251,14 @@ GRID_REGISTRY: Dict[str, Dict[str, Any]] = {
 
 
 def get_grid_config(grid_name: str | None) -> Dict[str, Any] | None:
-    """Return the registry entry for an exact or inferable grid name."""
+    """Return the registry entry for a production grid or its paired test grid."""
     if not grid_name:
         return None
     if grid_name in GRID_REGISTRY:
         return GRID_REGISTRY[grid_name]
+    for config in GRID_REGISTRY.values():
+        if grid_name == config.get("test_grid_name"):
+            return config
     inferred = infer_grid_name(grid_name)
     return GRID_REGISTRY.get(inferred) if inferred else None
 
