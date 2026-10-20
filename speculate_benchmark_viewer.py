@@ -4593,7 +4593,8 @@ def _(
                 for _obs in _obs_list
             }
             _tier3_checkpoint_config = {
-                "schema_version": 2,
+                # Version 3 prevents resuming fits made with the old distance-prior approximation.
+                "schema_version": 3,
                 "emulator": str(_Path(_emu_path).expanduser().resolve()),
                 "grid_name": _grid_name,
                 "flux_scale": _flux_scale,
@@ -4758,7 +4759,7 @@ def _(
                     try:
                         _cp_entry = {
                             "kind": "tier3_observation",
-                            "schema_version": 2,
+                            "schema_version": 3,
                             "config_hash": _tier3_checkpoint_hash,
                             "config": _tier3_checkpoint_config,
                             "tier3_export_dir": _tier3_export_dir,

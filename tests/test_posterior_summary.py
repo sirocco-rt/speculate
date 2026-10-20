@@ -1,4 +1,4 @@
-"""Posterior centres must agree across tables, model inputs and saved results."""
+"""Distance priors and posterior summaries must preserve their stated coordinates."""
 
 import ast
 import importlib.util
@@ -15,8 +15,12 @@ import marimo as mo
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
+from scipy.integrate import quad
 
-from Speculate_addons.distance_scale import log_scale_to_distance_pc
+from Speculate_addons.distance_scale import (
+    distance_prior_to_log_scale_prior, distance_to_log_scale, log_scale_to_distance_pc,
+)
+from Speculate_addons.gp_covariance import bounds_for_frozen_prior
 from Speculate_addons.Spec_functions import (
     posterior_arviz_summary, posterior_corner, posterior_summary_rows, summarize_posterior,
 )
@@ -89,6 +93,57 @@ def spectrum(model):
         "model_cov_diag": [1., 1., 1.],
         "covariance_components": {"observation_variance": [1., 1., 1.]},
     }
+
+
+class DistancePriorTests(unittest.TestCase):
+    def test_exact_density_and_quantiles_recover_positive_normal_distance(self):
+        # Cover the observed CV prior, a broad prior, and appreciable truncation.
+        for mean, sigma in ((90.36, .15), (100., 45.), (10., 20.)):
+            with self.subTest(mean=mean, sigma=sigma):
+                reference = 250.
+                prior = distance_prior_to_log_scale_prior(mean, sigma, reference)
+                distance_prior = stats.truncnorm(-mean / sigma, np.inf, loc=mean, scale=sigma)
+                q = np.array([.01, .16, .5, .84, .99])
+                distances = distance_prior.ppf(q)
+                s = distance_to_log_scale(distances, reference)
+                # Omitting the Jacobian fails this density-in-parsecs check.
+                np.testing.assert_allclose(
+                    prior.logpdf(s) - np.log(distances / 2.),
+                    distance_prior.logpdf(distances), atol=1e-10,
+                )
+                np.testing.assert_allclose(prior.cdf(s), 1. - q, atol=1e-10)
+                np.testing.assert_allclose(prior.ppf(1. - q), s, atol=1e-10)
+                lo, hi = prior.ppf([1e-8, 1. - 1e-8])
+                self.assertAlmostEqual(quad(prior.pdf, lo, hi)[0], 1. - 2e-8, places=8)
+                self.assertEqual(prior.interval(1.), (-np.inf, np.inf))
+                self.assertFalse(np.isnan(prior.logpdf([-1e6, 1e6])).any())
+
+    def test_tier3_bounds_metadata_and_initial_value_use_exact_prior(self):
+        for mean, sigma in ((90.36, .15), (100., 45.), (10., 20.)):
+            metadata, priors, start = benchmark._tier3_distance_prior_to_log_scale(
+                {"mean_pc": mean, "sigma_pc": sigma},
+            )
+            prior = priors["log_scale"]
+            bounds = bounds_for_frozen_prior("log_scale", prior)
+            self.assertTrue(np.isfinite(bounds).all())
+            np.testing.assert_allclose(prior.cdf(bounds), stats.norm.cdf([-4., 4.]), atol=1e-10)
+            self.assertAlmostEqual(log_scale_to_distance_pc(start["log_scale"]), mean)
+            np.testing.assert_allclose(
+                [metadata["plot_min_pc"], metadata["plot_max_pc"]],
+                log_scale_to_distance_pc(np.array(bounds)[::-1]),
+            )
+            self.assertEqual(metadata["transform"], "exact_positive_distance")
+            self.assertNotIn("log_scale_sigma", metadata)
+            json.dumps(metadata)
+        # Existing priors retain their previous optimizer bounds.
+        self.assertEqual(bounds_for_frozen_prior("param1", stats.uniform(2., 3.)), (2., 5.))
+        self.assertEqual(bounds_for_frozen_prior("param1", stats.norm(2., 3.)), (-10., 14.))
+
+    def test_distance_prior_rejects_invalid_parameters(self):
+        for invalid in (0., -1., np.inf, np.nan):
+            for args in ((invalid, 1., 100.), (100., invalid, 100.), (100., 1., invalid)):
+                with self.assertRaises(ValueError):
+                    distance_prior_to_log_scale_prior(*args)
 
 
 class PosteriorTests(unittest.TestCase):
@@ -183,10 +238,11 @@ class PosteriorTests(unittest.TestCase):
 
     def test_sampler_defaults_to_median_and_keeps_explicit_mean_fields(self):
         chain = np.tile(self.samples, (7, 1))[:20, None, :].repeat(8, axis=1)
+        initial_positions = []
         sampler = SimpleNamespace(
             get_chain=lambda discard=0, thin=1: chain[discard::thin],
             get_autocorr_time=lambda **kwargs: np.full(2, np.nan),
-            run_mcmc=lambda *a, **kw: None,
+            run_mcmc=lambda ball, *a, **kw: initial_positions.append(np.array(ball)),
             acceptance_fraction=np.full(8, .3),
         )
         with patch("emcee.EnsembleSampler", return_value=sampler), patch.object(
@@ -195,8 +251,11 @@ class PosteriorTests(unittest.TestCase):
             benchmark, "_extract_spectrum_nuisance_transforms", return_value={},
         ):
             result = benchmark.run_mcmc_single(
-                self.model, {}, nsteps=20, nwalkers=8, burnin=1, freeze_params={"Av": True},
+                self.model, {"log_scale": distance_prior_to_log_scale_prior(100., 45.)},
+                nsteps=20, nwalkers=8, burnin=1, freeze_params={"Av": True},
             )
+        self.assertTrue(np.isfinite(initial_positions[0]).all())
+        self.assertGreater(np.ptp(initial_positions[0][:, 1]), 0.)
         self.assertEqual(result["summary_statistic"], "median")
         self.assertEqual(result["bestfit_spec"], result["posterior_models"]["median"]["spectrum"])
         self.assertEqual(result["posterior_mean_bestfit_spec"], result["posterior_models"]["mean"]["spectrum"])
@@ -446,6 +505,8 @@ class NotebookTests(unittest.TestCase):
             iteration = 0
 
             def run_mcmc(self, *args, **kwargs):
+                if self.iteration == 0:
+                    self.initial_positions = np.array(args[0])
                 self.iteration += 1
 
             def get_chain(self, discard=0, thin=1):
@@ -461,7 +522,10 @@ class NotebookTests(unittest.TestCase):
                     if "run_mcmc_btn" in cell.refs)
         args = {
             "get_mle_model": lambda: model,
-            "get_mle_priors": lambda: {"param1": stats.uniform(0, 20), "log_scale": stats.norm()},
+            "get_mle_priors": lambda: {
+                "param1": stats.uniform(0, 20),
+                "log_scale": distance_prior_to_log_scale_prior(100., 45.),
+            },
             "ground_truth_params": {}, "grid_selector": SimpleNamespace(value=None),
             "mcmc_burnin": SimpleNamespace(value=1),
             "mcmc_freeze": SimpleNamespace(value={}),
@@ -508,6 +572,8 @@ class NotebookTests(unittest.TestCase):
             self.assertEqual(evaluate.call_count, 2)
             construct.assert_called_once()
             self.assertEqual(sampler.iteration, 20)
+            self.assertTrue(np.isfinite(sampler.initial_positions).all())
+            self.assertGreater(np.ptp(sampler.initial_positions[:, 1]), 0.)
             self.assertEqual(plt.get_fignums(), [])
 
     def test_benchmark_switch_restores_report_choice_and_updates_selected_model(self):

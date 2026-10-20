@@ -1215,6 +1215,7 @@ def _tier3_distance_prior_to_log_scale(distance_prior_pc: Optional[dict]):
 
     from Speculate_addons.distance_scale import (
         distance_prior_to_log_scale_prior,
+        distance_to_log_scale,
         log_scale_to_distance_pc,
     )
     mean_pc = float(distance_prior_pc["mean_pc"])
@@ -1222,16 +1223,11 @@ def _tier3_distance_prior_to_log_scale(distance_prior_pc: Optional[dict]):
     if not all(np.isfinite(value) and value > 0 for value in (mean_pc, sigma_pc)):
         raise ValueError("Tier 3 distance mean and sigma must be finite and positive.")
 
-    # Match the Inference Tool's first-order propagation through
-    # log_scale = 2 ln(100 pc / distance). Table A1 uncertainties are all <1%.
-    log_scale_mean, log_scale_sigma = distance_prior_to_log_scale_prior(
-        mean_pc,
-        sigma_pc,
-    )
-    plot_distances = log_scale_to_distance_pc(
-        [log_scale_mean - 4.0 * log_scale_sigma,
-         log_scale_mean + 4.0 * log_scale_sigma]
-    )
+    # Match Inference: a Normal in positive parsecs, transformed exactly.
+    prior = distance_prior_to_log_scale_prior(mean_pc, sigma_pc)
+    log_scale_center = distance_to_log_scale(mean_pc)
+    log_scale_bounds = bounds_for_frozen_prior("log_scale", prior)
+    plot_distances = log_scale_to_distance_pc(log_scale_bounds)
     metadata = {
         "kind": "normal",
         "mean_pc": mean_pc,
@@ -1240,13 +1236,15 @@ def _tier3_distance_prior_to_log_scale(distance_prior_pc: Optional[dict]):
         "max_pc": mean_pc + 2.0 * sigma_pc,
         "plot_min_pc": float(np.min(plot_distances)),
         "plot_max_pc": float(np.max(plot_distances)),
-        "log_scale_mean": float(log_scale_mean),
-        "log_scale_sigma": float(log_scale_sigma),
+        "backend_kind": "distance_log_scale",
+        "transform": "exact_positive_distance",
+        "log_scale_center": float(log_scale_center),
+        "log_scale_bounds": list(log_scale_bounds),
     }
     return (
         metadata,
-        {"log_scale": stats.norm(loc=log_scale_mean, scale=log_scale_sigma)},
-        {"log_scale": float(log_scale_mean)},
+        {"log_scale": prior},
+        {"log_scale": float(log_scale_center)},
     )
 
 
@@ -1712,11 +1710,14 @@ def run_mcmc_single(
         mle_val = model[key]
         if pr is not None and hasattr(pr, 'interval'):
             lo, hi = pr.interval(1.0)
-            # Use the distribution's native σ only for Normal-family
-            # priors; for Uniform (and anything else) use a controlled
-            # fraction of the prior width.
-            _is_normal = getattr(getattr(pr, 'dist', None), 'name', '') in ('norm', 'truncnorm')
-            if _is_normal:
+            # Distance needs a quantile width in log_scale; other Normal
+            # priors use their native sigma and Uniform priors a width fraction.
+            _prior_kind = getattr(getattr(pr, 'dist', None), 'name', '')
+            if _prior_kind == 'distance_log_scale':
+                # A finite central-68% width sets the starting ball only;
+                # log_prob still evaluates the exact, unbounded prior in s.
+                sigma = float(np.diff(pr.ppf(stats.norm.cdf([-1., 1.])))[0] / 2.)
+            elif _prior_kind in ('norm', 'truncnorm'):
                 sigma = pr.std()
             else:
                 sigma = _INIT_FRAC * (hi - lo)

@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
+from scipy.special import ndtr
 
 
 GP_LOG_AMP_PRIOR_SIGMA = 2.5
@@ -85,6 +86,10 @@ def log_amp_optimizer_bounds(
 
 def bounds_for_frozen_prior(label: str, dist) -> Optional[tuple[float, float]]:
     """Convert a scipy frozen prior to optimizer bounds when possible."""
+    if dist.dist.name == "distance_log_scale":
+        # Match the probability covered by the existing +/-4 sigma Normal box.
+        # These are search bounds, not a truncation of the sampling prior.
+        return tuple(float(value) for value in dist.ppf(ndtr([-4.0, 4.0])))
     loc, scale = get_frozen_dist_loc_scale(dist)
     if dist.dist.name == "uniform":
         return float(loc), float(loc + scale)

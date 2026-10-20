@@ -2739,15 +2739,15 @@ def _(
                     _distance_lo = float(w_min['log_scale'].value)
                     _distance_hi = float(w_max['log_scale'].value)
                     _distance_sigma = max((_distance_hi - _distance_lo) / 4.0, 1e-12)
-                    _ls_loc, _ls_sigma = _distance_prior_to_log_scale_prior(
-                        _distance_pc, _distance_sigma
-                    )
+                    _ls_loc = _distance_to_log_scale(_distance_pc)
                     if w_fix.value['log_scale']:
                         _model.params['log_scale'] = _ls_loc
                         _model.freeze('log_scale')
                     else:
                         _model.params['log_scale'] = _ls_loc
-                        _priors['log_scale'] = stats.norm(loc=_ls_loc, scale=_ls_sigma)
+                        _priors['log_scale'] = _distance_prior_to_log_scale_prior(
+                            _distance_pc, _distance_sigma
+                        )
 
                 # D. GP Priors (log_amp and log_ls handled independently)
                 if 'log_amp' in param_names:
@@ -3019,6 +3019,11 @@ def _(
                                     _col = _simplex_column_uniform(_loc, _sc, _N)
                                 elif _dist.dist.name == 'norm':
                                     _col = _simplex_column_norm(_loc, _sc, _N)
+                                elif _dist.dist.name == 'distance_log_scale':
+                                    # Quantiles remain finite for broad distance
+                                    # priors and give a nonzero simplex at s=0.
+                                    _lo, _hi = _dist.ppf(stats.norm.cdf([-2., 2.]))
+                                    _col = np.linspace(_lo, _hi, _N + 1)
                                 else:
                                     _cv = _model.get_param_vector()[_col_idx]
                                     _col = [_cv + (_cv * 0.01 * k) for k in range(_N + 1)]
@@ -3967,11 +3972,14 @@ def _(
                     _mle_val = _model[_key]
                     if _pr is not None and hasattr(_pr, 'interval'):
                         _lo, _hi = _pr.interval(1.0)
-                        # Use the distribution's native σ only for Normal-family
-                        # priors; for Uniform (and anything else) use a controlled
-                        # fraction of the prior width.
-                        _is_normal = getattr(getattr(_pr, 'dist', None), 'name', '') in ('norm', 'truncnorm')
-                        if _is_normal:
+                        # Distance needs a quantile width in log_scale; other
+                        # Normal priors use sigma and Uniform priors a width fraction.
+                        _prior_kind = getattr(getattr(_pr, 'dist', None), 'name', '')
+                        if _prior_kind == 'distance_log_scale':
+                            # Starting spread only; the target density retains
+                            # the exact distance prior and its full support.
+                            _sigma = float(np.diff(_pr.ppf(stats.norm.cdf([-1., 1.])))[0] / 2.)
+                        elif _prior_kind in ('norm', 'truncnorm'):
                             _sigma = _pr.std()          # Normal prior
                         else:
                             _sigma = _INIT_FRAC * (_hi - _lo)  # Uniform prior
@@ -4185,13 +4193,15 @@ def _(
 
                     _fig_corner = _corner_fig(_burn_samples_display, _friendly_labels, _truths)
 
-                    # Prior-range corner plot: axes span the full prior support so
-                    # the user can judge posterior breadth relative to the prior.
+                    # Prior-range corner plot: use finite display windows for
+                    # unbounded priors to compare prior and posterior breadth.
                     _prior_ranges = []
                     for _label in _model.labels:
                         _pr = _priors.get(_label)
                         if _pr is not None and hasattr(_pr, 'interval'):
-                            if getattr(getattr(_pr, 'dist', None), 'name', None) == 'norm':
+                            if getattr(getattr(_pr, 'dist', None), 'name', None) == 'distance_log_scale':
+                                _lo, _hi = _pr.ppf(stats.norm.cdf([-4., 4.]))
+                            elif getattr(getattr(_pr, 'dist', None), 'name', None) == 'norm':
                                 _lo = float(_pr.mean() - 4.0 * _pr.std())
                                 _hi = float(_pr.mean() + 4.0 * _pr.std())
                             else:
