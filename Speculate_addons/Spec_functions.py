@@ -34,6 +34,128 @@ ALT_THEME_SIZES = {
 }
 
 
+def summarize_posterior(samples, labels, internal_labels=None, frozen_values=None):
+    """Summarise retained draws in displayed coordinates, with both model points.
+
+    Inputs use backend coordinates. Distance is summarised in parsecs before
+    converting the chosen centre back to log_scale; log-labelled grid axes
+    retain their existing coordinates. Frozen values are exact model inputs.
+    Returned samples are for display; keep the original array for PPC and
+    sampler checkpoints. Point-estimate dictionaries use model coordinates.
+    """
+    from Speculate_addons.distance_scale import (
+        distance_to_log_scale, log_scale_to_distance_pc,
+    )
+
+    values = np.asarray(samples, dtype=float)
+    internal = list(internal_labels if internal_labels is not None else labels)
+    names = list(labels)
+    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] != len(names):
+        raise ValueError("Posterior samples must be a nonempty (draws, parameters) array.")
+    if len(internal) != len(names) or len(set(internal)) != len(internal):
+        raise ValueError("Posterior internal labels must uniquely match sample columns.")
+    if not np.isfinite(values).all():
+        raise ValueError("Posterior samples must be finite.")
+    display = values.copy()
+    for i, label in enumerate(internal):
+        if label == "log_scale":
+            display[:, i] = log_scale_to_distance_pc(values[:, i])
+            names[i] = "Distance (pc)"
+    if not np.isfinite(display).all():
+        raise ValueError("Posterior values are not finite in displayed coordinates.")
+    if len(set(names)) != len(names):
+        raise ValueError("Posterior display labels must be unique.")
+    summary = {}
+    points = {method: dict(frozen_values or {}) for method in ("mean", "median")}
+    for i, (label, name) in enumerate(zip(internal, names)):
+        column = display[:, i]
+        q03, q16, q50, q84, q97 = np.percentile(column, [3, 16, 50, 84, 97])
+        summary[name] = {
+            "mean": float(np.mean(column)), "median": float(q50),
+            "std": float(np.std(column)), "q03": float(q03), "q16": float(q16),
+            "q84": float(q84), "q97": float(q97),
+        }
+        for method in points:
+            centre = summary[name][method]
+            points[method][label] = (
+                float(distance_to_log_scale(centre)) if label == "log_scale" else centre
+            )
+    return {
+        "samples": display, "labels": names, "summary": summary,
+        "point_estimates": points, "summary_space": "display", "summary_version": 1,
+    }
+
+
+def posterior_summary_rows(summary, statistic="median", truths=None):
+    """Build explicitly labelled point estimates and equal-tailed interval bounds."""
+    if statistic not in ("mean", "median"):
+        raise ValueError("Posterior statistic must be mean or median.")
+    rows = []
+    for label, stats in summary.items():
+        row = {
+            "Parameter": label, statistic.title(): float(stats[statistic]),
+            "Posterior SD": float(stats["std"]),
+            "16th percentile": stats.get("q16", np.nan),
+            "84th percentile": stats.get("q84", np.nan),
+        }
+        key = "Inclination" if "Inclination" in label else label
+        if truths:
+            truth = truths.get(label, truths.get(key))
+            row["Truth"] = truth
+            row[f"Δ/SD ({statistic})"] = (
+                (stats[statistic] - truth) / stats["std"]
+                if truth is not None and stats["std"] > 0 else np.nan
+            )
+        rows.append(row)
+    return rows
+
+
+def posterior_corner(samples, labels, statistic="median", truths=None, ranges=None):
+    """Draw the chosen centre separately from the unchanged 16–84% interval.
+
+    Corner's automatic titles always describe a quantile. Explicit titles
+    avoid presenting the mean as the 50th percentile or as an interval centre.
+    """
+    import corner
+
+    if statistic not in ("mean", "median"):
+        raise ValueError("Posterior statistic must be mean or median.")
+    values = np.asarray(samples)
+    kwargs = dict(
+        labels=labels, show_titles=False, quantiles=[0.16, 0.84],
+        levels=[0.6827, 0.9545, 0.9973], truths=truths, truth_color="#ff4444",
+    )
+    if ranges is not None:
+        kwargs["range"] = ranges
+    fig = corner.corner(values, **kwargs)
+    centres = (np.mean if statistic == "mean" else np.median)(values, axis=0)
+    corner.overplot_points(fig, centres[None, :], color="#2a9d8f", marker="s")
+    for i, label in enumerate(labels):
+        axis = fig.axes[i * len(labels) + i]
+        lo, hi = np.percentile(values[:, i], [16, 84])
+        axis.axvline(centres[i], color="#2a9d8f", linewidth=1.5)
+        axis.set_title(
+            f"{label}: {statistic}={centres[i]:.4f}\n"
+            f"68% interval [{lo:.4f}, {hi:.4f}]", fontsize=9,
+        )
+    return fig
+
+
+def posterior_arviz_summary(data, statistic="median", round_to=5):
+    """Select the point/MCSE while preserving ArviZ's SD, HDI and diagnostics."""
+    import arviz as az
+
+    if statistic not in ("mean", "median"):
+        raise ValueError("Posterior statistic must be mean or median.")
+    summary = az.summary(data, round_to=round_to, stat_focus="mean")
+    if statistic == "median":
+        median = az.summary(data, round_to=round_to, stat_focus="median")
+        summary["mean"] = median["median"]
+        summary["mcse_mean"] = median["mcse_median"]
+        summary = summary.rename(columns={"mean": "median", "mcse_mean": "mcse_median"})
+    return summary
+
+
 def fit_power_law_continuum(wl, flux, sigma_clip=3.0, max_iter=5, poly_deg=2):
     """Fit a smooth continuum to a spectrum using iterative sigma-clipping.
 

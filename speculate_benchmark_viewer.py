@@ -184,7 +184,7 @@ def _(mo):
     #                  (original, PCA-recon, LOO-recon); not stored in JSON
     # comparison_reports – list of JSON payloads for the side-by-side view
     # status_msg     – latest benchmark runner status text
-    get_report, set_report = mo.state(None)
+    get_raw_report, set_report = mo.state(None)
     get_tier1_arrays, set_tier1_arrays = mo.state(None)
     get_comparison_reports, set_comparison_reports = mo.state([])
     get_status_msg, set_status_msg = mo.state("")
@@ -192,18 +192,21 @@ def _(mo):
     # tier2_posteriors – list of per-spectrum dicts, each containing MCMC
     # flat samples, labels, ground-truth values, and summary stats so the
     # interactive corner-plot explorer can render any spectrum post-run.
-    get_tier2_posteriors, set_tier2_posteriors = mo.state(None)
+    get_raw_tier2_posteriors, set_tier2_posteriors = mo.state(None)
     # tier3_posteriors – compact per-observation Tier 3 records with paths to
     # external posterior/plot artifacts saved under exports/<benchmark-run>/.
-    get_tier3_posteriors, set_tier3_posteriors = mo.state(None)
+    get_raw_tier3_posteriors, set_tier3_posteriors = mo.state(None)
+    get_tier3_index, set_tier3_index = mo.state(0)
     return (
         get_comparison_reports,
         get_emulator,
-        get_report,
+        get_raw_report,
         get_status_msg,
         get_tier1_arrays,
-        get_tier2_posteriors,
-        get_tier3_posteriors,
+        get_raw_tier2_posteriors,
+        get_raw_tier3_posteriors,
+        get_tier3_index,
+        set_tier3_index,
         set_comparison_reports,
         set_emulator,
         set_report,
@@ -212,6 +215,79 @@ def _(mo):
         set_tier2_posteriors,
         set_tier3_posteriors,
     )
+
+
+@app.cell(hide_code=True)
+def _(get_raw_report, mo):
+    _report = get_raw_report() or {}
+    # Restore saved selections; legacy reports used means, fresh runs use medians.
+    get_benchmark_report_means, set_benchmark_report_means = mo.state(
+        _report.get("summary_statistic", "mean" if _report else "median") == "mean",
+        allow_self_loops=True,
+    )
+    return get_benchmark_report_means, set_benchmark_report_means
+
+
+@app.cell(hide_code=True)
+def _(get_benchmark_report_means, mo, set_benchmark_report_means):
+    _means = get_benchmark_report_means()
+    benchmark_summary_switch = mo.ui.switch(
+        value=_means,
+        label=f"Report posterior {'means' if _means else 'medians'}",
+        on_change=set_benchmark_report_means,
+    )
+    return (benchmark_summary_switch,)
+
+
+@app.cell
+def _(
+    benchmark_summary_switch, get_raw_report, get_raw_tier2_posteriors,
+    get_raw_tier3_posteriors,
+):
+    from Speculate_addons.speculate_benchmark import (
+        select_posterior_summary as _select_posterior,
+        select_report_summary as _select_report,
+    )
+    benchmark_summary_statistic = "mean" if benchmark_summary_switch.value else "median"
+    _raw = get_raw_report()
+    _report = _select_report(_raw, benchmark_summary_statistic) if _raw else None
+    _tier2 = [
+        _select_posterior(_p, benchmark_summary_statistic)
+        for _p in (get_raw_tier2_posteriors() or [])
+    ]
+    _tier3 = [
+        _select_posterior(_p, benchmark_summary_statistic)
+        for _p in (get_raw_tier3_posteriors() or [])
+    ]
+    # Presentation getters preserve existing rendering cells without feeding
+    # selection changes back into the benchmark runner or its checkpoints.
+    get_report = lambda: _report
+    get_tier2_posteriors = lambda: _tier2
+    get_tier3_posteriors = lambda: _tier3
+    return benchmark_summary_statistic, get_report, get_tier2_posteriors, get_tier3_posteriors
+
+
+
+@app.cell(hide_code=True)
+def _(get_report, mo, time):
+    _report = get_report()
+    mo.stop(_report is None)
+
+    def _save_selected(_):
+        from Speculate_addons.speculate_benchmark import save_report as _save_report
+        _method = _report["summary_statistic"]
+        _path = f"benchmark_results/benchmark_report_{_method}_{time.time_ns()}.json"
+        _save_report(_report, _path)
+        mo.status.toast(f"Saved {_method} report to {_path}")
+
+    save_summary_report_button = mo.ui.button(
+        label="Save report with selected summary", on_click=_save_selected,
+    )
+    mo.vstack([
+        mo.md(f"**Posterior point estimate: {_report['summary_statistic']}**"),
+        save_summary_report_button,
+    ])
+    return (save_summary_report_button,)
 
 
 @app.cell(hide_code=True)
@@ -290,6 +366,11 @@ def _(
                 entry["full_chain"] = np.array(p["full_chain"])
                 entry["burnin_used"] = p.get("burnin_used", 500)
             for diagnostic_key in (
+                "posterior_models", "display_summary", "internal_labels",
+                "summary_statistic", "summary_space", "summary_version", "summary_error",
+                "mle_bestfit_spec", "posterior_mean_bestfit_spec",
+                "mle_nll", "mle_likelihood_diagnostics",
+                "posterior_mean_likelihood_diagnostics",
                 "n_retained_draws",
                 "autocorr_time",
                 "effective_sample_size",
@@ -1486,9 +1567,9 @@ def _(alt, get_report, get_tier1_arrays, mo, np, pd, plt):
 
         def _fmt_t3(value, fmt):
             try:
-                return format(float(value), fmt)
+                return format(float(value), fmt) if np.isfinite(float(value)) else "Unavailable"
             except Exception:
-                return "nan"
+                return "Unavailable"
 
         _obs_rows = []
         for _r in _t3:
@@ -1529,9 +1610,9 @@ def _(alt, get_report, get_tier1_arrays, mo, np, pd, plt):
             _obs_metric_values = [
                 {
                     "Observation": _name,
-                    "Reduced chi2": float(_row.get("reduced_chi2", float("nan"))),
-                    "Sirocco Reduced chi2": float(_row.get("sirocco_reduced_chi2", float("nan"))),
-                    "PPC Coverage": float(_row.get("ppc_coverage", float("nan"))),
+                    "Reduced chi2": _row.get("reduced_chi2"),
+                    "Sirocco Reduced chi2": _row.get("sirocco_reduced_chi2"),
+                    "PPC Coverage": _row.get("ppc_coverage"),
                 }
                 for _name, _row in zip(_obs_names, _t3)
             ]
@@ -1621,8 +1702,8 @@ def _(alt, get_report, get_tier1_arrays, mo, np, pd, plt):
 
 
 @app.cell(hide_code=True)
-def _(get_tier2_posteriors, mo):
-    _posteriors = get_tier2_posteriors()
+def _(get_raw_tier2_posteriors, mo):
+    _posteriors = get_raw_tier2_posteriors()
     mo.stop(
         _posteriors is None or len(_posteriors) == 0,
         mo.md("*Run a Tier 2 benchmark to view per-spectrum corner plots.*"),
@@ -1648,16 +1729,20 @@ def _(get_tier2_posteriors, mo):
 
 @app.cell(hide_code=True)
 def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_slider):
-    import corner as _corner
+    from Speculate_addons.Spec_functions import (
+        posterior_corner as _posterior_corner, posterior_summary_rows as _summary_rows,
+    )
 
     _posteriors = get_tier2_posteriors()
     mo.stop(_posteriors is None or len(_posteriors) == 0)
 
     _idx = t2_spectrum_slider.value
     _post = _posteriors[_idx]
-    _samples = _post["samples"]       # (N, ndim)
-    _labels = _post["labels"]         # list of friendly labels
-    _summary = _post["summary"]       # dict of {label: {mean, std, median, ...}}
+    _statistic = _post["summary_statistic"]
+    _samples = _post["display_samples"]       # (N, ndim)
+    mo.stop(_samples.size == 0, mo.md(_post.get("summary_notice", "No retained samples.")))
+    _labels = _post["display_labels"]         # list of friendly labels
+    _summary = _post["display_summary"]       # dict of {label: {mean, std, median, ...}}
     _gt = _post["truths"]             # dict of {friendly_name: value}
     _run = _post["run"]
     _inc = _post["inclination"]
@@ -1680,19 +1765,7 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
 
     # Shared corner-plot builder so every variant looks identical.
     def _corner_fig(_data, _lbls, _tr, _rng=None):
-        _kw = dict(
-            labels=_lbls,
-            show_titles=True,
-            quantiles=[0.16, 0.5, 0.84],
-            levels=[0.6827, 0.9545, 0.9973],
-            title_fmt=".4f",
-            truths=_tr,
-            truth_color="#ff4444",
-            truth_kwargs={"linewidth": 2},
-        )
-        if _rng is not None:
-            _kw["range"] = _rng
-        return _corner.corner(_data, **_kw)
+        return _posterior_corner(_data, _lbls, _statistic, _tr, _rng)
 
     _plot_truths = _truths if _has_any_truth else None
     _fig = _corner_fig(_samples, _labels, _plot_truths)
@@ -1764,30 +1837,12 @@ def _(get_tier2_posteriors, mo, np, plt, render_fixed_matplotlib, t2_spectrum_sl
     )
 
     _conv_tag = "diagnostic passed" if _converged else "**diagnostic flagged**"
-    _summary_rows = []
-    for _lbl in _labels:
-        if _lbl in _summary:
-            _s = _summary[_lbl]
-            _row = {
-                "Parameter": _lbl,
-                "Mean": f"{_s['mean']:.4f}",
-                "Std": f"{_s['std']:.4f}",
-                "Median": f"{_s['median']:.4f}",
-                "HDI 3%": f"{_s['hdi_3']:.4f}",
-                "HDI 97%": f"{_s['hdi_97']:.4f}",
-            }
-            _gt_key = "Inclination" if "Inclination" in _lbl else _lbl
-            if _gt_key in _gt:
-                _row["Truth"] = f"{_gt[_gt_key]:.4f}"
-                _row["Δ/σ"] = f"{(_s['mean'] - _gt[_gt_key]) / max(_s['std'], 1e-10):.2f}"
-            else:
-                _row["Truth"] = "—"
-                _row["Δ/σ"] = "—"
-            _summary_rows.append(_row)
+    _rows = _summary_rows(_summary, _statistic, _gt)
 
     mo.vstack([
         mo.md(f"### {_filename} @ {_inc:.0f}° — {_conv_tag}"),
-        mo.ui.table(_summary_rows, label="Posterior Summary", selection=None),
+        mo.ui.table(_rows, label=f"Posterior {_statistic.title()}", selection=None),
+        mo.md(_post.get("summary_notice", "")),
         _corner_display,
     ])
     return
@@ -1805,11 +1860,13 @@ def _(get_tier2_posteriors, mo, np, os, t2_corner_export_btn, time):
         mo.callout(mo.md("No Tier 2 posteriors are available to export."), kind="warn"),
     )
 
+    _statistic = _posteriors[0]["summary_statistic"]
     _records = []
     _skipped = []
     _corner_settings = {
-        "show_titles": True,
-        "quantiles": [0.16, 0.5, 0.84],
+        "show_titles": False,
+        "point_estimate": _statistic,
+        "quantiles": [0.16, 0.84],
         "levels": [0.6827, 0.9545, 0.9973],
         "title_fmt": ".4f",
         "truth_color": "#ff4444",
@@ -1818,9 +1875,9 @@ def _(get_tier2_posteriors, mo, np, os, t2_corner_export_btn, time):
 
     for _idx, _post in enumerate(_posteriors):
         try:
-            _samples = np.asarray(_post.get("samples"))
-            _labels = [str(_label) for _label in (_post.get("labels") or [])]
-            if _samples.ndim != 2 or len(_labels) != _samples.shape[1]:
+            _samples = np.asarray(_post.get("display_samples"))
+            _labels = [str(_label) for _label in (_post.get("display_labels") or [])]
+            if _samples.ndim != 2 or _samples.size == 0 or len(_labels) != _samples.shape[1]:
                 raise ValueError("missing or mismatched samples/labels")
 
             _gt = _post.get("truths") or {}
@@ -1864,8 +1921,11 @@ def _(get_tier2_posteriors, mo, np, os, t2_corner_export_btn, time):
                 "inclination": _post.get("inclination"),
                 "converged": bool(_post.get("converged", False)),
                 "samples": _samples,
+                "summary_statistic": _statistic,
+                "summary_space": "display",
+                "summary_version": 1,
                 "labels": _labels,
-                "summary": _post.get("summary", {}),
+                "summary": _post.get("display_summary", {}),
                 "truths": _truths if _has_truth else None,
                 "ground_truth": dict(_gt),
                 "prior_ranges": _prior_ranges,
@@ -2032,7 +2092,9 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
     _converged = _post.get("converged", False)
     _conv_tag = "diagnostic passed" if _converged else "diagnostic flagged"
     _mle_bf = _post.get("mle_bestfit_spec")
-    _posterior_bf = _post.get("posterior_mean_bestfit_spec") or _post.get("bestfit_spec")
+    _statistic = _post["summary_statistic"]
+    _selected = _post.get("selected_model", {})
+    _posterior_bf = _selected.get("spectrum") if not _selected.get("error") else None
 
     mo.stop(
         not (_mle_bf or _posterior_bf),
@@ -2067,8 +2129,8 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
             zoom_name=f"tier2_mle_bestfit_zoom_{_post['run']}",
         )
     if _posterior_bf:
-        _pm_diag = _post.get("posterior_mean_likelihood_diagnostics", {})
-        _tabs["MCMC Posterior Mean"] = build_bestfit_spectrum_altair(
+        _pm_diag = _selected.get("diagnostics", {})
+        _tabs[f"MCMC Posterior {_statistic.title()}"] = build_bestfit_spectrum_altair(
             alt,
             wavelength=_posterior_bf["wavelength"],
             data_flux=_posterior_bf["data_flux"],
@@ -2076,29 +2138,31 @@ def _(alt, build_bestfit_spectrum_altair, get_tier2_posteriors, mo, t2_spectrum_
             model_cov_diag=_posterior_bf["model_cov_diag"],
             covariance_components=_posterior_bf.get("covariance_components"),
             title=(
-                f"MCMC Posterior Mean — {_filename} @ {_inc:.0f}° "
+                f"MCMC Posterior {_statistic.title()} — {_filename} @ {_inc:.0f}° "
                 f"({_conv_tag}{_nll_suffix(None, _pm_diag)})"
             ),
-            zoom_name=f"tier2_posterior_mean_zoom_{_post['run']}",
+            zoom_name=f"tier2_posterior_zoom_{_post['run']}",
         )
 
     mo.vstack([
         mo.md("#### Spectrum Fits"),
+        mo.md(_post.get("summary_notice", "")),
         mo.ui.tabs(_tabs) if len(_tabs) > 1 else next(iter(_tabs.values())),
     ])
     return
 
 
 @app.cell(hide_code=True)
-def _(get_tier3_posteriors, mo):
-    _posteriors = get_tier3_posteriors()
+def _(get_raw_tier3_posteriors, get_tier3_index, set_tier3_index, mo):
+    _posteriors = get_raw_tier3_posteriors()
     mo.stop(
         _posteriors is None or len(_posteriors) == 0,
         mo.md("*Run a Tier 3 benchmark to view per-observation Sirocco diagnostics.*"),
     )
     _n = len(_posteriors)
     t3_observation_slider = mo.ui.slider(
-        start=0, stop=_n - 1, value=0, step=1, show_value=True,
+        start=0, stop=_n - 1, value=min(get_tier3_index(), _n - 1), step=1, show_value=True,
+        on_change=set_tier3_index,
         label="Observation index", full_width=True,
     )
     t3_corner_export_btn = mo.ui.run_button(
@@ -2115,13 +2179,69 @@ def _(get_tier3_posteriors, mo):
 
 
 @app.cell(hide_code=True)
+def _(
+    benchmark_summary_statistic, get_raw_report, get_raw_tier3_posteriors,
+    mo, os, set_report, set_tier3_posteriors, sirocco_cpu_slider,
+    t3_observation_slider,
+):
+    _records = get_raw_tier3_posteriors() or []
+    mo.stop(not _records)
+    _index = t3_observation_slider.value
+    _record = _records[_index]
+    _method = benchmark_summary_statistic
+    _point = _record.get("posterior_models", {}).get(_method)
+    _available = bool(_point and not _point.get("error"))
+    _hosted = os.environ.get("SPACE_ID") is not None
+
+    def _export_selected(_run_sirocco):
+        from Speculate_addons.speculate_benchmark import export_tier3_summary as _export
+        try:
+            with mo.status.spinner(f"Preparing posterior {_method} model..."):
+                _result = _export(
+                    _record, _method, run_sirocco=_run_sirocco,
+                    cpus=int(sirocco_cpu_slider.value),
+                )
+            _exports = dict(_record.get("summary_exports", {}))
+            _exports[_method] = {**_exports.get(_method, {}), **_result}
+            _updated = dict(_record, summary_exports=_exports)
+            _new_records = list(_records)
+            _new_records[_index] = _updated
+            set_tier3_posteriors(_new_records)
+            _raw_report = get_raw_report()
+            if _raw_report:
+                set_report(dict(_raw_report, tier3=_new_records, summary_statistic=_method))
+            mo.status.toast(f"Exported posterior {_method} to {_result['pf_path']}")
+        except Exception as _exc:
+            mo.status.toast(f"Posterior {_method} export failed: {_exc}")
+
+    tier3_summary_export_button = mo.ui.button(
+        label=f"Export {_method} .pf", disabled=not _available,
+        on_click=lambda _: _export_selected(False),
+    )
+    tier3_summary_sirocco_button = mo.ui.button(
+        label=f"Run Sirocco for posterior {_method}",
+        disabled=not _available or _hosted,
+        on_click=lambda _: _export_selected(True),
+    )
+    mo.hstack([
+        tier3_summary_export_button,
+        *([] if _hosted else [tier3_summary_sirocco_button]),
+    ], justify="start")
+    return tier3_summary_export_button, tier3_summary_sirocco_button
+
+
+@app.cell(hide_code=True)
 def _(get_tier3_posteriors, mo, np, os, render_fixed_matplotlib, t3_observation_slider):
-    import corner as _corner
+    from Speculate_addons.Spec_functions import (
+        summarize_posterior as _summarize, posterior_corner as _posterior_corner,
+        posterior_summary_rows as _summary_rows,
+    )
 
     _posteriors = get_tier3_posteriors()
     mo.stop(_posteriors is None or len(_posteriors) == 0)
 
     _post = _posteriors[t3_observation_slider.value]
+    _statistic = _post["summary_statistic"]
     _artifacts = _post.get("artifacts") or {}
     _posterior_path = _artifacts.get("posterior_npz")
     mo.stop(
@@ -2132,36 +2252,18 @@ def _(get_tier3_posteriors, mo, np, os, render_fixed_matplotlib, t3_observation_
     with np.load(_posterior_path, allow_pickle=False) as _npz:
         _samples = np.array(_npz["samples"])
         _labels = [str(_x) for _x in _npz["labels"].tolist()]
+        _internal = _npz["internal_labels"].tolist() if "internal_labels" in _npz else _labels
 
     mo.stop(
         _samples.size == 0 or len(_labels) == 0,
         mo.md("*Tier 3 posterior artifact has no samples to plot.*"),
     )
 
-    # The backend samples distance as ``log_scale`` (natural-log flux scale), but
-    # it is presented to users as Distance (pc) — matching Tier 2 and the
-    # inference / quick-fit tools. Convert the sampled column (the mapping is
-    # non-linear, so the marginal must be built from the converted draws) and
-    # relabel before plotting and tabulating.
-    if "log_scale" in _labels:
-        from Speculate_addons.distance_scale import (
-            log_scale_to_distance_pc as _ls_to_distance_pc,
-        )
-
-        _ls_idx = _labels.index("log_scale")
-        _samples = _samples.copy()
-        _samples[:, _ls_idx] = _ls_to_distance_pc(_samples[:, _ls_idx])
-        _labels[_ls_idx] = "Distance (pc)"
+    _display = _summarize(_samples, _labels, _internal)
+    _samples, _labels = _display["samples"], _display["labels"]
 
     def _corner_fig(_data, _lbls):
-        return _corner.corner(
-            _data,
-            labels=_lbls,
-            show_titles=True,
-            quantiles=[0.16, 0.5, 0.84],
-            levels=[0.6827, 0.9545, 0.9973],
-            title_fmt=".4f",
-        )
+        return _posterior_corner(_data, _lbls, _statistic)
 
     _fig = _corner_fig(_samples, _labels)
 
@@ -2189,23 +2291,11 @@ def _(get_tier3_posteriors, mo, np, os, render_fixed_matplotlib, t3_observation_
 
     def _fmt_metric(_value, _fmt):
         try:
-            return format(float(_value), _fmt)
+            return format(float(_value), _fmt) if np.isfinite(float(_value)) else "Unavailable"
         except Exception:
-            return "nan"
+            return "Unavailable"
 
-    _summary = _post.get("mcmc_summary", {})
-    _rows = []
-    for _idx, _label in enumerate(_labels):
-        _s = _summary.get(_label, {})
-        _vals = _samples[:, _idx]
-        _rows.append({
-            "Parameter": _label,
-            "Mean": f"{float(_s.get('mean', np.mean(_vals))):.4f}",
-            "Std": f"{float(_s.get('std', np.std(_vals))):.4f}",
-            "Median": f"{float(_s.get('median', np.median(_vals))):.4f}",
-            "HDI 3%": f"{float(_s.get('hdi_3', np.percentile(_vals, 3))):.4f}",
-            "HDI 97%": f"{float(_s.get('hdi_97', np.percentile(_vals, 97))):.4f}",
-        })
+    _rows = _summary_rows(_display["summary"], _statistic)
 
     _metrics = [{
         "Metric": "Reduced chi2",
@@ -2229,7 +2319,8 @@ def _(get_tier3_posteriors, mo, np, os, render_fixed_matplotlib, t3_observation_
     mo.vstack([
         mo.md(f"### {_post.get('obs_file', '?')} @ {_inc_display} deg"),
         mo.ui.table(_metrics, label="Fit Metrics", selection=None),
-        mo.ui.table(_rows, label="Posterior Summary", selection=None),
+        mo.ui.table(_rows, label=f"Posterior {_statistic.title()}", selection=None),
+        mo.md(_post.get("summary_notice", "")),
         _corner_display,
     ])
     return
@@ -2247,11 +2338,13 @@ def _(get_tier3_posteriors, mo, np, os, t3_corner_export_btn, time):
         mo.callout(mo.md("No Tier 3 posteriors are available to export."), kind="warn"),
     )
 
+    _statistic = _posteriors[0]["summary_statistic"]
     _records = []
     _skipped = []
     _corner_settings = {
-        "show_titles": True,
-        "quantiles": [0.16, 0.5, 0.84],
+        "show_titles": False,
+        "point_estimate": _statistic,
+        "quantiles": [0.16, 0.84],
         "levels": [0.6827, 0.9545, 0.9973],
         "title_fmt": ".4f",
     }
@@ -2277,8 +2370,12 @@ def _(get_tier3_posteriors, mo, np, os, t3_corner_export_btn, time):
                     else None
                 )
 
-            if _samples.ndim != 2 or len(_labels) != _samples.shape[1]:
+            if _samples.ndim != 2 or _samples.size == 0 or len(_labels) != _samples.shape[1]:
                 raise ValueError("missing or mismatched samples/labels")
+
+            from Speculate_addons.Spec_functions import summarize_posterior as _summarize
+            _display = _summarize(_samples, _labels, _internal_labels or _labels)
+            _samples, _labels = _display["samples"], _display["labels"]
 
             _obs_file = _post.get("obs_file", f"observation_{_idx}")
             _records.append({
@@ -2290,9 +2387,12 @@ def _(get_tier3_posteriors, mo, np, os, t3_corner_export_btn, time):
                 "exact_inclination": _post.get("exact_inclination"),
                 "converged": bool(_post.get("mcmc_converged", False)),
                 "samples": _samples,
+                "summary_statistic": _statistic,
+                "summary_space": "display",
+                "summary_version": 1,
                 "labels": _labels,
                 "internal_labels": _internal_labels,
-                "summary": _post.get("mcmc_summary", {}),
+                "summary": _display["summary"],
                 "truths": None,
                 "prior_ranges": None,
                 "plot_variants": ["posterior_auto_range"],
@@ -2345,6 +2445,7 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
     mo.stop(_posteriors is None or len(_posteriors) == 0)
 
     _post = _posteriors[t3_observation_slider.value]
+    _statistic = _post["summary_statistic"]
     _artifacts = _post.get("artifacts") or {}
     _plot_path = _artifacts.get("plot_data_npz")
     mo.stop(
@@ -2353,22 +2454,27 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
     )
 
     with np.load(_plot_path, allow_pickle=False) as _npz:
-        _wl = np.array(_npz["wavelength"])
-        _data_flux = np.array(_npz["data_flux"])
-        _model_flux = np.array(_npz["model_flux"])
-        _model_cov_diag = np.array(_npz["model_cov_diag"])
-        # New artifacts retain the additive covariance diagonals.  Older NPZ
-        # files remain viewable and simply use the pre-existing total-only
-        # tooltip when these optional arrays are absent.
+        _prefix = _statistic + "_"
+        _model_available = (
+            _prefix + "model_flux" in _npz
+            and not _post.get("selected_model", {}).get("error")
+        )
+        if not _model_available:
+            _prefix = ""  # Only data/PPC are used from the legacy arrays below.
+        _wl = np.array(_npz[_prefix + "wavelength"])
+        _data_flux = np.array(_npz[_prefix + "data_flux"])
+        _model_flux = np.array(_npz[_prefix + "model_flux"])
+        _model_cov_diag = np.array(_npz[_prefix + "model_cov_diag"])
+        # Covariance diagonals belong to the same selected parameter vector.
         _covariance_components = {
-            _name: np.array(_npz[_name])
+            _name: np.array(_npz[_prefix + _name])
             for _name in (
                 "observation_variance",
                 "emulator_variance",
                 "global_variance",
                 "local_variance",
             )
-            if _name in _npz.files
+            if _prefix + _name in _npz.files
         }
         _ppc_wl = np.array(_npz["ppc_wavelength"])
         _ppc_low = np.array(_npz["ppc_low"])
@@ -2380,6 +2486,14 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
             _sirocco_label = str(_npz["sirocco_label"][0])
 
     _sirocco_label = _post.get("sirocco_transform_label") or _sirocco_label
+    if not _post.get("sirocco_matches_summary"):
+        _sirocco_wl, _sirocco_flux = np.array([]), np.array([])
+    _exported = _post.get("selected_export", {}).get("spectrum")
+    if _exported:
+        _sirocco_wl = np.asarray(_exported["wavelength"])
+        _sirocco_flux = np.asarray(_exported["flux"])
+        _sirocco_label = _exported["label"]
+
 
     _extra = []
     if len(_sirocco_wl) and len(_sirocco_flux):
@@ -2420,12 +2534,14 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
         model_flux=_model_flux,
         model_cov_diag=_model_cov_diag,
         covariance_components=_covariance_components,
-        title=f"Tier 3 Best Fit — {_post.get('obs_file', '?')}",
+        title=f"Tier 3 Posterior {_statistic.title()} — {_post.get('obs_file', '?')}",
         zoom_name=f"tier3_bestfit_zoom_{t3_observation_slider.value}",
         # Tier 3 includes every fitted Sirocco nuisance transform in this
         # legend entry, so retain the full diagnostic label.
         legend_label_limit=1000,
         extra_flux_series=_extra,
+    ) if _model_available else mo.md(
+        _post.get("summary_notice") or "This summary model was not stored."
     )
 
     _ppc_values = []
@@ -2480,7 +2596,8 @@ def _(alt, build_bestfit_spectrum_altair, get_tier3_posteriors, mo, np, os, t3_o
     ).add_params(_ppc_zoom)
 
     mo.vstack([
-        mo.md("#### Best-Fit Spectrum with Sirocco Overlay"),
+        mo.md(f"#### Spectrum at Posterior {_statistic.title()} Parameters"),
+        mo.md("" if len(_sirocco_wl) else "Run Sirocco for this summary to add a matching comparison."),
         _bestfit,
         mo.md("#### Posterior Predictive Check"),
         _ppc_chart,
@@ -2926,14 +3043,15 @@ def _(add_mean_switch, get_emulator, get_tier1_arrays, mo, np, pd, plt, spectrum
 
 
 @app.cell(hide_code=True)
-def _(alt, get_comparison_reports, mo, np, os):
-    _comp_reports = get_comparison_reports()
+def _(benchmark_summary_statistic, alt, get_comparison_reports, mo, np, os):
+    from Speculate_addons.speculate_benchmark import select_report_summary as _select_report
+    _comp_reports = [_select_report(_r, benchmark_summary_statistic) for _r in get_comparison_reports()]
     mo.stop(
         not _comp_reports or len(_comp_reports) < 2,
         mo.md("*Select 2+ reports above to compare.*"),
     )
 
-    _comp_items = [mo.md("## Report Comparison")]
+    _comp_items = [mo.md(f"## Report Comparison — Posterior {benchmark_summary_statistic.title()}")]
 
     def _report_full_label(_rep, _idx):
         _emu_path = _rep.get("config", {}).get("emulator", "")
@@ -3430,6 +3548,7 @@ def _(mo, obs_picker, os, tier_picker):
 
 @app.cell(hide_code=True)
 def _(
+    benchmark_summary_switch,
     emu_grid_info,
     emu_picker,
     flux_scale_picker,
@@ -3454,6 +3573,7 @@ def _(
         tier3_distance_prior_controls,
         tier3_inclination_prior_controls,
         mo.vstack([inclination_picker, max_spectra_slider, mle_restarts_slider, mcmc_steps_slider], gap=1),
+        benchmark_summary_switch,
         tier3_wl_range_slider,
         sirocco_cpu_slider,
     ])
@@ -3938,6 +4058,7 @@ def _(
                             if (
                                 "autocorr_time" not in _entry
                                 or "effective_sample_size" not in _entry
+                                or _entry.get("summary_version") != 1
                             ):
                                 continue
                             _case_key = (
@@ -3982,6 +4103,11 @@ def _(
                                     _post_entry["full_chain"] = _np.array(_entry["full_chain"])
                                     _post_entry["burnin_used"] = _entry.get("burnin_used", 500)
                                 for _diagnostic_key in (
+                                    "posterior_models", "display_summary", "internal_labels",
+                                    "summary_statistic", "summary_space", "summary_version", "summary_error",
+                                    "mle_bestfit_spec", "posterior_mean_bestfit_spec",
+                                    "mle_nll", "mle_likelihood_diagnostics",
+                                    "posterior_mean_likelihood_diagnostics",
                                     "n_retained_draws",
                                     "autocorr_time",
                                     "effective_sample_size",
@@ -4206,6 +4332,10 @@ def _(
 
                     # Checkpoint entry: includes samples for resume
                     _cp_entry = {
+                        **{_key: _mcmc[_key] for _key in (
+                            "posterior_models", "display_summary", "internal_labels",
+                            "summary_statistic", "summary_space", "summary_version", "summary_error",
+                        ) if _key in _mcmc},
                         "run": _run_idx,
                         "filename": _sf.name,
                         "inclination": _inc,
@@ -4228,7 +4358,7 @@ def _(
                         },
                         "truths": dict(_gt),
                         "bestfit_spec": _mcmc.get("bestfit_spec", {}),
-                        "posterior_mean_bestfit_spec": _mcmc.get("posterior_mean_bestfit_spec", _mcmc.get("bestfit_spec", {})),
+                        "posterior_mean_bestfit_spec": _mcmc.get("posterior_mean_bestfit_spec", {}),
                         "posterior_mean_likelihood_diagnostics": _mcmc.get("posterior_mean_likelihood_diagnostics", {}),
                         "mle_bestfit_spec": _mle.get("mle_bestfit_spec", {}),
                         "mle_nll": _mle.get("nll"),
@@ -4253,6 +4383,8 @@ def _(
                         ]
                     _cp_entry["prior_ranges"] = _prior_ranges_dict
 
+                    from Speculate_addons.speculate_benchmark import posterior_parameter_metrics as _point_metrics
+
                     # Map friendly names to their column index in the flat
                     # MCMC samples array. Columns follow model.labels order
                     # (nuisance params first), so we cannot assume grid param
@@ -4274,10 +4406,10 @@ def _(
                                 _cp_entry[f"{_fn}_samples"] = _samples_i.tolist()
                                 _spec_res[f"{_fn}_truth"] = _gt[_fn]
                                 _cp_entry[f"{_fn}_truth"] = _gt[_fn]
-                                _median = float(np.median(_samples_i))
-                                _spec_res[f"{_fn}_delta_sigma"] = (
-                                    _median - _gt[_fn]
-                                ) / max(_mcmc["summary"][_fn]["std"], 1e-10)
+                            _spec_res.update({
+                                f"{_fn}_{_key}": _value
+                                for _key, _value in _point_metrics(_samples_i, _gt.get(_fn)).items()
+                            })
 
                     # Update the spec_result in the checkpoint entry (it now has _mean/_std keys)
                     _cp_entry["spec_result"] = _spec_res
@@ -4285,6 +4417,10 @@ def _(
 
                     # Store full posterior for corner-plot explorer
                     _tier2_posteriors.append({
+                        **{_key: _mcmc[_key] for _key in (
+                            "posterior_models", "display_summary", "internal_labels",
+                            "summary_statistic", "summary_space", "summary_version", "summary_error",
+                        ) if _key in _mcmc},
                         "run": _run_idx,
                         "filename": _sf.name,
                         "inclination": _inc,
@@ -4302,7 +4438,7 @@ def _(
                         "converged": _mcmc["converged"],
                         "truths": dict(_gt),
                         "bestfit_spec": _mcmc.get("bestfit_spec", {}),
-                        "posterior_mean_bestfit_spec": _mcmc.get("posterior_mean_bestfit_spec", _mcmc.get("bestfit_spec", {})),
+                        "posterior_mean_bestfit_spec": _mcmc.get("posterior_mean_bestfit_spec", {}),
                         "posterior_mean_likelihood_diagnostics": _mcmc.get("posterior_mean_likelihood_diagnostics", {}),
                         "mle_bestfit_spec": _mle.get("mle_bestfit_spec", {}),
                         "mle_nll": _mle.get("nll"),
@@ -4457,7 +4593,7 @@ def _(
                 for _obs in _obs_list
             }
             _tier3_checkpoint_config = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "emulator": str(_Path(_emu_path).expanduser().resolve()),
                 "grid_name": _grid_name,
                 "flux_scale": _flux_scale,
@@ -4622,7 +4758,7 @@ def _(
                     try:
                         _cp_entry = {
                             "kind": "tier3_observation",
-                            "schema_version": 1,
+                            "schema_version": 2,
                             "config_hash": _tier3_checkpoint_hash,
                             "config": _tier3_checkpoint_config,
                             "tier3_export_dir": _tier3_export_dir,

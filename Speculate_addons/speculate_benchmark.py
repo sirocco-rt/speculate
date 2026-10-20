@@ -1657,8 +1657,14 @@ def run_mcmc_single(
     Returns
     -------
     dict with keys:
-        'samples'               : (N, ndim) burnt+thinned flat samples
-        'summary'               : posterior summaries keyed by friendly label
+        'samples'               : (N, ndim) retained samples in backend coordinates
+        'summary'               : sampling-coordinate statistics, including log_scale
+        'display_summary'       : statistics in displayed coordinates, including pc
+        'posterior_models'      : mean/median model points, spectra and diagnostics;
+                                  points use backend coordinates after summarising
+                                  in the displayed coordinates
+        'summary_error'         : failure message if post-processing failed;
+                                  retained samples remain available
         'autocorr_time'         : integrated autocorrelation time per parameter
         'effective_sample_size' : autocorrelation-adjusted ESS per parameter
         'converged'             : bool — chain >= 50*tau and every ESS >= 100
@@ -1689,6 +1695,7 @@ def run_mcmc_single(
         priors["Av"] = stats.uniform(loc=0, scale=2.0)
 
     _sampled_labels = list(model.labels)
+    _initial_model_point = dict(model.get_param_dict(flat=True))
     ndim = len(_sampled_labels)
     if ndim == 0:
         raise ValueError("MCMC has no thawed parameters to sample after applying the freeze settings.")
@@ -1806,6 +1813,8 @@ def run_mcmc_single(
         else:
             all_labels.append(l)
 
+    # Sampler diagnostics remain in sampling coordinates. Display summaries
+    # are stored separately so distance MCSE is never silently relabelled.
     summary = {}
     mcse_dict = {}
     _diagnostics = _autocorrelation_diagnostics(
@@ -1824,8 +1833,10 @@ def run_mcmc_single(
             "mean": float(np.mean(vals)),
             "std": float(np.std(vals)),
             "median": float(np.median(vals)),
-            "hdi_3": float(np.percentile(vals, 3)),
-            "hdi_97": float(np.percentile(vals, 97)),
+            "q03": float(np.percentile(vals, 3)),
+            "q16": float(np.percentile(vals, 16)),
+            "q84": float(np.percentile(vals, 84)),
+            "q97": float(np.percentile(vals, 97)),
         }
 
         _ess_i = ess_dict[label]
@@ -1840,20 +1851,22 @@ def run_mcmc_single(
     diagnostic_reasons = _diagnostics["diagnostic_reasons"]
     converged = _diagnostics["converged"]
 
-    # Best-fit spectrum at posterior means — set model params, evaluate, and
-    # store the arrays so the viewer can reconstruct the Starfish-style plot
-    # without needing the live model object.
-    bestfit_spec = {}
-    posterior_mean_diagnostics = {}
+    # Both summaries are evaluated once; display changes never resample.
     try:
-        _mean_params = {}
-        for i, label in enumerate(_sampled_labels):
-            _mean_params[label] = float(np.mean(flat[:, i]))
-        model.set_param_dict(_mean_params)
-        bestfit_spec = _model_bestfit_spectrum(model)
-        posterior_mean_diagnostics = _model_likelihood_diagnostics(model, priors)
-    except Exception:
-        pass  # non-critical — viewer will skip the plot
+        _posterior = evaluate_posterior_summaries(
+            model, priors, flat, all_labels, _sampled_labels, _frozen_param_values,
+        )
+    except Exception as exc:
+        # A failed display transform must not discard a completed chain or
+        # leave the model at the sampler's final proposal.
+        log.warning("Posterior summary unavailable: %s", exc)
+        _posterior = {"summary": {}, "posterior_models": {}, "summary_error": str(exc)}
+    finally:
+        model.set_param_dict(_initial_model_point)
+    bestfit_spec = _posterior["posterior_models"].get("median", {}).get("spectrum", {})
+    # Keep explicitly mean-named fields faithful for older report consumers.
+    _mean_model = _posterior["posterior_models"].get("mean", {})
+    posterior_mean_diagnostics = _mean_model.get("diagnostics", {})
 
     # Restore any nuisance params that were frozen for this MCMC run so the
     # model object is left in a usable state for downstream callers.
@@ -1893,13 +1906,60 @@ def run_mcmc_single(
         "n_retained_draws": int(flat.shape[0]),
         "labels": all_labels,
         "internal_labels": _sampled_labels,
+        "display_summary": _posterior["summary"],
+        "posterior_models": _posterior["posterior_models"],
+        "summary_statistic": "median",
+        "summary_space": "display",
+        "summary_version": 1,
+        "summary_error": _posterior.get("summary_error", ""),
         "bestfit_spec": bestfit_spec,
-        "posterior_mean_bestfit_spec": bestfit_spec,
+        "posterior_mean_bestfit_spec": _mean_model.get("spectrum", {}),
         "posterior_mean_likelihood_diagnostics": posterior_mean_diagnostics,
         "freeze_params": dict(_requested_freeze),
         "frozen_params": list(_applied_freezes),
         "frozen_param_values": dict(_frozen_param_values),
     }
+
+
+def evaluate_posterior_summaries(
+    model, priors, samples, labels, internal_labels=None, frozen_values=None,
+):
+    """Cache both parameter-summary models while preserving the caller's state."""
+    from Speculate_addons.Spec_functions import summarize_posterior
+
+    fixed = {key: value for key, value in _snapshot_model_params(model).items()
+             if key not in model.labels}
+    fixed.update(frozen_values or {})
+    result = summarize_posterior(samples, labels, internal_labels, fixed)
+    original = dict(model.get_param_dict(flat=True))
+    models = {}
+    try:
+        for method, point in result["point_estimates"].items():
+            model.set_param_dict(point)
+            payload = {
+                "statistic": method, "parameters": point,
+                "grid_params": np.asarray(model.grid_params, dtype=float).tolist(),
+                "summary_space": "display",
+                "parameter_space": "model",
+                "n_parameters": len(model.labels),
+            }
+            try:
+                payload["spectrum"] = _model_bestfit_spectrum(model)
+                payload["diagnostics"] = _model_likelihood_diagnostics(model, priors)
+                payload["transforms"] = _extract_spectrum_nuisance_transforms(model)
+                residual = np.asarray(model.data.flux) - np.asarray(payload["spectrum"]["model_flux"])
+                sigma = np.maximum(np.asarray(model.data.sigma), 1e-30)
+                payload["reduced_chi2"] = float(
+                    np.sum((residual / sigma) ** 2) / max(len(residual) - len(model.labels), 1)
+                )
+            except Exception as exc:
+                # Keep the other method usable, but never substitute its curve.
+                payload["error"] = str(exc)
+            models[method] = payload
+    finally:
+        model.set_param_dict(original)
+    result["posterior_models"] = models
+    return result
 
 
 def compute_crps(samples: np.ndarray, truth: float) -> float:
@@ -1920,6 +1980,208 @@ def compute_crps(samples: np.ndarray, truth: float) -> float:
     idx = np.arange(1, n + 1)
     term2 = 2.0 * np.sum((2 * idx - n - 1) * sorted_s) / (n * n)
     return float(term1 - 0.5 * term2)
+
+
+def select_posterior_summary(record: dict, statistic: str = "median") -> dict:
+    """Return a presentation copy; never evaluate a model or change raw samples.
+
+    Old reports can still summarise retained draws. Their model curves cannot
+    be relabelled, however: they were evaluated at means in backend coordinates.
+    """
+    from Speculate_addons.Spec_functions import summarize_posterior
+
+    if statistic not in ("mean", "median"):
+        raise ValueError("Posterior statistic must be mean or median.")
+    selected = dict(record, summary_statistic=statistic)
+    if "samples" in record:
+        selected.update(display_samples=np.empty((0, 0)), display_labels=[])
+    display_error = record.get("summary_error", "")
+    if record.get("samples") is not None:
+        try:
+            display = summarize_posterior(
+                record["samples"], record["labels"], record.get("internal_labels"),
+            )
+            selected.update(
+                display_samples=display["samples"], display_labels=display["labels"],
+                display_summary=display["summary"],
+            )
+        except (ValueError, TypeError, KeyError, OverflowError) as exc:
+            display_error = str(exc)
+            selected.update(display_samples=np.empty((0, 0)), display_labels=[], display_summary={})
+    model = record.get("posterior_models", {}).get(statistic, {})
+    selected["selected_model"] = model
+    selected["summary_notice"] = (
+        f"The {statistic} model could not be evaluated: {model['error']}"
+        if model.get("error") else ""
+    )
+    if not model:
+        selected["summary_notice"] = (
+            "This legacy result has no cached model for the displayed summary. "
+            "Retained draws can still be summarised; rerun the fit to obtain "
+            "matching spectra, fit metrics and parameter files."
+        )
+    if display_error:
+        selected["summary_notice"] = f"Posterior summary unavailable: {display_error}"
+    if "reduced_chi2" in record:
+        if record.get("summary_version") != 1:
+            selected["legacy_fit"] = record.get("legacy_fit") or {
+                "reduced_chi2": record.get("reduced_chi2"),
+                "exact_inclination": record.get("exact_inclination"),
+            }
+        selected["reduced_chi2"] = model.get("reduced_chi2")
+        selected["exact_inclination"] = model.get("observer_angle")
+        exported = record.get("summary_exports", {}).get(statistic, {})
+        comparison_keys = (
+            "pf_path", "sirocco_reduced_chi2", "emulator_sirocco_frac_rmse",
+            "sirocco_command", "sirocco_log_path", "sirocco_setup_log_path",
+            "sirocco_signal_log_path", "sirocco_spec_path", "sirocco_reduced_spec_path",
+        )
+        comparisons = record.get("sirocco_comparisons") or {
+            record.get("sirocco_statistic", "mean"): {
+                key: record.get(key) for key in comparison_keys
+            }
+        }
+        # Preserve the generating run's metrics through save/load and repeated
+        # selection changes, even when its curve is currently hidden.
+        selected["sirocco_comparisons"] = comparisons
+        matches = (
+            record.get("summary_version") == 1
+            and record.get("sirocco_statistic") == statistic
+        )
+        selected["sirocco_matches_summary"] = matches
+        selected["selected_export"] = exported
+        for key in comparison_keys:
+            selected[key] = exported.get(
+                key, exported.get("spectrum", {}).get(
+                    key, comparisons.get(statistic, {}).get(key) if matches else None,
+                ),
+            )
+    return selected
+
+
+def select_report_summary(report: dict, statistic: str = "median") -> dict:
+    """Select point metrics without changing distribution/calibration metrics."""
+    if statistic not in ("mean", "median"):
+        raise ValueError("Posterior statistic must be mean or median.")
+    selected = dict(report, summary_statistic=statistic)
+    if report.get("tier2"):
+        tier2 = dict(report["tier2"])
+        aggregate = {}
+        for label, stats in tier2.get("aggregate", {}).items():
+            item = dict(stats)
+            metrics = stats.get("point_metrics", {}).get(statistic)
+            if metrics is not None:
+                item.update(metrics)
+            elif statistic != "mean":
+                item.update(rmse=float("nan"), bias=float("nan"))
+            aggregate[label] = item
+        tier2["aggregate"] = aggregate
+        rows = []
+        for original in tier2.get("per_spectrum", []):
+            row = dict(original)
+            for label in aggregate:
+                centre = row.get(f"{label}_{statistic}", float("nan"))
+                row[f"{label}_estimate"] = centre
+                std = row.get(f"{label}_std", 0)
+                row[f"{label}_delta_sigma"] = (
+                    (centre - row[f"{label}_truth"]) / std
+                    if std > 0 and f"{label}_truth" in row else float("nan")
+                )
+            rows.append(row)
+        tier2["per_spectrum"] = rows
+        if "posteriors" in tier2:
+            tier2["posteriors"] = [
+                dict(item, summary_statistic=statistic)
+                for item in tier2["posteriors"]
+            ]
+        selected["tier2"] = tier2
+    if report.get("tier3"):
+        selected["tier3"] = [
+            select_posterior_summary(item, statistic) for item in report["tier3"]
+        ]
+    return selected
+
+
+def posterior_parameter_metrics(samples, truth):
+    """Shared Tier 2 point metrics, with the median used for default offsets."""
+    values = np.asarray(samples, dtype=float)
+    std = float(np.std(values))
+    result = {"mean": float(np.mean(values)), "median": float(np.median(values)), "std": std}
+    if truth is not None:
+        result["truth"] = float(truth)
+        for method in ("mean", "median"):
+            result[f"delta_sigma_{method}"] = (
+                (result[method] - truth) / std if std > 0 else float("nan")
+            )
+        result["delta_sigma"] = result["delta_sigma_median"]
+    return result
+
+
+def export_tier3_summary(record, statistic="median", run_sirocco=False, cpus=1):
+    """Explicitly export/run a cached Tier 3 point, without sampling again."""
+    from types import SimpleNamespace
+
+    point = record.get("posterior_models", {}).get(statistic)
+    if not point or point.get("error"):
+        raise ValueError("A usable cached model is required for this summary.")
+    directory = Path(record["artifacts"]["posterior_npz"]).parent / statistic
+    directory.mkdir(parents=True, exist_ok=True)
+    emu = SimpleNamespace(
+        param_names=record["param_names"], name=record.get("emulator_name", ""),
+    )
+    uncertainties = {
+        name: (stats["q16"], stats["q84"])
+        for name, stats in record.get("display_summary", {}).items()
+        if "q16" in stats and "q84" in stats
+    }
+    pf_path = directory / f"{_safe_artifact_stem(record['obs_file'])}_{statistic}.pf"
+    export_pf_template(
+        emu, np.asarray(point["grid_params"]), str(pf_path),
+        grid_name=record["grid_name"], uncertainties=uncertainties,
+        global_params={
+            key: value for key, value in point["parameters"].items()
+            if key not in emu.param_names and not key.startswith("local_cov")
+        },
+        observer_angles=[point["observer_angle"]], summary_statistic=statistic,
+    )
+    exported = {"pf_path": str(pf_path), "summary_statistic": statistic}
+    if run_sirocco:
+        # A different centre requires a new physical simulation. The UI calls
+        # this only from an explicit button, never while rendering a selection.
+        simulation = run_sirocco_model_spectrum(
+            pf_path, wl_range=record["wl_range"],
+            flux_scale=record.get("flux_scale", "linear"), cpus=cpus,
+            transforms=point.get("transforms", {}),
+            smoothing=record.get(
+                "sirocco_smoothing",
+                "_smooth" in os.path.basename(record.get("emulator_name", "")).lower(),
+            ),
+        )
+        exported["spectrum"] = {
+            key: value.tolist() if isinstance(value, np.ndarray) else value
+            for key, value in simulation.items()
+        }
+        # Compare the new simulation to this same cached emulator point.
+        # Never inherit the comparison metrics from the original mean run.
+        with np.load(record["artifacts"]["plot_data_npz"], allow_pickle=False) as data:
+            prefix = statistic + "_"
+            wavelength = data[prefix + "wavelength"]
+            observed = data[prefix + "data_flux"]
+            predicted = data[prefix + "model_flux"]
+            order = np.argsort(simulation["wavelength"])
+            simulated = np.interp(
+                wavelength, np.asarray(simulation["wavelength"])[order],
+                np.asarray(simulation["flux"])[order],
+            )
+            exported["emulator_sirocco_frac_rmse"] = float(np.sqrt(np.mean(
+                ((predicted - simulated) / np.maximum(np.abs(observed), 1e-30)) ** 2
+            )))
+            variance_key = prefix + "observation_variance"
+            if variance_key in data:
+                exported["sirocco_reduced_chi2"] = float(np.sum(
+                    (observed - simulated) ** 2 / np.maximum(data[variance_key], 1e-60)
+                ) / max(len(observed) - point["n_parameters"], 1))
+    return exported
 
 
 def compute_coverage(
@@ -2093,12 +2355,10 @@ def aggregate_tier2_results(
             [ps[f"{fname}_truth"] for ps in _parameter_results],
             dtype=float,
         )
-        means_arr = np.array(
-            [ps[f"{fname}_mean"] for ps in _parameter_results],
-            dtype=float,
-        )
-        rmse = float(np.sqrt(np.mean((means_arr - truths_arr) ** 2)))
-        bias = float(np.mean(means_arr - truths_arr))
+        means_arr = np.array([np.mean(draws) for draws in all_samples[fname]], dtype=float)
+        medians_arr = np.array([np.median(draws) for draws in all_samples[fname]], dtype=float)
+        rmse = float(np.sqrt(np.mean((medians_arr - truths_arr) ** 2)))
+        bias = float(np.mean(medians_arr - truths_arr))
 
         crps_vals = []
         for samples, truth in zip(all_samples[fname], all_truths[fname]):
@@ -2160,6 +2420,16 @@ def aggregate_tier2_results(
         aggregate[fname] = {
             "rmse": rmse,
             "bias": bias,
+            "point_metrics": {
+                method: {
+                    "rmse": float(np.sqrt(np.mean((centres - truths_arr) ** 2))),
+                    "bias": float(np.mean(centres - truths_arr)),
+                }
+                for method, centres in (
+                    ("mean", means_arr),
+                    ("median", medians_arr),
+                )
+            },
             "crps": crps_mean,
             "shrinkage": shrinkage,
             "coverage_68": _coverage_levels["0.68"]["fraction"],
@@ -2417,6 +2687,7 @@ def run_tier2(
             if fname in mcmc_result["summary"]:
                 spec_result[f"{fname}_mean"] = mcmc_result["summary"][fname]["mean"]
                 spec_result[f"{fname}_std"] = mcmc_result["summary"][fname]["std"]
+                spec_result[f"{fname}_median"] = mcmc_result["summary"][fname]["median"]
 
                 # Find the correct column for this parameter in the samples array
                 if fname in _mcmc_labels:
@@ -2431,10 +2702,10 @@ def run_tier2(
                     all_samples[fname].append(samples_i)
                     all_truths[fname].append(gt[fname])
                     spec_result[f"{fname}_truth"] = gt[fname]
-                    _median = float(np.median(samples_i))
-                    spec_result[f"{fname}_delta_sigma"] = (
-                        _median - gt[fname]
-                    ) / max(mcmc_result["summary"][fname]["std"], 1e-10)
+                spec_result.update({
+                    f"{fname}_{key}": value
+                    for key, value in posterior_parameter_metrics(samples_i, gt.get(fname)).items()
+                })
 
         per_spectrum.append(spec_result)
 
@@ -3176,32 +3447,6 @@ def resolve_sirocco_observer_angle(
     return _fixed_inclination_from_emulator(emu, grid_name)
 
 
-def _extract_posterior_mean_inclination(
-    emu,
-    samples: np.ndarray,
-    friendly_labels: Sequence[str],
-    grid_name: Optional[str] = None,
-    frozen_param_values: Optional[Dict[str, float]] = None,
-) -> float:
-    """Return the sampled or post-MLE frozen inclination for Sirocco."""
-    friendly_grid = internal_to_friendly(emu.param_names, grid_name)
-    if "Inclination" not in friendly_grid:
-        return _fixed_inclination_from_emulator(emu, grid_name)
-    if "Inclination" in friendly_labels:
-        col = list(friendly_labels).index("Inclination")
-        inclination = float(np.mean(samples[:, col]))
-    else:
-        inclination_index = friendly_grid.index("Inclination")
-        inclination_label = emu.param_names[inclination_index]
-        frozen_param_values = frozen_param_values or {}
-        if inclination_label not in frozen_param_values:
-            raise ValueError(
-                "MCMC samples and frozen parameter values do not contain Inclination."
-            )
-        inclination = float(frozen_param_values[inclination_label])
-    return float(np.clip(inclination, 0.0, 90.0))
-
-
 def _save_tier3_artifacts(
     output_dir: Union[str, Path],
     obs_stem: str,
@@ -3229,6 +3474,14 @@ def _save_tier3_artifacts(
     covariance_components = bestfit_spec.get("covariance_components") or {}
     np.savez_compressed(
         plot_path,
+        **{
+            f"{method}_{key}": np.asarray(value, dtype=np.float64)
+            for method, payload in mcmc.get("posterior_models", {}).items()
+            for key, value in {
+                **{k: v for k, v in payload.get("spectrum", {}).items() if k != "covariance_components"},
+                **payload.get("spectrum", {}).get("covariance_components", {}),
+            }.items()
+        },
         wavelength=np.asarray(bestfit_spec.get("wavelength", []), dtype=np.float64),
         data_flux=np.asarray(bestfit_spec.get("data_flux", []), dtype=np.float64),
         model_flux=np.asarray(bestfit_spec.get("model_flux", []), dtype=np.float64),
@@ -3327,7 +3580,7 @@ def run_tier3_single(
     require_sirocco : bool
         If True, missing runtime commands or failed Sirocco runs raise.
     run_sirocco : bool
-        If True, run Sirocco after exporting the posterior-mean .pf file.
+        If True, run Sirocco after exporting the posterior-median .pf file.
     enable_local_covariance : bool
         If True, Tier 3 uses a two-pass MLE in which Starfish residual peaks
         from the first pass are converted into fixed local covariance kernels
@@ -3427,7 +3680,25 @@ def run_tier3_single(
     )
     friendly_labels = mcmc.get("labels", [])
     internal_labels = mcmc.get("internal_labels", friendly_labels)
-    frozen_param_values = mcmc.get("frozen_param_values", {})
+    posterior_models = mcmc["posterior_models"]
+    _chosen = posterior_models.get("median", {})
+    if not _chosen or _chosen.get("error"):
+        # The default verification cannot run, but the expensive retained
+        # chain and any usable alternate model remain recoverable on disk.
+        summary_error = mcmc.get("summary_error") or _chosen.get("error", "Median model unavailable")
+        artifacts = _save_tier3_artifacts(
+            artifact_dir, obs_stem, mcmc, {}, {}, {},
+            {"summary_error": summary_error, "posterior_models": posterior_models},
+        )
+        raise ValueError(
+            f"Tier 3 posterior model unavailable: {summary_error}. "
+            f"Retained samples saved to {artifacts['posterior_npz']}"
+        )
+    # The sampler restores the caller's MLE freeze flags. A coordinate frozen
+    # for MLE may nevertheless have been sampled by MCMC, so applying retained
+    # points must assign values directly instead of skipping frozen keys.
+    for _key, _value in _chosen["parameters"].items():
+        model[_key] = _value
 
     # Posterior Predictive Check (PPC)
     # Draw random posterior samples, evaluate the model flux at each one, and
@@ -3442,7 +3713,8 @@ def run_tier3_single(
         indices = np.random.choice(mcmc["samples"].shape[0], size=n_ppc, replace=False)
         for j, idx in enumerate(indices):
             _sample_dict = dict(zip(internal_labels, mcmc["samples"][idx]))
-            model.set_param_dict(_sample_dict)
+            for _key, _value in _sample_dict.items():
+                model[_key] = _value
             try:
                 pred, _ = model()
                 if hasattr(pred, "detach"):
@@ -3462,38 +3734,17 @@ def run_tier3_single(
         env_hi = np.full(len(model.data.wave), np.nan)
         ppc_in = np.nan
 
-    # Set model back to posterior mean for export
-    mcmc_means = {}
-    for i, label in enumerate(internal_labels):
-        mcmc_means[label] = float(np.mean(mcmc["samples"][:, i]))
-    model.set_param_dict(mcmc_means)
-
-    try:
-        # Use the common exporter so posterior-mean plots retain the same
-        # covariance-source diagnostics as their MLE counterparts.
-        bestfit_spec = _model_bestfit_spectrum(model)
-    except Exception:
-        bestfit_spec = mcmc.get("bestfit_spec", {})
-
-    try:
-        _bf_data = np.asarray(bestfit_spec.get("data_flux", []), dtype=np.float64)
-        _bf_model = np.asarray(bestfit_spec.get("model_flux", []), dtype=np.float64)
-        _model_sigma = np.asarray(model.data.sigma, dtype=np.float64)
-        _n = min(len(_bf_data), len(_bf_model), len(_model_sigma))
-        residuals = _bf_data[:_n] - _bf_model[:_n]
-        n_dof = _n - len(internal_labels)
-        chi2 = float(np.sum((residuals / np.maximum(_model_sigma[:_n], 1e-30)) ** 2))
-        reduced_chi2 = chi2 / max(n_dof, 1)
-    except Exception:
-        reduced_chi2 = np.nan
-
-    exact_inclination = _extract_posterior_mean_inclination(
-        emu,
-        mcmc["samples"],
-        friendly_labels,
-        grid_name,
-        frozen_param_values=frozen_param_values,
-    )
+    # Default export is the median in displayed coordinates. Both emulator
+    # summaries are retained for later switching without sampling again.
+    for _method, _payload in posterior_models.items():
+        _payload["observer_angle"] = resolve_sirocco_observer_angle(
+            emu, _payload["grid_params"], grid_name,
+        )
+    for _key, _value in _chosen["parameters"].items():
+        model[_key] = _value
+    bestfit_spec = _chosen.get("spectrum", {})
+    reduced_chi2 = _chosen.get("reduced_chi2", np.nan)
+    exact_inclination = _chosen["observer_angle"]
 
     result = {
         "obs_file": os.path.basename(obs_csv),
@@ -3502,6 +3753,16 @@ def run_tier3_single(
         "mle_params": mle["grid_params"],
         "mle_all_params": mle.get("all_params", {}),
         "mcmc_summary": mcmc["summary"],
+        "display_summary": mcmc["display_summary"],
+        "posterior_models": {
+            method: {key: value for key, value in payload.items() if key != "spectrum"}
+            for method, payload in posterior_models.items()
+        },
+        "summary_statistic": "median", "summary_space": "display", "summary_version": 1,
+        "sirocco_statistic": "median",
+        "sirocco_smoothing": "_smooth" in os.path.basename(str(getattr(emu, "name", ""))).lower(),
+        "grid_name": grid_name, "param_names": list(emu.param_names),
+        "emulator_name": str(getattr(emu, "name", "")), "flux_scale": flux_scale,
         "mcmc_converged": mcmc["converged"],
         "n_retained_draws": mcmc.get("n_retained_draws"),
         "autocorr_time": mcmc.get("autocorr_time", {}),
@@ -3538,44 +3799,37 @@ def run_tier3_single(
     if prior_ranges:
         result["prior_ranges"] = prior_ranges
 
-    # Export a Sirocco .pf file from the posterior-mean parameters
+    # Export a Sirocco .pf file from the posterior-median parameters
     if grid_name is not None:
         _pf_path = artifact_dir / f"tier3_{obs_stem}.pf"
 
-        _grid_means = []
+        _grid_centres = []
         _uncertainties = {}
         _friendly_grid = internal_to_friendly(emu.param_names, grid_name)
         for _pn, _friendly in zip(emu.param_names, _friendly_grid):
+            _grid_value = float(_chosen["parameters"][_pn])
             if _pn in internal_labels:
                 _col = list(internal_labels).index(_pn)
-                _grid_value = float(np.mean(mcmc["samples"][:, _col]))
                 _lo = float(np.percentile(mcmc["samples"][:, _col], 16))
                 _hi = float(np.percentile(mcmc["samples"][:, _col], 84))
-            elif _pn in frozen_param_values:
-                _grid_value = float(frozen_param_values[_pn])
+            else:
                 _lo = _grid_value
                 _hi = _grid_value
-            else:
-                raise ValueError(
-                    f"MCMC samples and frozen parameter values do not contain required grid parameter {_pn}"
-                )
-            _grid_means.append(_grid_value)
+            _grid_centres.append(_grid_value)
             _uncertainties[_friendly] = (_lo, _hi)
 
-        _global = {}
-        for _i, _label in enumerate(internal_labels):
-            if not str(_label).startswith("param"):
-                _global[str(_label)] = float(np.mean(mcmc["samples"][:, _i]))
-        for _label, _value in frozen_param_values.items():
-            if not str(_label).startswith("param"):
-                _global[str(_label)] = float(_value)
+        _global = {
+            key: value for key, value in _chosen["parameters"].items()
+            if not key.startswith(("param", "local_cov"))
+        }
 
         export_pf_template(
-            emu, np.asarray(_grid_means), str(_pf_path),
+            emu, np.asarray(_grid_centres), str(_pf_path),
             uncertainties=_uncertainties,
             global_params=_global,
             grid_name=grid_name,
             observer_angles=[exact_inclination],
+            summary_statistic="median",
         )
         result["pf_path"] = str(_pf_path)
         log.info(f"Tier 3 exported .pf to {_pf_path}")
@@ -3583,7 +3837,7 @@ def run_tier3_single(
     sirocco_plot = {"wavelength": [], "flux": []}
     sirocco_reduced_chi2 = np.nan
     emulator_sirocco_frac_rmse = np.nan
-    sirocco_transforms = _extract_spectrum_nuisance_transforms(model)
+    sirocco_transforms = _chosen.get("transforms", {})
     sirocco_transform_label = _format_sirocco_transform_label(sirocco_transforms)
 
     if run_sirocco:
@@ -3607,6 +3861,7 @@ def run_tier3_single(
             sirocco_flux,
             flux_scale,
             sirocco_transforms,
+            smoothing=result["sirocco_smoothing"],
         )
         sirocco_plot = {
             "wavelength": sirocco_wl,
@@ -3681,6 +3936,10 @@ def run_tier3_single(
         "high": env_hi,
     }
     artifact_summary = {
+        "summary_statistic": "median", "summary_space": "display", "summary_version": 1,
+        "sirocco_statistic": "median", "sirocco_smoothing": result["sirocco_smoothing"],
+        "posterior_models": result["posterior_models"],
+        "display_summary": result["display_summary"],
         "obs_file": result["obs_file"],
         "labels": friendly_labels,
         "mcmc_summary": mcmc["summary"],
@@ -3735,6 +3994,7 @@ def export_pf_template(
     global_params: Optional[dict] = None,
     grid_name: Optional[str] = None,
     observer_angles: Optional[Sequence[float]] = None,
+    summary_statistic: Optional[str] = None,
 ):
     """
     Export a Sirocco .pf file by updating a full template with emulator results.
@@ -3747,7 +4007,7 @@ def export_pf_template(
     output_path : str
         Path to write the .pf file.
     uncertainties : dict or None
-        {friendly_name: (lo_1sigma, hi_1sigma)} for annotation.
+        {friendly_name: (16th percentile, 84th percentile)} for annotation.
     global_params : dict or None
         Global params (Av, log_scale, etc.) for annotation.
     grid_name : str or None
@@ -3776,8 +4036,13 @@ def export_pf_template(
         "###",
     ]
 
+    if summary_statistic is not None:
+        if summary_statistic not in ("mean", "median"):
+            raise ValueError("Posterior statistic must be mean or median")
+        header.extend([f"### Posterior point estimate: {summary_statistic}",
+                       "### Summary coordinates: displayed parameter coordinates", "###"])
     if uncertainties:
-        header.append("### Posterior Uncertainties (1σ):")
+        header.append("### Posterior equal-tailed interval (16th–84th percentiles):")
         for name, (lo, hi) in uncertainties.items():
             header.append(f"###   {name}: [{lo:.6f}, {hi:.6f}]")
         header.append("###")
@@ -3812,6 +4077,7 @@ def export_posterior_csv(
     labels: List[str],
     output_path: str,
     summary: Optional[dict] = None,
+    summary_statistic: Optional[str] = None,
 ):
     """
     Export MCMC posterior samples and summary statistics to CSV.
@@ -3824,6 +4090,9 @@ def export_posterior_csv(
     summary : dict or None — if provided, appended as comment header.
     """
     header_lines = ["# Speculate Posterior Samples"]
+    if summary_statistic is not None:
+        header_lines.extend([f"# Posterior point estimate: {summary_statistic}",
+                             "# Summary coordinates: displayed parameter coordinates"])
     if summary:
         header_lines.append("# Summary Statistics:")
         for label, stats_dict in summary.items():
@@ -4012,6 +4281,9 @@ def build_report_card(
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
+    report["summary_statistic"] = "median"
+    report["summary_space"] = "display"
+    report["summary_version"] = 1
     if config:
         report["config"] = config
 
@@ -4085,6 +4357,11 @@ def build_report_card(
                 ):
                     if _diagnostic_key in _p:
                         _entry[_diagnostic_key] = _p[_diagnostic_key]
+                for _key in ("posterior_models", "display_summary", "internal_labels",
+                             "summary_statistic", "summary_space", "summary_version", "summary_error",
+                             "mle_bestfit_spec", "posterior_mean_bestfit_spec"):
+                    if _key in _p:
+                        _entry[_key] = _p[_key]
                 if "bestfit_spec" in _p and _p["bestfit_spec"]:
                     _entry["bestfit_spec"] = _p["bestfit_spec"]
                 if "prior_ranges" in _p and _p["prior_ranges"]:
@@ -4122,6 +4399,10 @@ def build_report_card(
                 "mcmc_converged": r.get("mcmc_converged", None),
             }
             for key in (
+                "posterior_models", "display_summary", "summary_statistic",
+                "summary_space", "summary_version", "summary_error", "sirocco_statistic",
+                "grid_name", "param_names", "emulator_name", "flux_scale",
+                "summary_exports", "sirocco_comparisons", "sirocco_smoothing",
                 "n_retained_draws",
                 "autocorr_time",
                 "effective_sample_size",

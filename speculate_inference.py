@@ -2423,6 +2423,8 @@ def _(mo):
     get_mle_model, set_mle_model = mo.state(None)       # fitted SpectrumModel
     get_mle_priors, set_mle_priors = mo.state(None)     # frozen scipy priors dict
     get_mle_result, set_mle_result = mo.state(None)     # rendered Stage 3 summary/plot payload
+    # Retain a renderer backed by completed samples, independent of the run button.
+    get_mcmc_renderer, set_mcmc_renderer = mo.state(None)
     # MCMC State - stores results for export
     get_mcmc_samples, set_mcmc_samples = mo.state(None)     # (n_samples, n_dim) array
     get_mcmc_labels, set_mcmc_labels = mo.state(None)       # friendly parameter names
@@ -2435,6 +2437,7 @@ def _(mo):
     return (
         get_mle_model, get_mle_priors, get_mle_result,
         set_mle_model, set_mle_priors, set_mle_result,
+        get_mcmc_renderer, set_mcmc_renderer,
         get_mcmc_bestfit_plot, set_mcmc_bestfit_plot,
         get_mcmc_samples, set_mcmc_samples,
         get_mcmc_sirocco_spectrum, set_mcmc_sirocco_spectrum,
@@ -3845,7 +3848,6 @@ def _(emu, get_mle_model, mo, param_names, re):
 
 @app.cell
 def _(
-    covariance_diagonal_components,
     get_mle_model,
     get_mle_priors,
     ground_truth_params,
@@ -3858,6 +3860,7 @@ def _(
     mo,
     np,
     run_mcmc_btn,
+    set_mcmc_renderer,
     set_mcmc_bestfit_plot,
     set_mcmc_labels,
     set_mcmc_corner_meta,
@@ -3880,18 +3883,20 @@ def _(
     #     distributions, and summary statistics.
     #  6. Generate a corner plot (truths drawn from the lookup table when
     #     running in test-grid validation mode).
-    #  7. Set the model to the posterior mean and plot the best-fit.
+    #  7. Cache models at the posterior mean and median for later selection.
     #  8. Persist the cleaned samples and labels in reactive state for the
     #     export cells.
-    mcmc_results = None
+    _mcmc_run_status = None
+    set_mcmc_renderer(None)
+
+    set_mcmc_samples(None)
+    set_mcmc_labels(None)
+    set_mcmc_summary_df(None)
+    set_mcmc_corner_meta(None)
+    set_mcmc_bestfit_plot(None)
+    set_mcmc_sirocco_spectrum(None)
 
     if run_mcmc_btn.value:
-        set_mcmc_samples(None)
-        set_mcmc_labels(None)
-        set_mcmc_summary_df(None)
-        set_mcmc_corner_meta(None)
-        set_mcmc_bestfit_plot(None)
-        set_mcmc_sirocco_spectrum(None)
 
         _model = get_mle_model()
         _priors = get_mle_priors()
@@ -3917,6 +3922,7 @@ def _(
         def _friendly(internal_label):
             return mcmc_label_map.get(internal_label, internal_label)
 
+        _initial_model_point = dict(_model.get_param_dict(flat=True))
         with mo.status.spinner("Running MCMC..."):
             try:
                 import emcee as _emcee
@@ -4090,349 +4096,344 @@ def _(
                 _fig_burn_chain.suptitle("MCMC Chains (Post Burn-in)", y=1.02)
                 _fig_burn_chain.tight_layout()
 
-                # Summary table
-                _summary_df = _az.summary(_burn_data, round_to=5)
-                _summary_md = _summary_df.to_markdown()
-
-                # Persist the post-burn samples and summary table so the export cells
-                # can write files without rerunning the sampler.
-                set_mcmc_samples(_burn_samples_display.copy())
-                set_mcmc_labels(list(_friendly_labels))
-                set_mcmc_summary_df(_summary_df)
-
-                # Posterior distributions
-                _fig_posterior = _az.plot_posterior(
-                    _burn_data,
-                    var_names=_friendly_labels
-                )
-                _fig_post = _fig_posterior.ravel()[0].figure
-                _fig_post.suptitle("Posterior Distributions", y=1.02)
-                _fig_post.tight_layout()
-
-                # ============================================================
-                # Stage 18: Corner plot
-                # ============================================================
-                _corner_quantiles = [0.16, 0.5, 0.84]
-                _corner_levels = [0.6827, 0.9545, 0.9973]
-
-                # Corner-plot truths are matched through the same friendly-name map
-                # used elsewhere, with all inclination variants collapsed onto the
-                # single lookup-table "Inclination" key.
-                from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map
-                _truth_label_map = {
-                    int(_idx): _label
-                    for _idx, (_label, _sirocco_key) in _benchmark_param_map(
-                        grid_selector.value if grid_selector is not None else None
-                    ).items()
+                _fig_full_chain_html = mo.as_html(_fig_full_chain)
+                _fig_burn_chain_html = mo.as_html(_fig_burn_chain)
+                _plt.close(_fig_full_chain)
+                _plt.close(_fig_burn_chain)
+                from Speculate_addons.speculate_benchmark import evaluate_posterior_summaries
+                _frozen_values = {
+                    _key: float(_value) for _key, _value in _model.params.items()
+                    if _key not in _model.labels and np.ndim(_value) == 0
                 }
-
-                def _truth_key_for(_display_name, _internal_label):
-                    if "Inclination" in _display_name:
-                        return "Inclination"
-                    _internal_text = str(_internal_label)
-                    if _internal_text.startswith("param") and _internal_text[5:].isdigit():
-                        return _truth_label_map.get(int(_internal_text[5:]), _display_name)
-                    return _display_name
-
-                _truths = None
-                if ground_truth_params:
-                    _truths = []
-                    _has_any = False
-                    for _label in _model.labels:
-                        _gt_key = _truth_key_for(_friendly(_label), _label)
-                        if _gt_key in ground_truth_params:
-                            _truths.append(ground_truth_params[_gt_key])
-                            _has_any = True
-                        else:
-                            _truths.append(None)
-                    if not _has_any:
-                        _truths = None
-
-                # Shared corner-plot builder so every variant (auto-range,
-                # full-prior, and their marginalised versions) looks identical.
-                def _corner_fig(_data, _lbls, _tr, _rng=None):
-                    _kw = dict(
-                        labels=_lbls,
-                        show_titles=True,
-                        quantiles=_corner_quantiles,
-                        levels=_corner_levels,
-                        title_fmt=".4f",
-                        truths=_tr,
-                        truth_color="#ff4444",
-                        truth_kwargs={"linewidth": 2},
-                    )
-                    if _rng is not None:
-                        _kw["range"] = _rng
-                    _f = _corner.corner(_data, **_kw)
-                    for _axis in _f.axes:
-                        _axis.grid(False)
-                    return _f
-
-                _fig_corner = _corner_fig(_burn_samples_display, _friendly_labels, _truths)
-
-                # Prior-range corner plot: axes span the full prior support so
-                # the user can judge posterior breadth relative to the prior.
-                _prior_ranges = []
-                for _label in _model.labels:
-                    _pr = _priors.get(_label)
-                    if _pr is not None and hasattr(_pr, 'interval'):
-                        if getattr(getattr(_pr, 'dist', None), 'name', None) == 'norm':
-                            _lo = float(_pr.mean() - 4.0 * _pr.std())
-                            _hi = float(_pr.mean() + 4.0 * _pr.std())
-                        else:
-                            _lo, _hi = _pr.interval(1.0)
-                        if _label == 'log_scale':
-                            _d0 = _log_scale_to_distance_pc(_lo)
-                            _d1 = _log_scale_to_distance_pc(_hi)
-                            _prior_ranges.append((min(_d0, _d1), max(_d0, _d1)))
-                        else:
-                            _prior_ranges.append((_lo, _hi))
-                    else:
-                        _prior_ranges.append(None)
-
-                # Marginalised variants drop only the GP covariance and Chebyshev
-                # nuisance terms — physical grid parameters plus Av and Distance
-                # are kept.  Columns follow _model.labels / _friendly_labels order,
-                # so we pick the surviving columns by index.
-                _marginalise_hide = {
-                    "cheb:1", "cheb_1",
-                    "global_cov:log_amp", "GP log_amp",
-                    "global_cov:log_ls", "GP log_ls",
-                }
-                _keep_cols = [
-                    _ci for _ci in range(len(_friendly_labels))
-                    if str(_model.labels[_ci]) not in _marginalise_hide
-                    and str(_friendly_labels[_ci]) not in _marginalise_hide
-                ]
-                _has_nuisance = 0 < len(_keep_cols) < len(_friendly_labels)
-                _has_prior = any(_r is not None for _r in _prior_ranges)
-
-                # Assemble the available corner-plot tabs.  Marginalised tabs only
-                # appear when there is a nuisance term to drop.
-                _corner_tabs = {"Posterior (Auto Range)": _fig_corner}
-                _corner_variants = ["posterior_auto_range"]
-
-                if _has_prior:
-                    # Replace None entries with auto-range sentinel (corner uses 0.999 quantile)
-                    _safe_ranges = [_r if _r is not None else (1.0,) for _r in _prior_ranges]
-                    _corner_tabs["Full Prior Range"] = _corner_fig(
-                        _burn_samples_display, _friendly_labels, _truths, _safe_ranges
-                    )
-                    _corner_variants.append("full_prior_range")
-
-                if _has_nuisance:
-                    _marg_samples = _burn_samples_display[:, _keep_cols]
-                    _marg_labels = [_friendly_labels[_ci] for _ci in _keep_cols]
-                    _marg_truths = (
-                        [_truths[_ci] for _ci in _keep_cols] if _truths is not None else None
-                    )
-                    _corner_tabs["Marginalised (Auto Range)"] = _corner_fig(
-                        _marg_samples, _marg_labels, _marg_truths
-                    )
-                    _corner_variants.append("marginalised_auto_range")
-                    if _has_prior:
-                        _marg_ranges = [_safe_ranges[_ci] for _ci in _keep_cols]
-                        _corner_tabs["Marginalised (Full Prior Range)"] = _corner_fig(
-                            _marg_samples, _marg_labels, _marg_truths, _marg_ranges
-                        )
-                        _corner_variants.append("marginalised_full_prior_range")
-
-                _corner_display = (
-                    mo.ui.tabs(_corner_tabs) if len(_corner_tabs) > 1 else _fig_corner
+                from uuid import uuid4 as _uuid4
+                _run_id = str(_uuid4())
+                _posterior = evaluate_posterior_summaries(
+                    _model, _priors, _burn_samples, _friendly_labels,
+                    list(_model.labels), _frozen_values,
                 )
 
-                set_mcmc_corner_meta({
-                    "source": "inference",
-                    "data_name": getattr(_model, "data_name", None),
-                    "internal_labels": list(_model.labels),
-                    "truths": list(_truths) if _truths is not None else None,
-                    "ground_truth": dict(ground_truth_params or {}),
-                    "prior_ranges": [
-                        list(_r) if _r is not None else None
-                        for _r in _prior_ranges
-                    ],
-                    "plot_variants": list(_corner_variants),
-                    "corner_settings": {
-                        "show_titles": True,
-                        "quantiles": list(_corner_quantiles),
-                        "levels": list(_corner_levels),
-                        "title_fmt": ".4f",
-                    },
-                    "mcmc": {
-                        "nsteps": int(_nsteps),
-                        "nwalkers": int(_nwalkers),
-                        "manual_burnin": int(_burnin_manual),
-                        "auto_burnin": int(_auto_burnin),
-                        "burnin_used": int(_burnin_used),
-                        "thin_used": int(_thin_used),
-                        "effective_samples": int(_burn_samples.shape[0]),
-                    },
-                })
+                def _render_mcmc(_statistic):
+                    # Summary table
+                    from Speculate_addons.Spec_functions import posterior_arviz_summary
+                    _summary_df = posterior_arviz_summary(_burn_data, _statistic)
+                    _summary_md = _summary_df.to_markdown()
 
-                # ============================================================
-                # Stage 19: Best-fit MCMC model plot
-                # ============================================================
-                # Set model to posterior means (using internal labels)
-                _mcmc_means = {}
-                for _i, _label in enumerate(_model.labels):
-                    _mcmc_means[_label] = float(np.mean(_burn_samples[:, _i]))
-                _model.set_param_dict(_mcmc_means)
+                    # Persist the post-burn samples and summary table so the export cells
+                    # can write files without rerunning the sampler.
+                    set_mcmc_samples(_burn_samples_display.copy())
+                    set_mcmc_labels(list(_friendly_labels))
+                    set_mcmc_summary_df(_summary_df)
 
-                _mcmc_global = _model.params
-                _mcmc_distance_pc = 100.0
-                if 'log_scale' in _mcmc_global:
-                    _mcmc_distance_pc = float(_log_scale_to_distance_pc(_mcmc_global['log_scale']))
-                elif hasattr(_model, '_log_scale') and _model._log_scale is not None:
-                    _mcmc_distance_pc = float(_log_scale_to_distance_pc(_model._log_scale))
-                _mcmc_playground_payload = {
-                    "source": "inference_mcmc",
-                    "grid_name": grid_selector.value if grid_selector is not None else None,
-                    "phys": [float(_v) for _v in _model.grid_params],
-                    "Av": float(_mcmc_global.get('Av', 0.0)),
-                    "Distance (pc)": _mcmc_distance_pc,
-                    "cheb_1": float(_mcmc_global.get('cheb:1', 0.0)),
-                    "log_amp": float(_mcmc_global.get('global_cov:log_amp', -60.0)),
-                    "log_ls": float(_mcmc_global.get('global_cov:log_ls', 4.5)),
-                }
-
-                _plot_flux, _plot_cov = _model()
-                if hasattr(_plot_flux, 'detach'):
-                    _plot_flux = _plot_flux.detach().cpu().numpy()
-                if hasattr(_plot_cov, 'detach'):
-                    _plot_cov = _plot_cov.detach().cpu().numpy()
-                _plot_covariance_components = covariance_diagonal_components(
-                    _model,
-                    _plot_cov,
-                )
-                # Store only the arrays needed to rebuild the plot.  The
-                # downstream plot cell can then react to a completed Sirocco
-                # simulation without re-entering this MCMC sampling cell.
-                _fit_key = tuple(
-                    float(_mcmc_means[_label])
-                    for _label in _model.labels
-                )
-                _sirocco_transforms = {}
-                for _label in ("Av", "Rv", "log_scale"):
-                    if _label in _model.params:
-                        _sirocco_transforms[_label] = float(_model.params[_label])
-                if "Av" in _sirocco_transforms and "Rv" not in _sirocco_transforms:
-                    _sirocco_transforms["Rv"] = 3.1
-                _cheb_terms = []
-                _cheb_index = 1
-                while f"cheb:{_cheb_index}" in _model.params:
-                    _cheb_terms.append(float(_model.params[f"cheb:{_cheb_index}"]))
-                    _cheb_index += 1
-                if _cheb_terms:
-                    _sirocco_transforms["cheb"] = _cheb_terms
-
-                set_mcmc_bestfit_plot({
-                    "fit_key": _fit_key,
-                    "wavelength": np.asarray(_model.data.wave, dtype=np.float64),
-                    "data_flux": np.asarray(_model.data.flux, dtype=np.float64),
-                    "model_flux": np.asarray(_plot_flux, dtype=np.float64),
-                    "model_cov_diag": np.asarray(_plot_cov, dtype=np.float64),
-                    "covariance_components": {
-                        _key: np.asarray(_value, dtype=np.float64)
-                        for _key, _value in _plot_covariance_components.items()
-                    },
-                    "title": f"Best-Fit Model (MCMC Posterior Mean) — {_model.data_name}",
-                    "grid_params": np.asarray(_model.grid_params, dtype=np.float64),
-                    "transforms": _sirocco_transforms,
-                })
-
-                # ============================================================
-                # Results table with ground truth comparison
-                # ============================================================
-                _results_md = "### MCMC Parameter Estimates\n\n"
-                if _frozen_list:
-                    _results_md += f"**Frozen (not sampled):** {', '.join(_frozen_list)}\n\n"
-                _results_md += "| Parameter | Mean | Std | Median | "
-                if ground_truth_params:
-                    _results_md += "Truth | Δσ (median/std) |\n"
-                    _results_md += "|-----------|------|-----|--------|-------|----|\n"
-                else:
-                    _results_md += "\n|-----------|------|-----|--------|\n"
-
-                for _i, _label in enumerate(_model.labels):
-                    _display_name = _friendly(_label)
-                    _display_vals = _display_chain_values(
-                        _label, _burn_samples[:, _i]
+                    # Posterior distributions
+                    _fig_posterior = _az.plot_posterior(
+                        _burn_data,
+                        var_names=_friendly_labels, point_estimate=_statistic,
                     )
-                    _mean = np.mean(_display_vals)
-                    _std = np.std(_display_vals)
-                    _median = np.median(_display_vals)
+                    _fig_post = _fig_posterior.ravel()[0].figure
+                    _fig_post.suptitle("Posterior Distributions", y=1.02)
+                    _fig_post.tight_layout()
+                    _fig_post_html = mo.as_html(_fig_post)
+                    _plt.close(_fig_post)
 
-                    _results_md += f"| **{_display_name}** | {_mean:.4f} | {_std:.4f} | {_median:.4f} | "
+                    # ============================================================
+                    # Stage 18: Corner plot
+                    # ============================================================
+                    _corner_quantiles = [0.16, 0.84]
+                    _corner_levels = [0.6827, 0.9545, 0.9973]
 
+                    # Corner-plot truths are matched through the same friendly-name map
+                    # used elsewhere, with all inclination variants collapsed onto the
+                    # single lookup-table "Inclination" key.
+                    from Speculate_addons.grid_registry import benchmark_param_map as _benchmark_param_map
+                    _truth_label_map = {
+                        int(_idx): _label
+                        for _idx, (_label, _sirocco_key) in _benchmark_param_map(
+                            grid_selector.value if grid_selector is not None else None
+                        ).items()
+                    }
+
+                    def _truth_key_for(_display_name, _internal_label):
+                        if "Inclination" in _display_name:
+                            return "Inclination"
+                        _internal_text = str(_internal_label)
+                        if _internal_text.startswith("param") and _internal_text[5:].isdigit():
+                            return _truth_label_map.get(int(_internal_text[5:]), _display_name)
+                        return _display_name
+
+                    _truths = None
                     if ground_truth_params:
-                        _gt_key = _truth_key_for(_display_name, _label)
-                        if _gt_key in ground_truth_params:
-                            _gt_val = ground_truth_params[_gt_key]
-                            _delta_sigma = (_median - _gt_val) / _std if _std > 0 else 0
-                            _results_md += f"{_gt_val:.4f} | {_delta_sigma:+.2f}σ |\n"
+                        _truths = []
+                        _has_any = False
+                        for _label in _model.labels:
+                            _gt_key = _truth_key_for(_friendly(_label), _label)
+                            if _gt_key in ground_truth_params:
+                                _truths.append(ground_truth_params[_gt_key])
+                                _has_any = True
+                            else:
+                                _truths.append(None)
+                        if not _has_any:
+                            _truths = None
+
+                    # Shared corner-plot builder so every variant (auto-range,
+                    # full-prior, and their marginalised versions) looks identical.
+                    def _corner_fig(_data, _lbls, _tr, _rng=None):
+                        from Speculate_addons.Spec_functions import posterior_corner
+                        _fig = posterior_corner(_data, _lbls, _statistic, _tr, _rng)
+                        _html = mo.as_html(_fig)
+                        _plt.close(_fig)
+                        return _html
+
+                    _fig_corner = _corner_fig(_burn_samples_display, _friendly_labels, _truths)
+
+                    # Prior-range corner plot: axes span the full prior support so
+                    # the user can judge posterior breadth relative to the prior.
+                    _prior_ranges = []
+                    for _label in _model.labels:
+                        _pr = _priors.get(_label)
+                        if _pr is not None and hasattr(_pr, 'interval'):
+                            if getattr(getattr(_pr, 'dist', None), 'name', None) == 'norm':
+                                _lo = float(_pr.mean() - 4.0 * _pr.std())
+                                _hi = float(_pr.mean() + 4.0 * _pr.std())
+                            else:
+                                _lo, _hi = _pr.interval(1.0)
+                            if _label == 'log_scale':
+                                _d0 = _log_scale_to_distance_pc(_lo)
+                                _d1 = _log_scale_to_distance_pc(_hi)
+                                _prior_ranges.append((min(_d0, _d1), max(_d0, _d1)))
+                            else:
+                                _prior_ranges.append((_lo, _hi))
                         else:
-                            _results_md += "- | - |\n"
+                            _prior_ranges.append(None)
+
+                    # Marginalised variants drop only the GP covariance and Chebyshev
+                    # nuisance terms — physical grid parameters plus Av and Distance
+                    # are kept.  Columns follow _model.labels / _friendly_labels order,
+                    # so we pick the surviving columns by index.
+                    _marginalise_hide = {
+                        "cheb:1", "cheb_1",
+                        "global_cov:log_amp", "GP log_amp",
+                        "global_cov:log_ls", "GP log_ls",
+                    }
+                    _keep_cols = [
+                        _ci for _ci in range(len(_friendly_labels))
+                        if str(_model.labels[_ci]) not in _marginalise_hide
+                        and str(_friendly_labels[_ci]) not in _marginalise_hide
+                    ]
+                    _has_nuisance = 0 < len(_keep_cols) < len(_friendly_labels)
+                    _has_prior = any(_r is not None for _r in _prior_ranges)
+
+                    # Assemble the available corner-plot tabs.  Marginalised tabs only
+                    # appear when there is a nuisance term to drop.
+                    _corner_tabs = {"Posterior (Auto Range)": _fig_corner}
+                    _corner_variants = ["posterior_auto_range"]
+
+                    if _has_prior:
+                        # Replace None entries with auto-range sentinel (corner uses 0.999 quantile)
+                        _safe_ranges = [_r if _r is not None else (1.0,) for _r in _prior_ranges]
+                        _corner_tabs["Full Prior Range"] = _corner_fig(
+                            _burn_samples_display, _friendly_labels, _truths, _safe_ranges
+                        )
+                        _corner_variants.append("full_prior_range")
+
+                    if _has_nuisance:
+                        _marg_samples = _burn_samples_display[:, _keep_cols]
+                        _marg_labels = [_friendly_labels[_ci] for _ci in _keep_cols]
+                        _marg_truths = (
+                            [_truths[_ci] for _ci in _keep_cols] if _truths is not None else None
+                        )
+                        _corner_tabs["Marginalised (Auto Range)"] = _corner_fig(
+                            _marg_samples, _marg_labels, _marg_truths
+                        )
+                        _corner_variants.append("marginalised_auto_range")
+                        if _has_prior:
+                            _marg_ranges = [_safe_ranges[_ci] for _ci in _keep_cols]
+                            _corner_tabs["Marginalised (Full Prior Range)"] = _corner_fig(
+                                _marg_samples, _marg_labels, _marg_truths, _marg_ranges
+                            )
+                            _corner_variants.append("marginalised_full_prior_range")
+
+                    _corner_display = (
+                        mo.ui.tabs(_corner_tabs) if len(_corner_tabs) > 1 else _fig_corner
+                    )
+
+                    set_mcmc_corner_meta({
+                        "source": "inference",
+                        "summary_statistic": _statistic,
+                        "summary_space": "display",
+                        "summary_version": 1,
+                        "data_name": getattr(_model, "data_name", None),
+                        "internal_labels": list(_model.labels),
+                        "truths": list(_truths) if _truths is not None else None,
+                        "ground_truth": dict(ground_truth_params or {}),
+                        "prior_ranges": [
+                            list(_r) if _r is not None else None
+                            for _r in _prior_ranges
+                        ],
+                        "plot_variants": list(_corner_variants),
+                        "corner_settings": {
+                            "show_titles": False,
+                            "point_estimate": _statistic,
+                            "quantiles": list(_corner_quantiles),
+                            "levels": list(_corner_levels),
+                            "title_fmt": ".4f",
+                        },
+                        "mcmc": {
+                            "nsteps": int(_nsteps),
+                            "nwalkers": int(_nwalkers),
+                            "manual_burnin": int(_burnin_manual),
+                            "auto_burnin": int(_auto_burnin),
+                            "burnin_used": int(_burnin_used),
+                            "thin_used": int(_thin_used),
+                            "effective_samples": int(_burn_samples.shape[0]),
+                        },
+                    })
+
+                    # ============================================================
+                    # Stage 19: Best-fit MCMC model plot
+                    # ============================================================
+                    # Reuse the selected model evaluated once after sampling. No
+                    # mutable model or sampler is touched when the switch changes.
+                    _chosen = _posterior["posterior_models"][_statistic]
+                    _point = _chosen["parameters"]
+                    _mcmc_playground_payload = {
+                        "source": "inference_mcmc",
+                        "summary_statistic": _statistic,
+                        "grid_name": grid_selector.value if grid_selector is not None else None,
+                        "phys": _chosen["grid_params"],
+                        "Av": float(_point.get('Av', 0.0)),
+                        "Distance (pc)": float(_log_scale_to_distance_pc(_point.get('log_scale', 0.0))),
+                        "cheb_1": float(_point.get('cheb:1', 0.0)),
+                        "log_amp": float(_point.get('global_cov:log_amp', -60.0)),
+                        "log_ls": float(_point.get('global_cov:log_ls', 4.5)),
+                    }
+                    _spectrum = _chosen.get("spectrum")
+                    if _spectrum:
+                        set_mcmc_bestfit_plot({
+                            **_spectrum,
+                            "fit_key": (_run_id, _statistic, *sorted(_point.items())),
+                            "summary_statistic": _statistic,
+                            "summary_space": "display",
+                            "parameters": _point,
+                            "title": f"Model at posterior {_statistic} parameters — {_model.data_name}",
+                            "grid_params": _chosen["grid_params"],
+                            "transforms": _chosen.get("transforms", {}),
+                        })
                     else:
-                        _results_md += "\n"
+                        set_mcmc_bestfit_plot(None)
 
-                # ============================================================
-                # Assemble output with accordions
-                # ============================================================
-                _frozen_info = f", frozen: {', '.join(_frozen_list)}" if _frozen_list else ""
-                _status_callout = mo.callout(
-                    mo.md(
-                        f"{mo.icon('lucide:check-circle')} MCMC Complete! ({_nsteps} steps, "
-                        f"{_nwalkers} walkers, burn-in {_burnin_used}, thin {_thin_used}"
-                        f"{_frozen_info})"
-                    ),
-                    kind="success"
-                )
+                    # ============================================================
+                    # Results table with ground truth comparison
+                    # ============================================================
+                    from Speculate_addons.Spec_functions import posterior_summary_rows
+                    _truths_for_table = {
+                        _friendly(_label): ground_truth_params[_truth_key_for(_friendly(_label), _label)]
+                        for _label in _model.labels
+                        if _truth_key_for(_friendly(_label), _label) in (ground_truth_params or {})
+                    }
+                    _results_md = f"### MCMC Parameter Estimates — {_statistic.title()}\n\n"
+                    if _frozen_list:
+                        _results_md += f"**Frozen (not sampled):** {', '.join(_frozen_list)}\n\n"
+                    _results_table = mo.ui.table(
+                        posterior_summary_rows(_posterior["summary"], _statistic, _truths_for_table),
+                        selection=None,
+                    )
 
-                def _send_mcmc_to_playground(_):
-                    set_inf_playground_target(_mcmc_playground_payload)
-                    mo.status.toast("Loaded MCMC posterior mean into the Parameter Playground")
+                    # ============================================================
+                    # Assemble output with accordions
+                    # ============================================================
+                    _frozen_info = f", frozen: {', '.join(_frozen_list)}" if _frozen_list else ""
+                    _status_callout = mo.callout(
+                        mo.md(
+                            f"{mo.icon('lucide:check-circle')} MCMC Complete! ({_nsteps} steps, "
+                            f"{_nwalkers} walkers, burn-in {_burnin_used}, thin {_thin_used}"
+                            f"{_frozen_info})"
+                        ),
+                        kind="success"
+                    )
 
-                # This button must have a public cell name for Marimo to keep
-                # the state-updating callback registered after MCMC completes.
-                mcmc_playground_export_button = mo.ui.button(
-                    label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
-                    on_click=_send_mcmc_to_playground,
-                    kind="success",
-                )
+                    def _send_mcmc_to_playground(_):
+                        set_inf_playground_target(_mcmc_playground_payload)
+                        mo.status.toast(f"Loaded MCMC posterior {_statistic} into the Parameter Playground")
 
-                _chain_accordion = mo.accordion({
-                    f"{mo.icon('lucide:link')} Raw MCMC Chains (Full)": mo.vstack([
-                        mo.md("Walker traces for all parameters before burn-in removal."),
-                        _fig_full_chain
-                    ]),
-                    f"{mo.icon('lucide:flame')} Burnt MCMC Chains (Post Burn-in)": mo.vstack([
-                        mo.md(_burnin_info),
-                        _fig_burn_chain
-                    ]),
-                    f"{mo.icon('lucide:chart-bar')} Posterior Distributions": mo.vstack([
-                        _fig_post
-                    ]),
-                    f"{mo.icon('lucide:clipboard-list')} Arviz Summary Statistics": mo.vstack([
-                        mo.md(_summary_md)
-                    ]),
-                })
+                    # This button must have a public cell name for Marimo to keep
+                    # the state-updating callback registered after MCMC completes.
+                    mcmc_playground_export_button = mo.ui.button(
+                        label=f"{mo.icon('lucide:sliders-horizontal')} Export to Parameter Playground",
+                        on_click=_send_mcmc_to_playground,
+                        kind="success",
+                    )
 
-                mcmc_results = mo.vstack([
-                    _status_callout,
-                    mcmc_playground_export_button,
-                    mo.md(_results_md),
-                    _chain_accordion,
-                    mo.md("### Corner Plot"),
-                    _corner_display,
-                ])
+                    _chain_accordion = mo.accordion({
+                        f"{mo.icon('lucide:link')} Raw MCMC Chains (Full)": mo.vstack([
+                            mo.md("Walker traces for all parameters before burn-in removal."),
+                            _fig_full_chain_html
+                        ]),
+                        f"{mo.icon('lucide:flame')} Burnt MCMC Chains (Post Burn-in)": mo.vstack([
+                            mo.md(_burnin_info),
+                            _fig_burn_chain_html
+                        ]),
+                        f"{mo.icon('lucide:chart-bar')} Posterior Distributions": mo.vstack([
+                            _fig_post_html
+                        ]),
+                        f"{mo.icon('lucide:clipboard-list')} Arviz Summary Statistics": mo.vstack([
+                            mo.md(_summary_md)
+                        ]),
+                    })
+
+                    mcmc_results = mo.vstack([
+                        _status_callout,
+                        mcmc_playground_export_button,
+                        mo.md(_results_md),
+                        _results_table,
+                        mo.md(_chosen.get("error", "")),
+                        _chain_accordion,
+                        mo.md("### Corner Plot"),
+                        _corner_display,
+                    ])
+
+                    return mcmc_results, mcmc_playground_export_button
+
+                _model.set_param_dict(_initial_model_point)
+                set_mcmc_renderer(lambda _: _render_mcmc)
 
             except Exception as _e:
+                _model.set_param_dict(_initial_model_point)
                 import traceback as _traceback
                 _tb = _traceback.format_exc()
-                mcmc_results = mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} MCMC Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
+                _mcmc_run_status = mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} MCMC Failed: {str(_e)}\n\n```\n{_tb}\n```"), kind="danger")
 
-    mcmc_results if mcmc_results else mo.md("*Configure and run MCMC after MLE*")
+    _mcmc_run_status if _mcmc_run_status else mo.md("")
     return
+
+
+@app.cell
+def _(mo):
+    # Let the switch refresh its own label while keeping the selected summary.
+    get_mcmc_report_means, set_mcmc_report_means = mo.state(False, allow_self_loops=True)
+    return get_mcmc_report_means, set_mcmc_report_means
+
+
+@app.cell
+def _(get_mcmc_report_means, mo, set_mcmc_report_means):
+    _means = get_mcmc_report_means()
+    mcmc_summary_switch = mo.ui.switch(
+        value=_means,
+        label=f"Report posterior {'means' if _means else 'medians'}",
+        on_change=set_mcmc_report_means,
+    )
+    mcmc_summary_switch
+    return (mcmc_summary_switch,)
+
+
+@app.cell
+def _(get_mcmc_renderer, mcmc_summary_switch, mo):
+    _render = get_mcmc_renderer()
+    mo.stop(_render is None, mo.md("*Configure and run MCMC after MLE*"))
+    mcmc_results, mcmc_playground_export_button = _render(
+        "mean" if mcmc_summary_switch.value else "median"
+    )
+    mcmc_results
+    return (mcmc_playground_export_button,)
 
 
 @app.cell
@@ -4443,7 +4444,7 @@ def _(
     get_mcmc_sirocco_spectrum,
     mo,
 ):
-    """Render the posterior-mean plot independently of the MCMC run cell."""
+    """Render the selected posterior model without entering the sampling cell."""
     _plot = get_mcmc_bestfit_plot()
     if _plot is None:
         mo.stop(True, mo.md(""))
@@ -4474,7 +4475,7 @@ def _(
         extra_flux_series=_extra_series,
     )
     mo.vstack([
-        mo.md("### Best-Fit Model (MCMC Posterior Mean)"),
+        mo.md(f"### Model at posterior {_plot['summary_statistic']} parameters"),
         _bestfit_chart,
     ])
     return
@@ -4515,30 +4516,246 @@ def _(mo, os):
 
 
 @app.cell(hide_code=True)
+def _(mo):
+    export_dir_input = mo.ui.text(value="exports", label="Output directory")
+    get_mcmc_export_status, set_mcmc_export_status = mo.state("")
+    return export_dir_input, get_mcmc_export_status, set_mcmc_export_status
+
+
+@app.cell
 def _(
     emu,
-    get_mcmc_labels,
+    export_dir_input,
+    get_mcmc_bestfit_plot,
     get_mcmc_corner_meta,
+    get_mcmc_labels,
     get_mcmc_samples,
     get_mcmc_summary_df,
     get_mle_model,
+    grid_selector,
     inference_sirocco_cpu_slider,
     mo,
     np,
+    obs_flux_scale,
     os,
+    set_mcmc_sirocco_spectrum,
+    set_mcmc_export_status,
 ):
+    import time as _time
     _samples = get_mcmc_samples()
     _labels = get_mcmc_labels()
     _summary_df = get_mcmc_summary_df()
+    _corner_meta = get_mcmc_corner_meta()
     _model = get_mle_model()
+    _out_dir = export_dir_input.value or "exports"
+
+    # Side effects run only inside explicit click callbacks. Rebuilding this
+    # cell after a mean/median change cannot export or launch a simulation,
+    # including when the notebook uses lazy execution.
+    def _perform_export(_action):
+        _ts = _time.strftime("%Y%m%d_%H%M%S")
+        _msg = ""
+
+        def _summary_to_dict(_df):
+            if _df is None:
+                return None
+            _summary = {}
+            for _idx_name in _df.index:
+                _row = _df.loc[_idx_name]
+                _summary[str(_idx_name)] = {
+                    k: float(v) for k, v in _row.items() if np.isfinite(v)
+                }
+            return _summary
+
+        _summary_dict = _summary_to_dict(_summary_df)
+
+        def _write_mcmc_pf(_pf_path):
+            """Export the same selected parameter vector used by the spectrum plot."""
+            from Speculate_addons.speculate_benchmark import (
+                export_pf_template as _export_pf_template,
+                internal_to_friendly as _internal_to_friendly,
+                resolve_sirocco_observer_angle as _resolve_sirocco_observer_angle,
+            )
+
+            os.makedirs(os.path.dirname(_pf_path) or ".", exist_ok=True)
+            _plot_payload = get_mcmc_bestfit_plot() or {}
+            if not _plot_payload:
+                raise ValueError("The selected posterior model is unavailable.")
+            _grid_means = np.asarray(
+                _plot_payload["grid_params"],
+                dtype=np.float64,
+            )
+            _friendly_grid = _internal_to_friendly(
+                emu.param_names,
+                grid_selector.value,
+            )
+
+            # Frozen grid parameters do not have MCMC columns.  Add uncertainty
+            # annotations only for axes that were actually sampled.
+            _uncertainties = {}
+            for _friendly_label in _friendly_grid:
+                if _friendly_label not in (_labels or []):
+                    continue
+                _sample_index = list(_labels).index(_friendly_label)
+                _uncertainties[_friendly_label] = (
+                    float(np.percentile(_samples[:, _sample_index], 16)),
+                    float(np.percentile(_samples[:, _sample_index], 84)),
+                )
+
+            # Nuisance values are annotations in the parameter file; physical
+            # transformations are applied separately to the returned spectrum.
+            _global = {
+                _key: _value for _key, _value in _plot_payload["parameters"].items()
+                if _key not in emu.param_names and not _key.startswith("local_cov")
+            }
+
+            _observer_angle = _resolve_sirocco_observer_angle(
+                emu,
+                _grid_means,
+                grid_selector.value,
+            )
+            _export_pf_template(
+                emu,
+                _grid_means,
+                _pf_path,
+                uncertainties=_uncertainties,
+                global_params=_global,
+                grid_name=grid_selector.value,
+                observer_angles=[_observer_angle],
+                summary_statistic=_plot_payload["summary_statistic"],
+            )
+            return _plot_payload
+
+        if _action == "pf" and _model is not None and _samples is not None:
+            try:
+                _pf_path = os.path.join(_out_dir, f"speculate_export_{_ts}.pf")
+                _write_mcmc_pf(_pf_path)
+                _msg += f"{mo.icon('lucide:check-circle')} .pf template exported to `{_pf_path}`\n\n"
+            except Exception as _e:
+                _msg += f"{mo.icon('lucide:x-circle')} .pf export failed: {_e}\n\n"
+
+        if (
+            _action == "sirocco"
+            and inference_sirocco_cpu_slider is not None
+            and _model is not None
+            and _samples is not None
+        ):
+            try:
+                from Speculate_addons.speculate_benchmark import (
+                    check_sirocco_runtime as _check_sirocco_runtime,
+                    run_sirocco_model_spectrum as _run_sirocco_model_spectrum,
+                )
+
+                _sirocco_cpus = int(inference_sirocco_cpu_slider.value)
+                _runtime = _check_sirocco_runtime(_sirocco_cpus)
+                if not _runtime["ok"]:
+                    raise RuntimeError(
+                        "Missing Sirocco runtime command(s): "
+                        + ", ".join(_runtime["missing"])
+                    )
+
+                import tempfile as _tempfile
+
+                os.makedirs(_out_dir, exist_ok=True)
+                _run_dir = _tempfile.mkdtemp(
+                    prefix=f"speculate_sirocco_{_ts}_",
+                    dir=_out_dir,
+                )
+                _pf_path = os.path.join(
+                    _run_dir,
+                    f"speculate_sirocco_{_ts}.pf",
+                )
+                _plot_payload = _write_mcmc_pf(_pf_path)
+                _wavelength = np.asarray(_plot_payload["wavelength"], dtype=np.float64)
+
+                with mo.status.spinner(
+                    title=f"Running Sirocco model with {_sirocco_cpus} CPU(s)..."
+                ) as _spinner:
+                    def _progress(_event):
+                        _spinner.update(_event.get("message", "Running Sirocco model..."))
+
+                    _sirocco_result = _run_sirocco_model_spectrum(
+                        _pf_path,
+                        (float(np.min(_wavelength)), float(np.max(_wavelength))),
+                        # Use the fitted model's space rather than a live
+                        # observation-preprocessing selector.
+                        flux_scale=str(
+                            getattr(_model, "flux_scale", obs_flux_scale.value)
+                        ),
+                        transforms=_plot_payload.get("transforms"),
+                        smoothing=(
+                            "_smooth"
+                            in os.path.basename(
+                                str(getattr(emu, "name", ""))
+                            ).lower()
+                        ),
+                        cpus=_sirocco_cpus,
+                        progress_callback=_progress,
+                    )
+
+                _sirocco_result["fit_key"] = tuple(_plot_payload.get("fit_key", ()))
+                set_mcmc_sirocco_spectrum(_sirocco_result)
+                _msg += (
+                    f"{mo.icon('lucide:check-circle')} Sirocco model completed and "
+                    f"was added to the MCMC best-fit plot using "
+                    f"**{_sirocco_cpus} CPU(s)**. Output: "
+                    f"`{_sirocco_result['sirocco_spec_path']}`\n\n"
+                )
+            except Exception as _e:
+                _msg += f"{mo.icon('lucide:x-circle')} Sirocco run failed: {_e}\n\n"
+
+        if _action == "csv" and _samples is not None:
+            try:
+                from Speculate_addons.speculate_benchmark import export_posterior_csv
+
+                os.makedirs(_out_dir, exist_ok=True)
+
+                _csv_path = os.path.join(_out_dir, f"speculate_posterior_{_ts}.csv")
+                export_posterior_csv(
+                    _samples, _labels, _csv_path, summary=_summary_dict,
+                    summary_statistic=(_corner_meta or {}).get("summary_statistic"),
+                )
+                _msg += f"{mo.icon('lucide:check-circle')} Posterior CSV exported to `{_csv_path}`\n\n"
+            except Exception as _e:
+                _msg += f"{mo.icon('lucide:x-circle')} CSV export failed: {_e}\n\n"
+
+        if _action == "corner" and _samples is not None:
+            try:
+                from Speculate_addons.speculate_benchmark import export_cornerplot_data
+
+                os.makedirs(_out_dir, exist_ok=True)
+                _corner_labels = _labels or [
+                    f"param_{_i}" for _i in range(_samples.shape[1])
+                ]
+                _record = dict(_corner_meta or {})
+                _record.update({
+                    "source": "inference",
+                    "record_id": f"inference_{_ts}",
+                    "samples": _samples,
+                    "labels": _corner_labels,
+                    "summary": _summary_dict,
+                })
+                _export = export_cornerplot_data(
+                    _record,
+                    _out_dir,
+                    bundle_name=f"speculate_cornerplot_{_ts}",
+                    manifest_metadata={"source": "inference"},
+                )
+                _msg += (
+                    f"{mo.icon('lucide:check-circle')} Cornerplot data exported to "
+                    f"`{_export['bundle_dir']}`\n\n"
+                )
+            except Exception as _e:
+                _msg += f"{mo.icon('lucide:x-circle')} Cornerplot export failed: {_e}\n\n"
+
+        set_mcmc_export_status(_msg)
 
     # Widgets must be defined unconditionally so the downstream export cell never
     # receives an undefined reference — mo.stop() would prevent their creation if
     # they were placed after it.
-    export_pf_btn = mo.ui.run_button(label=f"{mo.icon('lucide:file-text')} Export .pf Template", kind="success")
-    export_csv_btn = mo.ui.run_button(label=f"{mo.icon('lucide:chart-bar')} Export Posterior CSV", kind="success")
-    export_corner_btn = mo.ui.run_button(label=f"{mo.icon('lucide:download')} Export Cornerplot Data", kind="success")
-    export_dir_input = mo.ui.text(value="exports", label="Output directory")
+    export_pf_btn = mo.ui.button(on_click=lambda _: _perform_export("pf"),label=f"{mo.icon('lucide:file-text')} Export .pf Template", kind="success")
+    export_csv_btn = mo.ui.button(on_click=lambda _: _perform_export("csv"),label=f"{mo.icon('lucide:chart-bar')} Export Posterior CSV", kind="success")
+    export_corner_btn = mo.ui.button(on_click=lambda _: _perform_export("corner"),label=f"{mo.icon('lucide:download')} Export Cornerplot Data", kind="success")
 
     run_sirocco_model_btn = None
     _button_row = [export_pf_btn]
@@ -4563,12 +4780,12 @@ def _(
         _sirocco_missing = ", ".join(
             _inference_sirocco_runtime.get("missing", [])
         )
-        run_sirocco_model_btn = mo.ui.run_button(
+        run_sirocco_model_btn = mo.ui.button(on_click=lambda _: _perform_export("sirocco"),
             label=f"{mo.icon('lucide:wind')} Run Sirocco Model",
             kind="success" if _inference_sirocco_runtime["ok"] else "danger",
             disabled=not _inference_sirocco_runtime["ok"],
             tooltip=(
-                "Run the MCMC posterior-mean model through Sirocco"
+                "Run the selected MCMC summary model through Sirocco"
                 if _inference_sirocco_runtime["ok"]
                 else f"Sirocco is unavailable; missing: {_sirocco_missing}"
             ),
@@ -4607,247 +4824,13 @@ def _(
         mo.hstack(_button_row, gap=1, align="end"),
         *_runtime_notes,
     ])
-    return (
-        export_corner_btn,
-        export_csv_btn,
-        export_dir_input,
-        export_pf_btn,
-        run_sirocco_model_btn,
-    )
+    return export_corner_btn, export_csv_btn, export_pf_btn, run_sirocco_model_btn
 
 
-@app.cell
-def _(
-    emu,
-    export_corner_btn,
-    export_csv_btn,
-    export_dir_input,
-    export_pf_btn,
-    get_mcmc_bestfit_plot,
-    get_mcmc_corner_meta,
-    get_mcmc_labels,
-    get_mcmc_samples,
-    get_mcmc_summary_df,
-    get_mle_model,
-    grid_selector,
-    inference_sirocco_cpu_slider,
-    mo,
-    np,
-    obs_flux_scale,
-    os,
-    run_sirocco_model_btn,
-    set_mcmc_sirocco_spectrum,
-):
-    import time as _time
-    _samples = get_mcmc_samples()
-    _labels = get_mcmc_labels()
-    _summary_df = get_mcmc_summary_df()
-    _corner_meta = get_mcmc_corner_meta()
-    _model = get_mle_model()
-    _out_dir = export_dir_input.value or "exports"
-    _ts = _time.strftime("%Y%m%d_%H%M%S")
-
-    _msg = ""
-
-    def _summary_to_dict(_df):
-        if _df is None:
-            return None
-        _summary = {}
-        for _idx_name in _df.index:
-            _row = _df.loc[_idx_name]
-            _summary[str(_idx_name)] = {
-                k: float(v) for k, v in _row.items() if np.isfinite(v)
-            }
-        return _summary
-
-    _summary_dict = _summary_to_dict(_summary_df)
-
-    def _write_mcmc_pf(_pf_path):
-        """Write one posterior-mean `.pf` shared by export and model runs."""
-        from Speculate_addons.speculate_benchmark import (
-            export_pf_template as _export_pf_template,
-            internal_to_friendly as _internal_to_friendly,
-            resolve_sirocco_observer_angle as _resolve_sirocco_observer_angle,
-        )
-
-        os.makedirs(os.path.dirname(_pf_path) or ".", exist_ok=True)
-        _plot_payload = get_mcmc_bestfit_plot() or {}
-        _grid_means = np.asarray(
-            _plot_payload.get("grid_params", _model.grid_params),
-            dtype=np.float64,
-        )
-        _friendly_grid = _internal_to_friendly(
-            emu.param_names,
-            grid_selector.value,
-        )
-
-        # Frozen grid parameters do not have MCMC columns.  Add uncertainty
-        # annotations only for axes that were actually sampled.
-        _uncertainties = {}
-        for _friendly_label in _friendly_grid:
-            if _friendly_label not in (_labels or []):
-                continue
-            _sample_index = list(_labels).index(_friendly_label)
-            _uncertainties[_friendly_label] = (
-                float(np.percentile(_samples[:, _sample_index], 16)),
-                float(np.percentile(_samples[:, _sample_index], 84)),
-            )
-
-        # Nuisance values are annotations in the parameter file; physical
-        # transformations are applied separately to the returned spectrum.
-        _global = {}
-        for _sample_index, _label in enumerate(_labels or []):
-            if _label not in _friendly_grid:
-                _global[_label] = float(np.mean(_samples[:, _sample_index]))
-
-        _observer_angle = _resolve_sirocco_observer_angle(
-            emu,
-            _grid_means,
-            grid_selector.value,
-        )
-        _export_pf_template(
-            emu,
-            _grid_means,
-            _pf_path,
-            uncertainties=_uncertainties,
-            global_params=_global,
-            grid_name=grid_selector.value,
-            observer_angles=[_observer_angle],
-        )
-        return _plot_payload
-
-    if export_pf_btn.value and _model is not None and _samples is not None:
-        try:
-            _pf_path = os.path.join(_out_dir, f"speculate_export_{_ts}.pf")
-            _write_mcmc_pf(_pf_path)
-            _msg += f"{mo.icon('lucide:check-circle')} .pf template exported to `{_pf_path}`\n\n"
-        except Exception as _e:
-            _msg += f"{mo.icon('lucide:x-circle')} .pf export failed: {_e}\n\n"
-
-    if (
-        run_sirocco_model_btn is not None
-        and run_sirocco_model_btn.value
-        and inference_sirocco_cpu_slider is not None
-        and _model is not None
-        and _samples is not None
-    ):
-        try:
-            from Speculate_addons.speculate_benchmark import (
-                check_sirocco_runtime as _check_sirocco_runtime,
-                run_sirocco_model_spectrum as _run_sirocco_model_spectrum,
-            )
-
-            _sirocco_cpus = int(inference_sirocco_cpu_slider.value)
-            _runtime = _check_sirocco_runtime(_sirocco_cpus)
-            if not _runtime["ok"]:
-                raise RuntimeError(
-                    "Missing Sirocco runtime command(s): "
-                    + ", ".join(_runtime["missing"])
-                )
-
-            import tempfile as _tempfile
-
-            os.makedirs(_out_dir, exist_ok=True)
-            _run_dir = _tempfile.mkdtemp(
-                prefix=f"speculate_sirocco_{_ts}_",
-                dir=_out_dir,
-            )
-            _pf_path = os.path.join(
-                _run_dir,
-                f"speculate_sirocco_{_ts}.pf",
-            )
-            _plot_payload = _write_mcmc_pf(_pf_path)
-            _wavelength = np.asarray(_plot_payload["wavelength"], dtype=np.float64)
-
-            with mo.status.spinner(
-                title=f"Running Sirocco model with {_sirocco_cpus} CPU(s)..."
-            ) as _spinner:
-                def _progress(_event):
-                    _spinner.update(_event.get("message", "Running Sirocco model..."))
-
-                _sirocco_result = _run_sirocco_model_spectrum(
-                    _pf_path,
-                    (float(np.min(_wavelength)), float(np.max(_wavelength))),
-                    # Use the fitted model's space rather than a live
-                    # observation-preprocessing selector.
-                    flux_scale=str(
-                        getattr(_model, "flux_scale", obs_flux_scale.value)
-                    ),
-                    transforms=_plot_payload.get("transforms"),
-                    smoothing=(
-                        "_smooth"
-                        in os.path.basename(
-                            str(getattr(emu, "name", ""))
-                        ).lower()
-                    ),
-                    cpus=_sirocco_cpus,
-                    progress_callback=_progress,
-                )
-
-            _sirocco_result["fit_key"] = tuple(_plot_payload.get("fit_key", ()))
-            set_mcmc_sirocco_spectrum(_sirocco_result)
-            _msg += (
-                f"{mo.icon('lucide:check-circle')} Sirocco model completed and "
-                f"was added to the MCMC best-fit plot using "
-                f"**{_sirocco_cpus} CPU(s)**. Output: "
-                f"`{_sirocco_result['sirocco_spec_path']}`\n\n"
-            )
-        except Exception as _e:
-            _msg += f"{mo.icon('lucide:x-circle')} Sirocco run failed: {_e}\n\n"
-
-    if export_csv_btn.value and _samples is not None:
-        try:
-            from Speculate_addons.speculate_benchmark import export_posterior_csv
-
-            os.makedirs(_out_dir, exist_ok=True)
-
-            _csv_path = os.path.join(_out_dir, f"speculate_posterior_{_ts}.csv")
-            export_posterior_csv(_samples, _labels, _csv_path, summary=_summary_dict)
-            _msg += f"{mo.icon('lucide:check-circle')} Posterior CSV exported to `{_csv_path}`\n\n"
-        except Exception as _e:
-            _msg += f"{mo.icon('lucide:x-circle')} CSV export failed: {_e}\n\n"
-
-    if export_corner_btn.value and _samples is not None:
-        try:
-            from Speculate_addons.speculate_benchmark import export_cornerplot_data
-
-            os.makedirs(_out_dir, exist_ok=True)
-            _corner_labels = _labels or [
-                f"param_{_i}" for _i in range(_samples.shape[1])
-            ]
-            _record = dict(_corner_meta or {})
-            _record.update({
-                "source": "inference",
-                "record_id": f"inference_{_ts}",
-                "samples": _samples,
-                "labels": _corner_labels,
-                "summary": _summary_dict,
-            })
-            _export = export_cornerplot_data(
-                _record,
-                _out_dir,
-                bundle_name=f"speculate_cornerplot_{_ts}",
-                manifest_metadata={"source": "inference"},
-            )
-            _msg += (
-                f"{mo.icon('lucide:check-circle')} Cornerplot data exported to "
-                f"`{_export['bundle_dir']}`\n\n"
-            )
-        except Exception as _e:
-            _msg += f"{mo.icon('lucide:x-circle')} Cornerplot export failed: {_e}\n\n"
-
-    # Keep the status callout as the cell's rendered expression.  This makes
-    # long Sirocco runs and export failures visibly resolve in the notebook,
-    # instead of relying on an imperative output replacement at cell teardown.
-    _result_output = (
-        mo.callout(
-            mo.md(_msg),
-            kind="danger" if "failed:" in _msg.lower() else "success",
-        )
-        if _msg
-        else mo.md("")
-    )
-    _result_output
+@app.cell(hide_code=True)
+def _(get_mcmc_export_status, mo):
+    _message = get_mcmc_export_status()
+    mo.callout(mo.md(_message), kind="danger" if "failed:" in _message.lower() else "success") if _message else mo.md("")
     return
 
 
