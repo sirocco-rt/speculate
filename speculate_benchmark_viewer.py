@@ -3099,19 +3099,16 @@ def _(glob, mo, os):
 
 
 @app.cell(hide_code=True)
-def _(emu_picker, glob, mo, os):
-    """Show bundled observations compatible with the selected emulator family."""
+def _(emu_picker, mo, os):
+    """List the same CSV/TXT observations accepted by the fitting notebooks."""
     from Speculate_addons.grid_registry import infer_grid_name as _infer_grid_name
+    from Speculate_addons.observation_files import list_observation_files as _list_observation_files
     from Speculate_addons.observation_priors import filter_observation_files_for_grid as _filter_observation_files_for_grid
 
     _grid_name = _infer_grid_name(emu_picker.value)
-    _obs_csvs = sorted(glob.glob("observation_files/*.csv"))
-    _compatible_obs_csvs = _filter_observation_files_for_grid(_obs_csvs, _grid_name)
+    _obs_files = _filter_observation_files_for_grid(_list_observation_files(), _grid_name)
     obs_picker = mo.ui.multiselect(
-        options=dict(zip(
-            [os.path.basename(_file) for _file in _compatible_obs_csvs],
-            _compatible_obs_csvs,
-        )) if _compatible_obs_csvs else {},
+        options={_file: os.path.join("observation_files", _file) for _file in _obs_files},
         label="Observations (Tier 3)",
     )
     return (obs_picker,)

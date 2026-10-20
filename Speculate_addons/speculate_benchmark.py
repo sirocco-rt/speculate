@@ -3298,6 +3298,9 @@ def run_tier3_single(
 
     Parameters
     ----------
+    obs_csv : str
+        Path to a CSV or TXT observation table using the same format as the
+        fitting notebooks. The parameter name is retained for existing callers.
     grid_name : str
         Grid identifier (e.g. ``speculate_cv_bl_grid_v87f``) used to select
         the correct Sirocco template for .pf export. Strict Tier 3 runs require
@@ -3360,9 +3363,10 @@ def run_tier3_single(
             missing = ", ".join(runtime["missing"])
             raise RuntimeError(f"Tier 3 requires Sirocco runtime command(s): {missing}")
 
-    # Load observation
-    df = pd.read_csv(obs_csv)
-    df.columns = [c.strip().lower() for c in df.columns]
+    # Load observations with the same format rules used by every notebook.
+    from Speculate_addons.observation_files import read_observation_file
+
+    df = read_observation_file(obs_csv)
     wl = np.array(df["wavelength"])
     flux = np.array(df["flux"])
     if "error" in df.columns:

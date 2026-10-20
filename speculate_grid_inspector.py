@@ -519,62 +519,29 @@ def _(mo):
 
 
 @app.cell
-def _(mo):
+def _(mo, set_obs_refresh):
     # File upload for observational spectra
-    obs_file_uploader = mo.ui.file(
-        kind="area",
-        label="**Drag and drop a new observational spectra (CSV)**",
-        multiple=False
+    from Speculate_addons.observation_files import (
+        build_observation_uploader as _build_observation_uploader,
+        build_observation_upload_ui as _build_observation_upload_ui,
     )
 
-    file_upload_ui = mo.vstack([
-         obs_file_uploader,
-         mo.md("<center><small>Format: CSV with headers `WAVELENGTH`, `FLUX`, and optionally `ERROR`</small></center>")
-    ])
+    obs_file_uploader = _build_observation_uploader(mo, set_obs_refresh)
+    file_upload_ui = _build_observation_upload_ui(mo, obs_file_uploader)
     return file_upload_ui, obs_file_uploader
 
 
 @app.cell
-def _(mo, obs_file_uploader, os, set_obs_refresh):
-    # Handle file upload
-    if obs_file_uploader.value:
-        save_dir = "observation_files"
-        os.makedirs(save_dir, exist_ok=True)
-
-        files = obs_file_uploader.value
-        # Check if it's a single file (has 'name' attribute) or a list/tuple
-        if hasattr(files, "name"):
-            files = [files]
-
-        for file in files:
-            save_path = os.path.join(save_dir, file.name)
-            with open(save_path, "wb") as file_handle:
-                file_handle.write(file.contents)
-            mo.md(f"{mo.icon('lucide:check-circle')} Uploaded `{file.name}` to `{save_dir}`")
-
-        # Trigger refresh of the file list
-        set_obs_refresh(lambda v: v + 1)
-    return
-
-
-@app.cell
-def _(get_obs_refresh, obs_file_uploader, os, selected_grid):
+def _(get_obs_refresh, selected_grid):
     # Build the observation list for the active production or test grid.  Only
     # bundled AGN:/CV: demonstrations are family-restricted; user uploads with
     # ordinary filenames remain available for every grid.
-    import glob
+    from Speculate_addons.observation_files import list_observation_files as _list_observation_files
     from Speculate_addons.observation_priors import filter_observation_files_for_grid as _filter_observation_files_for_grid
 
     # Trigger refresh on upload or delete
-    _ = obs_file_uploader.value
     _ = get_obs_refresh()
-
-    obs_dir = "observation_files"
-    if os.path.exists(obs_dir):
-        obs_files = sorted([os.path.basename(f) for f in glob.glob(os.path.join(obs_dir, "*.csv"))])
-        obs_files = _filter_observation_files_for_grid(obs_files, selected_grid)
-    else:
-        obs_files = []
+    obs_files = _filter_observation_files_for_grid(_list_observation_files(), selected_grid)
     return (obs_files,)
 
 
@@ -590,34 +557,31 @@ def _(mo, obs_files):
 
 
 @app.cell
-def _(mo, obs_file_selector, os, set_obs_refresh):
-    # Select observational spectrum - Delete Action
-    def delete_selected_file():
-        protected_files = [
-            "CV:ixvel_all.csv", 
-            "CV:rwsex_all.csv", 
-            "CV:rwtri_dered.csv", 
-            "CV:uxuma_all.csv", 
-            "CV:v3885sgr_all.csv"
-        ]
+def _(mo, obs_file_selector, set_obs_refresh):
+    from Speculate_addons.observation_files import delete_uploaded_observation as _delete_uploaded_observation
+    from Speculate_addons.observation_files import is_demo_observation as _is_demo_observation
 
-        if obs_file_selector.value:
-            if obs_file_selector.value in protected_files:
-                return
-
-            save_dir = "observation_files"
-            file_path = os.path.join(save_dir, obs_file_selector.value)
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                    set_obs_refresh(lambda v: v + 1)
-                except Exception:
-                    pass
+    def _delete_selected_observation(_):
+        """Delete the current selection, including files that cannot be plotted."""
+        _filename = obs_file_selector.value
+        if not _filename:
+            return
+        try:
+            _delete_uploaded_observation(_filename)
+            mo.status.toast(f"Deleted {_filename}")
+        except FileNotFoundError:
+            mo.status.toast(f"{_filename} was already removed; refreshing the list.")
+        except (OSError, ValueError) as _exc:
+            mo.status.toast(f"Could not delete {_filename}: {_exc}")
+            return
+        set_obs_refresh(lambda value: value + 1)
 
     delete_obs_btn = mo.ui.button(
         label=f"{mo.icon('lucide:trash-2')} Delete Selected",
         kind="danger",
-        on_click=lambda _: delete_selected_file()
+        disabled=not obs_file_selector.value or _is_demo_observation(obs_file_selector.value),
+        tooltip="Delete the selected upload. Bundled CV and AGN demos are protected.",
+        on_click=_delete_selected_observation,
     )
     return (delete_obs_btn,)
 
@@ -895,6 +859,7 @@ def _(
     flux_scale_selector,
     inclination_selector,
     load_spectrum,
+    mo,
     np,
     obs_file_selector,
     os,
@@ -1013,10 +978,13 @@ def _(
         plot_data_list.append(current_df)
 
     # 3. Add Observational spectrum (foreground)
+    _observation_error = None
     if show_obs.value and obs_file_selector.value:
         try:
+            from Speculate_addons.observation_files import read_observation_file as _read_observation_file
+
             obs_path = os.path.join("observation_files", obs_file_selector.value)
-            obs_df = pd.read_csv(obs_path)
+            obs_df = _read_observation_file(obs_path)
 
             # Normalize column names to uppercase for check
             obs_df.columns = [c.upper() for c in obs_df.columns]
@@ -1053,7 +1021,9 @@ def _(
                     })
                     plot_data_list.append(obs_plot_df)
         except Exception as e:
-            pass # Keep silent on error
+            _observation_error = mo.callout(
+                mo.md(f"Could not load observation: {e}"), kind="warn"
+            )
 
     # Once every visible series has been normalized into the same schema, render
     # one interactive Altair chart with styling driven by the synthetic/observed
@@ -1115,7 +1085,7 @@ def _(
             title='No spectra to display'
         )
 
-    spectrum_chart
+    mo.vstack([_observation_error, spectrum_chart]) if _observation_error is not None else spectrum_chart
     return
 
 
@@ -1279,9 +1249,9 @@ def _(mo):
         f"{mo.icon('lucide:book-open')} Usage Guide": mo.md("""
     ### Grid & Data Selection
     - **Select Grid Dataset**: Choose which Sirocco spectral grid to browse.
-    - **Select Observational Spectrum**: Pick an observation CSV to overlay on the plot.
-    - **Delete Selected**: Remove the selected uploaded observation file (built-in CV examples are protected).
-    - **Drag and drop a new observational spectra (CSV)**: Upload your own observation (headers `WAVELENGTH`, `FLUX`, optional `ERROR`).
+    - **Select Observational Spectrum**: Pick an observation CSV or TXT to overlay on the plot.
+    - **Delete Selected**: Remove the selected upload and refresh the list. Bundled CV and AGN demos are protected.
+    - **Drag and drop an observational spectrum (CSV or TXT)**: Upload a comma-, tab-, or space-separated table with `WAVELENGTH`, `FLUX`, and optional `ERROR` headers, or exactly two/three numeric columns in that order. The list refreshes after upload; select any file to view or delete.
 
     ### Display Toggles
     - **Show Current Spectrum**: Toggle visibility of the spectrum at the current run/inclination.

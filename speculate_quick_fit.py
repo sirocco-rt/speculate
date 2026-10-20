@@ -3399,14 +3399,8 @@ def _(
 
 @app.cell
 def _(mo):
-    get_qf_last_uploaded_obs, set_qf_last_uploaded_obs = mo.state(None)
     get_qf_obs_refresh, set_qf_obs_refresh = mo.state(0)
-    return (
-        get_qf_last_uploaded_obs,
-        get_qf_obs_refresh,
-        set_qf_last_uploaded_obs,
-        set_qf_obs_refresh,
-    )
+    return get_qf_obs_refresh, set_qf_obs_refresh
 
 
 @app.cell
@@ -3421,26 +3415,22 @@ def _(mo):
 
 
 @app.cell
-def _(get_qf_last_uploaded_obs, get_qf_obs_refresh, mo, os, qf_inf_emu_data, qf_inf_model_selector):
+def _(get_qf_obs_refresh, mo, qf_inf_emu_data, qf_inf_model_selector):
     from Speculate_addons.grid_registry import infer_grid_name as _infer_grid_name
+    from Speculate_addons.observation_files import list_observation_files as _list_observation_files
     from Speculate_addons.observation_priors import filter_observation_files_for_grid as _filter_observation_files_for_grid
 
+    # Rebuild from disk after each upload or deletion, including malformed files.
     _ = get_qf_obs_refresh()
-    _obs_dir = "observation_files"
-    qf_obs_files = []
-    if os.path.exists(_obs_dir):
-        qf_obs_files = sorted([f for f in os.listdir(_obs_dir) if f.endswith(('.csv', '.txt', '.dat'))])
-        _grid_name = qf_inf_emu_data.get("grid_name") if qf_inf_emu_data is not None else None
-        if not _grid_name and qf_inf_model_selector is not None:
-            _grid_name = _infer_grid_name(qf_inf_model_selector.value)
-        qf_obs_files = _filter_observation_files_for_grid(qf_obs_files, _grid_name)
+    _grid_name = qf_inf_emu_data.get("grid_name") if qf_inf_emu_data is not None else None
+    if not _grid_name and qf_inf_model_selector is not None:
+        _grid_name = _infer_grid_name(qf_inf_model_selector.value)
+    _obs_files = _filter_observation_files_for_grid(_list_observation_files(), _grid_name)
 
-    if qf_obs_files:
-        _last_uploaded = get_qf_last_uploaded_obs()
-        _default_file = _last_uploaded if _last_uploaded in qf_obs_files else qf_obs_files[0]
+    if _obs_files:
         qf_obs_selector = mo.ui.dropdown(
-            options=qf_obs_files,
-            value=_default_file,
+            options=_obs_files,
+            value=_obs_files[0],
             label="Select Observation File:",
             full_width=True,
         )
@@ -3451,17 +3441,51 @@ def _(get_qf_last_uploaded_obs, get_qf_obs_refresh, mo, os, qf_inf_emu_data, qf_
             label="Select Observation File:",
             full_width=True,
         )
+    return (qf_obs_selector,)
 
-    qf_obs_uploader = mo.ui.file(
-        kind="area",
-        label="**Drag and drop an observational spectrum (CSV)**",
-        multiple=False,
+
+@app.cell
+def _(mo, set_qf_obs_refresh):
+    # Keep the uploader independent of list refreshes: deleting a file must
+    # never re-run the upload handler with the previous upload's contents.
+    from Speculate_addons.observation_files import (
+        build_observation_uploader as _build_observation_uploader,
+        build_observation_upload_ui as _build_observation_upload_ui,
     )
-    qf_file_upload_ui = mo.vstack([
-         qf_obs_uploader,
-         mo.md("<center><small>Format: CSV with headers `WAVELENGTH`, `FLUX`, and optionally `ERROR`</small></center>")
-    ])
-    return qf_file_upload_ui, qf_obs_selector, qf_obs_uploader
+
+    qf_obs_uploader = _build_observation_uploader(mo, set_qf_obs_refresh)
+    qf_file_upload_ui = _build_observation_upload_ui(mo, qf_obs_uploader)
+    return qf_file_upload_ui, qf_obs_uploader
+
+
+@app.cell
+def _(mo, qf_obs_selector, set_qf_obs_refresh):
+    from Speculate_addons.observation_files import delete_uploaded_observation as _delete_uploaded_observation
+    from Speculate_addons.observation_files import is_demo_observation as _is_demo_observation
+
+    def _delete_selected_observation(_):
+        """Delete the dropdown selection independently of model/data loading."""
+        _filename = qf_obs_selector.value
+        if not _filename:
+            return
+        try:
+            _delete_uploaded_observation(_filename)
+            mo.status.toast(f"Deleted {_filename}")
+        except FileNotFoundError:
+            mo.status.toast(f"{_filename} was already removed; refreshing the list.")
+        except (OSError, ValueError) as _exc:
+            mo.status.toast(f"Could not delete {_filename}: {_exc}")
+            return
+        set_qf_obs_refresh(lambda value: value + 1)
+
+    qf_delete_obs_btn = mo.ui.button(
+        label=f"{mo.icon('lucide:trash-2')} Delete Selected",
+        kind="danger",
+        disabled=not qf_obs_selector.value or _is_demo_observation(qf_obs_selector.value),
+        tooltip="Delete the selected upload. Bundled CV and AGN demos are protected.",
+        on_click=_delete_selected_observation,
+    )
+    return (qf_delete_obs_btn,)
 
 
 @app.cell
@@ -3609,27 +3633,6 @@ def _(mo, qf_inf_emu_data, qf_test_grid_files, qf_test_grid_info):
 
 
 @app.cell
-def _(mo, os, qf_obs_uploader, set_qf_last_uploaded_obs, set_qf_obs_refresh):
-    if qf_obs_uploader.value:
-        _obs_dir = "observation_files"
-        os.makedirs(_obs_dir, exist_ok=True)
-
-        uploaded_file = qf_obs_uploader.value[0]
-        file_path = os.path.join(_obs_dir, uploaded_file.name)
-
-        try:
-            with open(file_path, "wb") as _f:
-                _f.write(uploaded_file.contents)
-
-            set_qf_last_uploaded_obs(uploaded_file.name)
-            set_qf_obs_refresh(lambda v: v + 1)
-            mo.status.toast(f"{mo.icon('lucide:check-circle')} Uploaded {uploaded_file.name}")
-        except Exception as e:
-            mo.status.toast(f"{mo.icon('lucide:x-circle')} Upload failed: {str(e)}")
-    return
-
-
-@app.cell
 def _(
     mo,
     np,
@@ -3755,24 +3758,18 @@ def _(
 
     elif qf_obs_selector.value and qf_obs_selector.value != "":
         try:
-            _path = os.path.join(_obs_dir, qf_obs_selector.value)
-            _df = pd.read_csv(_path)
-            _df.columns = _df.columns.astype(str).str.lower()
+            from Speculate_addons.observation_files import read_observation_file as _read_observation_file
 
-            if 'wavelength' in _df.columns and 'flux' in _df.columns:
-                _df = _df.sort_values('wavelength', ascending=True).reset_index(drop=True)
-                if 'sigma_source' in _df.columns:
-                    _df['sigma_source'] = _df['sigma_source'].astype(str).str.lower()
-                elif 'error' not in _df.columns:
-                    _df['sigma_source'] = 'uploaded_default_continuum'
-                _df.attrs["is_test_grid"] = False
-                _df.attrs["source_label"] = qf_obs_selector.value
-                qf_obs_data = _df
-                qf_data_source_info = f"Observation: {qf_obs_selector.value}"
-            else:
-                mo.output.replace(
-                    mo.callout(mo.md("CSV must have 'Wavelength' and 'Flux' columns."), kind="danger")
-                )
+            _path = os.path.join(_obs_dir, qf_obs_selector.value)
+            _df = _read_observation_file(_path)
+            if 'sigma_source' in _df.columns:
+                _df['sigma_source'] = _df['sigma_source'].astype(str).str.lower()
+            elif 'error' not in _df.columns:
+                _df['sigma_source'] = 'uploaded_default_continuum'
+            _df.attrs["is_test_grid"] = False
+            _df.attrs["source_label"] = qf_obs_selector.value
+            qf_obs_data = _df
+            qf_data_source_info = f"Observation: {qf_obs_selector.value}"
         except Exception as e:
             mo.output.replace(
                 mo.callout(mo.md(f"Error reading file: {e}"), kind="danger")
@@ -3843,6 +3840,8 @@ def _(
     os,
     qf_data_source_info,
     qf_data_source_selector,
+    qf_delete_obs_btn,
+    qf_file_upload_ui,
     qf_inf_emu_data,
     qf_inf_is_grid_interp,
     qf_inf_model_picker,
@@ -3852,7 +3851,6 @@ def _(
     qf_obs_data,
     qf_obs_scale_selector,
     qf_obs_selector,
-    qf_obs_uploader,
     qf_param_map_db_for_grid,
     set_qf_playground_target,
     qf_test_inclination_selector,
@@ -4001,7 +3999,10 @@ def _(
             mo.hstack([qf_test_run_selector, qf_test_inclination_selector], widths=[3, 1], align="end")
         )
     else:
-        _stage3_controls.extend([qf_obs_selector, qf_file_upload_ui])
+        _stage3_controls.extend([
+            mo.hstack([qf_obs_selector, qf_delete_obs_btn], align="end"),
+            qf_file_upload_ui,
+        ])
 
     _stage3_controls.extend([
         mo.hstack([qf_inf_wl_slider, qf_obs_scale_selector], widths=[3, 1], align="end"),

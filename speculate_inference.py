@@ -508,12 +508,21 @@ def _(get_loaded_emu_filename, get_selected_emu_filename, grid_selector, inf_par
 
 @app.cell
 def _(mo):
+    get_obs_refresh, set_obs_refresh = mo.state(0)
+    return get_obs_refresh, set_obs_refresh
+
+
+@app.cell
+def _(mo, set_obs_refresh):
     # UI widgets for the data-source half of Stage 1.  The user switches
     # between two modes:
-    #   "Observation File"   — user-uploaded CSV with Wavelength/Flux columns
+    #   "Observation File"   — user-uploaded CSV/TXT observation table
     #   "Test Grid"          — extracted Sirocco .spec files from a paired
     #                          validation grid, for ground-truth comparison.
-    get_obs_refresh, set_obs_refresh = mo.state(0)
+    from Speculate_addons.observation_files import (
+        build_observation_uploader as _build_observation_uploader,
+        build_observation_upload_ui as _build_observation_upload_ui,
+    )
 
     # Source Type Selector: Observation vs Test Grid
     data_source_selector = mo.ui.dropdown(
@@ -524,72 +533,26 @@ def _(mo):
     )
 
     # File upload for observational spectra
-    obs_file_uploader = mo.ui.file(
-        kind="area",
-        label="**Drag and drop a new observational spectra (CSV)**",
-        multiple=False
-    )
-
-    file_upload_ui = mo.vstack([
-         obs_file_uploader,
-         mo.md("<center><small>Format: CSV with headers `WAVELENGTH`, `FLUX`, and optionally `ERROR`</small></center>")
-    ])
+    obs_file_uploader = _build_observation_uploader(mo, set_obs_refresh)
+    file_upload_ui = _build_observation_upload_ui(mo, obs_file_uploader)
     return (
         data_source_selector,
         file_upload_ui,
-        get_obs_refresh,
         obs_file_uploader,
-        set_obs_refresh,
     )
 
 
-@app.cell
-def _(mo, obs_file_uploader, os, set_obs_refresh):
-    # Persist an uploaded observation into the shared observation directory and
-    # bump the refresh state so downstream file-picker cells rerun.
-    if obs_file_uploader.value:
-        # Create directory if it doesn't exist
-        _obs_dir = "observation_files"
-        os.makedirs(_obs_dir, exist_ok=True)
-
-        # Save file (taking the first one since multiple=False)
-        uploaded_file = obs_file_uploader.value[0]
-        file_path = os.path.join(_obs_dir, uploaded_file.name)
-
-        try:
-            with open(file_path, "wb") as _f:
-                _f.write(uploaded_file.contents)
-
-            # Force refresh of the file list
-            set_obs_refresh(lambda v: v + 1)
-
-            mo.status.toast(f"{mo.icon('lucide:check-circle')} Uploaded {uploaded_file.name}")
-        except Exception as e:
-             mo.status.toast(f"{mo.icon('lucide:x-circle')} Upload failed: {str(e)}")
-    return
-
-
 @app.cell(hide_code=True)
-def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
+def _(get_obs_refresh, grid_selector, os):
     # Build the selectable observation-file list and, when possible, the paired
     # test-grid metadata derived from the currently selected emulator grid.
     from Speculate_addons.grid_registry import get_grid_config as _get_grid_config
+    from Speculate_addons.observation_files import list_observation_files as _list_observation_files
     from Speculate_addons.observation_priors import filter_observation_files_for_grid as _filter_observation_files_for_grid
 
     # Trigger refresh on upload or delete
-    _ = obs_file_uploader.value
     _ = get_obs_refresh()
-
-    _obs_dir = "observation_files"  # Underscore to make local to this cell
-    obs_files = []
-
-    if os.path.exists(_obs_dir):
-        # Filter for likely data files
-        obs_files = sorted([f for f in os.listdir(_obs_dir) if f.endswith(('.csv', '.txt', '.dat'))])
-        obs_files = _filter_observation_files_for_grid(obs_files, grid_selector.value)
-
-    if not obs_files:
-        obs_files = [] # Ensure it's empty list if no files found
+    obs_files = _filter_observation_files_for_grid(_list_observation_files(), grid_selector.value)
 
     # Test Grid Files (based on selected grid)
     test_grid_files = []
@@ -622,7 +585,7 @@ def _(get_obs_refresh, grid_selector, obs_file_uploader, os):
 
 
 @app.cell
-def _(grid_selector, mo, obs_files, os, set_obs_refresh, test_grid_files):
+def _(grid_selector, mo, obs_files, test_grid_files):
     from Speculate_addons.grid_registry import default_fixed_inclination as _default_fixed_inclination, inclination_values as _get_inclination_values
 
     # Dropdown for selecting observation file
@@ -657,27 +620,6 @@ def _(grid_selector, mo, obs_files, os, set_obs_refresh, test_grid_files):
             full_width=True
         )
 
-    # The delete action only applies to uploaded observation files; test-grid
-    # spectra remain immutable because they are part of the grid dataset.
-    def delete_selected_file():
-        if obs_file_selector.value:
-            try:
-                _obs_dir = "observation_files"
-                file_path = os.path.join(_obs_dir, obs_file_selector.value)
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    set_obs_refresh(lambda v: v + 1)
-                    mo.status.toast(f"{mo.icon('lucide:trash-2')} Deleted {obs_file_selector.value}")
-            except Exception as e:
-                mo.status.toast(f"Error deleting file: {e}")
-
-    delete_obs_btn = mo.ui.button(
-        label=f"{mo.icon('lucide:trash-2')}",
-        kind="danger",
-        tooltip="Delete selected file",
-        on_click=lambda _: delete_selected_file()
-    )
-
     # Inclination selector for test grids.  CV and AGN .spec files expose
     # different angle sets, so both the options and default come from the registry.
     _inclination_values = _get_inclination_values(grid_selector.value if grid_selector is not None else None)
@@ -689,11 +631,41 @@ def _(grid_selector, mo, obs_files, os, set_obs_refresh, test_grid_files):
         full_width=True
     )
     return (
-        delete_obs_btn,
         obs_file_selector,
         test_inclination_selector,
         test_run_selector,
     )
+
+
+@app.cell
+def _(mo, obs_file_selector, set_obs_refresh):
+    from Speculate_addons.observation_files import delete_uploaded_observation as _delete_uploaded_observation
+    from Speculate_addons.observation_files import is_demo_observation as _is_demo_observation
+
+    def _delete_selected_observation(_):
+        """Delete the dropdown selection even when its data cannot be loaded."""
+        _filename = obs_file_selector.value
+        if not _filename:
+            return
+        try:
+            _delete_uploaded_observation(_filename)
+            mo.status.toast(f"Deleted {_filename}")
+        except FileNotFoundError:
+            mo.status.toast(f"{_filename} was already removed; refreshing the list.")
+        except (OSError, ValueError) as _exc:
+            mo.status.toast(f"Could not delete {_filename}: {_exc}")
+            return
+        set_obs_refresh(lambda value: value + 1)
+
+    # A separate cell updates the disabled state whenever the selection changes.
+    delete_obs_btn = mo.ui.button(
+        label=f"{mo.icon('lucide:trash-2')} Delete Selected",
+        kind="danger",
+        disabled=not obs_file_selector.value or _is_demo_observation(obs_file_selector.value),
+        tooltip="Delete the selected upload. Bundled CV and AGN demos are protected.",
+        on_click=_delete_selected_observation,
+    )
+    return (delete_obs_btn,)
 
 
 @app.cell
@@ -850,7 +822,6 @@ def _(
     obs_file_selector,
     os,
     pd,
-    re,
     test_grid_params_df,
     test_grid_path,
     test_inclination_selector,
@@ -924,24 +895,13 @@ def _(
             mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Error loading test grid: {e}"), kind="danger"))
 
     elif obs_file_selector.value:
-        # Observation mode accepts user-uploaded tabular data as long as it has
-        # wavelength and flux columns after column-name normalization.
+        # Use the same validated CSV/TXT format as Quick Fit and Grid Inspector.
         try:
+            from Speculate_addons.observation_files import read_observation_file as _read_observation_file
+
             path = os.path.join(_obs_dir, obs_file_selector.value)
-            # Try flexible loading
-            df = pd.read_csv(path)
-
-            # Normalize column names
-            df.columns = df.columns.astype(str).str.lower()
-
-            # Check for required columns
-            if 'wavelength' in df.columns and 'flux' in df.columns:
-                # Sort by wavelength ascending (handles decreasing-wavelength files)
-                df = df.sort_values('wavelength', ascending=True).reset_index(drop=True)
-                obs_data = df
-                data_source_info = f"Observation: {obs_file_selector.value}"
-            else:
-                 mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Invalid file format. Metadata columns 'Wavelength' and 'Flux' not found."), kind="danger"))
+            obs_data = _read_observation_file(path)
+            data_source_info = f"Observation: {obs_file_selector.value}"
 
         except Exception as e:
              mo.output.replace(mo.callout(mo.md(f"{mo.icon('lucide:x-circle')} Error reading file: {e}"), kind="danger"))
@@ -1297,7 +1257,7 @@ def _(
         if obs_data is not None:
             data_control_row = mo.vstack([
                 data_source_selector,
-                mo.hstack([obs_file_selector, delete_obs_btn], align="end", widths=[6, 1]),
+                mo.hstack([obs_file_selector, delete_obs_btn], align="end"),
                 wl_range_slider,
                 obs_flux_scale,
                 file_upload_ui
