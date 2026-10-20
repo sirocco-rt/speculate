@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.6.0 (2026-10-20)
+
+### Bug Fixes
+
+- Fixing inconsistencies in posterior summary evaluation between mcmc medians and means.
+  ([`49ac084`](https://github.com/sirocco-rt/speculate/commit/49ac084af9e3a26c614dbb48f031c77d85497bd2))
+
+### Features
+
+- Expanded observation file handling and UI components
+  ([`3f1cc7a`](https://github.com/sirocco-rt/speculate/commit/3f1cc7afd9b57634f869f5c6248188559c1d2d19))
+
+
 ## v0.5.0 (2026-08-21)
 
 ### Bug Fixes
