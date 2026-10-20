@@ -3274,7 +3274,7 @@ def run_tier3_single(
     flux_scale: str = "linear",
     wl_range: Optional[Tuple[float, float]] = None,
     distance_prior_pc: Optional[dict] = None,
-    max_mle_iter: int = 10000,
+    max_mle_iter: int = 20000,
     mle_restarts: int = 5,
     n_ppc_draws: int = 100,
     mcmc_walkers: int = 64,

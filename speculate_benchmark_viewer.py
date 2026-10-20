@@ -3074,7 +3074,7 @@ def _(glob, mo, os):
         label="Max test spectra (Tier 2)",
     )
     mcmc_steps_slider = mo.ui.slider(
-        start=100, stop=5000, value=5000, step=100, show_value=True,
+        start=100, stop=10000, value=5000, step=100, show_value=True,
         label="MCMC steps (Tier 2/3)",
     )
     mle_restarts_slider = mo.ui.slider(
