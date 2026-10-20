@@ -1,4 +1,8 @@
-<img width="1659" height="779" alt="Screenshot 2025-11-06 at 20 17 28" src="https://github.com/user-attachments/assets/7ffd7afb-90de-460a-8211-58ecc64877d4" />
+<div align="center">
+<img width="700" alt="Screenshot 2026-06-09 at 14 08 46" src="https://github.com/user-attachments/assets/9da324af-a7d2-4a79-b270-0381a626f91b" />
+    
+[![arXiv](https://img.shields.io/badge/arXiv-2610.07364-b31b1b.svg)](https://arxiv.org/abs/2610.07364)
+</div>
 
 An emulator for Sirocco for faster inference of an observational spectrum's outflow parameters
 ## Local Installation
